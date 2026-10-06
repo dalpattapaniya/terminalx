@@ -13,6 +13,8 @@ vi.mock("@/components/account/AccountSidebarEntry", () => ({ AccountSidebarEntry
 vi.mock("@/lib/mobileDriver", () => ({ useMobileDrivenTabs: () => new Set<string>() }));
 vi.mock("@/lib/tabViews", () => ({ useTabViews: () => ({ views: {} }) }));
 vi.mock("@/lib/automations", () => ({ useAutomationStore: () => ({ automations: [] }) }));
+// These tests are about the detailed (project tree) sidebar.
+(await import("@/lib/prefs")).setPrefs({ sidebarLayout: "detailed" });
 
 const { ProjectRail } = await import("./ProjectRail");
 const store = await import("@/lib/sessions");

@@ -18,6 +18,8 @@ vi.mock("@/lib/automations", () => ({ useAutomationStore: () => ({ automations: 
 vi.mock("@/lib/account", async (original) => ({ ...(await original<typeof import("@/lib/account")>()), useAccount: () => mocks.account }));
 vi.mock("@/lib/pairing", async (original) => ({ ...(await original<typeof import("@/lib/pairing")>()), usePairing: () => ({ status: { relay: { phase: mocks.relay } } }) }));
 vi.mock("@/components/account/AccountAvatar", () => ({ AccountAvatar: () => <span data-testid="avatar" /> }));
+// These tests are about the detailed (project tree) sidebar.
+(await import("@/lib/prefs")).setPrefs({ sidebarLayout: "detailed" });
 
 const { ProjectRail } = await import("./ProjectRail");
 const store = await import("@/lib/sessions");

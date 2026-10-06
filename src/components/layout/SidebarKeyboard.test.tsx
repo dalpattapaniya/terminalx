@@ -42,6 +42,8 @@ vi.mock("@/lib/cloudConnections", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/lib/cloudConnections")>();
   return { ...original, wakeCloudConnection: vi.fn(original.wakeCloudConnection), retainCloudConnection: vi.fn(original.retainCloudConnection) };
 });
+// These tests are about the detailed (project tree) sidebar.
+(await import("@/lib/prefs")).setPrefs({ sidebarLayout: "detailed" });
 
 const { ProjectRail } = await import("./ProjectRail");
 const prefs = await import("@/lib/prefs");

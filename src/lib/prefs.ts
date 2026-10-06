@@ -37,6 +37,11 @@ export interface Prefs {
    */
   sidebarSections: Record<string, "expanded" | "collapsed">;
   /**
+   * The sidebar's shape: "simple" lists every conversation newest first, as a
+   * chat app does; "detailed" is the project, workspace and tab tree.
+   */
+  sidebarLayout: "simple" | "detailed";
+  /**
    * Cloud projects the reader added with "+ Add project", per organization:
    * repository identities (`host/owner/name`). Projects with workspaces show
    * without being added.
@@ -91,6 +96,7 @@ const DEFAULTS: Prefs = {
   useWorktree: true,
   bypassConfirmed: false,
   sidebarSections: {},
+  sidebarLayout: "simple",
   cloudProjects: {},
   cloudBlankProjects: {},
   cloudPinned: {},

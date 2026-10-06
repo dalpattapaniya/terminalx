@@ -54,6 +54,8 @@ vi.mock("@/lib/cloudTerminals", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/lib/cloudTerminals")>();
   return { ...original, createCloudTerminal: mocks.createCloudTerminal };
 });
+// These tests are about the detailed (project tree) sidebar.
+(await import("@/lib/prefs")).setPrefs({ sidebarLayout: "detailed" });
 
 const { ProjectRail } = await import("@/components/layout/ProjectRail");
 const { CloudSessionHost } = await import("./CloudSessionHost");

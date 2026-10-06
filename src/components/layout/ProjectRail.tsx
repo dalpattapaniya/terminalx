@@ -9,6 +9,7 @@ import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/R
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/menu";
 import { cn } from "@/lib/cn";
 import { useShortcutKeys } from "@/lib/hotkeys";
+import { setPrefs, usePrefs } from "@/lib/prefs";
 import type { ShortcutId } from "@/lib/shortcuts";
 import { errorMessage } from "@/lib/api";
 import {
@@ -39,8 +40,9 @@ import { refreshCloudCatalog } from "@/lib/cloudCatalog";
 import { TreeToggle } from "./SidebarRows";
 import { CloudSections, useCloudSections, useSectionCollapsed } from "./cloud/CloudSections";
 import { DevelopmentSection } from "@/components/cloud/DevRuntime";
+import { SessionSidebar } from "./SessionSidebar";
 
-interface RailProps {
+export interface RailProps {
   onOpenSettings: () => void;
   onOpenAccount: () => void;
   onOpenIssues: () => void;
@@ -51,11 +53,17 @@ interface RailProps {
   onSearch: () => void;
 }
 
+/** The sidebar in the shape the reader chose: a list of conversations, or the project tree. */
+export function ProjectRail(props: RailProps) {
+  const { sidebarLayout } = usePrefs();
+  return sidebarLayout === "detailed" ? <DetailedRail {...props} /> : <SessionSidebar {...props} />;
+}
+
 /**
- * The unified sidebar: global destinations followed by an expandable project
+ * The detailed sidebar: global destinations followed by an expandable project
  * tree. The project menu remains the home for naming, appearance and refresh.
  */
-export function ProjectRail({
+function DetailedRail({
   onOpenSettings,
   onOpenAccount,
   onOpenIssues,
@@ -201,6 +209,10 @@ export function ProjectRail({
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => void refreshAll()}>
             <RefreshCw className={cn(spinning && "animate-spin")} /> Refresh everything
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setPrefs({ sidebarLayout: "simple" })}>
+            <MessagesSquare /> Simple sidebar
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

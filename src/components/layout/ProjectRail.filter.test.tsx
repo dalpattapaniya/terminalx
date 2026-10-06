@@ -14,6 +14,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn(), open: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 vi.mock("@/lib/mobileDriver", () => ({ useMobileDrivenTabs: () => new Set() }));
 vi.mock("@/lib/tabViews", () => ({ useTabViews: () => ({ views: {} }) }));
+// These tests are about the detailed (project tree) sidebar.
+(await import("@/lib/prefs")).setPrefs({ sidebarLayout: "detailed" });
 
 const { ProjectRail } = await import("./ProjectRail");
 const sessions = await import("@/lib/sessions");
