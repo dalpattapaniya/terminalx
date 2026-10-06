@@ -1137,6 +1137,15 @@ pub fn add_project(path: String) -> CmdResult<Project> {
     projects::add(&path).map_err(err)
 }
 
+/// The folder the sidebar's New chat runs in: a plain directory in the store,
+/// so a chat needs no project of the user's and no worktree.
+#[tauri::command]
+pub fn chats_dir() -> CmdResult<String> {
+    let dir = store::ensure_dir(store::root().map_err(err)?.join("Chats")).map_err(err)?;
+    // Canonical, as a session's project path is, so the sidebar can match them.
+    Ok(std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 pub fn remove_project(path: String) -> CmdResult<()> {
     projects::remove(&path).map_err(err)

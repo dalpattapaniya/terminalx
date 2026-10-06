@@ -390,6 +390,7 @@ pub fn run() {
             commands::pairing_revoke,
             commands::pairing_set_host_name,
             commands::add_project,
+            commands::chats_dir,
             commands::remove_project,
             commands::select_project,
             commands::list_sessions,

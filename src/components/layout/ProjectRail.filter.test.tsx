@@ -100,7 +100,8 @@ describe("the sidebar's session filter (local)", () => {
     expect(projectNames()).toEqual(["Api", "Quiet", "Web"]);
     const control = screen.getByTestId("sidebar-filter");
     expect(control.getAttribute("data-filter")).toBe("all");
-    expect(control.getAttribute("aria-label")).toBe("Filter sessions");
+    expect(control.getAttribute("aria-label")).toBe("View options");
+    expect(screen.queryByTestId("sidebar-filter-chip")).toBeNull();
   });
 
   it("Needs you shows only the sessions waiting for a person, with their projects opened", async () => {
@@ -113,8 +114,9 @@ describe("the sidebar's session filter (local)", () => {
     expect(shown("Refactor the router")).toBe(false);
     expect(shown("Archived and waiting")).toBe(false);
     const control = screen.getByTestId("sidebar-filter");
-    expect(control.getAttribute("aria-label")).toBe("Filter sessions: Needs you");
     expect(control.className).toContain("bg-veil-strong");
+    // The filter in force is named beside the controls, and one click lifts it.
+    expect(screen.getByTestId("sidebar-filter-chip").textContent).toBe("Needs you ×");
   });
 
   it("Unread shows only finished answers nobody has read", async () => {

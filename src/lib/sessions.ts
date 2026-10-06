@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { api, type WorkspaceRemoveOptions } from "@/lib/api";
+import { getPrefs } from "@/lib/prefs";
 import { getAccount } from "@/lib/account";
 import { cloudKeyOrgId, mayStartCloudSessions } from "@/lib/multiOrg";
 import { closeSessionShells, dropSessionTerminals, dropTabTerminals, setArchivedTerminalSessions, setSelectedAgent } from "@/lib/terminal";
@@ -21,6 +22,8 @@ interface State {
   lastProject: string | null;
   sessions: SessionEntry[];
   harnesses: HarnessInfo[];
+  /** The folder New chat runs in; its sessions are chats, listed apart from projects. */
+  chatsPath: string | null;
   selectedSessionId: string | null;
   /** Explicit navigation also reveals a destination that was collapsed. */
   navigationVersion: number;
@@ -61,6 +64,7 @@ let state: State = {
   lastProject: null,
   sessions: [],
   harnesses: [],
+  chatsPath: null,
   selectedSessionId: null,
   navigationVersion: 0,
   view: "new",
@@ -126,6 +130,7 @@ export async function bootSessions() {
   const [projects, sessions] = await Promise.all([api.listProjects(), api.listSessions()]);
   set({ loaded: true, projects: projects.projects, lastProject: projects.lastSelected, sessions });
   void api.listHarnesses().then((harnesses) => set({ harnesses })).catch(() => {});
+  void api.chatsDir().then((chatsPath) => set({ chatsPath })).catch(() => {});
   try {
     await listen<SessionEntry>("session_created", (e) => upsertSession(e.payload));
     await listen<SessionEntry>("session_updated", (e) => upsertSession(e.payload));
@@ -424,6 +429,35 @@ export async function addProject(path: string) {
   const exists = state.projects.some((x) => x.path === p.path);
   set({ projects: exists ? state.projects.map((existing) => existing.path === p.path ? p : existing) : [...state.projects, p], lastProject: p.path });
   return p;
+}
+
+/**
+ * The sidebar's New chat: an agent conversation in the store's Chats folder,
+ * so talking to a model needs no project. The folder is a plain directory, so
+ * the session runs in place with no worktree, and it is never added as a
+ * project: the sidebar lists its sessions on their own.
+ */
+export async function startChat(): Promise<SessionEntry> {
+  const harness = state.harnesses.find((item) => item.id === "claude" && item.available) ?? state.harnesses.find((item) => item.available);
+  if (!harness) throw new Error("Install and sign in to an agent to start a chat.");
+  const chatsPath = state.chatsPath ?? (await api.chatsDir());
+  if (chatsPath !== state.chatsPath) set({ chatsPath });
+  const prefs = getPrefs();
+  const session = await api.createSession({
+    projectPath: chatsPath,
+    cwd: chatsPath,
+    title: "Chat",
+    useWorktree: false,
+    tab: {
+      harness: harness.id,
+      model: prefs.lastModel[harness.id] ?? "",
+      effort: prefs.lastEffort[harness.id] ?? null,
+      permissionMode: prefs.lastMode,
+    },
+  });
+  upsertSession(session);
+  selectSession(session.id);
+  return session;
 }
 
 export async function removeProject(path: string) {

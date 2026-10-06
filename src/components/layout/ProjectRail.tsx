@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Archive, BarChart3, Check, ListFilter, CalendarClock, ChevronDown, CircleDot, Ellipsis, FolderOpen, FolderPlus, ImagePlus, LayoutGrid, Pin, PinOff, RefreshCw, Search, Settings, Sparkles, Trash2 } from "lucide-react";
+import { Archive, BarChart3, Check, CalendarClock, ChevronDown, CircleDot, Ellipsis, FolderOpen, FolderPlus, ImagePlus, LayoutGrid, MessagesSquare, Pin, Plus, PinOff, RefreshCw, Search, Settings, Sparkles, Trash2 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
 import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/menu";
 import { cn } from "@/lib/cn";
 import { useShortcutKeys } from "@/lib/hotkeys";
 import type { ShortcutId } from "@/lib/shortcuts";
@@ -19,6 +19,7 @@ import {
   selectProjectInSidebar,
   setShowArchived as setSessionsArchived,
   setProjectLogo,
+  startChat,
   startSessionIn,
   updateProject,
   useSessionStore,
@@ -31,13 +32,24 @@ import { MASCOTS, PROJECT_COLORS, PixelMascot, colorCss } from "./PixelMascot";
 import { TITLEBAR_INSET } from "./AppShell";
 import { useAutomationStore } from "@/lib/automations";
 import { AccountSidebarEntry } from "@/components/account/AccountSidebarEntry";
-import { ProjectNavigation } from "./SidebarTree";
+import { ChatsNode, ProjectNavigation } from "./SidebarTree";
 import { navigateTree } from "./treeKeyboard";
 import { refreshAccountRoles } from "@/lib/accountRoles";
 import { refreshCloudCatalog } from "@/lib/cloudCatalog";
 import { TreeToggle } from "./SidebarRows";
 import { CloudSections, useCloudSections, useSectionCollapsed } from "./cloud/CloudSections";
 import { DevelopmentSection } from "@/components/cloud/DevRuntime";
+
+interface RailProps {
+  onOpenSettings: () => void;
+  onOpenAccount: () => void;
+  onOpenIssues: () => void;
+  onOpenAgents: () => void;
+  onOpenStats: () => void;
+  onOpenAutomations: () => void;
+  onOpenSkills: () => void;
+  onSearch: () => void;
+}
 
 /**
  * The unified sidebar: global destinations followed by an expandable project
@@ -52,25 +64,13 @@ export function ProjectRail({
   onOpenAutomations,
   onOpenSkills,
   onSearch,
-}: {
-  onOpenSettings: () => void;
-  onOpenAccount: () => void;
-  onOpenIssues: () => void;
-  onOpenAgents: () => void;
-  onOpenStats: () => void;
-  onOpenAutomations: () => void;
-  onOpenSkills: () => void;
-  onSearch: () => void;
-}) {
+}: RailProps) {
   const store = useSessionStore();
-  // A destination looks active only while it is what the main slot shows: no session and no cloud workspace selected.
-  const onNavView = !store.selectedSessionId && !store.selectedCloudWorkspace;
   // Section headers appear only when an organization section exists; otherwise the sidebar is as it was.
   const cloud = useCloudSections();
   const sectioned = cloud.orgs.length > 0;
   const [localCollapsedPref, toggleLocal] = useSectionCollapsed("local");
   const localCollapsed = sectioned && localCollapsedPref;
-  const automationStore = useAutomationStore();
   const [error, setError] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [spinning, setSpinning] = useState(false);
@@ -78,16 +78,14 @@ export function ProjectRail({
 
   const filter = useSidebarFilter();
   const projects = [...store.projects]
+    // The Chats folder is New chat's, not a project, even where an earlier build registered it.
+    .filter((p) => p.path !== store.chatsPath)
     .filter((p) => !!p.archived === showArchived || store.sessions.some((s) => s.id === store.selectedSessionId && s.projectPath === p.path))
     // Unread or Needs you: only the projects with such a session.
     .filter((p) => !filter.active || filter.showsProject(p.path))
     .sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || a.name.localeCompare(b.name));
   const archivedCount = store.projects.filter((p) => p.archived).length;
   // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
-  const cloudSessions = useCloudDashboard();
-  const dashboardBuckets = useMemo(() => (cloudSessions.length ? bucketSessions([...store.sessions, ...cloudSessions]) : bucketSessions(store.sessions)), [store.sessions, cloudSessions]);
-  const automationRunning = automationStore.automations.some((automation) => automation.lastOutcome === "pending" || automation.lastOutcome === "running");
-  const automationFailures = automationStore.automations.filter((automation) => automation.lastOutcome === "failed").length;
   const selectedSession = store.sessions.find((session) => session.id === store.selectedSessionId) ?? null;
   const focus = store.selectedProject ?? selectedSession?.projectPath ?? store.lastProject ?? store.projects[0]?.path ?? null;
 
@@ -119,6 +117,15 @@ export function ProjectRail({
     }
   };
 
+  const newChat = async () => {
+    try {
+      await startChat();
+      setError(null);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
   const refreshAll = async () => {
     setSpinning(true);
     try {
@@ -130,59 +137,79 @@ export function ProjectRail({
   };
 
   const filterLabel = SIDEBAR_FILTERS.find((entry) => entry.id === filter.filter)!.label;
+  // Two quiet buttons: + makes something, ⋯ holds the view (filter, archived) and refresh.
   const headerActions = (
     <div className="flex items-center">
+      {filter.active && (
+        <button
+          type="button"
+          onClick={() => setSidebarFilter("all")}
+          className="mr-1 rounded-sm bg-veil-strong px-1.5 text-[10px] text-foreground hover:bg-veil-raised"
+          title="Show all sessions"
+          data-testid="sidebar-filter-chip"
+        >
+          {filterLabel} ×
+        </button>
+      )}
       <DropdownMenu>
-        <WithTooltip label={filter.active ? `Showing: ${filterLabel}` : "Filter sessions"}>
+        <WithTooltip label="New">
           <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={filter.active ? `Filter sessions: ${filterLabel}` : "Filter sessions"}
-              className={filter.active ? "bg-veil-strong text-foreground" : undefined}
-              data-testid="sidebar-filter"
-              data-filter={filter.filter}
-            >
-              <ListFilter />
+            <Button variant="ghost" size="icon-xs" aria-label="New">
+              <Plus />
             </Button>
           </DropdownMenuTrigger>
         </WithTooltip>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => void newChat()}>
+            <MessagesSquare /> New chat
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void pickProject()}>
+            <FolderPlus /> Add project…
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <DropdownMenu>
+        <WithTooltip label="View options">
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="View options"
+              className={filter.active || store.showArchived ? "bg-veil-strong text-foreground" : undefined}
+              data-testid="sidebar-filter"
+              data-filter={filter.filter}
+            >
+              <Ellipsis />
+            </Button>
+          </DropdownMenuTrigger>
+        </WithTooltip>
+        <DropdownMenuContent align="end">
+          <DropdownMenuLabel>Show</DropdownMenuLabel>
           {SIDEBAR_FILTERS.map((entry) => (
             <DropdownMenuItem key={entry.id} onSelect={() => setSidebarFilter(entry.id)} aria-checked={filter.filter === entry.id} role="menuitemradio">
               {filter.filter === entry.id ? <Check /> : <span aria-hidden className="size-4" />}
               {entry.label}
             </DropdownMenuItem>
           ))}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setSessionsArchived(!store.showArchived)} aria-checked={store.showArchived} role="menuitemcheckbox">
+            {store.showArchived ? <Check /> : <Archive />} Archived sessions
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setShowArchived((v) => !v)} aria-checked={showArchived} role="menuitemcheckbox">
+            {showArchived ? <Check /> : <Archive />} Archived projects{archivedCount ? ` (${archivedCount})` : ""}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => void refreshAll()}>
+            <RefreshCw className={cn(spinning && "animate-spin")} /> Refresh everything
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <WithTooltip label={store.showArchived ? "Show active sessions" : "Show archived sessions"}>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          aria-label={store.showArchived ? "Show active sessions" : "Show archived sessions"}
-          aria-pressed={store.showArchived}
-          className={store.showArchived ? "bg-veil-strong text-foreground" : undefined}
-          onClick={() => setSessionsArchived(!store.showArchived)}
-        >
-          <Archive />
-        </Button>
-      </WithTooltip>
-      <WithTooltip label="Refresh every project">
-        <Button variant="ghost" size="icon-xs" aria-label="Refresh all" onClick={() => void refreshAll()}>
-          <RefreshCw className={cn(spinning && "animate-spin")} />
-        </Button>
-      </WithTooltip>
-      <WithTooltip label="Add project">
-        <Button variant="ghost" size="icon-xs" aria-label="Add project" onClick={() => void pickProject()}>
-          <FolderPlus />
-        </Button>
-      </WithTooltip>
     </div>
   );
 
   const localRows = (
     <>
+      {!localCollapsed && <ChatsNode onNewChat={() => void newChat()} />}
       {!localCollapsed && projects.length === 0 && (
         <div className="px-2 py-6 text-center text-xs text-muted-foreground" data-testid={filter.active ? "sidebar-filter-empty" : undefined}>
           {filter.active ? (
@@ -234,63 +261,7 @@ export function ProjectRail({
           Search
           <Keys shortcut="app.commandPalette" />
         </Button>
-        <Button
-          variant="ghost"
-          className={cn("justify-start gap-2 px-2", store.view === "issues" && onNavView ? "bg-selected text-foreground" : "")}
-          onClick={onOpenIssues}
-        >
-          <CircleDot />
-          Issues
-          <Keys shortcut="app.issues" />
-        </Button>
-        <WithTooltip label="Agent dashboard" shortcut="app.agentDashboard">
-          <Button
-            variant="ghost"
-            className={cn("min-w-0 justify-start gap-2 px-2", store.view === "agents" && onNavView ? "bg-selected text-foreground" : "")}
-            onClick={onOpenAgents}
-          >
-            <LayoutGrid />
-            <span className="min-w-0 truncate">Agent Dashboard</span>
-            <DashboardTotals buckets={dashboardBuckets} />
-          </Button>
-        </WithTooltip>
-        <WithTooltip label="Stats & Usage" shortcut="app.stats">
-          <Button
-            variant="ghost"
-            className={cn("justify-start gap-2 px-2", store.view === "stats" && onNavView ? "bg-selected text-foreground" : "")}
-            onClick={onOpenStats}
-          >
-            <BarChart3 />
-            <span className="truncate">Stats &amp; Usage</span>
-          </Button>
-        </WithTooltip>
-        <WithTooltip label="Automations" shortcut="app.automations">
-          <Button
-            variant="ghost"
-            className={cn("justify-start gap-2 px-2", store.view === "automations" && onNavView ? "bg-selected text-foreground" : "")}
-            onClick={onOpenAutomations}
-          >
-            <CalendarClock />
-            <span className="truncate">Automations</span>
-            {(automationRunning || automationFailures > 0) && (
-              <span className="ml-auto flex items-center gap-1.5 text-[10px] tabular-nums">
-                {automationRunning && <span className="size-1.5 rounded-full bg-info animate-pulse-soft" title="Automation running" />}
-                {automationFailures > 0 && <span className="text-warning">{automationFailures}</span>}
-              </span>
-            )}
-          </Button>
-        </WithTooltip>
-        <WithTooltip label="Skills" shortcut="app.skills">
-          <Button
-            variant="ghost"
-            className={cn("justify-start gap-2 px-2", store.view === "skills" && onNavView ? "bg-selected text-foreground" : "")}
-            onClick={onOpenSkills}
-          >
-            <Sparkles />
-            Skills
-            <Keys shortcut="app.skills" />
-          </Button>
-        </WithTooltip>
+        <AppDestinations onOpenIssues={onOpenIssues} onOpenAgents={onOpenAgents} onOpenStats={onOpenStats} onOpenAutomations={onOpenAutomations} onOpenSkills={onOpenSkills} />
       </div>
 
       {!sectioned && (
@@ -301,7 +272,7 @@ export function ProjectRail({
             className="text-[11px] font-medium uppercase tracking-wide text-faint hover:text-muted-foreground"
             title={archivedCount ? `${archivedCount} archived` : undefined}
           >
-            {showArchived ? "Archived" : "Projects"}
+            {showArchived ? "Archived" : "Workspace"}
           </button>
           {headerActions}
         </div>
@@ -356,27 +327,97 @@ export function ProjectRail({
   );
 }
 
-/** Full column totals, including zero counts and read Done sessions. */
-function DashboardTotals({ buckets }: { buckets: Record<ColumnId, readonly unknown[]> }) {
+/** Issues, the dashboard, stats, automations and skills, as one strip of icons that carry their own status. */
+export function AppDestinations({
+  onOpenIssues,
+  onOpenAgents,
+  onOpenStats,
+  onOpenAutomations,
+  onOpenSkills,
+}: Pick<RailProps, "onOpenIssues" | "onOpenAgents" | "onOpenStats" | "onOpenAutomations" | "onOpenSkills">) {
+  const store = useSessionStore();
+  const automationStore = useAutomationStore();
+  // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
+  const cloudSessions = useCloudDashboard();
+  const dashboardBuckets = useMemo(() => (cloudSessions.length ? bucketSessions([...store.sessions, ...cloudSessions]) : bucketSessions(store.sessions)), [store.sessions, cloudSessions]);
+  const automationRunning = automationStore.automations.some((automation) => automation.lastOutcome === "pending" || automation.lastOutcome === "running");
+  const automationFailures = automationStore.automations.filter((automation) => automation.lastOutcome === "failed").length;
+  // A destination looks active only while it is what the main slot shows: no session and no cloud workspace selected.
+  const onNavView = !store.selectedSessionId && !store.selectedCloudWorkspace;
   return (
-    <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10px] tabular-nums">
-      {COLUMNS.map(({ id, label }) => {
-        const count = buckets[id].length;
-        const description = `${count} ${label.toLowerCase()}`;
+    <DestinationStrip
+      active={onNavView ? store.view : null}
+      destinations={[
+        { id: "issues", label: "Issues", shortcut: "app.issues", icon: <CircleDot />, onOpen: onOpenIssues },
+        { id: "agents", label: "Agent dashboard", shortcut: "app.agentDashboard", icon: <LayoutGrid />, onOpen: onOpenAgents, ...dashboardStatus(dashboardBuckets) },
+        { id: "stats", label: "Stats & Usage", shortcut: "app.stats", icon: <BarChart3 />, onOpen: onOpenStats },
+        {
+          id: "automations",
+          label: "Automations",
+          shortcut: "app.automations",
+          icon: <CalendarClock />,
+          onOpen: onOpenAutomations,
+          dot: automationFailures > 0 ? { tone: "warning", label: `${automationFailures} failed` } : automationRunning ? { tone: "info", label: "Running" } : null,
+        },
+        { id: "skills", label: "Skills", shortcut: "app.skills", icon: <Sparkles />, onOpen: onOpenSkills },
+      ]}
+    />
+  );
+}
+
+type Dot = { tone: "warning" | "info" | "add"; label: string } | null;
+
+/** The dashboard's totals, read out in full, and one dot: needs you before working. */
+function dashboardStatus(buckets: Record<ColumnId, readonly unknown[]>): { status: string; dot: Dot } {
+  const status = COLUMNS.map(({ id, label }) => `${buckets[id].length} ${label.toLowerCase()}`).join(", ");
+  const dot: Dot = buckets.needs.length ? { tone: "warning", label: status } : buckets.working.length ? { tone: "info", label: status } : null;
+  return { status, dot };
+}
+
+/**
+ * The app's destinations as one row of icons: each names itself and its keys
+ * in a tooltip, marks itself while it is what the main slot shows, and carries
+ * a dot when something there wants a look.
+ */
+function DestinationStrip({
+  active,
+  destinations,
+}: {
+  active: string | null;
+  /** `status` is read out with the label; `dot` marks it when something there wants a look. */
+  destinations: { id: string; label: string; shortcut: ShortcutId; icon: ReactNode; onOpen: () => void; status?: string; dot?: Dot }[];
+}) {
+  return (
+    <div className="flex items-center justify-between px-1 py-0.5" role="toolbar" aria-label="Destinations" data-testid="destination-strip">
+      {destinations.map((destination) => {
+        const status = destination.status ?? destination.dot?.label;
         return (
-          <span
-            key={id}
-            role="img"
-            aria-label={description}
-            title={description}
-            className={cn("flex items-center gap-1", id === "needs" && "text-warning", id === "working" && "text-info", id === "done" && "text-add")}
+        <WithTooltip key={destination.id} label={status ? `${destination.label} · ${status}` : destination.label} shortcut={destination.shortcut}>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={status ? `${destination.label}, ${status}` : destination.label}
+            aria-pressed={active === destination.id}
+            className={cn("relative", active === destination.id && "bg-selected text-foreground")}
+            onClick={destination.onOpen}
           >
-            <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current" />
-            {count}
-          </span>
+            {destination.icon}
+            {destination.dot && (
+              <span
+                aria-hidden
+                className={cn(
+                  "absolute right-1 top-1 size-1.5 rounded-full",
+                  destination.dot.tone === "warning" && "bg-warning",
+                  destination.dot.tone === "info" && "bg-info animate-pulse-soft",
+                  destination.dot.tone === "add" && "bg-add",
+                )}
+              />
+            )}
+          </Button>
+        </WithTooltip>
         );
       })}
-    </span>
+    </div>
   );
 }
 

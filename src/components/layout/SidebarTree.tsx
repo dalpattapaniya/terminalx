@@ -7,6 +7,7 @@ import {
   FolderOpen,
   GitBranch,
   GitFork,
+  MessagesSquare,
   Pin,
   Plus,
   Sparkles,
@@ -17,7 +18,7 @@ import {
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { AgentMark } from "@/components/AgentMark";
 import { WorkspaceNameEditor } from "@/components/session/WorkspaceNameEditor";
-import { RowActions } from "@/components/layout/RowActions";
+import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
 import {
   AgentTabRow,
   BrowserTabRow,
@@ -35,6 +36,7 @@ import {
   TreeToggle,
 } from "@/components/layout/SidebarRows";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/cn";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -53,7 +55,7 @@ import { confirmDeleteSession } from "@/lib/deleteSessionFlow";
 import { workspaceName as sessionWorkspaceName } from "@/lib/dashboard";
 import { openSettle, openWorkspaceDelete } from "@/lib/dialogs";
 import { useMobileDrivenTabs } from "@/lib/mobileDriver";
-import { getPrefs } from "@/lib/prefs";
+import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
 import { useSidebarFilter } from "@/lib/sidebarFilter";
 import { useWorkspaceSizes } from "@/lib/workspaceSizes";
 import {
@@ -199,6 +201,106 @@ export function ProjectNavigation({ project, expanded }: { project: Project; exp
         />
       ))}
     </TreeGroup>
+  );
+}
+
+/**
+ * Chats as the first entry of the sidebar's list, drawn like a project: its
+ * `+` starts a chat (as the row itself does while there is none). Folded, the
+ * default, it shows the latest chat and the open one; unfolded, every chat.
+ * The choice is remembered like a sidebar section's.
+ */
+export function ChatsNode({ onNewChat }: { onNewChat: () => void }) {
+  const store = useSessionStore();
+  const filter = useSidebarFilter();
+  const { sidebarSections } = usePrefs();
+  const expanded = sidebarSections.chats === "expanded";
+  const toggle = () => setPrefs({ sidebarSections: { ...sidebarSections, chats: expanded ? "collapsed" : "expanded" } });
+  const chats = useChats();
+  if (filter.active && !chats.length) return null;
+  // A filter shows everything it found, as it opens projects.
+  const open = expanded || filter.active;
+  const latest = chats.length ? chats.reduce((a, b) => (b.modified > a.modified ? b : a)) : null;
+  const shown = open ? chats : chats.filter((session) => session.id === latest?.id || session.id === store.selectedSessionId);
+  const hidden = chats.length - shown.length;
+
+  return (
+    <div role="treeitem" aria-label="Chats" aria-expanded={open} className="min-w-0" data-testid="chats-node">
+      <div data-tree-row className={cn(actionRow, "relative flex h-8 cursor-default items-center gap-1 rounded-md px-1 hover:bg-selected/50")}>
+        <TreeToggle expanded={open} label="Chats" onToggle={toggle} />
+        <button
+          type="button"
+          onClick={chats.length ? toggle : onNewChat}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+        >
+          <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 flex-1 truncate text-[13px]">Chats</span>
+          {chats.length > 1 ? <span className={cn("shrink-0 text-[11px] tabular-nums text-faint", yieldsToRowActions)}>{chats.length}</span> : null}
+        </button>
+        <RowActions>
+          <WithTooltip label="New chat">
+            <Button variant="ghost" size="icon-xs" aria-label="New chat" onClick={onNewChat}>
+              <Plus />
+            </Button>
+          </WithTooltip>
+        </RowActions>
+      </div>
+      {shown.length ? (
+        <div role="group" className="pb-1 pl-2">
+          {shown.map((session) => <ChatRow key={session.id} session={session} selected={store.selectedSessionId === session.id} />)}
+          {hidden > 0 ? (
+            <button
+              type="button"
+              onClick={toggle}
+              className="flex h-6 w-full items-center rounded-md pl-3 text-[11px] text-faint outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+            >
+              {hidden} more
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Sessions started with New chat, in sidebar order, under the sidebar's archive and filter choices. */
+function useChats() {
+  const store = useSessionStore();
+  const filter = useSidebarFilter();
+  const chatsPath = store.chatsPath;
+  return useMemo(
+    () => (chatsPath
+      ? sortSessions(store.sessions.filter((session) =>
+        canon(session.projectPath) === canon(chatsPath)
+        && (session.archived === store.showArchived || session.id === store.selectedSessionId)
+        && (!filter.active || filter.shows(session.id))))
+      : []),
+    [chatsPath, store.sessions, store.showArchived, store.selectedSessionId, filter],
+  );
+}
+
+function ChatRow({ session, selected }: { session: SessionEntry; selected: boolean }) {
+  // The conversation's own title once the agent has named it.
+  const title = session.tabs[0]?.title?.trim() || session.title;
+  return (
+    <DropdownMenu>
+      <div role="treeitem" aria-label={title} className="min-w-0">
+        <TreeRow level="item" selected={selected}>
+          <StatusStripe status={sessionStatus(session)} size="row" />
+          <span className="w-1 shrink-0" />
+          <ItemTitle title={title} pinned={session.pinned} archived={session.archived} onActivate={() => selectSession(session.id)} />
+          <RowTime at={session.modified} />
+          <RowActions>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon-xs" aria-label={`Chat menu for ${title}`}>
+                <Ellipsis />
+              </Button>
+            </DropdownMenuTrigger>
+          </RowActions>
+        </TreeRow>
+      </div>
+      <SessionMenu session={session} />
+    </DropdownMenu>
   );
 }
 
@@ -498,7 +600,7 @@ function NewTabButton({ session }: { session: SessionEntry }) {
   );
 }
 
-function SessionMenu({ session }: { session: SessionEntry }) {
+export function SessionMenu({ session }: { session: SessionEntry }) {
   return (
     <DropdownMenuContent align="end">
       <DropdownMenuItem onSelect={() => pinSession(session.id, !session.pinned)}>

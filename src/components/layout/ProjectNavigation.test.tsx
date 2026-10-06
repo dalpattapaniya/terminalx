@@ -61,13 +61,10 @@ describe("complete navigation hierarchy", () => {
     await act(async () => { await store.refreshSessions(); });
     const openAgents = vi.fn();
     mount(openAgents);
-    const row = screen.getByRole("button", { name: /Agent Dashboard/ });
-    expect(row.textContent).toBe("Agent Dashboard029");
-    for (const [label, color] of [["0 needs you", "warning"], ["2 working", "info"], ["9 done", "add"]]) {
-      const badge = within(row).getByRole("img", { name: label });
-      expect(badge.getAttribute("title")).toBe(label);
-      expect(badge.className).toContain(`text-${color}`);
-    }
+    const row = screen.getByRole("button", { name: /^Agent dashboard/ });
+    expect(row.getAttribute("aria-label")).toBe("Agent dashboard, 0 needs you, 2 working, 9 done");
+    // Working, with nobody needed: the dot says so in the working tone.
+    expect(row.querySelector(".bg-info")).not.toBeNull();
     fireEvent.click(row);
     expect(openAgents).toHaveBeenCalledOnce();
   });
@@ -76,15 +73,14 @@ describe("complete navigation hierarchy", () => {
     sessions = [];
     await act(async () => { await store.refreshSessions(); });
     mount();
-    const row = screen.getByRole("button", { name: /Agent Dashboard/ });
-    expect(within(row).getAllByRole("img").map((badge) => badge.getAttribute("aria-label")))
-      .toEqual(["0 needs you", "0 working", "0 done"]);
+    const row = screen.getByRole("button", { name: /^Agent dashboard/ });
+    expect(row.getAttribute("aria-label")).toBe("Agent dashboard, 0 needs you, 0 working, 0 done");
+    expect(row.querySelector(".rounded-full")).toBeNull();
   });
 
   it("updates totals from the live store through reads, status changes, navigation and eligibility changes", async () => {
     mount();
-    const totals = () => within(screen.getByRole("button", { name: /Agent Dashboard/ }))
-      .getAllByRole("img").map((badge) => badge.getAttribute("aria-label"));
+    const totals = () => screen.getByRole("button", { name: /^Agent dashboard/ }).getAttribute("aria-label")!.split(", ").slice(1);
     expect(totals()).toEqual(["0 needs you", "0 working", "2 done"]);
     act(() => store.patchTab("one", "one-tab", { status: "completed" }));
     expect(totals()).toEqual(["0 needs you", "0 working", "2 done"]);
@@ -324,9 +320,54 @@ it("opens an empty folder from the project rail and shows folder navigation", as
     return original(cmd, args);
   });
   mount();
-  fireEvent.click(screen.getByRole("button", { name: "Add project" }));
+  fireEvent.pointerDown(screen.getByRole("button", { name: "New" }), { button: 0, ctrlKey: false, pointerType: "mouse" });
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Add project…" }));
   await screen.findByText("folder", { selector: "span" });
   expect(mocks.invoke).toHaveBeenCalledWith("add_project", { path: folder.path });
   expect(store.getSessions().selectedProject).toBe(folder.path);
   expect(store.getSessions().projects.find((p) => p.path === folder.path)?.kind).toBe("folder");
+});
+
+describe("chats", () => {
+  const chatsPath = "/store/Chats";
+  const chat = (id: string, modified: string): SessionEntry => ({ ...makeSession(id, chatsPath), modified, tabs: [{ ...makeSession(id).tabs[0], title: `Chat ${id}` }] });
+  const rows = (node: HTMLElement) => within(node).getAllByRole("treeitem").map((row) => row.getAttribute("aria-label"));
+
+  async function bootWith(list: SessionEntry[]) {
+    sessions = list;
+    const answer = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args?: Record<string, string>) => (command === "chats_dir" ? chatsPath : answer(command, args)));
+    await act(async () => {
+      await store.bootSessions();
+      await store.refreshSessions();
+    });
+  }
+
+  it("puts chats first in the list, folded to the latest, keeping the open one in view", async () => {
+    await bootWith([makeSession("one"), chat("old", "2026-09-01"), chat("new", "2026-09-03"), chat("mid", "2026-09-02")]);
+    mount();
+
+    const node = screen.getByRole("treeitem", { name: "Chats" });
+    expect(screen.getByRole("tree").firstElementChild).toBe(node);
+    expect(rows(node)).toEqual(["Chat new"]);
+    expect(screen.queryByRole("treeitem", { name: chatsPath })).toBeNull();
+
+    fireEvent.click(within(node).getByRole("button", { name: "2 more" }));
+    expect(rows(node)).toEqual(["Chat new", "Chat mid", "Chat old"]);
+
+    fireEvent.click(within(node).getByRole("button", { name: "Collapse Chats" }));
+    act(() => store.selectSession("old"));
+    expect(rows(node)).toEqual(["Chat new", "Chat old"]);
+  });
+
+  it("starts a chat from the row while there is none, and from its + always", async () => {
+    await bootWith([makeSession("one")]);
+    const onNewChat = vi.fn();
+    const { ChatsNode } = await import("./SidebarTree");
+    render(<TooltipProvider><div role="tree"><ChatsNode onNewChat={onNewChat} /></div></TooltipProvider>);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Chats/ }));
+    fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+    expect(onNewChat).toHaveBeenCalledTimes(2);
+  });
 });

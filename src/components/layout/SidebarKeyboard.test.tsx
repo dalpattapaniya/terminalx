@@ -162,6 +162,9 @@ describe("tree keyboard across Local and organization sections", () => {
     press("Home");
     expect(focusedItem()).toBe("Local section");
     press("ArrowDown");
+    // Chats lead Local's list, before its projects.
+    expect(focusedItem()).toBe("Chats");
+    press("ArrowDown");
     expect(focusedItem()).toBe("Raccoon");
     press("ArrowDown");
     expect(focusedItem()).toBe("Acme organization");
@@ -171,6 +174,7 @@ describe("tree keyboard across Local and organization sections", () => {
     expect(focusedItem()).toBe("Fix login redirect");
     press("ArrowUp");
     expect(focusedItem()).toBe("acme/api");
+    press("ArrowUp");
     press("ArrowUp");
     press("ArrowUp");
     press("ArrowUp");

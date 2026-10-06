@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { AccountStatus } from "@/lib/api";
@@ -169,8 +169,8 @@ describe("sidebar rail DOM", () => {
     await setAccount(signedIn(withCloud));
     const { getByRole } = mount();
     const active = () =>
-      ["Issues", "Agent Dashboard", "Stats & Usage", "Automations", "Skills"].filter((label) =>
-        getByRole("button", { name: new RegExp(`^${label.replace(/[&]/g, "\\$&")}`) }).className.split(" ").includes("bg-selected"),
+      ["Issues", "Agent dashboard", "Stats & Usage", "Automations", "Skills"].filter((label) =>
+        getByRole("button", { name: new RegExp(`^${label.replace(/[&]/g, "\\$&")}`) }).getAttribute("aria-pressed") === "true",
       );
     act(() => sessions.openIssues());
     expect(active()).toEqual(["Issues"]);
@@ -184,8 +184,10 @@ describe("sidebar rail DOM", () => {
   it("Refresh all also re-reads the account, so organizations and a changed role appear", async () => {
     const { getByRole } = mount();
     mocks.invoke.mockClear();
+    fireEvent.pointerDown(getByRole("button", { name: "View options" }), { button: 0, ctrlKey: false, pointerType: "mouse" });
+    const refresh = await screen.findByRole("menuitem", { name: "Refresh everything" });
     await act(async () => {
-      fireEvent.click(getByRole("button", { name: "Refresh all" }));
+      fireEvent.click(refresh);
     });
     // Its organizations and roles are asked of the account service at once, not left to the throttle.
     expect(mocks.invoke.mock.calls).toContainEqual(["account_refresh_roles", { force: true }]);

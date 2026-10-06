@@ -327,6 +327,7 @@ export const api = {
   // projects
   listProjects: () => invoke<{ projects: Project[]; lastSelected: string | null }>("list_projects"),
   addProject: (path: string) => invoke<Project>("add_project", { path }),
+  chatsDir: () => invoke<string>("chats_dir"),
   removeProject: (path: string) => invoke<void>("remove_project", { path }),
   selectProject: (path: string) => invoke<void>("select_project", { path }),
   updateProject: (path: string, patch: ProjectPatch) => invoke<Project>("update_project", { path, patch }),
