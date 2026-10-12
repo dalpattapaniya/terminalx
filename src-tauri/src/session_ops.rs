@@ -219,6 +219,7 @@ fn create_session_entry_with_name(req: NewSession, name: Option<&str>) -> std::r
         archived: false,
         pinned: false,
         active_tab: first_tab.as_ref().map(|tab| tab.id.clone()),
+        link: None,
         tabs: first_tab.into_iter().collect(),
         unknown: BTreeMap::new(),
     };

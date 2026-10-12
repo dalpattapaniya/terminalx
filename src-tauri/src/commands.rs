@@ -1142,6 +1142,10 @@ pub fn add_project(path: String) -> CmdResult<Project> {
 #[tauri::command]
 pub fn chats_dir() -> CmdResult<String> {
     let dir = store::ensure_dir(store::root().map_err(err)?.join("Chats")).map_err(err)?;
+    // Its agents are told to start a branch as a worktree, not in the reader's checkout.
+    if let Err(error) = crate::chat_link::ensure_instructions(&dir) {
+        log::warn!("write the chats' agent note: {error:#}");
+    }
     // Canonical, as a session's project path is, so the sidebar can match them.
     Ok(std::fs::canonicalize(&dir).unwrap_or(dir).to_string_lossy().into_owned())
 }
@@ -1511,6 +1515,7 @@ pub async fn fork_session(app: AppHandle, session_id: String, tab_id: String) ->
             pinned: false,
             tabs: vec![new_tab.clone()],
             active_tab: Some(new_tab.id.clone()),
+            link: None,
             unknown: BTreeMap::new(),
         };
         if src.worktree_name.is_some() && !src.worktree_removed {
@@ -2907,6 +2912,7 @@ mod command_tests {
             archived: false,
             pinned: false,
             tabs: Vec::new(),
+            link: None,
             active_tab: None,
             unknown: Default::default(),
         };

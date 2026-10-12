@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
-import { Archive, ChevronDown, Ellipsis, FolderInput, FolderOpen, FolderPlus, GitBranch, ListTree, MessagesSquare, Pin, Search, Settings, SquarePen, Trash2 } from "lucide-react";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { Archive, Ellipsis, FolderInput, FolderOpen, FolderPlus, GitBranch, ListTree, ChevronDown, Pin, Plus, Search, Settings, SquarePen, Trash2 } from "lucide-react";
+import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from "@/components/ui/menu";
@@ -8,19 +9,18 @@ import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/R
 import { AccountSidebarEntry } from "@/components/account/AccountSidebarEntry";
 import { cn } from "@/lib/cn";
 import { errorMessage } from "@/lib/api";
-import { setPrefs } from "@/lib/prefs";
-import { useShortcutKeys } from "@/lib/hotkeys";
-import { addProject, archiveSession, pinSession, selectSession, startChat, startSessionIn, useSessionStore } from "@/lib/sessions";
+import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
+import { addProject, archiveSession, pinSession, removeProject, selectSession, startChat, startSessionIn, updateProject, useSessionStore } from "@/lib/sessions";
 import { moveChatToProject } from "@/lib/continuation";
 import { confirmDeleteSession } from "@/lib/deleteSessionFlow";
-import type { Project } from "@/types/session";
+import type { Project, Workspace } from "@/types/session";
 import { sessionStatus, type SessionEntry } from "@/types/session";
-import { StatusStripe } from "./SidebarRows";
-import { AppDestinations, type RailProps } from "./ProjectRail";
+import { RowTime } from "./SidebarRows";
+import { AppDestinations, ProjectGlyph, type RailProps } from "./ProjectRail";
 import { TITLEBAR_INSET } from "./AppShell";
+import { AgentMark } from "@/components/AgentMark";
 
 const canon = (path: string) => path.replace(/\/+$/, "");
-const DAY = 24 * 60 * 60 * 1000;
 
 /** A conversation's name: its agent's title for it once there is one. */
 export function conversationTitle(session: SessionEntry): string {
@@ -28,50 +28,155 @@ export function conversationTitle(session: SessionEntry): string {
   return tab?.title?.trim() || session.title;
 }
 
-/** Pinned first, then by when each was last touched, in the buckets a chat app uses. */
-export function groupByRecency(sessions: SessionEntry[], now = Date.now()): { label: string; sessions: SessionEntry[] }[] {
-  const midnight = new Date(now);
-  midnight.setHours(0, 0, 0, 0);
-  const today = midnight.getTime();
-  const buckets: { label: string; since: number; sessions: SessionEntry[] }[] = [
-    { label: "Today", since: today, sessions: [] },
-    { label: "Yesterday", since: today - DAY, sessions: [] },
-    { label: "Previous 7 days", since: today - 7 * DAY, sessions: [] },
-    { label: "Older", since: -Infinity, sessions: [] },
-  ];
-  const pinned: SessionEntry[] = [];
-  for (const session of [...sessions].sort((a, b) => b.modified.localeCompare(a.modified))) {
-    if (session.pinned) {
-      pinned.push(session);
-      continue;
-    }
-    const at = Date.parse(session.modified);
-    (buckets.find((bucket) => (Number.isNaN(at) ? -Infinity : at) >= bucket.since) ?? buckets[buckets.length - 1]).sessions.push(session);
-  }
-  return [{ label: "Pinned", sessions: pinned }, ...buckets].filter((group) => group.sessions.length > 0);
+const byRecency = (a: SessionEntry, b: SessionEntry) => Number(b.pinned) - Number(a.pinned) || b.modified.localeCompare(a.modified);
+
+/** Every live conversation as one list, pinned first, then newest; the open one stays even when archived. */
+export function orderConversations(sessions: SessionEntry[], selectedId: string | null): SessionEntry[] {
+  return sessions.filter((session) => !session.archived || session.id === selectedId).sort(byRecency);
 }
 
 /**
- * The sidebar as a chat app draws it: start a conversation, find one, and
- * every conversation newest first, each a single line. Where it runs (a
- * project, or nowhere in particular) is a quiet tag on the row rather than a
- * level of a tree; the tree is one click away as the detailed sidebar.
+ * What a conversation is linked to, with the branch it works on: a chat's is
+ * the repo its agent last worked in (nothing until it has), a project
+ * conversation's is its project, on its worktree's branch or the one it last worked on.
+ */
+export function conversationLink(
+  session: SessionEntry,
+  projects: Project[],
+  chatsPath: string | null,
+  workspaces: Record<string, Workspace[]> = {},
+): { path: string; project: Project | null; name: string; branch: string | null } | null {
+  if (canon(session.projectPath) === chatsPath) {
+    // A chat links itself to whichever repo its agent last worked in.
+    if (!session.link) return null;
+    const linked = canon(session.link.path);
+    const project = projects.find((entry) => canon(entry.path) === linked) ?? null;
+    return { path: session.link.path, project, name: project?.name ?? (linked.split("/").pop() || linked), branch: session.link.branch ?? null };
+  }
+  const path = canon(session.projectPath);
+  const project = projects.find((entry) => canon(entry.path) === path) ?? null;
+  const checkout = (workspaces[session.projectPath] ?? []).find((workspace) => canon(workspace.path) === canon(session.cwd));
+  // A worktree has its branch to itself. A conversation in the project's own
+  // checkout shares it, so it names the branch its agent last worked on (or
+  // started on), not wherever another conversation has since switched it.
+  const branch = session.worktreeName && !session.worktreeRemoved
+    ? (session.branch ?? session.worktreeName)
+    : (session.link?.branch ?? session.branch ?? checkout?.branch ?? null);
+  return { path: session.projectPath, project, name: project?.name ?? (path.split("/").pop() || path), branch };
+}
+
+export interface ConversationGroup {
+  path: string;
+  name: string;
+  project: Project | null;
+  sessions: SessionEntry[];
+  /** The branch each conversation works on, by its id. */
+  branches: Record<string, string | null>;
+}
+
+/**
+ * Conversations under the project each is linked to (a chat by the repo its
+ * agent works in, any other by its own project), and the chats linked to
+ * nothing on their own. Projects come by their latest activity, pinned ones
+ * first; inside each, pinned conversations first, then the newest.
+ */
+export function groupConversations(
+  sessions: SessionEntry[],
+  projects: Project[],
+  chatsPath: string | null,
+  workspaces: Record<string, Workspace[]>,
+  selectedId: string | null,
+): { groups: ConversationGroup[]; chats: SessionEntry[] } {
+  const groups = new Map<string, ConversationGroup>();
+  const chats: SessionEntry[] = [];
+  for (const session of orderConversations(sessions, selectedId)) {
+    const link = conversationLink(session, projects, chatsPath, workspaces);
+    if (!link) {
+      chats.push(session);
+      continue;
+    }
+    const key = canon(link.path);
+    const group = groups.get(key) ?? { path: link.path, name: link.name, project: link.project, sessions: [], branches: {} };
+    group.sessions.push(session);
+    group.branches[session.id] = link.branch;
+    groups.set(key, group);
+  }
+  const latest = (group: ConversationGroup) => group.sessions.reduce((max, session) => (session.modified > max ? session.modified : max), "");
+  const ordered = [...groups.values()].sort((a, b) => Number(!!b.project?.pinned) - Number(!!a.project?.pinned) || latest(b).localeCompare(latest(a)));
+  return { groups: ordered, chats };
+}
+
+/**
+ * Ask, then take a project out of the sidebar. Its conversations are
+ * archived, not deleted, so they can come back; the folder on disk is not
+ * touched.
+ */
+export async function confirmRemoveProject(group: ConversationGroup) {
+  const open = group.sessions.filter((session) => !session.archived);
+  const conversations = open.length === 1 ? "Its conversation is archived" : open.length ? `Its ${open.length} conversations are archived` : "";
+  const detail = conversations ? `${conversations}, and the folder on disk is left as it is.` : "The folder on disk is left as it is.";
+  const yes = await askDialog(`Remove ${group.name} from TerminalX? ${detail}`, { title: "Remove project", kind: "warning", okLabel: "Remove", cancelLabel: "Cancel" }).catch(() => false);
+  if (!yes) return;
+  try {
+    for (const session of open) await archiveSession(session.id, true);
+    if (group.project) await removeProject(group.path);
+  } catch (error) {
+    console.error("remove project", errorMessage(error));
+  }
+}
+
+/** The agent a conversation runs: its open tab's. */
+export function conversationAgent(session: SessionEntry): string | null {
+  return (session.tabs.find((tab) => tab.id === session.activeTab) ?? session.tabs[0])?.harness ?? null;
+}
+
+/**
+ * Whether rows name their agent: only once the conversations use more than
+ * one, so a reader who only ever runs Claude never sees a mark that tells
+ * them nothing.
+ */
+export function mixesAgents(sessions: SessionEntry[]): boolean {
+  return new Set(sessions.map(conversationAgent).filter(Boolean)).size > 1;
+}
+
+const ShowAgents = createContext(false);
+
+/** How many conversations a project shows before "View all". */
+const PEEK = 3;
+
+/** A fold the sidebar remembers between launches. */
+function useFold(key: string, byDefault: boolean): [boolean, () => void] {
+  const { sidebarSections } = usePrefs();
+  const stored = sidebarSections[key];
+  const open = stored ? stored === "expanded" : byDefault;
+  return [open, () => setPrefs({ sidebarSections: { ...getPrefs().sidebarSections, [key]: open ? "collapsed" : "expanded" } })];
+}
+
+/**
+ * The sidebar as a chat app draws it: each project with its conversations
+ * under it (a chat joins the project its agent works in), then the chats
+ * that belong to none. Workspaces and tabs are not levels here; a row names
+ * its branch, and the full tree is one click away as the detailed sidebar.
  */
 export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...destinations }: RailProps) {
   const store = useSessionStore();
   const [error, setError] = useState<string | null>(null);
   const chatsPath = store.chatsPath ? canon(store.chatsPath) : null;
-  const projectNames = useMemo(() => new Map(store.projects.map((project) => [canon(project.path), project.name])), [store.projects]);
   const projects = store.projects.filter((project) => !project.archived && canon(project.path) !== chatsPath).sort((a, b) => a.name.localeCompare(b.name));
-  const groups = useMemo(
-    () => groupByRecency(store.sessions.filter((session) => !session.archived || session.id === store.selectedSessionId)),
-    [store.sessions, store.selectedSessionId],
+  const showAgents = useMemo(() => mixesAgents(store.sessions.filter((session) => !session.archived)), [store.sessions]);
+  const { groups, chats } = useMemo(
+    () => groupConversations(store.sessions, store.projects, chatsPath, store.workspaces, store.selectedSessionId),
+    [store.sessions, store.projects, chatsPath, store.workspaces, store.selectedSessionId],
   );
 
   const run = (action: () => Promise<unknown>) => () => {
     action().then(() => setError(null), (cause) => setError(errorMessage(cause)));
   };
   const newChat = run(() => startChat());
+  const move = async (session: SessionEntry, projectPath: string, worktree: boolean) => {
+    const moved = await moveChatToProject({ ...session, title: conversationTitle(session) }, projectPath, worktree);
+    if (!moved.delivered) throw new Error("Moved, but the chat's context could not be confirmed as sent. It is in the new conversation's composer.");
+  };
   const addAndStart = run(async () => {
     const dir = await openDialog({ directory: true, multiple: false, title: "Add a project" });
     if (typeof dir === "string") startSessionIn((await addProject(dir)).path, null);
@@ -79,92 +184,109 @@ export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...des
 
   return (
     <div className="flex h-full min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-hairline" data-testid="sidebar-rail">
-      <div data-tauri-drag-region="deep" className="h-(--titlebar-h) shrink-0" style={{ paddingLeft: TITLEBAR_INSET }} />
+      <div data-tauri-drag-region="deep" className="flex h-(--titlebar-h) shrink-0 items-center justify-end gap-1 pr-2" style={{ paddingLeft: TITLEBAR_INSET }}>
+        <WithTooltip label="Search" shortcut="app.commandPalette">
+          <Button variant="ghost" size="icon-sm" aria-label="Search" onClick={onSearch}>
+            <Search />
+          </Button>
+        </WithTooltip>
+      </div>
 
-      <div className="flex shrink-0 flex-col gap-0.5 px-2">
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2 px-2 text-foreground" onClick={newChat}>
+      <div className="shrink-0 px-2">
+        <div className="flex items-center rounded-md bg-veil-raised">
+          <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2 px-2 font-medium text-foreground" onClick={newChat}>
             <SquarePen />
             New chat
           </Button>
           <DropdownMenu>
-            <WithTooltip label="Start in a project">
+            <WithTooltip label="New chat in a project">
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon-sm" aria-label="Start in a project">
+                <Button variant="ghost" size="icon-sm" aria-label="New chat in a project">
                   <ChevronDown />
                 </Button>
               </DropdownMenuTrigger>
             </WithTooltip>
             <DropdownMenuContent align="end" className="w-60">
-              <DropdownMenuItem onSelect={newChat}>
-                <MessagesSquare /> New chat
-              </DropdownMenuItem>
               {projects.length > 0 && (
                 <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuLabel>Start in a project</DropdownMenuLabel>
+                  <DropdownMenuLabel>New chat in a project</DropdownMenuLabel>
                   {projects.map((project) => (
                     <DropdownMenuItem key={project.path} onSelect={() => startSessionIn(project.path, null)}>
-                      <FolderOpen /> <span className="truncate">{project.name}</span>
+                      <ProjectGlyph project={project} /> <span className="truncate">{project.name}</span>
                     </DropdownMenuItem>
                   ))}
+                  <DropdownMenuSeparator />
                 </>
               )}
-              <DropdownMenuSeparator />
               <DropdownMenuItem onSelect={addAndStart}>
                 <FolderPlus /> Add a project…
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
-        <Button variant="ghost" className="justify-start gap-2 px-2" onClick={onSearch}>
-          <Search />
-          Search
-          <Keys />
-        </Button>
+        <div className="mt-1"><AppDestinations {...destinations} variant="list" /></div>
       </div>
 
       {error && <div className="mx-2 mt-1 shrink-0 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</div>}
 
-      <nav className="mt-2 min-h-0 flex-1 basis-0 overflow-y-auto overscroll-contain scrollbar-thin px-2 pb-2" aria-label="Conversations" data-testid="conversation-list">
-        {groups.length === 0 ? (
-          <p className="px-2 py-6 text-center text-xs text-muted-foreground">No conversations yet.</p>
+      <ShowAgents.Provider value={showAgents}>
+      <nav className="mt-2 min-h-0 flex-1 basis-0 overflow-y-auto overscroll-contain scrollbar-thin border-t border-hairline px-2 py-2" aria-label="Conversations" data-testid="conversation-list">
+        {groups.length === 0 && chats.length === 0 ? (
+          <button
+            type="button"
+            onClick={newChat}
+            className="flex w-full flex-col items-center gap-1 rounded-lg px-3 py-6 text-center text-[12px] text-faint outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+          >
+            <SquarePen className="size-4" />
+            Start a chat. It joins a project as soon as it works in one.
+          </button>
         ) : (
-          groups.map((group) => (
-            <section key={group.label} aria-label={group.label} className="mt-3 first:mt-0">
-              <h2 className="px-2 pb-1 text-[11px] font-medium text-faint">{group.label}</h2>
-              <ul className="flex flex-col gap-px">
-                {group.sessions.map((session) => (
-                  <ConversationRow
-                    key={session.id}
-                    session={session}
-                    selected={store.selectedSessionId === session.id}
-                    place={placeOf(session, chatsPath, projectNames)}
-                    projects={canon(session.projectPath) === chatsPath ? projects : null}
-                    onMove={(project, worktree) => run(async () => {
-                      const moved = await moveChatToProject({ ...session, title: conversationTitle(session) }, project.path, worktree);
-                      if (!moved.delivered) throw new Error("Moved, but the chat's context could not be confirmed as sent. It is in the new conversation's composer.");
-                    })()}
-                    onAddProject={(worktree) => run(async () => {
-                      const dir = await openDialog({ directory: true, multiple: false, title: "Move this chat into a project" });
-                      if (typeof dir !== "string") return;
-                      const project = await addProject(dir);
-                      const moved = await moveChatToProject({ ...session, title: conversationTitle(session) }, project.path, worktree && project.kind !== "folder");
-                      if (!moved.delivered) throw new Error("Moved, but the chat's context could not be confirmed as sent. It is in the new conversation's composer.");
-                    })()}
+          <>
+            {groups.length > 0 && (
+              <ListSection id="projects" label="Projects">
+                {groups.map((group) => (
+                  <ProjectGroup
+                    key={group.path}
+                    group={group}
+                    selectedId={store.selectedSessionId}
+                    workspaces={store.workspaces[group.path] ?? []}
+                    onNewSession={(cwd) => run(() => startChat({ projectPath: group.path, cwd }))()}
                   />
                 ))}
-              </ul>
-            </section>
-          ))
+              </ListSection>
+            )}
+            {chats.length > 0 && (
+              <ListSection id="chats" label="Chats">
+                <ul className="flex flex-col gap-px">
+                  {chats.map((session) => (
+                    <ConversationRow
+                      key={session.id}
+                      session={session}
+                      selected={store.selectedSessionId === session.id}
+                      branch={null}
+                      linkTo={{
+                        projects,
+                        onMove: (project, worktree) => run(() => move(session, project.path, worktree))(),
+                        onAddProject: (worktree) => run(async () => {
+                          const dir = await openDialog({ directory: true, multiple: false, title: "Link this chat to a project" });
+                          if (typeof dir !== "string") return;
+                          const project = await addProject(dir);
+                          await move(session, project.path, worktree && project.kind !== "folder");
+                        })(),
+                      }}
+                    />
+                  ))}
+                </ul>
+              </ListSection>
+            )}
+          </>
         )}
       </nav>
+      </ShowAgents.Provider>
 
-      <div className="shrink-0 border-t border-hairline px-2 pt-1">
-        <AppDestinations {...destinations} />
-      </div>
-      <div className="flex shrink-0 items-center gap-1 px-2 pb-2" data-testid="sidebar-account-row">
-        <div className="min-w-0 flex-1">
+      <div className="flex shrink-0 items-center gap-1 border-t border-hairline px-2 pb-2 pt-1" data-testid="sidebar-account-row">
+        {/* The account and, beside it, the switch to the detailed sidebar; Settings keeps the far end. */}
+        <div className="min-w-0 max-w-[70%]">
           <AccountSidebarEntry onOpenAccount={onOpenAccount} />
         </div>
         <WithTooltip label="Detailed sidebar: projects, workspaces and tabs" side="top">
@@ -172,6 +294,7 @@ export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...des
             <ListTree />
           </Button>
         </WithTooltip>
+        <div className="flex-1" />
         <WithTooltip label="Settings" shortcut="app.settings" side="top">
           <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Settings" onClick={() => onOpenSettings()}>
             <Settings />
@@ -182,49 +305,253 @@ export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...des
   );
 }
 
-/** Where a conversation runs, as a row's quiet tag: nothing for a chat, else the project and any worktree branch. */
-function placeOf(session: SessionEntry, chatsPath: string | null, projectNames: Map<string, string>): string | null {
-  if (canon(session.projectPath) === chatsPath) return null;
-  const project = projectNames.get(canon(session.projectPath)) ?? session.projectPath.split("/").pop() ?? null;
-  return session.worktreeName && !session.worktreeRemoved && session.branch ? `${project} · ${session.branch}` : project;
+function ListSection({ id, label, children }: { id: string; label: string; children: ReactNode }) {
+  const [open, toggle] = useFold(`list:${id}`, true);
+  return (
+    <section aria-labelledby={`list-${id}`} className="mb-3">
+      <button
+        type="button"
+        id={`list-${id}`}
+        onClick={toggle}
+        aria-expanded={open}
+        className="flex h-6 items-center gap-1 rounded-sm px-2 text-[12px] text-faint outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+      >
+        {label}
+        <ChevronDown className={cn("size-3 transition-transform", !open && "-rotate-90")} />
+      </button>
+      {open && children}
+    </section>
+  );
+}
+
+/** A project, then its conversations along a guide line: the latest few, the open one, and "View all". */
+function ProjectGroup({
+  group,
+  selectedId,
+  workspaces,
+  onNewSession,
+}: {
+  group: ConversationGroup;
+  selectedId: string | null;
+  /** The project's checkouts, to find the folder a branch is checked out in. */
+  workspaces: Workspace[];
+  onNewSession: (cwd: string) => void;
+}) {
+  // Another session on a branch runs where that branch is checked out; one checked out nowhere has nowhere to run.
+  const newSessionOn = (branch: string) => {
+    const checkout = workspaces.find((workspace) => workspace.branch === branch);
+    return checkout ? () => onNewSession(checkout.path) : null;
+  };
+  const [all, toggleAll] = useFold(`project-all:${canon(group.path)}`, false);
+  // One row per branch, newest work first; the conversations come in that order already.
+  const branches = useMemo(() => {
+    const byBranch = new Map<string, SessionEntry[]>();
+    for (const session of group.sessions) {
+      const branch = group.branches[session.id] ?? "";
+      byBranch.set(branch, [...(byBranch.get(branch) ?? []), session]);
+    }
+    return [...byBranch.entries()].map(([branch, sessions]) => ({ branch, sessions }));
+  }, [group]);
+  const shown = all ? branches : branches.filter((entry, index) => index < PEEK || entry.sessions.some((session) => session.id === selectedId));
+  const more = branches.length > shown.length || (all && branches.length > PEEK);
+  return (
+    <div role="group" aria-label={group.name} className="mb-1">
+      <DropdownMenu>
+        <div className={cn(actionRow, "relative flex h-8 items-center gap-2 rounded-md px-2 hover:bg-selected/50")} title={group.path}>
+          {group.project ? <ProjectGlyph project={group.project} /> : <FolderOpen className="size-4 shrink-0 text-faint" />}
+          <span className="min-w-0 flex-1 truncate text-[13px]">{group.name}</span>
+          <RowActions>
+            <WithTooltip label={`New chat in ${group.name}`}>
+              <Button variant="ghost" size="icon-xs" aria-label={`New chat in ${group.name}`} onClick={() => startSessionIn(group.path, null)}>
+                <Plus />
+              </Button>
+            </WithTooltip>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon-xs" aria-label={`Project menu for ${group.name}`}>
+                <Ellipsis />
+              </Button>
+            </DropdownMenuTrigger>
+          </RowActions>
+        </div>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => startSessionIn(group.path, null)}>
+            <SquarePen /> New chat in {group.name}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void revealItemInDir(group.path)}>
+            <FolderOpen /> Reveal in Finder
+          </DropdownMenuItem>
+          {group.project && (
+            <DropdownMenuItem onSelect={() => void updateProject(group.path, { pinned: !group.project?.pinned })}>
+              <Pin /> {group.project.pinned ? "Unpin project" : "Pin project"}
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem destructive onSelect={() => void confirmRemoveProject(group)}>
+            <Trash2 /> Remove from TerminalX…
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <ul className="ml-[15px] flex flex-col gap-px border-l border-hairline pl-1.5">
+        {shown.map(({ branch, sessions }) =>
+          sessions.length === 1 ? (
+            <ConversationRow
+              key={branch}
+              session={sessions[0]}
+              selected={selectedId === sessions[0].id}
+              branch={branch || null}
+              named="branch"
+              onNewSession={newSessionOn(branch)}
+              linkTo={null}
+            />
+          ) : (
+            <BranchRow key={branch} path={group.path} branch={branch} sessions={sessions} selectedId={selectedId} onNewSession={newSessionOn(branch)} />
+          ),
+        )}
+        {more && (
+          <li>
+            <button
+              type="button"
+              onClick={toggleAll}
+              className="flex h-7 w-full items-center rounded-md px-2 text-[12px] text-faint outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+            >
+              {all ? "Show less" : "View all"}
+            </button>
+          </li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
+/** A branch more than one conversation works on: the branch, how many, and the conversations under it. */
+function BranchRow({
+  path,
+  branch,
+  sessions,
+  selectedId,
+  onNewSession,
+}: {
+  path: string;
+  branch: string;
+  sessions: SessionEntry[];
+  selectedId: string | null;
+  onNewSession: (() => void) | null;
+}) {
+  const holdsSelected = sessions.some((session) => session.id === selectedId);
+  const [open, toggle] = useFold(`branch:${canon(path)}:${branch}`, false);
+  const expanded = open || holdsSelected;
+  const label = branch || "No branch";
+  return (
+    <li>
+      <div className={cn(actionRow, "relative flex h-8 items-center rounded-md pr-1 text-foreground/85 hover:bg-selected/50")}>
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={expanded}
+          title={label}
+          className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md pl-2 pr-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+        >
+          <GitBranch className="size-3.5 shrink-0 text-faint" />
+          <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{label}</span>
+          <span className={cn("shrink-0 text-[11px] tabular-nums text-faint", yieldsToRowActions)}>{sessions.length}</span>
+          <ChevronDown className={cn("size-3 shrink-0 text-faint transition-transform", !expanded && "-rotate-90")} />
+        </button>
+        {onNewSession && (
+          <RowActions>
+            <NewSessionButton branch={label} onClick={onNewSession} />
+          </RowActions>
+        )}
+      </div>
+      {expanded && (
+        <ul className="ml-[13px] flex flex-col gap-px border-l border-hairline pl-1.5">
+          {sessions.map((session) => (
+            <ConversationRow key={session.id} session={session} selected={selectedId === session.id} branch={null} linkTo={null} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+function NewSessionButton({ branch, onClick }: { branch: string; onClick: () => void }) {
+  return (
+    <WithTooltip label={`New session on ${branch}`}>
+      <Button variant="ghost" size="icon-xs" aria-label={`New session on ${branch}`} onClick={onClick}>
+        <Plus />
+      </Button>
+    </WithTooltip>
+  );
 }
 
 function ConversationRow({
   session,
   selected,
-  place,
-  projects,
-  onMove,
-  onAddProject,
+  branch,
+  named = "title",
+  onNewSession = null,
+  linkTo,
 }: {
   session: SessionEntry;
   selected: boolean;
-  place: string | null;
-  /** The projects a chat may move into; null for a conversation already in one. */
-  projects: Project[] | null;
-  onMove: (project: Project, worktree: boolean) => void;
-  onAddProject: (worktree: boolean) => void;
+  /** What the row is called: the conversation's title, or (alone on its branch in a project) the branch. */
+  named?: "title" | "branch";
+  /** Start another session on the row's branch, where it is checked out. */
+  onNewSession?: (() => void) | null;
+  /** The branch it works on, named at the row's end; without one the row shows when it was last active. */
+  branch: string | null;
+  /** For a chat linked to nothing: the projects it may be linked to. */
+  linkTo: { projects: Project[]; onMove: (project: Project, worktree: boolean) => void; onAddProject: (worktree: boolean) => void } | null;
 }) {
   const title = conversationTitle(session);
+  const status = sessionStatus(session);
+  const agent = useContext(ShowAgents) ? conversationAgent(session) : null;
+  const mark = agent && <AgentMark id={agent} className={cn("size-3 text-faint", yieldsToRowActions)} />;
   return (
     <li>
       <DropdownMenu>
         <div
           className={cn(actionRow, "relative flex h-8 items-center gap-2 rounded-md pl-2 pr-1", selected ? "bg-selected text-foreground" : "text-foreground/85 hover:bg-selected/50")}
-          title={place ? `${title} · ${place}` : title}
+          title={branch ? `${branch} · ${title}` : title}
         >
-          <StatusStripe status={sessionStatus(session)} size="row" />
           <button
             type="button"
             onClick={() => selectSession(session.id)}
             aria-current={selected ? "true" : undefined}
+            aria-label={named === "branch" ? `${branch ?? "No branch"}, ${title}` : undefined}
             className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           >
+            {(status === "waiting" || status === "in_progress") && (
+              <span
+                role="img"
+                aria-label={status === "waiting" ? "Needs you" : "Working"}
+                className={cn("size-1.5 shrink-0 rounded-full", status === "waiting" ? "bg-warning" : "bg-info animate-pulse-soft")}
+              />
+            )}
             {session.pinned && <Pin className="size-3 shrink-0 text-faint" />}
-            <span className="min-w-0 flex-1 truncate text-[13px]">{title}</span>
-            {place && <span className={cn("max-w-[45%] shrink-0 truncate text-[11px] text-faint", yieldsToRowActions)}>{place}</span>}
+            {named === "branch" ? (
+              <>
+                <GitBranch className="size-3.5 shrink-0 text-faint" />
+                <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{branch ?? "No branch"}</span>
+                {mark}
+                <RowTime at={session.modified} />
+              </>
+            ) : (
+              <>
+                <span className="min-w-0 flex-1 truncate text-[13px]">{title}</span>
+                {mark}
+              </>
+            )}
+            {named === "branch" ? null : branch ? (
+              <span className={cn("flex max-w-[45%] shrink-0 items-center gap-1 font-mono text-[10px] text-faint", yieldsToRowActions)}>
+                <GitBranch className="size-3 shrink-0" />
+                <span className="truncate">{branch}</span>
+              </span>
+            ) : (
+              <RowTime at={session.modified} />
+            )}
           </button>
           <RowActions>
+            {onNewSession && <NewSessionButton branch={branch ?? "this branch"} onClick={onNewSession} />}
             <DropdownMenuTrigger asChild>
               <Button variant="ghost" size="icon-xs" aria-label={`Menu for ${title}`}>
                 <Ellipsis />
@@ -233,39 +560,40 @@ function ConversationRow({
           </RowActions>
         </div>
         <DropdownMenuContent align="end" className="w-56">
-          {projects && (
+          {linkTo && (
             <>
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger>
-                  <FolderInput /> Move to a project
+                  <FolderInput /> Link to a project
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent className="w-60">
-                  {projects.map((project) =>
+                  {linkTo.projects.map((project) =>
                     project.kind === "folder" ? (
-                      <DropdownMenuItem key={project.path} onSelect={() => onMove(project, false)}>
-                        <FolderOpen /> <span className="truncate">{project.name}</span>
+                      <DropdownMenuItem key={project.path} onSelect={() => linkTo.onMove(project, false)}>
+                        <ProjectGlyph project={project} /> <span className="truncate">{project.name}</span>
                       </DropdownMenuItem>
                     ) : (
                       <DropdownMenuSub key={project.path}>
                         <DropdownMenuSubTrigger>
-                          <FolderOpen /> <span className="truncate">{project.name}</span>
+                          <ProjectGlyph project={project} /> <span className="truncate">{project.name}</span>
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          <DropdownMenuItem onSelect={() => onMove(project, false)}>
-                            <FolderOpen /> In the project
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => onMove(project, true)}>
+                          {/* A worktree first: the project's own checkout is shared with its other conversations. */}
+                          <DropdownMenuItem onSelect={() => linkTo.onMove(project, true)}>
                             <GitBranch /> On a new branch (worktree)
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onSelect={() => linkTo.onMove(project, false)}>
+                            <FolderOpen /> In its main checkout
                           </DropdownMenuItem>
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
                     ),
                   )}
-                  {projects.length > 0 && <DropdownMenuSeparator />}
-                  <DropdownMenuItem onSelect={() => onAddProject(false)}>
+                  {linkTo.projects.length > 0 && <DropdownMenuSeparator />}
+                  <DropdownMenuItem onSelect={() => linkTo.onAddProject(false)}>
                     <FolderPlus /> Choose a folder…
                   </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => onAddProject(true)}>
+                  <DropdownMenuItem onSelect={() => linkTo.onAddProject(true)}>
                     <GitBranch /> Choose a repo, new branch…
                   </DropdownMenuItem>
                 </DropdownMenuSubContent>
@@ -286,18 +614,5 @@ function ConversationRow({
         </DropdownMenuContent>
       </DropdownMenu>
     </li>
-  );
-}
-
-function Keys() {
-  const keys = useShortcutKeys("app.commandPalette");
-  return (
-    <span className="ml-auto flex gap-0.5 text-[10px] text-faint">
-      {keys.map((key) => (
-        <kbd key={key} className="rounded-sm bg-veil-raised px-1 font-sans">
-          {key}
-        </kbd>
-      ))}
-    </span>
   );
 }

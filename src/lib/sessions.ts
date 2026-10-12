@@ -175,6 +175,13 @@ export function upsertSession(s: SessionEntry) {
   const known = state.workspaces[s.projectPath] ?? [];
   const stale = !s.worktreeRemoved && !known.some((w) => w.path === s.cwd);
   if (stale && !state.workspacesLoading[s.projectPath]) void refreshWorkspaces(s.projectPath);
+  // A chat that followed its agent into a repo the app had not seen: the
+  // backend registered it as a project, so the list catches up.
+  const linked = s.link?.path;
+  if (linked && !state.projects.some((project) => project.path === linked)) {
+    void api.listProjects().then((projects) => set({ projects: projects.projects })).catch(() => {});
+    if (!state.workspacesLoading[linked]) void refreshWorkspaces(linked);
+  }
 }
 
 /** Forget sessions the backend has deleted, dropping the selection if it was one of them. */
@@ -437,15 +444,16 @@ export async function addProject(path: string) {
  * the session runs in place with no worktree, and it is never added as a
  * project: the sidebar lists its sessions on their own.
  */
-export async function startChat(): Promise<SessionEntry> {
+export async function startChat(place?: { projectPath: string; cwd: string }): Promise<SessionEntry> {
   const harness = state.harnesses.find((item) => item.id === "claude" && item.available) ?? state.harnesses.find((item) => item.available);
   if (!harness) throw new Error("Install and sign in to an agent to start a chat.");
-  const chatsPath = state.chatsPath ?? (await api.chatsDir());
-  if (chatsPath !== state.chatsPath) set({ chatsPath });
+  // Without a place, a chat of its own; with one, another session in that checkout, on its branch.
+  const chatsPath = place ? null : (state.chatsPath ?? (await api.chatsDir()));
+  if (chatsPath && chatsPath !== state.chatsPath) set({ chatsPath });
   const prefs = getPrefs();
   const session = await api.createSession({
-    projectPath: chatsPath,
-    cwd: chatsPath,
+    projectPath: place?.projectPath ?? chatsPath!,
+    cwd: place?.cwd ?? chatsPath!,
     title: "Chat",
     useWorktree: false,
     tab: {

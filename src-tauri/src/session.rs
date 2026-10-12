@@ -2297,6 +2297,17 @@ impl SessionManager {
             }
         }
 
+        // A chat links itself to the repo its agent just worked in. Off the
+        // hook's thread: git answers fast, but the CLI is waiting on this reply.
+        if frame.event == "PostToolUse" {
+            let (sink, session, payload) = (self.sink.clone(), frame.session.clone(), frame.payload.clone());
+            std::thread::spawn(move || match crate::chat_link::follow(&session, &payload) {
+                Ok(Some(entry)) => sink.emit("session_updated", &entry),
+                Ok(None) => {}
+                Err(error) => log::warn!("link chat {session}: {error:#}"),
+            });
+        }
+
         match frame.event.as_str() {
             // The CLI's session is up; the composer may stop waiting. Codex
             // also mints its own conversation id, so this is where the app

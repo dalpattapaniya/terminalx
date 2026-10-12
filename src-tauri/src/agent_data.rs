@@ -293,6 +293,7 @@ mod tests {
             archived: false,
             pinned: false,
             active_tab: None,
+            link: None,
             tabs,
             unknown: BTreeMap::new(),
         }

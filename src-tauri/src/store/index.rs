@@ -123,6 +123,15 @@ pub struct RemovedWorkspace {
     pub branch: Option<String>,
 }
 
+/// The repo a chat's agent is working in: its root, and the branch checked out there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatLink {
+    pub path: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionEntry {
@@ -159,6 +168,10 @@ pub struct SessionEntry {
     pub tabs: Vec<TabEntry>,
     #[serde(default)]
     pub active_tab: Option<String>,
+    /// For a chat (a session in the store's Chats folder): the repo its agent
+    /// last worked in, and on which branch, so the chat shows under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<ChatLink>,
     #[serde(flatten, default)]
     pub unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -292,6 +305,7 @@ mod tests {
             pinned: false,
             tabs: vec![],
             active_tab: None,
+            link: None,
             unknown: BTreeMap::new(),
         }
     }

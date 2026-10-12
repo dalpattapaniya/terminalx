@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Project, SessionEntry } from "@/types/session";
@@ -13,9 +13,9 @@ vi.mock("@/components/account/AccountSidebarEntry", () => ({ AccountSidebarEntry
 vi.mock("@/lib/automations", () => ({ useAutomationStore: () => ({ automations: [] }) }));
 
 const { ProjectRail } = await import("./ProjectRail");
-const { groupByRecency } = await import("./SessionSidebar");
+const { orderConversations } = await import("./SessionSidebar");
 const store = await import("@/lib/sessions");
-(await import("@/lib/prefs")).setPrefs({ sidebarLayout: "simple" });
+const prefs = await import("@/lib/prefs");
 
 const chatsPath = "/store/Chats";
 const projects: Project[] = [{ path: "/repos/web", name: "web", kind: "git" }];
@@ -27,58 +27,157 @@ const session = (id: string, projectPath: string, modified: string, extra: Parti
 let sessions: SessionEntry[];
 
 beforeEach(async () => {
+  // Folds are remembered; each test starts from the defaults.
+  prefs.setPrefs({ sidebarLayout: "simple", sidebarSections: {} });
   mocks.invoke.mockReset().mockImplementation(async (command: string) => {
     if (command === "list_projects") return { projects, lastSelected: null };
     if (command === "list_sessions") return sessions;
     if (command === "list_harnesses") return [];
     if (command === "chats_dir") return chatsPath;
-    if (command === "list_workspaces") return [];
+    if (command === "list_workspaces") return [{ path: "/repos/web", name: "web", branch: "main", head: "abc", isMain: true, managed: false, uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0 }];
     return undefined;
   });
 });
 afterEach(cleanup);
 
-describe("the conversation list", () => {
-  it("lists chats and project work as one list, newest first, the place a quiet tag", async () => {
-    const now = new Date();
-    const today = now.toISOString();
-    const lastMonth = new Date(now.getTime() - 40 * 24 * 60 * 60 * 1000).toISOString();
-    sessions = [
-      session("chat", chatsPath, today),
-      session("work", "/repos/web", today, { worktreeName: "fix-login", branch: "raccoon/fix-login" }),
-      session("old", "/repos/web", lastMonth),
-      session("gone", chatsPath, today, { archived: true }),
-    ];
-    await act(async () => {
-      await store.bootSessions();
-      await store.refreshEverything();
-    });
-    render(<TooltipProvider><ProjectRail onOpenSettings={() => {}} onOpenAccount={() => {}} onOpenIssues={() => {}} onOpenAgents={() => {}} onOpenStats={() => {}} onOpenAutomations={() => {}} onOpenSkills={() => {}} onSearch={() => {}} /></TooltipProvider>);
+const mount = () => render(<TooltipProvider><ProjectRail onOpenSettings={() => {}} onOpenAccount={() => {}} onOpenIssues={() => {}} onOpenAgents={() => {}} onOpenStats={() => {}} onOpenAutomations={() => {}} onOpenSkills={() => {}} onSearch={() => {}} /></TooltipProvider>);
+const rowsIn = (element: HTMLElement) => within(element).getAllByRole("listitem").map((row) => row.querySelector("[title]")?.getAttribute("title"));
 
-    const list = screen.getByRole("navigation", { name: "Conversations" });
-    expect(within(list).getAllByRole("heading").map((h) => h.textContent)).toEqual(["Today", "Older"]);
-    const rows = within(list).getAllByRole("listitem").map((row) => row.textContent);
-    expect(rows).toHaveLength(3);
-    expect(rows).toContain("Talk chat");
-    expect(rows).toContain("Talk workweb · raccoon/fix-login");
-    expect(rows.at(-1)).toBe("Talk oldweb");
-    expect(screen.queryByText("Projects")).toBeNull();
+async function boot(list: SessionEntry[]) {
+  sessions = list;
+  await act(async () => {
+    await store.bootSessions();
+    await store.refreshEverything();
+  });
+}
+
+describe("the conversation list", () => {
+  it("puts each conversation under the project it is linked to, a chat by the repo its agent works in, and the rest under Chats", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    await boot([
+      session("chat", chatsPath, at(3)),
+      session("work", "/repos/web", at(2), { worktreeName: "fix-login", branch: "raccoon/fix-login" }),
+      session("here", "/repos/web", at(1)),
+      session("gone", chatsPath, at(4), { archived: true }),
+      session("follow", chatsPath, at(0), { link: { path: "/repos/web", branch: "feature/new-work" } }),
+    ]);
+    mount();
+
+    // Under a project, a conversation alone on its branch is named by the branch.
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getAllByRole("button", { name: /, Talk/ }).map((row) => row.getAttribute("aria-label"))).toEqual([
+      "raccoon/fix-login, Talk work",
+      "main, Talk here",
+      "feature/new-work, Talk follow",
+    ]);
+    expect(rowsIn(screen.getByRole("region", { name: "Chats" }))).toEqual(["Talk chat"]);
+  });
+
+  it("names the branch a conversation in the shared checkout worked on, not where another one has since switched it", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    // The checkout is on main now; one conversation started on release, one last worked on dev.
+    await boot([
+      session("kept", "/repos/web", at(2), { branch: "release" }),
+      session("moved", "/repos/web", at(1), { branch: "release", link: { path: "/repos/web", branch: "dev" } }),
+    ]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getAllByRole("button", { name: /, Talk/ }).map((row) => row.getAttribute("aria-label"))).toEqual(["release, Talk kept", "dev, Talk moved"]);
+  });
+
+  it("starts another session on a branch from its row, in the folder where that branch is checked out", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    await boot([session("here", "/repos/web", at(1)), session("gone-branch", "/repos/web", at(2), { branch: "old" })]);
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "list_harnesses") return [{ id: "claude", name: "Claude", available: true }];
+      if (command === "create_session") return session("new", "/repos/web", at(3));
+      return base(command, args);
+    });
+    await act(async () => { await store.refreshHarnesses(); });
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    // A branch checked out nowhere has nowhere to start one.
+    expect(within(web).queryByRole("button", { name: "New session on old" })).toBeNull();
+    await act(async () => { fireEvent.click(within(web).getByRole("button", { name: "New session on main" })); });
+    const created = mocks.invoke.mock.calls.find(([command]) => command === "create_session");
+    expect(created?.[1]).toMatchObject({ req: { projectPath: "/repos/web", cwd: "/repos/web", useWorktree: false } });
+  });
+
+  it("removes a project from its menu after asking, archiving its conversations rather than deleting them", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    await boot([session("here", "/repos/web", at(1)), session("there", "/repos/web", at(2), { branch: "old" }), session("done", "/repos/web", at(3), { archived: true })]);
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(dialog.ask).mockResolvedValue(true);
+    mount();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project menu for web" }), { button: 0, ctrlKey: false, pointerType: "mouse" });
+    await act(async () => { fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from TerminalX…" })); });
+    expect(vi.mocked(dialog.ask).mock.calls[0][0]).toBe("Remove web from TerminalX? Its 2 conversations are archived, and the folder on disk is left as it is.");
+    const calls = mocks.invoke.mock.calls.filter(([command]) => command === "set_session_archived" || command === "remove_project").map(([command, args]) => [command, args]);
+    expect(calls).toEqual([["set_session_archived", { sessionId: "there", archived: true }], ["set_session_archived", { sessionId: "here", archived: true }], ["remove_project", { path: "/repos/web" }]]);
+    expect(screen.queryByRole("group", { name: "web" })).toBeNull();
+  });
+
+  it("marks each row with its agent only once the conversations use more than one", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    const codex = (entry: SessionEntry) => ({ ...entry, tabs: entry.tabs.map((tab) => ({ ...tab, harness: "codex" })) });
+    await boot([session("one", chatsPath, at(1)), session("two", chatsPath, at(2))]);
+    mount();
+    expect(document.querySelectorAll("[data-agent-id]")).toHaveLength(0);
+    cleanup();
+
+    await boot([session("one", chatsPath, at(1)), codex(session("two", chatsPath, at(2)))]);
+    mount();
+    const chats = screen.getByRole("region", { name: "Chats" });
+    expect([...chats.querySelectorAll("[data-agent-id]")].map((mark) => mark.getAttribute("data-agent-id"))).toEqual(["codex", "claude"]);
+  });
+
+  it("gathers the conversations on one branch under it, and shows a project's latest few branches before View all", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    await boot([
+      session("m1", "/repos/web", at(9)),
+      session("m2", "/repos/web", at(8)),
+      ...[1, 2, 3].map((n) => session(`w${n}`, "/repos/web", at(n), { worktreeName: `b${n}`, branch: `b${n}` })),
+    ]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    const main = within(web).getByRole("button", { name: /^main/ });
+    expect(main.textContent).toContain("2");
+    expect(within(web).queryByText("Talk m1")).toBeNull();
+    fireEvent.click(main);
+    expect(within(web).getByText("Talk m1")).toBeTruthy();
+    expect(within(web).getByText("Talk m2")).toBeTruthy();
+
+    expect(within(web).queryByRole("button", { name: "b1, Talk w1" })).toBeNull();
+    fireEvent.click(within(web).getByRole("button", { name: "View all" }));
+    expect(within(web).getByRole("button", { name: "b1, Talk w1" })).toBeTruthy();
+  });
+
+  it("invites a first chat when there is none", async () => {
+    await boot([]);
+    mount();
+    expect(within(screen.getByTestId("conversation-list")).getByRole("button", { name: /Start a chat/ })).toBeTruthy();
+  });
+
+  it("names the app's destinations above the conversations, the dashboard first", async () => {
+    await boot([]);
+    mount();
+    const destinations = screen.getByRole("toolbar", { name: "Destinations" });
+    expect(within(destinations).getAllByRole("button").map((button) => button.textContent)).toEqual(["Dashboard", "Issues", "Automations", "Skills", "Usage"]);
+    expect(destinations.compareDocumentPosition(screen.getByTestId("conversation-list")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 
-describe("recency groups", () => {
-  it("puts pinned conversations first, then today, yesterday, the week, and the rest", () => {
-    const now = new Date("2026-10-06T15:00:00").getTime();
-    const at = (iso: string) => new Date(iso).toISOString();
-    const groups = groupByRecency([
-      session("a", chatsPath, at("2026-10-06T09:00:00")),
-      session("b", chatsPath, at("2026-10-05T23:00:00")),
-      session("c", chatsPath, at("2026-10-01T12:00:00")),
-      session("d", chatsPath, at("2026-08-01T12:00:00")),
-      session("p", chatsPath, at("2026-07-01T12:00:00"), { pinned: true }),
-    ], now);
-    expect(groups.map((group) => [group.label, group.sessions.map((s) => s.id)])).toEqual([
-      ["Pinned", ["p"]], ["Today", ["a"]], ["Yesterday", ["b"]], ["Previous 7 days", ["c"]], ["Older", ["d"]],
-    ]);
+describe("ordering conversations", () => {
+  it("puts pinned ones first, then the newest, and keeps the open one even when archived", () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    const ordered = orderConversations([
+      session("old", chatsPath, at(1)),
+      session("new", "/a", at(5)),
+      session("pin", "/b", at(2), { pinned: true }),
+      session("arch", chatsPath, at(6), { archived: true }),
+      session("open", chatsPath, at(3), { archived: true }),
+    ], "open");
+    expect(ordered.map((entry) => entry.id)).toEqual(["pin", "new", "open", "old"]);
   });
 });

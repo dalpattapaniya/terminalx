@@ -1063,6 +1063,7 @@ mod tests {
             pinned: false,
             tabs: Vec::new(),
             active_tab: None,
+            link: None,
             unknown: std::collections::BTreeMap::new(),
         };
         index::update(|sessions| {

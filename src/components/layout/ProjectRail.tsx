@@ -324,11 +324,17 @@ function DetailedRail({
         <DevelopmentSection />
       </div>
 
-      {/* One row: the account (which opens Account) takes the width and truncates; the gear is its own target at the right end. */}
+      {/* One row: the account (which opens Account) truncates, the switch to the chat view sits beside it, and the gear is its own target at the right end. */}
       <div className="flex shrink-0 items-center gap-1 border-t border-hairline p-2" data-testid="sidebar-account-row">
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 max-w-[70%]">
           <AccountSidebarEntry onOpenAccount={onOpenAccount} />
         </div>
+        <WithTooltip label="Chat view: one list of conversations" side="top">
+          <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Chat view" onClick={() => setPrefs({ sidebarLayout: "simple" })}>
+            <MessagesSquare />
+          </Button>
+        </WithTooltip>
+        <div className="flex-1" />
         <WithTooltip label="Settings" shortcut="app.settings" side="top">
           <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Settings" onClick={() => onOpenSettings()}>
             <Settings />
@@ -339,14 +345,18 @@ function DetailedRail({
   );
 }
 
-/** Issues, the dashboard, stats, automations and skills, as one strip of icons that carry their own status. */
+/**
+ * Issues, the dashboard, stats, automations and skills, each carrying its own
+ * status: a strip of icons, or a labelled list where there is room to name them.
+ */
 export function AppDestinations({
   onOpenIssues,
   onOpenAgents,
   onOpenStats,
   onOpenAutomations,
   onOpenSkills,
-}: Pick<RailProps, "onOpenIssues" | "onOpenAgents" | "onOpenStats" | "onOpenAutomations" | "onOpenSkills">) {
+  variant = "strip",
+}: Pick<RailProps, "onOpenIssues" | "onOpenAgents" | "onOpenStats" | "onOpenAutomations" | "onOpenSkills"> & { variant?: "strip" | "list" }) {
   const store = useSessionStore();
   const automationStore = useAutomationStore();
   // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
@@ -356,24 +366,67 @@ export function AppDestinations({
   const automationFailures = automationStore.automations.filter((automation) => automation.lastOutcome === "failed").length;
   // A destination looks active only while it is what the main slot shows: no session and no cloud workspace selected.
   const onNavView = !store.selectedSessionId && !store.selectedCloudWorkspace;
+  const active = onNavView ? store.view : null;
+  const dashboard = { id: "agents", label: "Agent dashboard", shortcut: "app.agentDashboard", icon: <LayoutGrid />, onOpen: onOpenAgents, ...dashboardStatus(dashboardBuckets) } satisfies Destination;
+  const issues = { id: "issues", label: "Issues", shortcut: "app.issues", icon: <CircleDot />, onOpen: onOpenIssues } satisfies Destination;
+  const stats = { id: "stats", label: "Stats & Usage", shortcut: "app.stats", icon: <BarChart3 />, onOpen: onOpenStats } satisfies Destination;
+  const automations: Destination = {
+    id: "automations",
+    label: "Automations",
+    shortcut: "app.automations",
+    icon: <CalendarClock />,
+    onOpen: onOpenAutomations,
+    dot: automationFailures > 0 ? { tone: "warning", label: `${automationFailures} failed` } : automationRunning ? { tone: "info", label: "Running" } : null,
+    count: automationFailures || undefined,
+  };
+  const skills = { id: "skills", label: "Skills", shortcut: "app.skills", icon: <Sparkles />, onOpen: onOpenSkills } satisfies Destination;
+  if (variant === "list") {
+    // Named, the dashboard leads and says what is waiting on you, or what is still running.
+    const waiting = dashboardBuckets.needs.length || dashboardBuckets.working.length;
+    return <DestinationList active={active} destinations={[{ ...dashboard, label: "Dashboard", count: waiting || undefined }, issues, automations, skills, { ...stats, label: "Usage" }]} />;
+  }
+  return <DestinationStrip active={active} destinations={[issues, dashboard, stats, automations, skills]} />;
+}
+
+/** `status` is read out with the label; `dot` marks it when something there wants a look; `count` is shown beside it in a list. */
+type Destination = { id: string; label: string; shortcut: ShortcutId; icon: ReactNode; onOpen: () => void; status?: string; dot?: Dot; count?: number };
+
+/** The destinations as named rows, each with its count or dot on the right. */
+function DestinationList({ active, destinations }: { active: string | null; destinations: Destination[] }) {
   return (
-    <DestinationStrip
-      active={onNavView ? store.view : null}
-      destinations={[
-        { id: "issues", label: "Issues", shortcut: "app.issues", icon: <CircleDot />, onOpen: onOpenIssues },
-        { id: "agents", label: "Agent dashboard", shortcut: "app.agentDashboard", icon: <LayoutGrid />, onOpen: onOpenAgents, ...dashboardStatus(dashboardBuckets) },
-        { id: "stats", label: "Stats & Usage", shortcut: "app.stats", icon: <BarChart3 />, onOpen: onOpenStats },
-        {
-          id: "automations",
-          label: "Automations",
-          shortcut: "app.automations",
-          icon: <CalendarClock />,
-          onOpen: onOpenAutomations,
-          dot: automationFailures > 0 ? { tone: "warning", label: `${automationFailures} failed` } : automationRunning ? { tone: "info", label: "Running" } : null,
-        },
-        { id: "skills", label: "Skills", shortcut: "app.skills", icon: <Sparkles />, onOpen: onOpenSkills },
-      ]}
-    />
+    <div className="flex flex-col" role="toolbar" aria-orientation="vertical" aria-label="Destinations" data-testid="destination-list">
+      {destinations.map((destination) => {
+        const status = destination.status ?? destination.dot?.label;
+        const pressed = active === destination.id;
+        return (
+          <Button
+            key={destination.id}
+            variant="ghost"
+            className={cn("justify-start gap-2 px-2", pressed && "bg-selected text-foreground")}
+            aria-label={status ? `${destination.label}, ${status}` : destination.label}
+            aria-pressed={pressed}
+            title={status}
+            onClick={destination.onOpen}
+          >
+            {destination.icon}
+            {destination.label}
+            {destination.count ? (
+              <span
+                aria-hidden
+                className={cn(
+                  "ml-auto min-w-4 rounded-full px-1.5 text-center text-[10px] font-medium tabular-nums",
+                  destination.dot?.tone === "warning" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
+                )}
+              >
+                {destination.count}
+              </span>
+            ) : destination.dot ? (
+              <span aria-hidden className={cn("ml-auto size-1.5 rounded-full", destination.dot.tone === "warning" ? "bg-warning" : "bg-info animate-pulse-soft")} />
+            ) : null}
+          </Button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -396,8 +449,7 @@ function DestinationStrip({
   destinations,
 }: {
   active: string | null;
-  /** `status` is read out with the label; `dot` marks it when something there wants a look. */
-  destinations: { id: string; label: string; shortcut: ShortcutId; icon: ReactNode; onOpen: () => void; status?: string; dot?: Dot }[];
+  destinations: Destination[];
 }) {
   return (
     <div className="flex items-center justify-between px-1 py-0.5" role="toolbar" aria-label="Destinations" data-testid="destination-strip">

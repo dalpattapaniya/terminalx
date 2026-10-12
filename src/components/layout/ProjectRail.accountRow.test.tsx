@@ -53,15 +53,16 @@ afterEach(cleanup);
 
 // PRO-49: Settings was a full row of its own under the account entry.
 describe("the sidebar's account row", () => {
-  it("is one row: the account, its relay status, then the Settings gear at the right end", () => {
+  it("is one row: the account, its relay status, the switch to the chat view, then the Settings gear at the right end", () => {
     mount();
     const buttons = within(row()).getAllByRole("button");
-    expect(buttons).toHaveLength(2);
+    expect(buttons).toHaveLength(3);
     expect(buttons[0]!.textContent).toContain("Ada");
     expect(buttons[0]!.textContent).toContain("Relay connected");
+    expect(buttons[1]).toBe(within(row()).getByRole("button", { name: "Chat view" }));
     // The gear is icon-only, named for assistive technology, and the last thing in the row.
     const gear = within(row()).getByRole("button", { name: "Settings" });
-    expect(gear).toBe(buttons[1]);
+    expect(gear).toBe(buttons[2]);
     expect(gear.textContent).toBe("");
     expect(row().lastElementChild).toBe(gear);
     // No Settings row of its own is left anywhere in the sidebar.

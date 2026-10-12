@@ -13,6 +13,7 @@ mod desktop_links;
 #[cfg(feature = "desktop")]
 mod automations;
 mod binpath;
+mod chat_link;
 mod cleanup;
 #[cfg(feature = "desktop")]
 mod cloud_catalog;
