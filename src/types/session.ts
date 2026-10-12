@@ -1,4 +1,5 @@
 import type { AutomationRef } from "@/types/automations";
+import type { IssuePipelineSettings } from "@/types/issuePipeline";
 
 export type TabStatus = "idle" | "in_progress" | "completed" | "waiting";
 
@@ -117,6 +118,8 @@ export interface Project {
   logo?: string | null;
   pinned?: boolean;
   archived?: boolean;
+  /** Absent while every setting is the default. */
+  issuePipeline?: IssuePipelineSettings | null;
 }
 
 export interface ProjectPatch {
@@ -126,6 +129,7 @@ export interface ProjectPatch {
   logo?: string | null;
   pinned?: boolean;
   archived?: boolean;
+  issuePipeline?: IssuePipelineSettings;
 }
 
 /** One checkout of a project: the root or any worktree, whoever made it. */

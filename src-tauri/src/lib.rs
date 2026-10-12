@@ -80,6 +80,8 @@ mod git;
 mod github;
 mod harness;
 pub mod hooks;
+#[cfg(feature = "desktop")]
+mod issue_pipeline;
 mod issues;
 #[cfg(feature = "desktop")]
 mod installation;
@@ -318,6 +320,7 @@ pub fn run() {
             // cloud workspace's runtime does not.
             manager.follow_terminals();
             automations::start_scheduler(app.handle().clone());
+            issue_pipeline::desktop::start(app.handle().clone());
             // The built-in browser: sweep daemons a crashed run left behind,
             // then keep this run's own daemons warm and its page list honest.
             browser.attach(app.handle().clone());
@@ -607,6 +610,10 @@ pub fn run() {
             commands::worktree_cleanup_stop,
             quit::set_quit_warning,
             commands::issues_list,
+            commands::issue_pipelines_list,
+            commands::issue_pipeline_start,
+            commands::issue_pipeline_set_auto_merge,
+            commands::issue_pipeline_act,
             commands::issue_details,
             commands::linear_status,
             commands::linear_set_api_key,
