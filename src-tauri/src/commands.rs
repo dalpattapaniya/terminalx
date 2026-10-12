@@ -52,15 +52,21 @@ fn stop_agents_and_wait(state: &tauri::State<'_, crate::AppState>, session: &Ses
         .iter()
         .map(|tab| {
             state.host.kill(&format!("{}/{}", session.id, tab.id));
-            crate::session::SessionManager::pane_id(&tab.id)
+            tab.pane_id()
         })
         .collect();
     state.terminals.kill_all_and_wait(&panes, STOP_BEFORE_REMOVE_WAIT);
 }
 
-fn kill_tab(state: &tauri::State<'_, crate::AppState>, session_id: &str, tab_id: &str) {
+fn kill_tab(app: &AppHandle, state: &tauri::State<'_, crate::AppState>, session_id: &str, tab_id: &str) {
     state.host.kill(&format!("{session_id}/{tab_id}"));
-    state.terminals.kill(&crate::session::SessionManager::pane_id(tab_id));
+    // The tab's own pane, or the shell's it took over (#437).
+    let pane = index::get(session_id).ok().and_then(|session| session.tab(tab_id).map(TabEntry::pane_id)).unwrap_or_else(|| crate::session::SessionManager::pane_id(tab_id));
+    state.terminals.kill(&pane);
+    // A shell's pane is listed by every window, which is told it has gone.
+    if crate::pty::is_shell_id(&pane) {
+        let _ = app.emit(PTY_CLOSED_EVENT, &pane);
+    }
 }
 
 // ------------------------------------------------------------------ account
@@ -1485,7 +1491,7 @@ pub fn add_tab(app: AppHandle, state: State<'_, AppState>, session_id: String, t
 #[tauri::command]
 pub fn remove_tab(app: AppHandle, session_id: String, tab_id: String) -> CmdResult<()> {
     let state = app.state::<crate::AppState>();
-    kill_tab(&state, &session_id, &tab_id);
+    kill_tab(&app, &state, &session_id, &tab_id);
     index::update_session(&session_id, |s| {
         s.tabs.retain(|t| t.id != tab_id);
         if s.active_tab.as_deref() == Some(&tab_id) {
@@ -1596,7 +1602,8 @@ fn sweep_quick_chats(app: &AppHandle) {
     let state = app.state::<crate::AppState>();
     // A shell the reader left running in it is a use of it, whatever its date.
     let shells = state.terminals.shells();
-    let busy = |session: &SessionEntry| shells.iter().any(|shell| shell.session_id == session.id && !shell.exited);
+    let live: Vec<&str> = shells.iter().filter(|shell| !shell.exited).map(|shell| shell.session_id.as_str()).collect();
+    let busy = |session: &SessionEntry| crate::session_ops::has_shell_in_use(session, &live, |pane| state.terminals.is_running(pane));
     let stop = |session: &SessionEntry| stop_sessions_and_wait(&state, std::slice::from_ref(session));
     match crate::session_ops::sweep_idle_quick_chats(app, days, &busy, &stop) {
         Ok(removed) if !removed.is_empty() => log::info!("removed {} quick chat(s) idle for more than {days} day(s)", removed.len()),
@@ -1720,7 +1727,7 @@ pub async fn relocate_session(app: AppHandle, session_id: String) -> CmdResult<S
             return Err("session has no worktree".to_string());
         }
         for tab in &s.tabs {
-            kill_tab(&state, &s.id, &tab.id);
+            kill_tab(&app, &state, &s.id, &tab.id);
         }
         let branch = git::current_branch(Path::new(&s.project_path));
         let out = index::update_session(&session_id, |s| {
@@ -2377,12 +2384,30 @@ pub(crate) const PTY_RENAMED_EVENT: &str = "pty_renamed";
 /// they were opened (the floating one, a reload) lists them from this.
 #[tauri::command]
 pub fn pty_shells(state: State<'_, AppState>) -> Vec<crate::pty::ShellPane> {
-    state.terminals.shells()
+    // A shell an agent was started in is that agent's tab from then on
+    // (#437): the session lists it, and it is not also a shell tab.
+    let taken: std::collections::HashSet<String> = index::load().unwrap_or_default().iter().flat_map(|session| &session.tabs).filter_map(|tab| tab.follow.pane.clone()).collect();
+    state.terminals.shells().into_iter().filter(|shell| !taken.contains(&shell.id)).collect()
+}
+
+/// The agents in front of terminals right now (#437), for a window that
+/// loads after they were started.
+#[tauri::command]
+pub fn pane_agents(state: State<'_, AppState>) -> Vec<crate::session::follow::PaneAgent> {
+    state.manager().map(|manager| manager.pane_agents()).unwrap_or_default()
+}
+
+/// Start a tab's agent again on one of the tab's conversations (#437): the
+/// one it holds, or one it held before another agent was run in its terminal.
+#[tauri::command]
+pub async fn tab_resume_conversation(app: AppHandle, session_id: String, tab_id: String, harness: String, provider_session_id: String) -> CmdResult<()> {
+    let manager = app.state::<AppState>().manager().ok_or("not ready")?;
+    tauri::async_runtime::spawn_blocking(move || manager.resume_conversation(&session_id, &tab_id, &harness, &provider_session_id).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub fn pty_rename(app: AppHandle, state: State<'_, AppState>, id: String, title: String) {
-    state.terminals.set_title(&id, &title);
+    state.terminals.rename(&id, &title);
     if let Some(shell) = state.terminals.shell(&id) {
         let _ = app.emit(PTY_RENAMED_EVENT, &shell);
     }

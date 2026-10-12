@@ -35,6 +35,9 @@ use crate::store::index::{self, TabEntry, TabStatus};
 use crate::sink::{EventSink, SessionObserver};
 use crate::{git, pty, store};
 
+#[path = "session_follow.rs"]
+pub mod follow;
+
 #[derive(Clone)]
 pub struct PendingAsk {
     pub tool_use_id: String,
@@ -377,6 +380,11 @@ pub struct CliTab {
     /// What this launch's hooks have to prove to be heard: the secret it was
     /// given, and where its transcript is allowed to be.
     pub origin: Origin,
+    /// Set when the reader started this CLI by hand in the tab's terminal
+    /// (#437) and the app only follows it. Such a CLI was given none of the
+    /// app's hooks, so everything a hook would say is read from elsewhere,
+    /// and it is never restarted by the app.
+    pub by_hand: Option<Box<follow::ByHand>>,
 }
 
 pub enum Engine {
@@ -416,6 +424,10 @@ pub struct TabRuntime {
     pub stopping: bool,
     pub stop_in_flight: bool,
     pub stopping_pid: Option<u32>,
+    /// The transcript the tab's last CLI was writing, and how far it had been
+    /// read when that CLI was let go of: where to read on from if a CLI is
+    /// started on the same conversation by hand (#437).
+    left_at: Option<(PathBuf, u64)>,
     pub log_path: std::path::PathBuf,
     /// Back-reference so work finished off-thread (an HTTP reply) can re-enter.
     pub me: std::sync::Weak<Mutex<TabRuntime>>,
@@ -451,6 +463,14 @@ pub fn idle_orphaned_tabs() {
                 if matches!(t.status, TabStatus::InProgress | TabStatus::Waiting) {
                     t.status = TabStatus::Idle;
                 }
+                // Nor does any pane: a tab that lived in a shell's has its
+                // own from here on, and an agent that was started by hand
+                // went with the terminal it was started in. Its conversation
+                // is the tab's, for the app to resume when the tab is opened.
+                t.follow.pane = None;
+                if t.follow.front == index::Front::ByHand {
+                    t.follow.front = index::Front::Agent;
+                }
             }
         }
         Ok(())
@@ -472,6 +492,8 @@ pub struct SessionManager {
     /// interleave their paste and their Enter.
     writers: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     starts: Arc<std::sync::atomic::AtomicU64>,
+    /// Tabs following their terminal (#437); off until the desktop app asks.
+    follow: Arc<follow::Following>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -501,6 +523,12 @@ pub struct TabPtyEvent {
     pub pane_id: String,
     pub command: String,
     pub harness: String,
+    /// The CLI in the pane was started by hand in it (#437).
+    #[serde(default)]
+    pub by_hand: bool,
+    /// The pane holds a shell and no agent: the tab is a terminal (#437).
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -632,6 +660,7 @@ impl SessionManager {
             tabs: Arc::new(Mutex::new(HashMap::new())),
             writers: Arc::new(Mutex::new(HashMap::new())),
             starts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            follow: Arc::default(),
         };
         let watcher = manager.clone();
         std::thread::spawn(move || loop {
@@ -663,7 +692,7 @@ impl SessionManager {
         for rt_arc in tabs {
             let mut rt = rt_arc.lock().unwrap();
             let (pane, ended) = match &rt.engine {
-                Engine::Cli(p) => (Some(p.pane_id.clone()), p.transcript_turn == Some(tui::TurnMark::Ended)),
+                Engine::Cli(p) => (Some(p.pane_id.clone()), p.transcript_turn.is_some_and(tui::TurnMark::ends)),
                 _ => (None, false),
             };
             self.give_up_on_unanswered_settings(&mut rt, now);
@@ -720,7 +749,11 @@ impl SessionManager {
                 continue;
             }
             let quiet = drawn.map_or(silent, |drawn| now.saturating_duration_since(drawn).min(silent));
-            if recovery::is_stale(rt.status == TabStatus::InProgress, quiet, patience) {
+            // A CLI the reader started by hand answers its own questions in
+            // its own screen, and nothing says when it is doing so: silence
+            // there is not a stall the app can call.
+            let by_hand = matches!(&rt.engine, Engine::Cli(p) if p.by_hand.is_some());
+            if !by_hand && recovery::is_stale(rt.status == TabStatus::InProgress, quiet, patience) {
                 let kind = if matches!(&rt.engine, Engine::Cli(p) if p.awaiting_delivery.is_some()) {
                     RecoveryKind::DeliveryUnconfirmed
                 } else {
@@ -801,6 +834,7 @@ impl SessionManager {
                 stopping: false,
                 stop_in_flight: false,
                 stopping_pid: None,
+                left_at: None,
                 log_path,
                 me: std::sync::Weak::new(),
             }));
@@ -963,7 +997,9 @@ impl SessionManager {
         for event in &mut events { recovery::sanitize(&mut event.payload); }
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut rt = rt_arc.lock().unwrap();
-        if rt.status == TabStatus::Idle && !rt.turn_open && !rt.stopping {
+        // A tab that is a terminal has no agent to recover.
+        let terminal = index::get(session_id).ok().and_then(|entry| entry.tab(tab_id).map(TabEntry::is_terminal)).unwrap_or(false);
+        if rt.status == TabStatus::Idle && !rt.turn_open && !rt.stopping && !terminal {
             if let Some(kind) = recovery::from_history(&events) {
                 self.needs_recovery(&mut rt, kind);
             }
@@ -1220,6 +1256,11 @@ impl SessionManager {
         images: Vec<ImageInput>,
     ) -> Result<SendOutcome> {
         let outcome = self.send_impl(session_id, tab_id, PromptText { agent: text, display: display_text, author: None, shared_connection: None }, images, None);
+        // The app declining to type into the tab's terminal is no error of
+        // the agent's: nothing is raised in the tab, and the reason is said.
+        if outcome.as_ref().is_err_and(|error| error.is::<follow::Refusal>()) {
+            return outcome;
+        }
         if let Err(error) = &outcome {
             if let Ok(rt) = self.runtime(session_id, tab_id) {
                 self.apply(&mut rt.lock().unwrap(), Payload::Error { message: format!("{error:#}"), fatal: false }, None);
@@ -1238,10 +1279,31 @@ impl SessionManager {
         images: Vec<ImageInput>, receipt: Option<DeliveryReceipt>,
     ) -> Result<SendOutcome> {
         let rt_arc = self.runtime(session_id, tab_id)?;
-        let entry = index::get(session_id)?;
-        let tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
+        let mut entry = index::get(session_id)?;
+        let mut tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
         let mut rt = rt_arc.lock().unwrap();
         if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
+        // A CLI the reader started by hand is theirs to drive: it runs with
+        // whatever permissions they gave it, which no share was checked
+        // against. And a terminal is the host's to start an agent in.
+        if prompt.shared_connection.is_some() && tab.by_hand() {
+            bail!("This tab's agent was started by hand in its terminal. Only the host can send to it.");
+        }
+        if prompt.shared_connection.is_some() && tab.is_terminal() {
+            bail!("No agent is running in this tab. Only the host can start one.");
+        }
+        // A prompt for a tab that is a terminal starts its agent again on the
+        // tab's conversation, in the place of the shell.
+        if tab.is_terminal() && !matches!(rt.engine, Engine::Cli(_)) {
+            self.wake(&mut rt, &tab)?;
+            entry = index::get(session_id)?;
+            tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
+        }
+        // What is typed for a CLI the reader started by hand lands in their
+        // shell once that CLI is gone, and the watcher may be a moment behind.
+        if let Some(left) = self.left_the_terminal(&rt) {
+            return Err(follow::Refusal(left).into());
+        }
         let (refs, wire_images) = Self::archive_images(session_id, &images)?;
 
         if receipt.is_some() && (pty_first(&tab.harness).is_none() || rt.turn_open || !rt.pending.is_empty()) {
@@ -1460,7 +1522,12 @@ impl SessionManager {
         }
         let sent = match &mut rt.engine {
             // The TUI reads a bare Escape as "stop"; nothing else can reach it.
-            Engine::Cli(p) => self.terminals.write(&p.pane_id, tui::ESCAPE).is_ok(),
+            // One the reader started by hand that has left its terminal is
+            // not there to read it, and its shell is not sent it.
+            Engine::Cli(p) => {
+                let pane = p.pane_id.clone();
+                self.left_the_terminal(&rt).is_none() && self.terminals.write(&pane, tui::ESCAPE).is_ok()
+            }
             Engine::Acp(a) => {
                 let actions = a.interrupt();
                 let sent = !actions.is_empty();
@@ -1515,16 +1582,20 @@ impl SessionManager {
     pub fn stop(&self, session_id: &str, tab_id: &str) -> Result<()> {
         let key = key_of(session_id, tab_id);
         let rt_arc = self.runtime(session_id, tab_id)?;
+        if matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.by_hand.is_some()) {
+            return self.stop_by_hand(&rt_arc);
+        }
+        let own_pane = index::get(session_id).ok().and_then(|entry| entry.tab(tab_id).map(TabEntry::pane_id)).unwrap_or_else(|| Self::pane_id(tab_id));
         let (pane, pid) = {
             let mut rt = rt_arc.lock().unwrap();
             if rt.stop_in_flight { bail!("Stop is already in progress."); }
             rt.stop_in_flight = true;
             rt.stopping = true;
             rt.queued.clear();
-            let pid = rt.stopping_pid.or(rt.child_pid).or_else(|| {
-                let pane = Self::pane_id(tab_id);
-                self.terminals.panes().iter().find(|p| p.id == pane).and_then(|p| p.pid)
-            });
+            // Only an agent's own process: the shell of a tab that is a
+            // terminal is not what Stop is for.
+            let agent_pane = matches!(rt.engine, Engine::Cli(_)).then_some(&own_pane);
+            let pid = rt.stopping_pid.or(rt.child_pid).or_else(|| agent_pane.and_then(|pane| self.terminals.panes().iter().find(|p| &p.id == pane).and_then(|p| p.pid)));
             for request_id in rt.pending.drain().map(|(id, _)| id).collect::<Vec<_>>() {
                 self.publish(&mut rt, Payload::PermissionDecided { request_id, tool_use_id: None, allowed: false, label: "Cancelled".into(), automatic: true }, None);
             }
@@ -1640,6 +1711,11 @@ impl SessionManager {
     pub fn set_model(&self, session_id: &str, tab_id: &str, model: &str) -> Result<()> {
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut rt = rt_arc.lock().unwrap();
+        if HarnessId::parse(&rt.harness).settings().model == Apply::Restart {
+            if let Some(refusal) = Self::by_hand_refusal(&rt, "the model") {
+                bail!(refusal);
+            }
+        }
         let turn_open = rt.turn_open;
         let waits = self.change_waits(&rt, Setting::Model);
         let (before, after) = self.update_settings(&mut rt, |s| s.request_model(model, waits))?;
@@ -1858,7 +1934,10 @@ impl SessionManager {
         let sharing = self.sharing.lock().unwrap();
         let mut rt = rt_arc.lock().unwrap();
         let Some(mode) = rt.reported_mode_to_judge.take() else { return false };
-        if !sharing.sessions.contains_key(&rt.session_id) {
+        // A CLI started by hand is not the app's to restart, and takes no
+        // guest's prompt (`send_impl`): its mode is simply what it says.
+        let by_hand = matches!(&rt.engine, Engine::Cli(p) if p.by_hand.is_some());
+        if by_hand || !sharing.sessions.contains_key(&rt.session_id) {
             if let Err(error) = self.update_settings(&mut rt, |s| s.reported_mode(&mode)) {
                 log::warn!("mode reported by {}/{}: {error:#}", rt.session_id, rt.tab_id);
             }
@@ -1911,6 +1990,9 @@ impl SessionManager {
         }
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut rt = rt_arc.lock().unwrap();
+        if let Some(refusal) = Self::by_hand_refusal(&rt, "the permission mode") {
+            bail!(refusal);
+        }
         let turn_open = rt.turn_open;
         let waits = turn_open && matches!(rt.engine, Engine::Cli(_));
         let (_, after) = self.update_settings(&mut rt, |s| s.request_mode(mode, waits))?;
@@ -1953,6 +2035,11 @@ impl SessionManager {
         let mut rt = rt_arc.lock().unwrap();
         if HarnessId::parse(&rt.harness).settings().effort == Apply::Unsupported && effort.is_some_and(|e| !e.is_empty()) {
             bail!("{} has no effort setting.", agent_name(&rt.harness));
+        }
+        if HarnessId::parse(&rt.harness).settings().effort == Apply::Restart {
+            if let Some(refusal) = Self::by_hand_refusal(&rt, "the effort") {
+                bail!(refusal);
+            }
         }
         let turn_open = rt.turn_open;
         let waits = self.change_waits(&rt, Setting::Effort);
@@ -2002,6 +2089,7 @@ impl SessionManager {
     }
 
     pub fn kill_all(&self) {
+        self.closing();
         if let Err(error) = store::activity::shutdown() {
             log::error!("flush activity on shutdown: {error:#}");
         }
@@ -2026,6 +2114,12 @@ impl SessionManager {
         let rt_arc = self.runtime(session_id, tab_id)?;
         let entry = index::get(session_id)?;
         let tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
+        // A tab that is a terminal is opened as one: its shell, and no agent.
+        // So is one whose hand-started agent is no longer being followed.
+        let following = matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.by_hand.is_some());
+        if tab.is_terminal() || (tab.by_hand() && !following) {
+            return self.shell_for(session_id, tab_id);
+        }
         if pty_first(&tab.harness).is_none() {
             return Ok(());
         }
@@ -2046,11 +2140,16 @@ impl SessionManager {
     pub fn pane_of(&self, session_id: &str, tab_id: &str) -> Option<TabPtyEvent> {
         let rt_arc = self.runtime(session_id, tab_id).ok()?;
         let rt = rt_arc.lock().unwrap();
-        Self::pane_event(&rt)
+        Self::pane_event(&rt).or_else(|| {
+            // A tab that is a terminal has a pane and no CLI in it.
+            let entry = index::get(session_id).ok()?;
+            let tab = entry.tab(tab_id).filter(|tab| tab.is_terminal() && self.terminals.is_live(&tab.pane_id()))?;
+            Some(Self::terminal_pane_event(session_id, tab))
+        })
     }
 
-    /// The CLI process in a PTY pane exited. Hooks normally close the turn
-    /// first; when they do not, the process death is a failed automation run.
+    /// The process in a PTY pane exited. Hooks normally close the turn
+    /// first; when they do not, what becomes of the tab is `cli_gone`'s to say.
     pub fn pane_exited(&self, pane_id: &str, code: Option<i32>) {
         // A delayed exit from a replaced pane must not forget what its
         // successor was launched with (its grant, its configuration and MCP
@@ -2058,22 +2157,9 @@ impl SessionManager {
         if !self.terminals.is_running(pane_id) {
             crate::cloud_grants::forget_launch(pane_id);
         }
-        let Some(tab_id) = pane_id.strip_prefix("tab:") else { return };
-        let Some(entry) = index::load().ok().and_then(|sessions| sessions.into_iter().find(|session| session.tab(tab_id).is_some())) else { return };
-        let Ok(rt_arc) = self.runtime(&entry.id, tab_id) else { return };
-        let mut rt = rt_arc.lock().unwrap();
-        // A delayed exit from a replaced pane must not settle its successor.
-        if !matches!(rt.engine, Engine::Cli(_)) || self.terminals.is_running(pane_id) { return; }
-        let turn_was_open = rt.turn_open;
-        let recovery = rt.recovery.or(turn_was_open.then_some(RecoveryKind::Failed));
-        if turn_was_open { self.close_open_turn(&mut rt, TurnStatus::Error, None); }
-        self.release_cli(&mut rt);
-        if let Some(kind) = recovery { self.needs_recovery(&mut rt, kind); }
-        drop(rt);
-        if turn_was_open {
-            let detail = code.map(|value| format!(" with exit code {value}")).unwrap_or_else(|| " from a signal".into());
-            self.observer.automation_failed(&entry.id, tab_id, &format!("The agent process exited{detail} before the automation turn completed."));
-        }
+        let Some((entry, tab)) = self.tab_of_pane(pane_id) else { return };
+        let Ok(rt_arc) = self.runtime(&entry.id, &tab.id) else { return };
+        self.cli_gone(&rt_arc, pane_id, code, TurnStatus::Error);
     }
 
     fn pane_event(rt: &TabRuntime) -> Option<TabPtyEvent> {
@@ -2084,6 +2170,8 @@ impl SessionManager {
             pane_id: p.pane_id.clone(),
             command: p.command.clone(),
             harness: rt.harness.clone(),
+            by_hand: p.by_hand.is_some(),
+            terminal: false,
         })
     }
 
@@ -2098,13 +2186,21 @@ impl SessionManager {
     fn start_cli(&self, rt: &mut TabRuntime, rt_arc: &Arc<Mutex<TabRuntime>>, entry: &index::SessionEntry, tab: &TabEntry) -> Result<bool> {
         if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
         let Some(kind) = pty_first(&tab.harness) else { return Ok(false) };
-        let pane = Self::pane_id(&tab.id);
+        let pane = tab.pane_id();
         if let Engine::Cli(p) = &rt.engine {
             if p.pane_id == pane && self.terminals.is_running(&pane) {
                 return Ok(false);
             }
         }
         self.terminals.kill_and_wait(&pane, RESTART_WAIT);
+        // A conversation the reader started by hand comes with no mode the
+        // app knows (#437). Launched by the app it runs in the one that asks:
+        // not the app's default, which would hand it more than the reader
+        // may have, and from here on a mode the picker shows and can change.
+        if tab.permission_mode == follow::MODE_SET_IN_TERMINAL {
+            self.update_settings(rt, |s| s.permission_mode = follow::MODE_WHEN_RESUMED.into())?;
+        }
+        let tab = &index::get(&rt.session_id)?.tab(&rt.tab_id).cloned().unwrap_or_else(|| tab.clone());
         // A model, effort or mode that was waiting for the process to be
         // replaced rides with this launch, and is what the tab runs from
         // here on.
@@ -2197,6 +2293,7 @@ impl SessionManager {
             answered: HashMap::new(),
             command: launch.command,
             origin: Origin { token, transcript_root: launch.transcript_root, conversation: launch.conversation },
+            by_hand: None,
         });
         rt.turn_open = false;
         self.announce_pane(rt);
@@ -2353,9 +2450,13 @@ impl SessionManager {
         let rt_arc = self.runtime(session_id, tab_id)?;
         let entry = index::get(session_id)?;
         let tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
-        let pane = Self::pane_id(tab_id);
+        let pane = tab.pane_id();
         {
             let mut rt = rt_arc.lock().unwrap();
+            // Never a CLI the reader started by hand: its pane is their shell.
+            if let Some(refusal) = Self::by_hand_refusal(&rt, "its settings") {
+                bail!(refusal);
+            }
             if let Engine::Cli(p) = &mut rt.engine {
                 p.restart_when_idle = false;
             }
@@ -2384,6 +2485,7 @@ impl SessionManager {
     fn release_cli(&self, rt: &mut TabRuntime) -> Option<String> {
         let Engine::Cli(p) = &rt.engine else { return None };
         let pane = p.pane_id.clone();
+        rt.left_at = Some((p.tail.path(), p.tail.offset()));
         crate::cloud_grants::forget_launch(&pane);
         for request_id in rt.pending.drain().map(|(id, _)| id).collect::<Vec<_>>() {
             self.publish(rt, Payload::PermissionDecided { request_id, tool_use_id: None, allowed: false, label: "Lapsed".into(), automatic: true }, None);
@@ -2410,13 +2512,10 @@ impl SessionManager {
                 return;
             }
             manager.pump(&rt_arc, &tail);
+            manager.follow_by_hand(&rt_arc);
             if !manager.terminals.is_running(&pane) {
-                let mut rt = rt_arc.lock().unwrap();
-                if matches!(&rt.engine, Engine::Cli(p) if p.generation == generation) {
-                    let recovery = rt.recovery.or(rt.turn_open.then_some(RecoveryKind::Failed));
-                    manager.close_open_turn(&mut rt, TurnStatus::Aborted, None);
-                    manager.release_cli(&mut rt);
-                    if let Some(kind) = recovery { manager.needs_recovery(&mut rt, kind); }
+                if matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.generation == generation) {
+                    manager.cli_gone(&rt_arc, &pane, None, TurnStatus::Aborted);
                 }
                 return;
             }
@@ -2427,7 +2526,19 @@ impl SessionManager {
     /// tail's own lock orders this against the poll loop, so a `Stop` hook
     /// flushing before it closes the turn cannot overtake it.
     fn pump(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &Arc<tui::Tail>) {
+        // A CLI the reader started by hand has no hook to close its turns:
+        // the transcript does, so each record's word about the turn is acted
+        // on where it stands, not only the last of a read (#437).
+        if matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.by_hand.is_some()) {
+            return self.pump_by_hand(rt_arc, tail);
+        }
         let (payloads, mark) = tail.drain_marked();
+        self.pump_read(rt_arc, payloads, mark);
+    }
+
+    /// One read of the transcript: its payloads, and what it last said about
+    /// the turn.
+    fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, payloads: Vec<Payload>, mark: Option<tui::TurnMark>) {
         if payloads.is_empty() && mark.is_none() {
             return;
         }
@@ -2493,6 +2604,12 @@ impl SessionManager {
             }
             if matches!(payload, Payload::UserMessage { .. }) {
                 self.delivery_confirmed(&mut rt);
+                // A prompt typed into the terminal with no hook ahead of it
+                // (a CLI started by hand, #437) is where its turn's time is
+                // counted from.
+                if !rt.turn_open {
+                    rt.turn_started_at = Some(Instant::now());
+                }
                 rt.open_turn();
                 if let Engine::Cli(p) = &mut rt.engine {
                     p.turn_tail.opened();
@@ -2512,6 +2629,28 @@ impl SessionManager {
             }
             self.apply(&mut rt, payload, None);
         }
+        // No hook closes the turn of a CLI the reader started by hand (#437),
+        // so the transcript's own word that it ended is taken at once. It is
+        // read after the payloads, so the turn's reply is in it.
+        if mark.is_some_and(tui::TurnMark::ends) && rt.turn_open && matches!(&rt.engine, Engine::Cli(p) if p.by_hand.is_some()) {
+            let said = match &rt.engine {
+                Engine::Cli(p) => p.turn_tail.last_assistant_message().map(str::to_owned),
+                _ => None,
+            };
+            if mark == Some(tui::TurnMark::Aborted) {
+                // Interrupted in its own screen: not a turn that finished.
+                self.forget_tool_answers(&mut rt);
+                self.end_open_turn(&mut rt, TurnStatus::Aborted, None);
+                let (session, tab) = (rt.session_id.clone(), rt.tab_id.clone());
+                drop(rt);
+                self.observer.automation_failed(&session, &tab, "The automation turn was interrupted.");
+            } else {
+                self.end_open_turn(&mut rt, TurnStatus::Ok, None);
+                self.after_turn_completed(rt_arc, rt, said);
+            }
+            self.judge_reported_mode(rt_arc);
+            return;
+        }
         // Recorded after the payloads, so an end never gets ahead of the
         // reply before it, and only against an open turn: the end of a turn
         // the hooks already closed says nothing about the next one. That
@@ -2521,7 +2660,7 @@ impl SessionManager {
         let open = rt.turn_open;
         if let (Some(mark), Engine::Cli(p)) = (mark, &mut rt.engine) {
             let owed = std::mem::take(&mut p.transcript_end_owed);
-            if !(owed && mark == tui::TurnMark::Ended) {
+            if !(owed && mark.ends()) {
                 p.transcript_turn = open.then_some(mark);
             }
         }
@@ -2677,6 +2816,16 @@ impl SessionManager {
                 }
             };
             let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            // A CLI the reader started by hand shares its pane with the shell
+            // it was started from (#437). Once it has exited or been
+            // suspended, anything typed here is typed at that shell, and the
+            // Enter would run a prompt as a command. So the pane is asked who
+            // has it before every write, the Enter above all; the watcher
+            // that turns the tab into a terminal may be a moment behind.
+            let still_there = || match manager.left_the_terminal(&rt_arc.lock().unwrap()) {
+                Some(left) => Err(anyhow::Error::new(follow::Refusal(left))),
+                None => Ok(()),
+            };
             if let Some(ready) = &ready {
                 let readiness = manager.wait_ready(&pane, ready, shared.as_ref());
                 stage("ready", serde_json::json!({ "readiness": readiness.as_str() }));
@@ -2706,6 +2855,7 @@ impl SessionManager {
                     }
                 }
                 admitted_to_writer = true;
+                still_there()?;
                 terminals.write(&pane, tui::CLEAR_LINE)?;
                 for path in &attachments {
                     terminals.write(&pane, &tui::attachment_bytes(path))?;
@@ -2716,6 +2866,7 @@ impl SessionManager {
                     std::thread::sleep(std::time::Duration::from_millis(300));
                 }
                 let body = tui::body_bytes(&text);
+                still_there()?;
                 terminals.write(&pane, &body)?;
                 stage("body_written", serde_json::json!({ "bytes": body.len(), "attachments": attachments.len() }));
                 let read = tui::await_read(unread, tui::PASTE_READ_TIMEOUT);
@@ -2723,6 +2874,7 @@ impl SessionManager {
                     log::warn!("[{pane}] the CLI has not read the prompt; submitting anyway and watching for acceptance");
                 }
                 std::thread::sleep(tui::submit_delay(body.len()));
+                still_there()?;
                 if let Some((seq, _)) = &receipt {
                     // Hold the runtime lock across Enter and arming so a fast
                     // submit hook/echo cannot arrive between the two.
@@ -2765,6 +2917,10 @@ impl SessionManager {
                     rt.turn_open = false;
                     manager.set_status(&mut rt, TabStatus::Idle);
                     let _ = receipt.send(Err(format!("The new session opened, but writing its continuation prompt failed: {e}. The prepared prompt is retained.")));
+                } else if e.is::<follow::Refusal>() {
+                    // Nothing to recover: the tab is becoming a terminal, and
+                    // the watcher closes the turn this prompt opened and
+                    // says the agent went.
                 } else if ready.is_some() && matches!(&rt.engine, Engine::Cli(p) if p.awaiting_delivery.is_some()) {
                     manager.needs_recovery(&mut rt, RecoveryKind::DeliveryUnconfirmed);
                     rt.stalled_at = Some(Instant::now());
@@ -3388,7 +3544,7 @@ impl SessionManager {
             rt.turn_open = false;
             if let Engine::Cli(p) = &mut rt.engine {
                 p.awaiting_delivery = None;
-                p.transcript_end_owed = p.transcript_turn.take() != Some(tui::TurnMark::Ended);
+                p.transcript_end_owed = !p.transcript_turn.take().is_some_and(tui::TurnMark::ends);
                 // What the reader queued behind a stopped turn is still
                 // expected (#427): interrupted with a message queued, both
                 // CLIs send it at once as their next prompt (Claude Code
@@ -3486,6 +3642,10 @@ impl Sink for TabSink {
 #[cfg(test)]
 #[path = "session_watch_tests.rs"]
 mod watch_tests;
+
+#[cfg(test)]
+#[path = "session_follow_tests.rs"]
+mod follow_tests;
 
 #[cfg(test)]
 mod tests {
