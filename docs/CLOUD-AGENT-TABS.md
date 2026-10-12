@@ -515,8 +515,12 @@ A schedule on a cloud workspace is kept and dispatched by the server
   `working` in the claim), so an answer that is lost is never given again and
   that run times out on the server. A server without scheduled runs, or with
   the feature off, answers `404`: the runtime then asks every five minutes
-  and does nothing else (the same for a `401`). Asking never wakes anything; only the
-  server's dispatch starts a machine.
+  and does nothing else. A `401` (the credential is not accepted right
+  now) is asked about again after the usual 30 seconds: the workspace may
+  have been woken for a run. Waits are spread by up to a fifth, so
+  workspaces woken together do not ask together. No run is taken while the
+  workspace's launch is still cloning its repositories. Asking never wakes
+  anything; only the server's dispatch starts a machine.
 - **Start.** One new session in the project folder, named after the
   schedule, with the schedule's agent, model, effort and permission mode. A
   run with no mode, with `bypassPermissions` or with a mode this runtime
@@ -527,11 +531,28 @@ A schedule on a cloud workspace is kept and dispatched by the server
 - **Report.** `started` with the session and tab, then `completed` or
   `failed` with one of the server's categories (`timed-out`, `canceled`,
   `agent-failed`, `agent-exited`, `agent-start-failed`, `agent-unavailable`,
-  `agent-credential-required`, `project-unavailable`, the three prompt
-  refusals, `runtime-error`). `started` is sent again every minute; an
-  answer that says the run is over on the server (`409`), or that the
-  server no longer has it or has scheduled runs turned off (`404`), ends
-  the turn.
+  `agent-credential-required`, `project-unavailable`, `needs-approval`,
+  the three prompt refusals, `runtime-error`). `started` is sent again
+  every minute; an answer that says the run is over on the server (`409`),
+  or that the server does not know the run (`404` with
+  `cloud_workspace_scheduled_run_not_found`), ends the turn. Any other
+  `404` means scheduled runs were turned off (or the server is from before
+  them): that says nothing about the run, so the turn goes on to its end
+  or its limit, as the contract's "running ones still time out" says, and
+  its end stays on record until a server takes reports again.
+- **An approval nobody can give.** A scheduled run is never in bypass
+  permissions, so its agent may stop at a permission request. When it does
+  and no attached client may answer one (`cloud_activity::approver_attached`:
+  a manager, or a driver who may approve; a phone acts through the mailbox
+  and is not attached), the runtime waits three minutes
+  (`Timing::approval_grace`), then ends the turn and reports `failed` /
+  `needs-approval`. Otherwise the pending request would keep the machine
+  from idling until `maxRunMinutes`. An answer, or someone attaching,
+  starts the wait afresh. A server from before the category refuses a
+  report that names it; the run is then reported `canceled`.
+- **The agent process ends with the run**, however the run ends: a
+  workspace people keep up would otherwise collect one idle CLI per run.
+  The transcript and the resume state stay, so the tab can be continued.
 - **The limit.** `maxRunMinutes` after the claim the turn is interrupted;
   an agent that has not ended it 30 seconds later is stopped. The run is
   reported `failed` / `timed-out`.
@@ -540,6 +561,9 @@ A schedule on a cloud workspace is kept and dispatched by the server
   touched. A runtime that starts with a record of an unfinished run reports
   it `failed` / `runtime-error` and does not send its prompt again; an end
   that could not be reported is reported by a later pass.
+  `scheduled-runs-seen.json` keeps the ids of the last 64 runs taken: a run
+  the server hands out a second time is reported `failed` /
+  `runtime-error` and not run again.
 - **Idle.** From the claim until the turn is seen running the run is counted
   as work, like a launch. After that the turn is counted by the session
   manager like any other, and nothing is held once it ends, so the server

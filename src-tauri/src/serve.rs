@@ -507,8 +507,11 @@ fn start_scheduled_runs(
         store: Store::open(&crate::cloud_agents::CloudAgents::state_dir(data_dir)),
         root: std::path::PathBuf::from(root),
         timing: Timing::default(),
-        paused: Arc::new(move || quiesced.upgrade().is_none_or(|agents| agents.quiesced())),
+        // No run is taken while the workspace's launch is still cloning its
+        // repositories: the agent would start in a folder that is not there yet.
+        paused: Arc::new(move || crate::cloud_activity::launches() > 0 || quiesced.upgrade().is_none_or(|agents| agents.quiesced())),
         hold: Arc::new(crate::cloud_agents::scheduled::working),
+        approver: Arc::new(crate::cloud_activity::approver_attached),
     };
     let _ = std::thread::Builder::new().name("cloud-scheduled-runs".into()).spawn(move || runner.run());
 }

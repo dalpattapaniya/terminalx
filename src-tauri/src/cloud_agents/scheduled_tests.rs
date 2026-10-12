@@ -27,6 +27,12 @@ struct FakeApi {
     /// The next claim takes the run on the server and loses the answer.
     lose_claim: AtomicBool,
     not_offered: AtomicBool,
+    /// The credential is not accepted: `401` on a claim.
+    rejected: AtomicBool,
+    /// Reports are answered with a `404` that names no run, from the report after this many.
+    reports_not_offered_after: Mutex<Option<usize>>,
+    /// A server from before this failure category: a report naming it is refused like a malformed one.
+    unknown_category: Mutex<Option<String>>,
     reports: Mutex<Vec<Report>>,
     fail_reports: AtomicUsize,
     reject_reports: AtomicBool,
@@ -52,6 +58,9 @@ impl FakeApi {
 impl ScheduledApi for FakeApi {
     fn claim(&self) -> Result<Claimed, CallError> {
         self.claims.fetch_add(1, Ordering::SeqCst);
+        if self.rejected.load(Ordering::SeqCst) {
+            return Ok(Claimed::Rejected);
+        }
         if self.not_offered.load(Ordering::SeqCst) {
             return Ok(Claimed::NotOffered);
         }
@@ -70,7 +79,13 @@ impl ScheduledApi for FakeApi {
             self.fail_reports.fetch_sub(1, Ordering::SeqCst);
             return Err(CallError::Transient(anyhow!("lost response")));
         }
+        if report.category.is_some() && report.category == *self.unknown_category.lock().unwrap() {
+            return Err(CallError::Rejected);
+        }
         let mut reports = self.reports.lock().unwrap();
+        if self.reports_not_offered_after.lock().unwrap().is_some_and(|after| reports.len() >= after) {
+            return Ok(Reported::NotOffered);
+        }
         if self.settled_after.lock().unwrap().is_some_and(|after| reports.len() >= after) {
             return Ok(Reported::Settled("canceled".into()));
         }
@@ -98,6 +113,10 @@ struct FakeAgent {
     record_path: Mutex<Option<PathBuf>>,
     held: Arc<AtomicUsize>,
     held_seen: Mutex<Vec<(Turn, usize)>>,
+    /// The turn is stopped at a permission request.
+    awaiting_approval: AtomicBool,
+    /// Someone who may answer it is attached.
+    approver: Arc<AtomicBool>,
 }
 
 impl FakeAgent {
@@ -116,6 +135,8 @@ impl FakeAgent {
             record_path: Mutex::default(),
             held: Arc::default(),
             held_seen: Mutex::default(),
+            awaiting_approval: AtomicBool::new(false),
+            approver: Arc::default(),
         }
     }
 }
@@ -149,6 +170,10 @@ impl Agent for FakeAgent {
         turn
     }
 
+    fn awaiting_approval(&self, _session_id: &str, _tab_id: &str) -> bool {
+        self.awaiting_approval.load(Ordering::SeqCst) && !self.ended.load(Ordering::SeqCst)
+    }
+
     fn interrupt(&self, _session_id: &str, _tab_id: &str) {
         self.interrupts.fetch_add(1, Ordering::SeqCst);
         if self.obeys_interrupt {
@@ -179,7 +204,7 @@ struct Rig {
 
 fn fast() -> Timing {
     let ms = Duration::from_millis;
-    Timing { claim_every: ms(30_000), not_offered_every: ms(300_000), minute: ms(60_000), interrupt_grace: ms(40), start_grace: ms(60_000), heartbeat: ms(60_000), tick: ms(2) }
+    Timing { claim_every: ms(30_000), not_offered_every: ms(300_000), minute: ms(60_000), interrupt_grace: ms(40), start_grace: ms(60_000), heartbeat: ms(60_000), approval_grace: ms(60_000), tick: ms(2) }
 }
 
 fn rig_in(dir: tempfile::TempDir, api: Arc<FakeApi>, agent: FakeAgent, timing: Timing) -> Rig {
@@ -190,6 +215,7 @@ fn rig_in(dir: tempfile::TempDir, api: Arc<FakeApi>, agent: FakeAgent, timing: T
     *agent.record_path.lock().unwrap() = Some(state.join(FILE));
     let agent = Arc::new(agent);
     let held = agent.held.clone();
+    let approver = agent.approver.clone();
     let runner = Runner {
         api: api.clone(),
         agent: agent.clone(),
@@ -201,6 +227,7 @@ fn rig_in(dir: tempfile::TempDir, api: Arc<FakeApi>, agent: FakeAgent, timing: T
             held.fetch_add(1, Ordering::SeqCst);
             Box::new(Held(held.clone()))
         }),
+        approver: Arc::new(move || approver.load(Ordering::SeqCst)),
     };
     Rig { dir, api, agent, runner }
 }
@@ -222,7 +249,9 @@ fn a_run_is_started_reported_and_completed() {
     for report in &reports {
         assert_eq!((report.run_id.as_str(), report.session_id.as_deref(), report.tab_id.as_deref()), ("run_1", Some("session-1"), Some("tab-1")));
     }
-    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (0, 0));
+    // Nothing to interrupt; the agent process is ended with the run, so a
+    // workspace people keep up does not collect one idle CLI per run.
+    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (0, 1));
     assert!(rig.runner.store.get().is_none(), "nothing is owed once the end is reported");
     // Nothing more to run: wait for the next claim.
     assert_eq!(rig.runner.pass().unwrap(), fast().claim_every);
@@ -320,8 +349,8 @@ fn a_turn_past_the_limit_is_interrupted_and_reported_timed_out() {
     rig.runner.pass().unwrap();
     assert!(began.elapsed() >= Duration::from_millis(30), "not before the limit");
     assert_eq!(rig.api.ends(), [end("failed", Some("timed-out"))]);
-    // The agent ended its turn when asked: it is not killed.
-    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (1, 0));
+    // The agent ended its turn when asked; its process is ended once, with the run.
+    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (1, 1));
     assert_eq!(rig.agent.held.load(Ordering::SeqCst), 0);
     assert!(rig.runner.store.get().is_none());
 }
@@ -366,7 +395,7 @@ fn a_run_the_server_ended_has_its_turn_ended_and_nothing_more_reported() {
     let rig = rig_in(tempfile::tempdir().unwrap(), api, FakeAgent::new(&[Turn::Running]), timing);
     rig.runner.pass().unwrap();
     assert_eq!(rig.api.reports(), [end("started", None)]);
-    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (1, 0));
+    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (1, 1));
     assert_eq!(rig.agent.held.load(Ordering::SeqCst), 0);
     assert!(rig.runner.store.get().is_none());
 }
@@ -464,6 +493,117 @@ fn a_server_without_scheduled_runs_is_asked_rarely_and_nothing_happens() {
     rig.api.reject_reports.store(true, Ordering::SeqCst);
     assert_eq!(rig.runner.pass().unwrap(), fast().not_offered_every);
     assert!(rig.runner.store.get().is_some());
+}
+
+#[test]
+fn a_turn_waiting_for_an_approval_nobody_can_give_is_ended_and_says_so() {
+    // A limit of a minute; the wait for someone to turn up is far shorter.
+    let timing = Timing { approval_grace: Duration::from_millis(40), ..fast() };
+    let agent = FakeAgent::new(&[Turn::Running]);
+    agent.awaiting_approval.store(true, Ordering::SeqCst);
+    let rig = rig_in(tempfile::tempdir().unwrap(), FakeApi::with(vec![run("run_1")]), agent, timing.clone());
+    let began = Instant::now();
+    rig.runner.pass().unwrap();
+    assert!(began.elapsed() >= timing.approval_grace, "someone opening the workspace is given time to connect");
+    assert!(began.elapsed() < timing.minute, "not held until the limit");
+    assert_eq!(rig.api.ends(), [end("failed", Some("needs-approval"))]);
+    assert_eq!(rig.api.reports.lock().unwrap().last().unwrap().tab_id.as_deref(), Some("tab-1"));
+    assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (1, 1));
+    assert_eq!(rig.agent.held.load(Ordering::SeqCst), 0);
+    assert!(rig.runner.store.get().is_none());
+}
+
+#[test]
+fn a_turn_waiting_for_an_approval_is_left_alone_while_someone_who_can_give_it_is_attached() {
+    let timing = Timing { approval_grace: Duration::from_millis(10), minute: Duration::from_millis(80), ..fast() };
+    let agent = FakeAgent::new(&[Turn::Running]);
+    agent.awaiting_approval.store(true, Ordering::SeqCst);
+    agent.approver.store(true, Ordering::SeqCst);
+    let rig = rig_in(tempfile::tempdir().unwrap(), FakeApi::with(vec![run("run_1")]), agent, timing);
+    rig.runner.pass().unwrap();
+    // It ran to its limit: the wait was a person's to end.
+    assert_eq!(rig.api.ends(), [end("failed", Some("timed-out"))]);
+}
+
+#[test]
+fn an_approval_that_is_answered_starts_the_wait_afresh() {
+    // Asked, answered, asked again: neither wait reaches the grace, though
+    // together they pass it.
+    let timing = Timing { approval_grace: Duration::from_millis(60), minute: Duration::from_millis(200), ..fast() };
+    let agent = FakeAgent::new(&[Turn::Running]);
+    agent.awaiting_approval.store(true, Ordering::SeqCst);
+    let rig = rig_in(tempfile::tempdir().unwrap(), FakeApi::with(vec![run("run_1")]), agent, timing);
+    let agent = rig.agent.clone();
+    let answers = std::thread::spawn(move || {
+        for waiting in [false, true, false, true, false] {
+            std::thread::sleep(Duration::from_millis(35));
+            agent.awaiting_approval.store(waiting, Ordering::SeqCst);
+        }
+    });
+    rig.runner.pass().unwrap();
+    answers.join().unwrap();
+    assert_eq!(rig.api.ends(), [end("failed", Some("timed-out"))]);
+}
+
+#[test]
+fn a_server_from_before_needs_approval_is_told_the_turn_was_stopped() {
+    let timing = Timing { approval_grace: Duration::from_millis(10), ..fast() };
+    let agent = FakeAgent::new(&[Turn::Running]);
+    agent.awaiting_approval.store(true, Ordering::SeqCst);
+    let api = FakeApi::with(vec![run("run_1")]);
+    *api.unknown_category.lock().unwrap() = Some("needs-approval".into());
+    let rig = rig_in(tempfile::tempdir().unwrap(), api, agent, timing);
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.api.ends(), [end("failed", Some("canceled"))]);
+    assert!(rig.runner.store.get().is_none());
+}
+
+#[test]
+fn scheduled_runs_turned_off_under_a_running_turn_do_not_end_it() {
+    // `started` is taken; from then on every report is a `404` that names no run.
+    let timing = Timing { heartbeat: Duration::from_millis(5), ..fast() };
+    let api = FakeApi::with(vec![run("run_1")]);
+    *api.reports_not_offered_after.lock().unwrap() = Some(1);
+    let script: Vec<Turn> = std::iter::repeat_n(Turn::Running, 40).chain([Turn::Ended(TurnStatus::Ok)]).collect();
+    let rig = rig_in(tempfile::tempdir().unwrap(), api, FakeAgent::new(&script), timing);
+    rig.runner.pass().unwrap();
+    // The turn ran to its own end, uninterrupted.
+    assert_eq!(rig.agent.interrupts.load(Ordering::SeqCst), 0);
+    assert!(rig.agent.held_seen.lock().unwrap().iter().any(|(turn, _)| *turn == Turn::Ended(TurnStatus::Ok)));
+    // Its end waits on record for a server that takes reports again.
+    assert!(matches!(rig.runner.store.get(), Some(Record::Done { report }) if report.outcome == "completed"));
+    *rig.api.reports_not_offered_after.lock().unwrap() = None;
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.api.reports(), [end("started", None), end("completed", None)]);
+    assert!(rig.runner.store.get().is_none());
+    assert_eq!(rig.agent.started.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_run_handed_out_twice_is_run_once() {
+    let rig = rig(vec![run("run_1"), run("run_1")], FakeAgent::new(&[Turn::Ended(TurnStatus::Ok)]));
+    rig.runner.pass().unwrap();
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.agent.started.lock().unwrap().len(), 1, "the prompt was sent once");
+    assert_eq!(rig.api.ends(), [end("completed", None), end("failed", Some("runtime-error"))]);
+    // Also after a restart: the ids are on disk.
+    let rig = rig_in(rig.dir, FakeApi::with(vec![run("run_1"), run("run_2")]), FakeAgent::new(&[Turn::Ended(TurnStatus::Ok)]), fast());
+    rig.runner.pass().unwrap();
+    assert!(rig.agent.started.lock().unwrap().is_empty());
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.agent.started.lock().unwrap().len(), 1, "another run is taken as before");
+    assert_eq!(rig.api.ends(), [end("failed", Some("runtime-error")), end("completed", None)]);
+}
+
+#[test]
+fn a_credential_that_is_not_accepted_right_now_is_asked_about_again_soon() {
+    // The workspace may have been woken for a run: not the five minutes of
+    // a server without scheduled runs.
+    let rig = rig(vec![run("run_1")], FakeAgent::new(&[Turn::Running]));
+    rig.api.rejected.store(true, Ordering::SeqCst);
+    assert_eq!(rig.runner.pass().unwrap(), fast().claim_every);
+    assert!(fast().claim_every < fast().not_offered_every);
+    assert!(rig.agent.started.lock().unwrap().is_empty());
 }
 
 #[test]

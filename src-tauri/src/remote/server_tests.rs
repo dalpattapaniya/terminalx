@@ -742,6 +742,42 @@ async fn only_a_client_that_can_type_counts_as_attached_for_idle_suspend() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn only_a_client_that_may_answer_a_permission_request_counts_as_an_approver() {
+    // A scheduled run that stops at a permission request waits only for
+    // someone who could answer it (`cloud_agents::scheduled`).
+    let f = fixture();
+    let list = |alice_approves: bool| {
+        members(json!([
+            { "userId": "admin", "role": "manager" },
+            { "userId": "alice", "role": "driver", "canApprove": alice_approves },
+            { "userId": "dave", "role": "driver", "canApprove": true },
+            { "userId": "bob", "role": "viewer", "canApprove": true },
+        ]))
+    };
+    f.rpc.set_collaboration(list(false));
+    let (admin, _admin_events, _) = person(&f.rpc, "d-admin", Authority::Manage, "admin").await;
+    let (alice, _alice_events, _) = person(&f.rpc, "d-alice", Authority::Participate, "alice").await;
+    let (dave, _dave_events, _) = person(&f.rpc, "d-dave", Authority::Participate, "dave").await;
+    let (bob, _bob_events, _) = person(&f.rpc, "d-bob", Authority::Participate, "bob").await;
+    assert!(admin.counts_as_approver() && dave.counts_as_approver());
+    // A driver who may not approve types, and cannot answer the request.
+    assert!(alice.counts_as_attached() && !alice.counts_as_approver());
+    // A viewer answers nothing, whatever its share says.
+    assert!(!bob.counts_as_approver());
+    // No reconnect: the API's refresh alone gives and takes the right.
+    f.rpc.set_collaboration(list(true));
+    assert!(alice.counts_as_attached() && alice.counts_as_approver());
+    f.rpc.set_collaboration(list(false));
+    assert!(alice.counts_as_attached() && !alice.counts_as_approver());
+    f.rpc.disconnect(&dave);
+    assert!(!dave.counts_as_approver());
+    // A phone answers through the mailbox: it is not attached.
+    let (phone, _events) = Peer::for_user("p-admin".into(), Authority::Manage, Some("admin".into()));
+    call(&f.rpc, &phone, "rpc.hello", json!({ "protocol": PROTOCOL, "client": { "app": "terminalx-mobile", "version": "1.0.0" }, "want": ALL })).await.unwrap();
+    assert!(!phone.counts_as_approver());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_suspend_attachment_follows_connected_role_changes() {
     for (authority, initial_role, next_role) in [
         (Authority::Participate, "driver", "viewer"),

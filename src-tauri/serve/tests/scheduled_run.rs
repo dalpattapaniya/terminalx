@@ -75,6 +75,14 @@ impl World {
         }
     }
 
+    /// Whether an agent process of this world is running: the fake CLI is
+    /// started as this world's own `bin/claude`.
+    fn agent_running(&self) -> bool {
+        let listed = std::process::Command::new("ps").args(["-Ao", "command"]).output().unwrap();
+        let ours = self.world.bin.join("claude").display().to_string();
+        String::from_utf8_lossy(&listed.stdout).lines().any(|line| line.contains(&ours))
+    }
+
     /// The tab the runtime said it started for the run.
     fn tab(&self, run_id: &str) -> String {
         wait_until("the start of the run to be reported", || {
@@ -101,6 +109,9 @@ fn a_run_is_claimed_once_runs_its_prompt_and_is_reported() {
     assert_eq!(texts(&events, "assistant_text"), vec!["the nightly checks pass"]);
     // The session carries the schedule's name.
     assert!(serve.control("sessions.list", json!({})).to_string().contains("Nightly checks"));
+    // The run is over, and so is its agent process: nothing idles on a
+    // workspace people keep up. The transcript stays.
+    wait_until("the agent process to end", || (!world.agent_running()).then_some(()));
 
     // A restart asks again and gets nothing: no second tab, prompt or report.
     drop(serve);
@@ -119,14 +130,19 @@ fn a_run_asks_before_it_acts_in_the_schedules_mode() {
         return;
     }
     let world = World::new();
-    // `manual`: the fake CLI runs a command unasked only in bypass
-    // permissions, which is what a tab started with no mode would be in.
+    // `manual`: the fake CLI runs a command unasked in bypass permissions,
+    // which is how a tab started with no mode is launched
+    // (`--dangerously-skip-permissions`). A runner that dropped the mode
+    // would run the command and this test would see no request.
     world.mailbox.add_scheduled_run(run("csr_ask", "ask:touch scheduled.txt", 5));
     let serve = world.start();
     let pending = wait_until("the permission request", || {
         serve.control("permissions.list", json!({}))["permissions"].as_array().filter(|pending| !pending.is_empty()).cloned()
     });
     assert_eq!(pending[0]["toolName"], "Bash");
+    // The tab is in the schedule's mode, as the session index records it.
+    let session = serve.control("sessions.list", json!({}))["sessions"][0].clone();
+    assert_eq!(session["tabs"][0]["permissionMode"], "manual", "{session}");
     assert_eq!(world.mailbox.scheduled_run("csr_ask").state, "working");
     assert!(!world.world.project.join("scheduled.txt").exists());
     serve.control("permissions.deny", json!({ "request": pending[0]["requestId"] }));
@@ -171,6 +187,8 @@ fn a_turn_that_outlasts_the_limit_is_ended_and_reported_timed_out() {
     let serve = world.start();
     let began = Instant::now();
     let tab = world.tab("csr_long");
+    serve.wait_events(&tab, "the turn to start", |events| count(events, "assistant_text") >= 1);
+    assert!(world.agent_running(), "the check below would otherwise prove nothing");
     let done = world.settled("csr_long", Duration::from_secs(120));
     assert_eq!((done.state.as_str(), done.category.as_deref()), ("failed", Some("timed-out")), "{:?}", done.reports);
     assert!(began.elapsed() >= Duration::from_secs(55), "not before the limit: {:?}", began.elapsed());
@@ -180,6 +198,47 @@ fn a_turn_that_outlasts_the_limit_is_ended_and_reported_timed_out() {
     assert!(said < 400, "{said}");
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(count(&serve.events(&tab), "assistant_text"), said);
+    wait_until("the agent process to end", || (!world.agent_running()).then_some(()));
+}
+
+#[test]
+fn a_run_that_stops_at_a_permission_request_with_nobody_attached_is_ended_and_says_why() {
+    if !python() {
+        return;
+    }
+    let world = World::new();
+    // A limit of ten minutes. Nobody is attached (there is no relay), so
+    // nobody can answer: the run is not left to bill the machine until then.
+    world.mailbox.add_scheduled_run(run("csr_wait", "ask:touch scheduled.txt", 10));
+    let serve = world.start();
+    let began = Instant::now();
+    wait_until("the permission request", || serve.control("permissions.list", json!({}))["permissions"].as_array().filter(|pending| !pending.is_empty()).cloned());
+    let done = world.settled("csr_wait", Duration::from_secs(5 * 60));
+    assert_eq!((done.state.as_str(), done.category.as_deref()), ("failed", Some("needs-approval")), "{:?}", done.reports);
+    // Given the few minutes someone opening the workspace needs to connect.
+    assert!(began.elapsed() >= Duration::from_secs(170), "{:?}", began.elapsed());
+    assert!(!world.world.project.join("scheduled.txt").exists(), "nothing was run unasked");
+    assert!(serve.control("permissions.list", json!({}))["permissions"].as_array().is_none_or(Vec::is_empty));
+    wait_until("the agent process to end", || (!world.agent_running()).then_some(()));
+}
+
+#[test]
+fn scheduled_runs_turned_off_under_a_running_turn_let_it_finish() {
+    if !python() {
+        return;
+    }
+    let world = World::new();
+    // 150 messages half a second apart: the turn outlives the runner's
+    // once-a-minute question to the server, which is answered `404`.
+    world.mailbox.add_scheduled_run(run("csr_flag", "slow:150:500", 5));
+    let serve = world.start();
+    let tab = world.tab("csr_flag");
+    world.mailbox.turn_scheduled_runs_off();
+    let events = serve.wait_events_for(&tab, "the turn to end by itself", Duration::from_secs(150), |events| count(events, "turn_completed") >= 1);
+    assert_eq!(count(&events, "assistant_text"), 150, "the turn was not cut short");
+    // Nothing reached the server after the flag went off: the run is its to time out.
+    let run = world.mailbox.scheduled_run("csr_flag");
+    assert_eq!((run.state.as_str(), run.reports.len()), ("working", 1), "{:?}", run.reports);
 }
 
 #[test]
