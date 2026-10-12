@@ -253,6 +253,22 @@ export function TabView({
   );
   const deciding = !!outbox && transcript.pendingAsks.some((ask) => outbox.deciding(ask.requestId));
 
+  // Pending requests and recovery sit with the composer in the chat, where the
+  // reply goes; over a terminal there is no composer, so they head the pane.
+  const banner = (placement: "top" | "composer") => (
+    <RecoveryBanner placement={placement} kind={recovery} limit={transcript.rateLimit ?? null} waiting={tab.status === "waiting"} asks={transcript.pendingAsks} busy={recovering || !backend.caps.write} answering={answering || deciding} answerBlockedReason={backend.approveBlockedReason ?? null} askDetail={!!shared}
+        models={models.filter(m => m.id !== tab.model && !m.upgrade)} onOpenModels={refreshPickerModels} onPermission={answerPermission} onQuestions={answerQuestions}
+        onRetry={retry} onStop={stop} onContinue={() => {
+          if (recoveryLock.current) return;
+          recoveryLock.current = true;
+          setRecovering(true);
+          void backend.stop(tab.id).then(() => setContinueOpen(true)).catch(e => setError(safeError(e))).finally(() => {
+            recoveryLock.current = false;
+            setRecovering(false);
+          });
+        }} />
+  );
+
   const chat = (
     <Chat
       sessionId={backend.logSessionId}
@@ -266,6 +282,7 @@ export function TabView({
       onAnswerQuestions={answerQuestions}
       footer={
         <>
+        {banner("composer")}
         {backend.caps.steer && backend.caps.write && !gate?.blocked && live && draft.trim() && (
           <div className="mx-auto flex w-full max-w-3xl items-center gap-2 px-4 text-xs text-muted-foreground">
             <span>Send queues it for when the agent pauses.</span>
@@ -398,17 +415,7 @@ export function TabView({
       Session closed. Untracked or remote commands may still be running; verify their outcome before continuing.
       <Button size="sm" disabled={recovering} onClick={() => void retry()}>Resume safely</Button>
     </div>}
-    <RecoveryBanner kind={recovery} waiting={tab.status === "waiting"} asks={transcript.pendingAsks} busy={recovering || !backend.caps.write} answering={answering || deciding} answerBlockedReason={backend.approveBlockedReason ?? null} askDetail={!!shared}
-      models={models.filter(m => m.id !== tab.model && !m.upgrade)} onOpenModels={refreshPickerModels} onPermission={answerPermission} onQuestions={answerQuestions}
-      onRetry={retry} onStop={stop} onContinue={() => {
-        if (recoveryLock.current) return;
-        recoveryLock.current = true;
-        setRecovering(true);
-        void backend.stop(tab.id).then(() => setContinueOpen(true)).catch(e => setError(safeError(e))).finally(() => {
-          recoveryLock.current = false;
-          setRecovering(false);
-        });
-      }} />
+    {terminalMode && banner("top")}
     {continueOpen && <ContinuationDialog session={session} source={tab} onClose={() => setContinueOpen(false)} />}
     {collabLive && notesOpen && shared?.client ? (
       <div className="flex min-h-0 flex-1">

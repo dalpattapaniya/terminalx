@@ -202,6 +202,17 @@ pub fn run() {
         .manage(cloud_remote.clone())
         .manage(cloud_agents)
         .setup(move |app| {
+            // Attachments are shown from the data folder, wherever
+            // TERMINALX_HOME put it; the scope in tauri.conf.json only names
+            // the default one.
+            match store::root() {
+                Ok(root) => {
+                    if let Err(error) = app.asset_protocol_scope().allow_directory(root.join("attachments"), true) {
+                        log::warn!("allow attachments in the asset scope: {error:#}");
+                    }
+                }
+                Err(error) => log::warn!("allow attachments in the asset scope: {error:#}"),
+            }
             agent_keys.configure(&app.config().identifier);
             cloud_remote.watch_identity(app.handle().clone());
             account.configure(&app.config().identifier)?;
