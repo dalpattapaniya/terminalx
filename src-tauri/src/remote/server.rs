@@ -153,6 +153,13 @@ impl Peer {
         self.attached.lock().unwrap().is_some()
     }
 
+    /// Whether this connection is counted as one that may answer a
+    /// permission request.
+    #[cfg(test)]
+    pub(crate) fn counts_as_approver(&self) -> bool {
+        self.attached.lock().unwrap().as_ref().is_some_and(crate::cloud_activity::Attached::approves)
+    }
+
     pub fn for_user(device_id: String, authority: Authority, user_id: Option<String>) -> (Arc<Self>, Notifications) {
         Self::for_installation(device_id, authority, user_id, None)
     }
@@ -596,11 +603,17 @@ impl WorkspaceRpc {
         // Read access under the attachment lock: a concurrent hello must
         // not overwrite a role refresh with a decision from the old list.
         let mut attached = peer.attached.lock().unwrap();
-        let types = !self.collab.known() || self.access(peer).can_drive();
+        let access = self.access(peer);
+        let types = !self.collab.known() || access.can_drive();
+        // Whether it may answer the agent's permission requests; before
+        // there are roles to go by, as for typing.
+        let approves = !self.collab.known() || access.can_approve;
         if peer.phone.load(Ordering::SeqCst) || !types || peer.gone.load(Ordering::SeqCst) {
             *attached = None;
-        } else if attached.is_none() {
-            *attached = Some(crate::cloud_activity::attached());
+        } else if attached.as_ref().is_none_or(|current| current.approves() != approves) {
+            // The old count goes before the new one is taken.
+            *attached = None;
+            *attached = Some(crate::cloud_activity::attached(approves));
         }
     }
 

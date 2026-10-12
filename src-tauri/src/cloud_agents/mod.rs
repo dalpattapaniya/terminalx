@@ -16,6 +16,7 @@ pub mod keys;
 pub mod launch;
 pub mod mailbox;
 pub mod receipts;
+pub mod scheduled;
 pub mod slash;
 
 use std::collections::HashMap;

@@ -542,3 +542,70 @@ reports `outcome-unknown`. In neither case is the prompt sent twice. Tests:
 `cloud_agents::launch` unit tests and `serve/tests/launch_intent.rs`. The
 latter runs the real runtime with the fake Claude against the fake API and
 checks both work branches, one prompt, and no second prompt after a restart.
+
+## Scheduled runs (PRO-37)
+
+A schedule on a cloud workspace is kept and dispatched by the server
+(terminalx-saas contract §24). The runtime's part is
+`cloud_agents::scheduled`, a loop of its own next to the launch intent:
+
+- **Claim.** `POST …/scheduled-run/claim` at start and every 30 seconds
+  while no run is in hand. The server hands a run out once (it becomes
+  `working` in the claim), so an answer that is lost is never given again and
+  that run times out on the server. A server without scheduled runs, or with
+  the feature off, answers `404`: the runtime then asks every five minutes
+  and does nothing else. A `401` (the credential is not accepted right
+  now) is asked about again after the usual 30 seconds: the workspace may
+  have been woken for a run. Waits are spread by up to a fifth, so
+  workspaces woken together do not ask together. No run is taken while the
+  workspace's launch is still cloning its repositories. Asking never wakes
+  anything; only the server's dispatch starts a machine.
+- **Start.** One new session in the project folder, named after the
+  schedule, with the schedule's agent, model, effort and permission mode. A
+  run with no mode, with `bypassPermissions` or with a mode this runtime
+  does not know is not started (a tab made with no mode runs in bypass
+  permissions). The prompt is held to `slash::check` as for a person who may
+  drive but not configure: no slash command, no `!` shell line, no file
+  from outside the project.
+- **Report.** `started` with the session and tab, then `completed` or
+  `failed` with one of the server's categories (`timed-out`, `canceled`,
+  `agent-failed`, `agent-exited`, `agent-start-failed`, `agent-unavailable`,
+  `agent-credential-required`, `project-unavailable`, `needs-approval`,
+  the three prompt refusals, `runtime-error`). `started` is sent again
+  every minute; an answer that says the run is over on the server (`409`),
+  or that the server does not know the run (`404` with
+  `cloud_workspace_scheduled_run_not_found`), ends the turn. Any other
+  `404` means scheduled runs were turned off (or the server is from before
+  them): that says nothing about the run, so the turn goes on to its end
+  or its limit, as the contract's "running ones still time out" says, and
+  its end stays on record until a server takes reports again.
+- **An approval nobody can give.** A scheduled run is never in bypass
+  permissions, so its agent may stop at a permission request. When it does
+  and no attached client may answer one (`cloud_activity::approver_attached`:
+  a manager, or a driver who may approve; a phone acts through the mailbox
+  and is not attached), the runtime waits three minutes
+  (`Timing::approval_grace`), then ends the turn and reports `failed` /
+  `needs-approval`. Otherwise the pending request would keep the machine
+  from idling until `maxRunMinutes`. An answer, or someone attaching,
+  starts the wait afresh. A server from before the category refuses a
+  report that names it; the run is then reported `canceled`.
+- **The agent process ends with the run**, however the run ends: a
+  workspace people keep up would otherwise collect one idle CLI per run.
+  The transcript and the resume state stay, so the tab can be continued.
+- **The limit.** `maxRunMinutes` after the claim the turn is interrupted;
+  an agent that has not ended it 30 seconds later is stopped. The run is
+  reported `failed` / `timed-out`.
+- **Once.** `scheduled-run.json` in the runtime's state directory names the
+  run in hand (ids only, never the prompt) and is written before the agent is
+  touched. A runtime that starts with a record of an unfinished run reports
+  it `failed` / `runtime-error` and does not send its prompt again; an end
+  that could not be reported is reported by a later pass.
+  `scheduled-runs-seen.json` keeps the ids of the last 64 runs taken: a run
+  the server hands out a second time is reported `failed` /
+  `runtime-error` and not run again.
+- **Idle.** From the claim until the turn is seen running the run is counted
+  as work, like a launch. After that the turn is counted by the session
+  manager like any other, and nothing is held once it ends, so the server
+  can stop a machine that only the run woke.
+
+The runtime protocol is 2 from this change (`src-tauri/serve/Cargo.toml`).
