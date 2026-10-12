@@ -549,6 +549,7 @@ mod tests {
         fn session(&self, cwd: &Path, tabs: Vec<TabEntry>) -> SessionEntry {
             SessionEntry {
                 id: uuid::Uuid::now_v7().to_string(),
+                kind: crate::store::index::SessionKind::Project,
                 project_path: self.project.path.clone(),
                 cwd: cwd.to_string_lossy().into_owned(),
                 worktree_name: None,
@@ -594,7 +595,7 @@ mod tests {
             harness: harness.into(),
             title: None,
             model: String::new(),
-            effort: None,
+            effort: None, requested_model: None, requested_effort: None, requested_permission_mode: None,
             permission_mode: "default".into(),
             provider_session_id: Some(conversation.into()),
             status: TabStatus::Idle,

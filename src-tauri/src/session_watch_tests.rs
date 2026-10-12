@@ -69,11 +69,62 @@ struct Rig {
     _home: store::TempHome,
 }
 
+#[test]
+fn sharing_blocks_bypass_before_changing_the_saved_tab_or_runtime() {
+    let rig = Rig::new();
+    let entry: index::SessionEntry = serde_json::from_value(json!({
+        "id": SESSION, "projectPath": rig._dir.path(), "cwd": rig._dir.path(),
+        "title": "shared", "created": index::now(), "modified": index::now(),
+        "tabs": [{ "id": TAB, "harness": "claude", "permissionMode": "default", "created": index::now() }]
+    })).unwrap();
+    index::save(&[entry]).unwrap();
+    rig.manager.sharing.lock().unwrap().sessions.insert(SESSION.into(),
+        crate::local_sharing::Share::new("host".into(), "".into(), String::new()));
+    assert!(rig.manager.set_permission_mode(SESSION, TAB, "bypassPermissions").is_err());
+    assert_eq!(index::get(SESSION).unwrap().tab(TAB).unwrap().permission_mode, "default");
+    let rt = rig.rt.lock().unwrap();
+    assert!(matches!(&rt.engine, Engine::Cli(p) if p.mode == "default"));
+}
+
+#[test]
+fn a_shared_session_takes_no_new_bypass_tab_and_an_unshared_one_still_does() {
+    let rig = Rig::new();
+    let entry: index::SessionEntry = serde_json::from_value(json!({
+        "id": SESSION, "projectPath": rig._dir.path(), "cwd": rig._dir.path(),
+        "title": "shared", "created": index::now(), "modified": index::now(),
+        "tabs": [{ "id": TAB, "harness": "claude", "permissionMode": "default", "created": index::now() }]
+    })).unwrap();
+    index::save(&[entry]).unwrap();
+    let tab = |mode: &str| crate::session_ops::NewTab { harness: "claude".into(), model: String::new(), effort: None, permission_mode: Some(mode.into()) };
+    rig.manager.sharing.lock().unwrap().sessions.insert(SESSION.into(),
+        crate::local_sharing::Share::new("host".into(), "".into(), String::new()));
+    assert!(rig.manager.add_tab(SESSION, &tab("bypassPermissions")).is_err());
+    assert_eq!(index::get(SESSION).unwrap().tabs.len(), 1);
+    assert_eq!(rig.manager.add_tab(SESSION, &tab("plan")).unwrap().permission_mode, "plan");
+    rig.manager.sharing.lock().unwrap().sessions.clear();
+    assert_eq!(rig.manager.add_tab(SESSION, &tab("bypassPermissions")).unwrap().permission_mode, "bypassPermissions");
+}
+
 impl Rig {
     /// A tab with no pane process behind it: what its pane draws, and when,
     /// is the test's to say.
     fn new() -> Self {
         Self::of(CliKind::Claude, "")
+    }
+
+    fn with_live_pane() -> Self {
+        let rig = Self::new();
+        let sink = Arc::new(crate::sink::BroadcastSink::new(256));
+        let spec = pty::PaneSpec {
+            cwd: rig._dir.path().to_str().unwrap(), cols: 80, rows: 24,
+            command: Some("sh -c 'read line'"), env: &[],
+        };
+        rig.manager.terminals.spawn(sink, &rig.pane, spec).unwrap();
+        rig
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        self.manager.turn_counts_at(self.now.get())
     }
 
     /// A tab on either CLI, opened on a transcript that already holds
@@ -122,10 +173,16 @@ impl Rig {
                 pane_id: pane.clone(),
                 generation: 0,
                 restart_when_idle: false,
+                settings_asked_at: None,
+                launched_for: None,
+                status_names_model: false,
+                settings_command_is_ours: false,
                 ready: Arc::new(tui::Ready::new(kind == CliKind::Claude)),
                 tail: tail.clone(),
                 echoed: Default::default(),
                 awaiting_delivery: None,
+                delivery_sent_at: None,
+                accept_by: None,
                 decisions: HashMap::new(),
                 turn_tail: Default::default(),
                 transcript_turn: None,
@@ -141,6 +198,8 @@ impl Rig {
             last_activity: now,
             recovery: None,
             stalled_at: None,
+            last_settings_report: None,
+            reported_mode_to_judge: None,
             stopping: false,
             stop_in_flight: false,
             stopping_pid: None,
@@ -257,7 +316,7 @@ fn a_prompt_sent_to_an_idle_cli_counts_as_activity_before_the_pane_draws() {
         let old = Instant::now() - PATIENCE.stall - MOMENT;
         rig.rt.lock().unwrap().last_activity = old;
         rig.drew.set(Some(old));
-        let prompt = PromptText { agent: "hello".into(), display: "hello".into() };
+        let prompt = PromptText { shared_connection: None, author: None, agent: "hello".into(), display: "hello".into() };
         // The production send path, up to dispatching the input thread. Do
         // not use `stamp`: the send itself must refresh the activity clock.
         let (_, queued) = rig.manager.record_composer_prompt(&mut rig.rt.lock().unwrap(), &prompt, vec![], rig._dir.path().to_str().unwrap(), None);
@@ -428,6 +487,91 @@ fn a_hung_agent_with_no_output_and_no_events_still_raises_the_warning() {
     assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
     assert_eq!(rig.status(), TabStatus::Waiting);
     assert_eq!(rig.banner(), Some(RecoveryKind::Timeout));
+}
+
+/// A silence warning is not a turn boundary: cloud idle suspension must
+/// still see the live turn after the five-minute UI warning (#419).
+#[test]
+fn a_silent_live_turn_keeps_counting_after_the_warning() {
+    let rig = Rig::with_live_pane();
+    rig.start_turn();
+    assert_eq!(rig.manager.turn_counts(), (1, 0));
+    let start = rig.now.get();
+    for seconds in [299, 300, 400, 600] {
+        rig.now.set(start + Duration::from_secs(seconds));
+        rig.tick();
+        assert!(rig.manager.terminals.is_running(&rig.pane));
+        assert!(rig.turn_open());
+        assert_eq!(rig.counts(), (1, 0), "a quiet live turn must keep the workspace awake at {seconds}s");
+    }
+    assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+    rig.end_turn_in_transcript();
+    rig.advance(PATIENCE.settle);
+    rig.tick();
+    assert_eq!(rig.counts(), (0, 0), "completion releases compute even though the CLI stays alive");
+}
+
+#[test]
+fn a_silent_live_turn_has_a_separate_one_hour_cloud_budget() {
+    let rig = Rig::with_live_pane();
+    rig.start_turn();
+    rig.advance(crate::cloud_activity::MAX_TURN_SILENCE - MOMENT);
+    rig.tick();
+    assert_eq!(rig.counts(), (1, 0));
+    rig.advance(MOMENT);
+    assert_eq!(rig.counts(), (0, 0), "a hung process cannot hold compute forever");
+    assert!(rig.turn_open());
+    assert!(rig.manager.terminals.is_running(&rig.pane), "the budget does not kill the process");
+
+    rig.hook("PreToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }));
+    assert_eq!(rig.counts(), (1, 0), "real activity renews the silence budget");
+    rig.advance(crate::cloud_activity::MAX_TURN_SILENCE);
+    assert_eq!(rig.counts(), (0, 0), "the budget applies even before the watcher next runs");
+}
+
+#[test]
+fn a_silence_warning_does_not_keep_a_dead_process_awake() {
+    let rig = Rig::with_live_pane();
+    rig.start_turn();
+    rig.advance(PATIENCE.stall);
+    rig.tick();
+    assert_eq!(rig.counts(), (1, 0));
+    rig.manager.terminals.kill(&rig.pane);
+    assert!(rig.turn_open());
+    assert_eq!(rig.counts(), (0, 0));
+}
+
+#[test]
+fn cloud_counts_distinguish_silence_from_errors_and_unconfirmed_delivery() {
+    for kind in [RecoveryKind::Timeout, RecoveryKind::DeliveryUnconfirmed, RecoveryKind::Disconnected] {
+        let rig = Rig::with_live_pane();
+        rig.start_turn();
+        rig.manager.needs_recovery(&mut rig.rt.lock().unwrap(), kind);
+        assert_eq!(rig.counts(), (0, 0), "a reported {kind:?} is not a silence guess");
+        if kind == RecoveryKind::DeliveryUnconfirmed {
+            rig.rt.lock().unwrap().stalled_at = Some(rig.now.get());
+            assert_eq!(rig.counts(), (0, 0), "a watcher delivery warning does not hold compute either");
+        }
+    }
+}
+
+#[test]
+fn a_silent_turn_waiting_for_approval_is_counted_separately() {
+    let rig = Rig::with_live_pane();
+    rig.start_turn();
+    rig.advance(PATIENCE.stall);
+    rig.tick();
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        rig.manager.apply(&mut rt, Payload::PermissionRequested {
+            request_id: "r1".into(), tool_use_id: "call-2".into(), tool_name: "Bash".into(),
+            input: json!({ "command": "ls" }), title: None, description: None, options: vec![],
+        }, None);
+    }
+    assert_eq!(rig.counts(), (0, 1));
+    rig.advance(crate::cloud_activity::MAX_TURN_SILENCE);
+    rig.tick();
+    assert_eq!(rig.counts(), (0, 1), "the silence budget does not expire approvals");
 }
 
 /// A pane that has never drawn is judged on the events alone.
@@ -663,7 +807,7 @@ fn what_a_real_pane_draws_is_what_holds_the_warning_back() {
     let sent = Mutex::new(sent);
     sink.listen("pty_data", Box::new(move |_| { let _ = sent.lock().unwrap().send(()); }));
     assert_eq!(rig.manager.terminals.last_output(&rig.pane), None, "no pane yet");
-    let spec = pty::PaneSpec { cwd: dir.path().to_str().unwrap(), cols: 80, rows: 24, command: Some("sh -c 'while :; do echo working; sleep 0.1; done'"), env: &[] };
+    let spec = pty::PaneSpec { cwd: dir.path().to_str().unwrap(), cols: 80, rows: 24, command: Some("sh -c 'echo working; read line'"), env: &[] };
     rig.manager.terminals.spawn(sink, &rig.pane, spec).unwrap();
     drawn.recv_timeout(Duration::from_secs(300)).expect("the pane never drew");
     // Stamped before the event was sent, and after the turn's last event:
@@ -682,6 +826,12 @@ fn what_a_real_pane_draws_is_what_holds_the_warning_back() {
     // The same moment with the pane left out of it is a stall.
     rig.manager.watch_tabs(PATIENCE, now, |_| None);
     assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+
+    // The cloud budget also sees actual PTY output, even if no hook or
+    // transcript event arrived for an hour and the warning is still shown.
+    rig.rt.lock().unwrap().last_activity = drew - crate::cloud_activity::MAX_TURN_SILENCE;
+    assert_eq!(rig.manager.turn_counts_at(drew), (1, 0));
+    assert_eq!(rig.manager.turn_counts_at(drew + crate::cloud_activity::MAX_TURN_SILENCE), (0, 0));
 }
 
 /// What a prompt typed into the terminal, and one sent from the composer,
@@ -691,8 +841,736 @@ mod prompts;
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        // Only one test gives the tab a real pane; for the rest this is a
-        // pane that was never there.
+        // Most tests use a pane that was never there; those with a real
+        // process must release it even when an assertion fails.
         self.manager.terminals.kill(&self.pane);
     }
+}
+
+// ---- #404: one model and effort, whichever side changed it
+
+const STATUS_FRAMES: &str = include_str!("harness/claude/fixtures/status_line.jsonl");
+const CLAUDE_COMMANDS: &str = include_str!("harness/claude/fixtures/model_and_effort_commands.jsonl");
+const CODEX_SETTINGS: &str = include_str!("harness/codex/fixtures/settings.jsonl");
+
+/// What a tab says it is on: the model and effort every view draws, then
+/// whatever was asked for and is still waiting.
+type Shown = (String, Option<String>, Option<String>, Option<String>);
+
+fn shown(model: &str, effort: Option<&str>, asked_model: Option<&str>, asked_effort: Option<&str>) -> Shown {
+    (model.into(), effort.map(String::from), asked_model.map(String::from), asked_effort.map(String::from))
+}
+
+impl Rig {
+    /// A running tab the index knows, on `model` and `effort`.
+    fn on(kind: CliKind, model: &str, effort: Option<&str>) -> Self {
+        let rig = Self::of(kind, "");
+        let harness = rig.rt.lock().unwrap().harness.clone();
+        let entry: index::SessionEntry = serde_json::from_value(json!({
+            "id": SESSION, "projectPath": rig._dir.path(), "cwd": rig._dir.path(),
+            "title": "watched", "created": index::now(), "modified": index::now(),
+            "tabs": [{ "id": TAB, "harness": harness, "model": model, "effort": effort, "created": index::now() }]
+        })).unwrap();
+        index::save(&[entry]).unwrap();
+        rig
+    }
+
+    fn shown(&self) -> Shown {
+        let tab = index::get(SESSION).unwrap().tab(TAB).unwrap().clone();
+        (tab.model, tab.effort, tab.requested_model, tab.requested_effort)
+    }
+
+    /// The `settings_changed` events in the tab's log, as (model, effort).
+    fn changes(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.events().into_iter().filter_map(|e| match e.payload { Payload::SettingsChanged { model, effort, .. } => Some((model, effort)), _ => None }).filter(|(model, effort)| model.is_some() || effort.is_some()).collect()
+    }
+
+    fn notices(&self) -> Vec<String> {
+        self.events().into_iter().filter_map(|e| match e.payload { Payload::Status { text } => Some(text), _ => None }).collect()
+    }
+
+    fn status_line(&self, model: &str, effort: &str) {
+        self.hook("StatusLine", json!({ "model": { "id": model, "display_name": model }, "effort": { "level": effort } }));
+    }
+}
+
+/// The frames a real Claude Code sent as its model and effort were changed in
+/// the terminal — by `/model sonnet`, `/effort high`, the `/model` picker and
+/// the `/effort` slider — each move the tab, with nothing asked of the app.
+#[test]
+fn a_model_or_effort_changed_in_the_claude_terminal_reaches_the_tab() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    let (sent, updated) = std::sync::mpsc::channel();
+    rig.manager.sink.listen("session_updated", Box::new(move |payload| {
+        let session: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let _ = sent.send((session["tabs"][0]["model"].clone(), session["tabs"][0]["effort"].clone()));
+    }));
+    let mut seen = Vec::new();
+    for frame in STATUS_FRAMES.lines() {
+        rig.hook("StatusLine", serde_json::from_str(frame).unwrap());
+        seen.push(rig.shown());
+    }
+    assert_eq!(
+        seen,
+        [
+            // Startup: `opus` is what the tab was on, and stays an alias; the
+            // effort the CLI resolved is not the one the tab had stored.
+            shown("opus", Some("medium"), None, None),
+            shown("sonnet", Some("medium"), None, None),
+            shown("sonnet", Some("high"), None, None),
+            shown("opus", Some("medium"), None, None),
+            shown("opus", Some("xhigh"), None, None),
+        ]
+    );
+    // Each one is in the log, and went to every view of the session.
+    assert_eq!(rig.changes().len(), 5);
+    assert_eq!(rig.changes()[1], (Some("sonnet".into()), None));
+    assert_eq!(rig.changes()[4], (None, Some("xhigh".into())));
+    let views: Vec<_> = updated.try_iter().collect();
+    assert_eq!(views.len(), 5);
+    assert_eq!(views[4], (json!("opus"), json!("xhigh")));
+
+    // The same frame again — the CLI repeats itself after every reply — is not news.
+    rig.status_line("claude-opus-5-5", "xhigh");
+    assert_eq!(rig.changes().len(), 5);
+    assert!(updated.try_recv().is_err());
+}
+
+#[test]
+fn a_change_from_the_chat_is_pending_until_claude_says_it_is_running() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.manager.set_model(SESSION, TAB, "sonnet").unwrap();
+    rig.manager.set_effort(SESSION, TAB, Some("low")).unwrap();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), Some("sonnet"), Some("low")), "asked for, and not shown as current");
+    assert!(rig.changes().is_empty());
+
+    // A frame from before the commands landed.
+    rig.status_line("claude-opus-5-5", "high");
+    assert_eq!(rig.shown(), shown("opus", Some("high"), Some("sonnet"), Some("low")));
+
+    rig.status_line("claude-sonnet-5-5", "high");
+    assert_eq!(rig.shown(), shown("sonnet", Some("high"), None, Some("low")), "the alias that was asked for, not the id it runs");
+    rig.status_line("claude-sonnet-5-5", "low");
+    assert_eq!(rig.shown(), shown("sonnet", Some("low"), None, None));
+    assert_eq!(rig.changes(), [(Some("sonnet".into()), None), (None, Some("low".into()))]);
+}
+
+/// With no status line to go on, the command's own printed result settles it.
+#[test]
+fn claude_taking_the_command_settles_a_change_the_status_line_never_named() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.manager.set_model(SESSION, TAB, "sonnet").unwrap();
+    // The command as the CLI recorded it, then what it printed.
+    let command = CLAUDE_COMMANDS.lines().find(|line| line.contains("<command-args>sonnet</command-args>")).unwrap();
+    let taken = CLAUDE_COMMANDS.lines().find(|line| line.contains("Set model to `Sonnet 5.5`")).unwrap();
+    rig.append(&format!("{command}\n{taken}\n"));
+    assert_eq!(rig.shown(), shown("sonnet", Some("high"), None, None));
+    assert!(!rig.kinds().iter().any(|k| k == "user_message"), "the app's own keystrokes are not a message");
+}
+
+/// "Set model to …" names no id. Printed for a `/model` the reader typed in
+/// the terminal, it is not the answer to a change the app is waiting on.
+#[test]
+fn a_model_command_typed_in_the_terminal_does_not_settle_the_apps_request() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.manager.set_model(SESSION, TAB, "haiku").unwrap();
+    let typed = CLAUDE_COMMANDS.lines().find(|line| line.contains("<command-args>sonnet</command-args>")).unwrap();
+    let taken = CLAUDE_COMMANDS.lines().find(|line| line.contains("Set model to `Sonnet 5.5`")).unwrap();
+    rig.append(&format!("{typed}\n{taken}\n"));
+    assert_eq!(rig.shown(), shown("opus", Some("high"), Some("haiku"), None));
+    // Nor does the CLI turning down something else the reader typed.
+    let refused: String = CLAUDE_COMMANDS.lines().filter(|line| line.contains("nonsense-model")).map(|line| format!("{line}\n")).collect();
+    rig.append(&refused);
+    assert_eq!(rig.shown(), shown("opus", Some("high"), Some("haiku"), None));
+    assert!(rig.notices().is_empty());
+}
+
+/// Two changes waiting, one taken back: the other still has its deadline.
+#[test]
+fn taking_one_change_back_leaves_the_other_its_deadline() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.manager.set_effort(SESSION, TAB, Some("low")).unwrap();
+    rig.manager.set_model(SESSION, TAB, "sonnet").unwrap();
+    rig.manager.set_model(SESSION, TAB, "opus").unwrap();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, Some("low")));
+    rig.advance(SETTINGS_ANSWER_WAIT * 2);
+    rig.tick();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, None));
+}
+
+/// Asked for max, given high: what the CLI printed is what is running.
+#[test]
+fn an_effort_the_cli_set_to_something_else_is_not_shown_as_the_one_asked_for() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("low"));
+    rig.manager.set_effort(SESSION, TAB, Some("max")).unwrap();
+    let command = CLAUDE_COMMANDS.lines().find(|line| line.contains("<command-args>high</command-args>")).unwrap().replace("<command-args>high", "<command-args>max");
+    let printed = CLAUDE_COMMANDS.lines().find(|line| line.contains("Set effort level to high")).unwrap();
+    rig.append(&format!("{command}\n{printed}\n"));
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, Some("max")));
+}
+
+#[test]
+fn a_change_claude_turns_down_reverts_with_its_reason() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.manager.set_model(SESSION, TAB, "claude-haiku-5-5").unwrap();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), Some("claude-haiku-5-5"), None));
+    // What the CLI really wrote when it refused that very command.
+    let refused: String = CLAUDE_COMMANDS.lines().filter(|line| line.contains("claude-haiku-5-5")).map(|line| format!("{line}\n")).collect();
+    assert!(refused.contains("commandRun"));
+    rig.append(&refused);
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, None));
+    assert!(rig.changes().is_empty(), "what was running never changed");
+    assert_eq!(rig.notices(), ["Claude Code did not change the model to claude-haiku-5-5: Authentication failed. Please check your API credentials."]);
+    // The command the app typed is not drawn as something the reader said.
+    assert!(!rig.kinds().iter().any(|k| k == "user_message"));
+}
+
+#[test]
+fn a_change_claude_never_answers_is_taken_back() {
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.status_line("claude-opus-5-5", "high");
+    rig.start_turn();
+    rig.manager.set_effort(SESSION, TAB, Some("max")).unwrap();
+    // A CLI mid-turn may hold the command until the turn is over.
+    rig.advance(SETTINGS_ANSWER_WAIT * 3);
+    rig.stamp();
+    rig.tick();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, Some("max")));
+
+    rig.hook("Stop", json!({}));
+    assert!(!rig.turn_open());
+    rig.advance(SETTINGS_ANSWER_WAIT - MOMENT);
+    rig.tick();
+    assert_eq!(rig.shown().3.as_deref(), Some("max"));
+    rig.advance(MOMENT);
+    rig.tick();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, None));
+    assert_eq!(rig.notices(), ["Claude Code did not change the effort to max: it did not confirm the change."]);
+}
+
+/// The recorded session answered on Haiku, and each assistant record says
+/// so. That is the tab's model when nothing better has spoken — and not once
+/// the status line has, since a record can name a fallback the session is
+/// not set to.
+#[test]
+fn the_model_an_assistant_record_names_stands_in_for_a_silent_status_line() {
+    let rig = Rig::on(CliKind::Claude, "", None);
+    rig.start_turn();
+    assert_eq!(rig.shown(), shown("haiku", None, None, None));
+    // One rig at a time: each holds the test home.
+    drop(rig);
+
+    let rig = Rig::on(CliKind::Claude, "opus", Some("high"));
+    rig.status_line("claude-opus-5-5", "high");
+    rig.start_turn();
+    assert_eq!(rig.shown(), shown("opus", Some("high"), None, None));
+}
+
+/// What the `/model` picker of a real Codex wrote, and the turns either side.
+#[test]
+fn a_model_or_effort_changed_in_the_codex_terminal_reaches_the_tab() {
+    let rig = Rig::on(CliKind::Codex, "gpt-5.6-sol", Some("high"));
+    let mut seen = Vec::new();
+    for record in CODEX_SETTINGS.lines() {
+        rig.append(&format!("{record}\n"));
+        seen.push(rig.shown());
+    }
+    let terra = |effort| shown("gpt-5.6-terra", Some(effort), None, None);
+    assert_eq!(seen, [shown("gpt-5.6-sol", Some("high"), None, None), terra("high"), terra("low"), terra("low"), terra("low")]);
+    assert_eq!(rig.changes(), [(Some("gpt-5.6-terra".into()), None), (None, Some("low".into()))]);
+
+    // A model and a level this app has never heard of are the ones in use.
+    rig.append("{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-9-nova\",\"effort\":\"ultra\"}}\n");
+    assert_eq!(rig.shown(), shown("gpt-9-nova", Some("ultra"), None, None));
+}
+
+/// Codex only reads its model at startup. Asked mid-turn, the change waits
+/// for the turn and is never shown as what the running turn is on.
+#[test]
+fn a_change_to_codex_mid_turn_is_pending_until_the_restart_that_applies_it() {
+    let rig = Rig::on(CliKind::Codex, "gpt-5.6-sol", Some("low"));
+    rig.rt.lock().unwrap().turn_open = true;
+    rig.manager.set_model(SESSION, TAB, "gpt-6-astra").unwrap();
+    rig.manager.set_effort(SESSION, TAB, Some("high")).unwrap();
+    assert_eq!(rig.shown(), shown("gpt-5.6-sol", Some("low"), Some("gpt-6-astra"), Some("high")));
+    assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.restart_when_idle));
+    assert!(rig.changes().is_empty());
+
+    // The turn in progress goes on saying what it is really running.
+    rig.append("{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\",\"effort\":\"low\"}}\n");
+    assert_eq!(rig.shown(), shown("gpt-5.6-sol", Some("low"), Some("gpt-6-astra"), Some("high")));
+
+    // The restart, as far as letting go of the old process: launching a
+    // real Codex is refused here.
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        rt.turn_open = false;
+        rt.stopping = true;
+    }
+    assert!(rig.manager.restart_for_settings(SESSION, TAB).is_err());
+    assert_eq!(rig.shown(), shown("gpt-6-astra", Some("high"), None, None), "what the next launch is given");
+    assert_eq!(rig.changes(), [(Some("gpt-6-astra".into()), Some("high".into()))]);
+}
+
+/// A headless agent that exits before answering leaves nothing "switching":
+/// the change is what its next launch is given.
+#[test]
+fn a_change_a_headless_agent_never_answered_is_settled_when_it_exits() {
+    let rig = Rig::on(CliKind::Claude, "auto", None);
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        rt.harness = "cursor".into();
+        rt.engine = Engine::None;
+        rt.child_pid = Some(4242);
+    }
+    index::update_tab(SESSION, TAB, |t| {
+        t.requested_model = Some("sonnet-4.5".into());
+        Ok(())
+    })
+    .unwrap();
+    rig.manager.on_exit(&rig.rt, 4242, Some(1));
+    assert_eq!(rig.shown(), shown("sonnet-4.5", None, None, None));
+}
+
+#[test]
+fn a_restart_that_did_not_put_codex_on_the_model_asked_for_says_so() {
+    let rig = Rig::on(CliKind::Codex, "gpt-6-astra", Some("high"));
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        let Engine::Cli(p) = &mut rt.engine else { unreachable!() };
+        p.launched_for = Some(Settings { model: "gpt-6-astra".into(), effort: Some("high".into()), ..Default::default() });
+    }
+    rig.append(&format!("{}\n", CODEX_SETTINGS.lines().next().unwrap()));
+    assert_eq!(rig.shown(), shown("gpt-5.6-sol", Some("high"), None, None));
+    assert_eq!(rig.notices(), ["Codex is running model gpt-5.6-sol, not gpt-6-astra."]);
+    // Said once: the next report is only a report.
+    rig.append("{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-terra\",\"effort\":\"high\"}}\n");
+    assert_eq!(rig.notices().len(), 1);
+}
+
+/// A tab on Codex's own default was not restarted onto any model in
+/// particular, so whichever one it reports is not a miss.
+#[test]
+fn a_restarted_tab_on_the_default_model_is_not_told_it_missed() {
+    let rig = Rig::on(CliKind::Codex, "", Some("high"));
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        let Engine::Cli(p) = &mut rt.engine else { unreachable!() };
+        p.launched_for = Some(Settings { effort: Some("high".into()), ..Default::default() });
+    }
+    rig.append(&format!("{}\n", CODEX_SETTINGS.lines().next().unwrap()));
+    assert_eq!(rig.shown(), shown("gpt-5.6-sol", Some("high"), None, None));
+    assert!(rig.notices().is_empty());
+}
+
+/// Clearing the effort mid-turn still needs the restart that applies it.
+#[test]
+fn clearing_codex_effort_mid_turn_still_schedules_the_restart() {
+    let rig = Rig::on(CliKind::Codex, "gpt-5.6-sol", Some("high"));
+    rig.rt.lock().unwrap().turn_open = true;
+    rig.manager.set_effort(SESSION, TAB, None).unwrap();
+    assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.restart_when_idle));
+}
+
+/// A tab that is not running has nobody to wait for: the choice is what the
+/// next launch gets.
+#[test]
+fn a_change_to_a_tab_that_is_not_running_is_current_at_once() {
+    for kind in [CliKind::Claude, CliKind::Codex] {
+        let rig = Rig::on(kind, "before", Some("low"));
+        rig.rt.lock().unwrap().engine = Engine::None;
+        rig.manager.set_model(SESSION, TAB, "after").unwrap();
+        rig.manager.set_effort(SESSION, TAB, Some("high")).unwrap();
+        assert_eq!(rig.shown(), shown("after", Some("high"), None, None));
+    }
+}
+
+#[test]
+fn an_agent_with_no_effort_setting_refuses_one() {
+    let rig = Rig::on(CliKind::Claude, "auto", None);
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        rt.harness = "cursor".into();
+        rt.engine = Engine::None;
+    }
+    let error = rig.manager.set_effort(SESSION, TAB, Some("high")).unwrap_err();
+    assert_eq!(error.to_string(), "Cursor has no effort setting.");
+    assert_eq!(rig.shown(), shown("auto", None, None, None));
+}
+
+/// A command that failed, as each CLI records it: the call and its result.
+fn failed_command(kind: CliKind, id: &str) -> String {
+    match kind {
+        CliKind::Claude => format!(
+            "{}\n{}\n",
+            json!({ "type": "assistant", "uuid": format!("a-{id}"), "isSidechain": false, "message": { "id": format!("m-{id}"), "role": "assistant", "content": [{ "type": "tool_use", "id": id, "name": "Bash", "input": { "command": "cargo test" } }] } }),
+            json!({ "type": "user", "uuid": format!("u-{id}"), "isSidechain": false, "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": id, "is_error": true, "content": "test result: FAILED" }] } }),
+        ),
+        CliKind::Codex => format!(
+            "{}\n",
+            json!({ "type": "event_msg", "payload": { "type": "item_completed", "item": { "type": "CommandExecution", "id": id, "command": "cargo test", "cwd": "/w/demo", "status": "completed", "exit_code": 1, "aggregated_output": "test result: FAILED" } } }),
+        ),
+    }
+}
+
+/// The agent says something, as each CLI records it.
+fn agent_text(kind: CliKind, id: &str) -> String {
+    match kind {
+        CliKind::Claude => format!("{}\n", json!({ "type": "assistant", "uuid": format!("a-{id}"), "isSidechain": false, "message": { "id": format!("m-{id}"), "role": "assistant", "content": [{ "type": "text", "text": "Trying another way." }] } })),
+        CliKind::Codex => format!("{}\n", json!({ "type": "event_msg", "payload": { "type": "item_completed", "item": { "type": "AgentMessage", "id": id, "content": [{ "type": "text", "text": "Trying another way." }] } } })),
+    }
+}
+
+impl Rig {
+    /// A tab on either CLI with a turn open and the agent working.
+    fn working(kind: CliKind) -> Self {
+        let rig = Self::of(kind, "");
+        match kind {
+            CliKind::Claude => rig.start_turn(),
+            CliKind::Codex => rig.append(&format!(
+                "{}\n{}\n",
+                json!({ "type": "event_msg", "payload": { "type": "task_started", "turn_id": "turn-1" } }),
+                json!({ "type": "event_msg", "payload": { "type": "item_completed", "item": { "type": "UserMessage", "id": "user-1", "content": [{ "type": "text", "text": "run the tests" }] } } }),
+            )),
+        }
+        assert!(rig.turn_open());
+        assert_eq!(rig.status(), TabStatus::InProgress);
+        rig
+    }
+
+    /// The failed tool results in the log, and every recovery ever raised.
+    fn failed_tools_and_recoveries(&self) -> (usize, Vec<RecoveryKind>) {
+        let events = self.events();
+        let failed = events.iter().filter(|e| matches!(&e.payload, Payload::ToolCallCompleted { result, .. } if result.is_error)).count();
+        let raised = events.iter().filter_map(|e| match &e.payload { Payload::Recovery { kind } => *kind, _ => None }).collect();
+        (failed, raised)
+    }
+}
+
+/// A command that exits non-zero in a running turn is the agent's to read,
+/// not the reader's: the tab stays "Working" through the failure, through the
+/// thinking after it, and through the work that follows (#400).
+#[test]
+fn a_failed_command_in_a_running_turn_does_not_ask_for_attention() {
+    for kind in [CliKind::Claude, CliKind::Codex] {
+        let rig = Rig::working(kind);
+        for id in ["call-1", "call-2", "call-3"] {
+            rig.append(&failed_command(kind, id));
+            assert_eq!(rig.status(), TabStatus::InProgress, "{kind:?}: still working after a failed command");
+            assert_eq!(rig.recovery(), None);
+            rig.append(&agent_text(kind, &format!("text-{id}")));
+            assert_eq!(rig.status(), TabStatus::InProgress);
+        }
+        let (failed, raised) = rig.failed_tools_and_recoveries();
+        assert_eq!(failed, 3, "{kind:?}: each failure is still a failed row in the transcript");
+        assert_eq!(raised, vec![], "{kind:?}: and none of them was ever a banner");
+        assert_eq!(rig.banner(), None);
+    }
+}
+
+/// The last thing a turn did was a command that failed, and then the turn
+/// ended normally: it is completed, not in need of attention.
+#[test]
+fn a_turn_whose_last_tool_failed_and_then_completes_is_completed() {
+    for kind in [CliKind::Claude, CliKind::Codex] {
+        let rig = Rig::working(kind);
+        rig.append(&failed_command(kind, "call-1"));
+        rig.hook("Stop", json!({ "last_assistant_message": "The tests fail; see above." }));
+        assert!(!rig.turn_open());
+        assert_eq!(rig.status(), TabStatus::Completed, "{kind:?}");
+        assert_eq!(rig.recovery(), None);
+        assert_eq!(rig.failed_tools_and_recoveries(), (1, vec![]));
+    }
+}
+
+/// A turn that ends in an error is the reader's to look at, failed tools
+/// before it or not.
+#[test]
+fn a_turn_that_ends_in_an_error_asks_for_attention() {
+    for kind in [CliKind::Claude, CliKind::Codex] {
+        let rig = Rig::working(kind);
+        rig.append(&failed_command(kind, "call-1"));
+        {
+            let mut rt = rig.rt.lock().unwrap();
+            rig.manager.apply(&mut rt, Payload::TurnCompleted { status: TurnStatus::Error, final_text: Some("the agent crashed".into()), usage: None, duration_ms: None, head: None, auth_failed: false }, None);
+        }
+        assert!(!rig.turn_open());
+        assert_eq!(rig.status(), TabStatus::Waiting, "{kind:?}");
+        assert_eq!(rig.recovery(), Some(RecoveryKind::Failed));
+        assert_eq!(rig.banner(), Some(RecoveryKind::Failed));
+    }
+}
+
+/// Asking still waits, and a failed command while it waits changes nothing.
+#[test]
+fn a_pending_permission_still_waits_for_input_after_a_failed_command() {
+    let rig = Rig::working(CliKind::Claude);
+    rig.append(&failed_command(CliKind::Claude, "call-1"));
+    {
+        let mut rt = rig.rt.lock().unwrap();
+        rig.manager.apply(&mut rt, Payload::PermissionRequested { request_id: "r1".into(), tool_use_id: "call-2".into(), tool_name: "Bash".into(), input: json!({ "command": "rm file" }), title: None, description: None, options: vec![] }, None);
+    }
+    assert_eq!(rig.status(), TabStatus::Waiting);
+    assert_eq!(rig.recovery(), None);
+}
+// ---- #417: one permission mode, whichever side changed it
+
+const CLAUDE_MODE_FRAMES: &str = include_str!("harness/claude/fixtures/permission_mode_hooks.jsonl");
+const CODEX_PERMISSIONS: &str = include_str!("harness/codex/fixtures/permissions.jsonl");
+
+impl Rig {
+    /// A running tab the index knows, launched in `mode`.
+    fn in_mode(kind: CliKind, mode: &str) -> Self {
+        let rig = Self::of(kind, "");
+        let harness = {
+            let mut rt = rig.rt.lock().unwrap();
+            let Engine::Cli(p) = &mut rt.engine else { unreachable!() };
+            p.mode = mode.into();
+            rt.harness.clone()
+        };
+        let entry: index::SessionEntry = serde_json::from_value(json!({
+            "id": SESSION, "projectPath": rig._dir.path(), "cwd": rig._dir.path(),
+            "title": "watched", "created": index::now(), "modified": index::now(),
+            "tabs": [{ "id": TAB, "harness": harness, "model": "m", "permissionMode": mode, "created": index::now() }]
+        })).unwrap();
+        index::save(&[entry]).unwrap();
+        rig
+    }
+
+    /// The mode every view draws, and one asked for that is still waiting.
+    fn mode(&self) -> (String, Option<String>) {
+        let tab = index::get(SESSION).unwrap().tab(TAB).unwrap().clone();
+        (tab.permission_mode, tab.requested_permission_mode)
+    }
+
+    /// The modes the tab's log says it moved into.
+    fn mode_changes(&self) -> Vec<String> {
+        self.events().into_iter().filter_map(|e| match e.payload { Payload::SettingsChanged { permission_mode, .. } => permission_mode, _ => None }).collect()
+    }
+
+    /// The mode the app's own every-tool gate goes by.
+    fn launch_mode(&self) -> Option<String> {
+        match &self.rt.lock().unwrap().engine {
+            Engine::Cli(p) => Some(p.mode.clone()),
+            _ => None,
+        }
+    }
+
+    fn share(&self) {
+        self.manager.sharing.lock().unwrap().sessions.insert(SESSION.into(), crate::local_sharing::Share::new("host".into(), "".into(), String::new()));
+        // The restart a refused mode brings on goes as far as letting go of
+        // the CLI: launching a real one is refused here.
+        self.rt.lock().unwrap().stopping = true;
+    }
+
+    fn released(&self) -> bool {
+        matches!(self.rt.lock().unwrap().engine, Engine::None)
+    }
+}
+
+fn now_in(mode: &str) -> (String, Option<String>) {
+    (mode.into(), None)
+}
+
+/// The frames a real Claude Code sent as its mode was cycled with Shift+Tab,
+/// a prompt after each press: the prompt's own hook is where each is heard.
+#[test]
+fn a_mode_cycled_in_the_claude_terminal_reaches_the_tab_with_the_next_prompt() {
+    let rig = Rig::in_mode(CliKind::Claude, "manual");
+    let (sent, updated) = std::sync::mpsc::channel();
+    rig.manager.sink.listen("session_updated", Box::new(move |payload| {
+        let session: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let _ = sent.send(session["tabs"][0]["permissionMode"].as_str().unwrap().to_string());
+    }));
+    let mut seen = Vec::new();
+    for frame in CLAUDE_MODE_FRAMES.lines() {
+        let frame: serde_json::Value = serde_json::from_str(frame).unwrap();
+        rig.hook(frame["event"].as_str().unwrap(), frame["payload"].clone());
+        seen.push(rig.mode().0);
+    }
+    // SessionStart names no mode; `default` is the picker's "Ask every
+    // time"; SessionEnd changes nothing.
+    assert_eq!(seen, ["manual", "acceptEdits", "plan", "auto", "manual", "acceptEdits", "plan", "auto", "auto"]);
+    let moved = ["acceptEdits", "plan", "auto", "manual", "acceptEdits", "plan", "auto"];
+    assert_eq!(rig.mode_changes(), moved);
+    assert_eq!(updated.try_iter().collect::<Vec<_>>(), moved, "and every view is told each time");
+    assert_eq!(rig.launch_mode().as_deref(), Some("auto"));
+}
+
+/// A tool call's frame carries the mode too, so a change mid-turn is known
+/// before the tool it would judge is.
+#[test]
+fn a_mode_changed_mid_turn_reaches_the_tab_with_the_next_tool_call() {
+    let rig = Rig::in_mode(CliKind::Claude, "plan");
+    rig.hook("UserPromptSubmit", json!({ "permission_mode": "plan", "prompt": "go" }));
+    assert_eq!(rig.mode(), now_in("plan"));
+    assert!(rig.mode_changes().is_empty(), "the mode it is in is no news");
+    rig.hook("PreToolUse", json!({ "permission_mode": "acceptEdits", "tool_name": "Edit", "tool_input": {}, "tool_use_id": "t1" }));
+    assert_eq!(rig.mode(), now_in("acceptEdits"));
+    // A subagent's own mode is not the session's.
+    rig.hook("PreToolUse", json!({ "permission_mode": "bypassPermissions", "agent_id": "a1", "tool_name": "Bash", "tool_input": {}, "tool_use_id": "t2" }));
+    assert_eq!(rig.mode(), now_in("acceptEdits"));
+}
+
+#[test]
+fn a_mode_the_app_has_no_entry_for_is_shown_as_reported() {
+    let rig = Rig::in_mode(CliKind::Claude, "auto");
+    rig.hook("UserPromptSubmit", json!({ "permission_mode": "dontAsk" }));
+    assert_eq!(rig.mode(), now_in("dontAsk"));
+    rig.hook("UserPromptSubmit", json!({ "permission_mode": "something-newer" }));
+    assert_eq!(rig.mode(), now_in("something-newer"));
+
+    // One rig at a time: each holds the test home.
+    drop(rig);
+    let rig = Rig::in_mode(CliKind::Codex, "auto");
+    rig.append("{\"type\":\"turn_context\",\"payload\":{\"approval_policy\":\"never\",\"sandbox_policy\":{\"type\":\"workspace-write\"}}}\n");
+    assert_eq!(rig.mode(), now_in("never, workspace-write"));
+    assert_eq!(rig.mode_changes(), ["never, workspace-write"]);
+}
+
+/// What a real Codex wrote as its `/permissions` menu was taken through its
+/// three presets, from a tab launched in Plan.
+#[test]
+fn a_stance_changed_in_the_codex_terminal_reaches_the_tab() {
+    let rig = Rig::in_mode(CliKind::Codex, "plan");
+    let mut seen = Vec::new();
+    for record in CODEX_PERMISSIONS.lines() {
+        rig.append(&format!("{record}\n"));
+        seen.push(rig.mode().0);
+    }
+    assert_eq!(seen, ["plan", "auto", "auto", "auto", "auto", "bypassPermissions", "bypassPermissions", "bypassPermissions"]);
+    assert_eq!(rig.mode_changes(), ["auto", "bypassPermissions"]);
+}
+
+/// "Ask every time" is the app's own gate over a stance other modes share,
+/// so a report of that stance leaves the tab in it. Leaving the stance in
+/// the terminal leaves the gate behind too.
+#[test]
+fn a_codex_tab_keeps_its_own_mode_under_a_stance_that_mode_launches() {
+    let rig = Rig::in_mode(CliKind::Codex, "manual");
+    let turn = |approval: &str, sandbox: &str| format!("{{\"type\":\"turn_context\",\"payload\":{{\"approval_policy\":\"{approval}\",\"sandbox_policy\":{{\"type\":\"{sandbox}\"}}}}}}\n");
+    rig.append(&turn("on-request", "workspace-write"));
+    assert_eq!(rig.mode(), now_in("manual"));
+    assert!(codex::asks_every_tool(&rig.launch_mode().unwrap()));
+    rig.append(&turn("never", "danger-full-access"));
+    assert_eq!(rig.mode(), now_in("bypassPermissions"));
+    assert!(!codex::asks_every_tool(&rig.launch_mode().unwrap()), "the reader took the tab out of asking");
+}
+
+/// The CLI is only restarted between turns, so a mode chosen in the chat
+/// mid-turn is not the mode the turn is being judged under, and is not shown
+/// as if it were.
+#[test]
+fn a_mode_from_the_chat_mid_turn_is_pending_until_the_restart_that_applies_it() {
+    for kind in [CliKind::Claude, CliKind::Codex] {
+        let rig = Rig::in_mode(kind, "auto");
+        rig.rt.lock().unwrap().turn_open = true;
+        rig.manager.set_permission_mode(SESSION, TAB, "plan").unwrap();
+        assert_eq!(rig.mode(), ("auto".into(), Some("plan".into())));
+        assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.restart_when_idle));
+        assert!(rig.mode_changes().is_empty());
+        assert_eq!(rig.launch_mode().as_deref(), Some("auto"));
+
+        // What the running turn reports meanwhile is still where it is.
+        if kind == CliKind::Claude {
+            rig.hook("PreToolUse", json!({ "permission_mode": "auto", "tool_name": "Read", "tool_input": {}, "tool_use_id": "t1" }));
+            assert_eq!(rig.mode(), ("auto".into(), Some("plan".into())));
+        }
+
+        // The restart, as far as letting go of the old process.
+        {
+            let mut rt = rig.rt.lock().unwrap();
+            rt.turn_open = false;
+            rt.stopping = true;
+        }
+        assert!(rig.manager.restart_for_settings(SESSION, TAB).is_err());
+        assert_eq!(rig.mode(), now_in("plan"), "what the next launch is given");
+        assert_eq!(rig.mode_changes(), ["plan"]);
+    }
+}
+
+#[test]
+fn asking_for_the_mode_the_tab_is_in_takes_a_waiting_change_back() {
+    let rig = Rig::in_mode(CliKind::Claude, "auto");
+    rig.rt.lock().unwrap().turn_open = true;
+    rig.manager.set_permission_mode(SESSION, TAB, "plan").unwrap();
+    rig.manager.set_permission_mode(SESSION, TAB, "auto").unwrap();
+    assert_eq!(rig.mode(), now_in("auto"));
+    assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if !p.restart_when_idle), "and the restart with it");
+
+    // Codex may have a model waiting on the same restart.
+    // One rig at a time: each holds the test home.
+    drop(rig);
+    let rig = Rig::in_mode(CliKind::Codex, "auto");
+    rig.rt.lock().unwrap().turn_open = true;
+    rig.manager.set_model(SESSION, TAB, "gpt-6-astra").unwrap();
+    rig.manager.set_permission_mode(SESSION, TAB, "plan").unwrap();
+    rig.manager.set_permission_mode(SESSION, TAB, "auto").unwrap();
+    assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.restart_when_idle));
+}
+
+#[test]
+fn a_mode_for_a_tab_that_is_not_running_is_current_at_once() {
+    let rig = Rig::in_mode(CliKind::Claude, "auto");
+    rig.rt.lock().unwrap().engine = Engine::None;
+    rig.manager.set_permission_mode(SESSION, TAB, "plan").unwrap();
+    assert_eq!(rig.mode(), now_in("plan"));
+    assert_eq!(rig.mode_changes(), ["plan"]);
+}
+
+/// Outside a share, Bypass reached in the terminal is the mode the tab is in.
+#[test]
+fn bypass_chosen_in_the_terminal_is_shown_when_nothing_forbids_it() {
+    let rig = Rig::in_mode(CliKind::Claude, "auto");
+    rig.hook("UserPromptSubmit", json!({ "permission_mode": "bypassPermissions" }));
+    assert_eq!(rig.mode(), now_in("bypassPermissions"));
+    assert!(!rig.released());
+}
+
+/// A shared session may not be in Bypass, and a guest's prompt must never be
+/// typed into a CLI that is. Showing the mode would not undo it: the CLI is
+/// let go of at once and brought back in the mode the tab was in.
+#[test]
+fn a_shared_session_is_restarted_out_of_a_mode_it_may_not_be_in() {
+    // Codex: "Full Access" confirmed in the TUI's `/permissions`.
+    let rig = Rig::in_mode(CliKind::Codex, "auto");
+    rig.share();
+    rig.rt.lock().unwrap().turn_open = true;
+    for record in CODEX_PERMISSIONS.lines() {
+        rig.append(&format!("{record}\n"));
+    }
+    assert_eq!(rig.mode(), now_in("auto"), "never stored");
+    assert!(rig.mode_changes().iter().all(|mode| mode != "bypassPermissions"));
+    assert!(rig.released(), "the CLI that was in it is gone before anything else is typed");
+    assert!(!rig.turn_open());
+    assert_eq!(
+        rig.notices(),
+        ["Codex was switched to Bypass in the terminal. A shared session cannot be in Bypass, so Codex was restarted in Auto. Stop sharing this session before switching to Bypass."]
+    );
+
+    // Claude Code, and a stance with no sandbox under any other name.
+    // One rig at a time: each holds the test home.
+    drop(rig);
+    let rig = Rig::in_mode(CliKind::Claude, "plan");
+    rig.share();
+    rig.hook("PreToolUse", json!({ "permission_mode": "bypassPermissions", "tool_name": "Bash", "tool_input": {}, "tool_use_id": "t1" }));
+    assert_eq!(rig.mode(), now_in("plan"));
+    assert!(rig.released());
+
+    // One rig at a time: each holds the test home.
+    drop(rig);
+    let rig = Rig::in_mode(CliKind::Codex, "plan");
+    rig.share();
+    rig.append("{\"type\":\"turn_context\",\"payload\":{\"approval_policy\":\"on-request\",\"sandbox_policy\":{\"type\":\"danger-full-access\"}}}\n");
+    assert_eq!(rig.mode(), now_in("plan"));
+    assert!(rig.released());
+
+    // Any other mode changed in the terminal of a shared session is just shown.
+    // One rig at a time: each holds the test home.
+    drop(rig);
+    let rig = Rig::in_mode(CliKind::Claude, "plan");
+    rig.share();
+    rig.hook("UserPromptSubmit", json!({ "permission_mode": "acceptEdits" }));
+    assert_eq!(rig.mode(), now_in("acceptEdits"));
+    assert!(!rig.released());
 }

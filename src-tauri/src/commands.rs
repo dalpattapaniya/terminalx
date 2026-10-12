@@ -12,7 +12,7 @@ use crate::{git, harness, names, store};
 
 pub use crate::session_ops::{NewSession, NewTab};
 pub(crate) use crate::session_ops::create_session_blocking;
-use crate::session_ops::{available_worktree_name, rename_workspace_entries, sessions_in_workspace};
+use crate::session_ops::{available_worktree_name, rename_workspace_entries};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -38,6 +38,23 @@ fn stop_sessions_and_wait(state: &tauri::State<'_, crate::AppState>, sessions: &
         let tabs: Vec<String> = session.tabs.iter().map(|tab| tab.id.clone()).collect();
         panes.extend(state.terminals.session_pane_ids(&session.id, &tabs));
     }
+    state.terminals.kill_all_and_wait(&panes, STOP_BEFORE_REMOVE_WAIT);
+}
+
+/// Stop a session's agents and wait for them to exit, leaving its shells
+/// alone. For a session that changes directory and goes on: its agents must
+/// let go of their conversations before they start again elsewhere, but a
+/// shell the reader opened (a dev server, say) is theirs, and is not ended
+/// for a change they made to where the agents run.
+fn stop_agents_and_wait(state: &tauri::State<'_, crate::AppState>, session: &SessionEntry) {
+    let panes: Vec<String> = session
+        .tabs
+        .iter()
+        .map(|tab| {
+            state.host.kill(&format!("{}/{}", session.id, tab.id));
+            crate::session::SessionManager::pane_id(&tab.id)
+        })
+        .collect();
     state.terminals.kill_all_and_wait(&panes, STOP_BEFORE_REMOVE_WAIT);
 }
 
@@ -579,9 +596,11 @@ pub async fn cloud_agent_login_connect(
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let title = format!("{} API key", agent_label(provider));
             let text = format!(
-                "Enter the {} API key for organization {}. It is sent to the account service only for validation and encrypted storage, and is not shown again.",
+                "{}Enter the {} API key for organization {}. It is sent to the account service only for validation and encrypted storage, and is not shown again. {}",
+                replacement_notice(agent_label(provider), &organization, replaces),
                 agent_label(provider),
-                organization
+                organization,
+                authorization.reach(AgentLoginKind::ApiKey).sentence()
             );
             app.run_on_main_thread(move || {
                 let _ = sender.send(secure_prompt(&title, &text, "API key"));
@@ -600,7 +619,7 @@ pub async fn cloud_agent_login_connect(
             // account, and nothing is uploaded unless its own button is pressed. Every time.
             let expires = local_time(login.expires_at_ms);
             let account = login.account.clone().unwrap_or_else(|| "the Claude Code account signed in on this Mac (its name is not recorded here)".into());
-            let text = local_login_confirmation(&organization, &account, &expires, replaces);
+            let text = local_login_confirmation(&organization, &account, &expires, replaces, &authorization.reach(AgentLoginKind::LoginDocument));
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             app.run_on_main_thread(move || {
                 let _ = sender.send(native_confirm("Lend this Mac's Claude Code sign-in?", &text, "Upload access token"));
@@ -625,6 +644,29 @@ pub async fn cloud_agent_login_connect(
     tauri::async_runtime::spawn_blocking(move || service.save_agent_login(authorization, provider, kind, secret, identity.as_deref()))
         .await
         .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Mutation))?
+}
+
+/// What the native dialog for the sign-in's code says: what it finishes,
+/// what is replaced, and who the login reaches (a default for a new login,
+/// the stored scope for one that is replaced).
+fn claude_code_prompt(organization: &str, replaces: Option<crate::cloud_workspaces::AgentLoginKind>, reach: &crate::cloud_workspaces::AgentLoginReach) -> String {
+    format!(
+        "{}Paste the code the Claude page showed after you approved. It finishes the sign-in for organization {organization}: the account service keeps the login and renews it. {}",
+        replacement_notice("Claude Code", organization, replaces),
+        reach.sentence()
+    )
+}
+
+/// What a native dialog says first when storing a login replaces one that
+/// is there: every way of connecting says it, in the dialog as on the page.
+/// Empty when nothing is stored for the agent.
+fn replacement_notice(agent: &str, organization: &str, replaces: Option<crate::cloud_workspaces::AgentLoginKind>) -> String {
+    use crate::cloud_workspaces::AgentLoginKind;
+    match replaces {
+        Some(AgentLoginKind::ApiKey) => format!("THIS REPLACES the API key now stored for {agent} in {organization}.\n\n"),
+        Some(AgentLoginKind::LoginDocument) => format!("THIS REPLACES the login now stored for {agent} in {organization}.\n\n"),
+        None => String::new(),
+    }
 }
 
 /// Text for a native dialog: no control or direction-changing characters, bounded.
@@ -661,8 +703,15 @@ fn local_time(at_ms: i64) -> String {
 /// What the native confirmation says before a local sign-in is uploaded:
 /// which organization gets it, whose it is, what exactly leaves this Mac,
 /// who can use it, and when and how it ends.
-fn local_login_confirmation(organization: &str, account: &str, expires: &str, replaces: Option<crate::cloud_workspaces::AgentLoginKind>) -> String {
+fn local_login_confirmation(
+    organization: &str,
+    account: &str,
+    expires: &str,
+    replaces: Option<crate::cloud_workspaces::AgentLoginKind>,
+    reach: &crate::cloud_workspaces::AgentLoginReach,
+) -> String {
     use crate::cloud_workspaces::AgentLoginKind;
+    let reach = reach.sentence();
     let replacing = match replaces {
         Some(AgentLoginKind::ApiKey) => format!(
             "THIS REPLACES the API key now stored for Claude Code in {organization}. The key is removed; when the lent sign-in expires, Claude Code agents in every workspace of the organization stop until a login is connected again.\n\n"
@@ -676,8 +725,8 @@ fn local_login_confirmation(organization: &str, account: &str, expires: &str, re
         "Organization: {organization}\nAccount (as Claude Code on this Mac records it): {account}\n\n{replacing}\
          TerminalX will upload this sign-in's short-lived access token to the account service, for agents in the cloud workspaces of {organization}. \
          The refresh token stays on this Mac, so this Mac's sign-in keeps working and the uploaded token cannot be renewed: it stops working on {expires}.\n\n\
-         Until then, agents in every member's workspaces of this organization may run on your Claude subscription, \
-         and anyone who can drive one of those workspaces can read the token off its machine.\n\n\
+         Until then agents run on your Claude subscription. {reach} \
+         Anyone who can drive one of those workspaces can read the token off its machine.\n\n\
          To end it sooner, disconnect it in Settings (the service refuses while a workspace still uses the login)."
     )
 }
@@ -764,7 +813,7 @@ pub async fn cloud_agent_claude_login_complete(
     consent: crate::cloud_workspaces::AgentLoginConsent,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<crate::cloud_workspaces::ClaudeLoginOutcome, crate::cloud_workspaces::CloudWorkspaceClientError> {
-    use crate::cloud_workspaces::{AgentLoginProvider, CloudWorkspaceClientError, RequestRisk};
+    use crate::cloud_workspaces::{AgentLoginKind, AgentLoginProvider, CloudWorkspaceClientError, RequestRisk};
     static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = GUARD.try_lock().map_err(|_| CloudWorkspaceClientError::local("cloud_provider_operation_in_progress", true))?;
     let service = state.cloud_workspaces.clone();
@@ -778,9 +827,7 @@ pub async fn cloud_agent_claude_login_complete(
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| authorization.organization_id().to_owned());
     let unavailable = || CloudWorkspaceClientError::local("cloud_provider_secure_input_unavailable", false);
-    let text = format!(
-        "Paste the code the Claude page showed after you approved. It finishes the sign-in for organization {organization}: the account service keeps the login, renews it, and agents in every member's cloud workspaces of the organization may run on it."
-    );
+    let text = claude_code_prompt(&organization, authorization.replaces(), &authorization.reach(AgentLoginKind::LoginDocument));
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     app.run_on_main_thread(move || {
         let _ = sender.send(secure_prompt("Log in with Claude", &text, "Code from the Claude page"));
@@ -1132,9 +1179,14 @@ pub fn list_projects() -> CmdResult<ProjectsResponse> {
     Ok(ProjectsResponse { projects, last_selected })
 }
 
+/// The project list changed: a window that did not make the change reads it again.
+pub(crate) const PROJECTS_CHANGED_EVENT: &str = "projects_changed";
+
 #[tauri::command]
-pub fn add_project(path: String) -> CmdResult<Project> {
-    projects::add(&path).map_err(err)
+pub fn add_project(app: AppHandle, path: String) -> CmdResult<Project> {
+    let project = projects::add(&path).map_err(err)?;
+    let _ = app.emit(PROJECTS_CHANGED_EVENT, &());
+    Ok(project)
 }
 
 /// The folder the sidebar's New chat runs in: a plain directory in the store,
@@ -1151,13 +1203,59 @@ pub fn chats_dir() -> CmdResult<String> {
 }
 
 #[tauri::command]
-pub fn remove_project(path: String) -> CmdResult<()> {
-    projects::remove(&path).map_err(err)
+pub fn remove_project(app: AppHandle, path: String) -> CmdResult<()> {
+    projects::remove(&path).map_err(err)?;
+    let _ = app.emit(PROJECTS_CHANGED_EVENT, &());
+    Ok(())
 }
 
 #[tauri::command]
 pub fn select_project(path: String) -> CmdResult<()> {
     projects::set_last_selected(&path).map_err(err)
+}
+
+/// The event a running local clone reports its progress on.
+pub const PROJECT_CLONE_PROGRESS_EVENT: &str = "project_clone_progress";
+
+type StartResult<T> = Result<T, crate::project_start::Failure>;
+
+fn start_failure(error: impl std::fmt::Display) -> crate::project_start::Failure {
+    crate::project_start::Failure { code: crate::project_start::FAILED, message: error.to_string() }
+}
+
+/// The reader's GitHub repositories through `gh`, or why there is no list.
+#[tauri::command]
+pub async fn github_repositories() -> CmdResult<crate::project_start::GithubRepositories> {
+    tauri::async_runtime::spawn_blocking(crate::project_start::github_repositories).await.map_err(err)
+}
+
+/// Clone a repository under `parent`. Resolves when the clone is whole (or
+/// was already there); `id` names it for progress events and for canceling.
+#[tauri::command]
+pub async fn project_clone(app: AppHandle, id: String, source: String, parent: String) -> StartResult<crate::project_start::CloneOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::project_start::clone_repository(&id, &source, &parent, move |progress| {
+            let _ = app.emit(PROJECT_CLONE_PROGRESS_EVENT, &progress);
+        })
+    })
+    .await
+    .map_err(start_failure)?
+}
+
+#[tauri::command]
+pub fn project_clone_cancel(id: String) {
+    crate::project_start::cancel_clone(&id);
+}
+
+#[tauri::command]
+pub fn project_start_defaults(parent: Option<String>) -> crate::project_start::StartDefaults {
+    crate::project_start::defaults(parent.as_deref())
+}
+
+/// Quick start: a new empty Git repository at `parent/name`, returned as a path to add.
+#[tauri::command]
+pub async fn project_create(parent: String, name: String) -> StartResult<String> {
+    tauri::async_runtime::spawn_blocking(move || crate::project_start::create_project(&parent, &name)).await.map_err(start_failure)?
 }
 
 // ------------------------------------------------------------------ sessions
@@ -1297,9 +1395,20 @@ pub async fn create_session(app: AppHandle, req: NewSession) -> CmdResult<Sessio
         .map_err(err)?
 }
 
+/// Tell every window what a session is now. The window that made a change
+/// updates its own copy from the reply; another window showing the same
+/// session (the floating one beside the main one) only learns of it here.
+fn announce_session(app: &AppHandle, session_id: &str) {
+    if let Ok(session) = index::get(session_id) {
+        let _ = app.emit("session_updated", &session);
+    }
+}
+
 #[tauri::command]
-pub fn add_tab(session_id: String, tab: NewTab) -> CmdResult<TabEntry> {
-    crate::session_ops::add_tab_entry(&session_id, &tab)
+pub fn add_tab(app: AppHandle, state: State<'_, AppState>, session_id: String, tab: NewTab) -> CmdResult<TabEntry> {
+    let tab = state.manager().ok_or("not ready")?.add_tab(&session_id, &tab).map_err(err)?;
+    announce_session(&app, &session_id);
+    Ok(tab)
 }
 
 #[tauri::command]
@@ -1317,36 +1426,122 @@ pub fn remove_tab(app: AppHandle, session_id: String, tab_id: String) -> CmdResu
     if let Ok(p) = store::log_path(&session_id, &tab_id) {
         let _ = std::fs::remove_file(p);
     }
+    announce_session(&app, &session_id);
+    Ok(())
+}
+
+fn patch_session(app: &AppHandle, session_id: &str, patch: crate::session_ops::SessionPatch) -> CmdResult<()> {
+    let session = crate::session_ops::update_session_meta(session_id, &patch)?;
+    let _ = app.emit("session_updated", &session);
     Ok(())
 }
 
 #[tauri::command]
-pub fn rename_session(session_id: String, title: String) -> CmdResult<()> {
-    let patch = crate::session_ops::SessionPatch { title: Some(title), ..Default::default() };
-    crate::session_ops::update_session_meta(&session_id, &patch).map(|_| ())
+pub fn rename_session(app: AppHandle, session_id: String, title: String) -> CmdResult<()> {
+    patch_session(&app, &session_id, crate::session_ops::SessionPatch { title: Some(title), ..Default::default() })
 }
 
 #[tauri::command]
-pub fn set_session_archived(session_id: String, archived: bool) -> CmdResult<()> {
-    let patch = crate::session_ops::SessionPatch { archived: Some(archived), ..Default::default() };
-    crate::session_ops::update_session_meta(&session_id, &patch).map(|_| ())
+pub fn set_session_archived(app: AppHandle, session_id: String, archived: bool) -> CmdResult<()> {
+    patch_session(&app, &session_id, crate::session_ops::SessionPatch { archived: Some(archived), ..Default::default() })
 }
 
 #[tauri::command]
-pub fn set_session_pinned(session_id: String, pinned: bool) -> CmdResult<()> {
-    let patch = crate::session_ops::SessionPatch { pinned: Some(pinned), ..Default::default() };
-    crate::session_ops::update_session_meta(&session_id, &patch).map(|_| ())
+pub fn set_session_pinned(app: AppHandle, session_id: String, pinned: bool) -> CmdResult<()> {
+    patch_session(&app, &session_id, crate::session_ops::SessionPatch { pinned: Some(pinned), ..Default::default() })
 }
 
 #[tauri::command]
-pub fn set_active_tab(session_id: String, tab_id: String) -> CmdResult<()> {
-    index::update_session(&session_id, |s| {
+pub fn set_active_tab(app: AppHandle, session_id: String, tab_id: String) -> CmdResult<()> {
+    let session = index::update_session(&session_id, |s| {
         if s.tab(&tab_id).is_some() {
             s.active_tab = Some(tab_id);
         }
-        Ok(())
+        Ok(s.clone())
     })
-    .map_err(err)
+    .map_err(err)?;
+    let _ = app.emit("session_updated", &session);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- quick chats
+
+/// Create a quick chat: a session with no project, in a scratch directory of
+/// its own (or in `req.cwd`, which does not become a project).
+#[tauri::command]
+pub async fn create_quick_chat(app: AppHandle, req: crate::session_ops::NewQuickChat) -> CmdResult<SessionEntry> {
+    tauri::async_runtime::spawn_blocking(move || crate::session_ops::create_quick_chat_blocking(&app, req))
+        .await
+        .map_err(err)?
+}
+
+/// Run a quick chat in another folder, or in its scratch directory again when
+/// `cwd` is `None`. Its agents are stopped and start again there.
+#[tauri::command]
+pub async fn set_quick_chat_cwd(app: AppHandle, session_id: String, cwd: Option<String>) -> CmdResult<SessionEntry> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        let stop = |session: &SessionEntry| stop_agents_and_wait(&state, session);
+        crate::session_ops::set_quick_chat_cwd(&app, &session_id, cwd.as_deref(), &stop)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Turn a quick chat into an ordinary session of a project, with its history.
+#[tauri::command]
+pub async fn move_quick_chat_to_project(app: AppHandle, session_id: String, project_path: String) -> CmdResult<SessionEntry> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        let stop = |session: &SessionEntry| stop_agents_and_wait(&state, session);
+        let moved = crate::session_ops::move_quick_chat_to_project(&app, &session_id, &project_path, &stop)?;
+        // The project may have been added by this: every window lists it.
+        let _ = app.emit(PROJECTS_CHANGED_EVENT, &());
+        Ok(moved)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// How often idle quick chats are looked for.
+const RETENTION_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// A scratch directory with no session is left alone this long: one being
+/// made right now is a moment ahead of its index entry.
+const ORPHAN_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Apply the retention setting now, and again every few hours while the app runs.
+pub fn start_quick_chat_retention(app: AppHandle) {
+    let spawned = std::thread::Builder::new().name("quick-chat-retention".into()).spawn(move || loop {
+        sweep_quick_chats(&app);
+        std::thread::sleep(RETENTION_SWEEP_EVERY);
+    });
+    if let Err(error) = spawned {
+        log::warn!("quick chat retention is off for this run: {error}");
+    }
+}
+
+fn sweep_quick_chats(app: &AppHandle) {
+    let days = store::settings::load().floating.retention_days;
+    let state = app.state::<crate::AppState>();
+    // A shell the reader left running in it is a use of it, whatever its date.
+    let shells = state.terminals.shells();
+    let busy = |session: &SessionEntry| shells.iter().any(|shell| shell.session_id == session.id && !shell.exited);
+    let stop = |session: &SessionEntry| stop_sessions_and_wait(&state, std::slice::from_ref(session));
+    match crate::session_ops::sweep_idle_quick_chats(app, days, &busy, &stop) {
+        Ok(removed) if !removed.is_empty() => log::info!("removed {} quick chat(s) idle for more than {days} day(s)", removed.len()),
+        Ok(_) => {}
+        Err(error) => log::warn!("quick chat retention: {error}"),
+    }
+    let orphans = crate::session_ops::remove_orphan_scratch(ORPHAN_SCRATCH_AGE);
+    if orphans > 0 {
+        log::info!("removed {orphans} scratch director(ies) no session uses");
+    }
+}
+
+/// What a session's scratch directory holds, for the delete confirmation.
+#[tauri::command]
+pub async fn quick_chat_scratch(session_id: String) -> CmdResult<crate::session_ops::QuickChatScratch> {
+    tauri::async_runtime::spawn_blocking(move || crate::session_ops::quick_chat_scratch(&session_id)).await.map_err(err)?
 }
 
 /// The sessions a workspace removal deleted or moved, and what became of
@@ -1496,10 +1691,25 @@ pub async fn fork_session(app: AppHandle, session_id: String, tab_id: String) ->
         // Claude can fork a conversation; Codex starts a new thread over the copied log.
         new_tab.fork_from = if tab.harness == "claude" { tab.provider_session_id.clone() } else { None };
         new_tab.provider_session_id = None;
+        // A quick chat's fork is a quick chat with a scratch directory of its
+        // own: sharing the parent's would have either one's deletion take the
+        // other's files. What the parent had there is copied, since the
+        // conversation refers to it.
+        let scratch = if src.is_quick() { Some(store::quick::create(&id).map_err(err)?) } else { None };
+        let in_scratch = src.is_quick() && store::quick::is_scratch(&src.id, &src.cwd);
+        if let (Some(scratch), true) = (&scratch, in_scratch) {
+            let _ = copy_dir(Path::new(&src.cwd), Path::new(scratch));
+            // The fork's CLI reopens the parent conversation from the new
+            // directory, and Claude Code looks for it under that directory's name.
+            if let (Some(parent), Some(projects)) = (new_tab.fork_from.as_deref(), crate::agent_data::claude_projects_root()) {
+                let _ = crate::harness::claude::transcript::rehome_in(&projects, &src.cwd, scratch, parent, true);
+            }
+        }
         let mut entry = SessionEntry {
             id: id.clone(),
-            project_path: src.project_path.clone(),
-            cwd: src.cwd.clone(),
+            kind: src.kind,
+            project_path: scratch.clone().unwrap_or_else(|| src.project_path.clone()),
+            cwd: if in_scratch { scratch.clone().unwrap_or_else(|| src.cwd.clone()) } else { src.cwd.clone() },
             worktree_name: None,
             branch: src.branch.clone(),
             base_ref: None,
@@ -1656,6 +1866,31 @@ pub async fn load_tab_events(state: State<'_, AppState>, session_id: String, tab
 }
 
 #[tauri::command]
+pub async fn session_share_create(state: State<'_, AppState>, session_id: String, settings: crate::local_sharing::LinkSettings, direct_only: bool) -> CmdResult<serde_json::Value> {
+    state.pairing.create_share(session_id, settings, direct_only).await.map_err(err)
+}
+#[tauri::command]
+pub fn session_share_status(state: State<'_, AppState>, session_id: String) -> CmdResult<serde_json::Value> {
+    state.pairing.share_status(&session_id).map_err(err)
+}
+#[tauri::command]
+pub fn session_share_change(state: State<'_, AppState>, session_id: String, action: String, params: serde_json::Value) -> CmdResult<serde_json::Value> {
+    state.pairing.change_share(&session_id, &action, params).map_err(err)
+}
+#[tauri::command]
+pub fn session_join_pending(state: State<'_, AppState>) -> Option<String> { state.pairing.pending_join() }
+#[tauri::command]
+pub async fn session_guest_join(state: State<'_, AppState>, link: String) -> CmdResult<serde_json::Value> {
+    state.pairing.join_guest(link).await.map_err(err)
+}
+#[tauri::command]
+pub fn session_guest_send(state: State<'_, AppState>, connection_id: String, request: serde_json::Value) -> CmdResult<()> {
+    state.pairing.guest_send(&connection_id, request).map_err(err)
+}
+#[tauri::command]
+pub fn session_guest_leave(state: State<'_, AppState>, connection_id: Option<String>) { state.pairing.leave_guest_connection(connection_id.as_deref()); }
+
+#[tauri::command]
 pub async fn send_message(
     state: State<'_, AppState>,
     session_id: String,
@@ -1799,6 +2034,7 @@ pub struct StatusBarPatch {
     pub resources: Option<bool>,
     pub percent: Option<crate::store::settings::StatusPercent>,
     pub usage_mode: Option<crate::store::settings::StatusUsageMode>,
+    pub usage_refresh_minutes: Option<u32>,
 }
 
 #[tauri::command]
@@ -1824,6 +2060,12 @@ pub fn set_status_bar_settings(app: AppHandle, patch: StatusBarPatch) -> CmdResu
     if let Some(value) = patch.usage_mode {
         settings.status_bar.usage_mode = value;
     }
+    if let Some(value) = patch.usage_refresh_minutes {
+        if !crate::store::settings::USAGE_REFRESH_MINUTES.contains(&value) {
+            return Err(format!("Usage cannot refresh every {value} minutes."));
+        }
+        settings.status_bar.usage_refresh_minutes = value;
+    }
     store::settings::save(&settings).map_err(err)?;
     crate::status::set_menu_checked(&app, settings.status_bar.visible);
     let _ = app.emit(crate::status::SETTINGS_EVENT, &settings.status_bar);
@@ -1840,17 +2082,19 @@ pub async fn status_usage_refresh(app: AppHandle, state: State<'_, AppState>, ma
     let status = state.status.clone();
     let manager = state.manager().ok_or("not ready")?;
     let manual = manual.unwrap_or(false);
+    // Read per request, so a changed interval governs the very next refresh.
+    let cadence = store::settings::load().status_bar.usage_refresh_ms();
     let publishing_app = app.clone();
     let publishing_manager = manager.clone();
     let failures = tauri::async_runtime::spawn_blocking(move || {
         let mut failures = Vec::new();
-        if let Err(error) = status.usage.refresh_claude(manual) {
+        if let Err(error) = status.usage.refresh_claude(manual, cadence) {
             failures.push(format!("Claude usage refresh: {error:#}"));
         }
         // Publish Claude as soon as its source settles; starting Codex's
         // app-server must not hold a confirmed Claude rollover off-screen.
         let _ = publishing_app.emit(crate::status::usage::EVENT, publishing_manager.usage_snapshot());
-        if let Err(error) = status.usage.refresh_codex(manual) {
+        if let Err(error) = status.usage.refresh_codex(manual, cadence) {
             failures.push(format!("Codex usage refresh: {error:#}"));
         }
         failures
@@ -2040,10 +2284,38 @@ pub fn gh_available() -> bool {
 
 // ------------------------------------------------------------------ terminals
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-pub fn pty_spawn(app: AppHandle, state: State<'_, AppState>, id: String, cwd: String, cols: u16, rows: u16, command: Option<String>) -> CmdResult<()> {
+pub fn pty_spawn(app: AppHandle, state: State<'_, AppState>, id: String, cwd: String, cols: u16, rows: u16, command: Option<String>, title: Option<String>) -> CmdResult<()> {
     let spec = crate::pty::PaneSpec { cwd: &cwd, cols: cols.max(2), rows: rows.max(1), command: command.as_deref(), env: &[] };
-    state.terminals.spawn(std::sync::Arc::new(app), &id, spec).map_err(err)
+    state.terminals.spawn(std::sync::Arc::new(app.clone()), &id, spec).map_err(err)?;
+    if let Some(title) = title.as_deref().filter(|title| !title.trim().is_empty()) {
+        state.terminals.set_title(&id, title);
+    }
+    // A shell tab is every window's to list, not only the one that opened it.
+    if let Some(shell) = state.terminals.shell(&id) {
+        let _ = app.emit(PTY_OPENED_EVENT, &shell);
+    }
+    Ok(())
+}
+
+pub(crate) const PTY_OPENED_EVENT: &str = "pty_opened";
+pub(crate) const PTY_CLOSED_EVENT: &str = "pty_closed";
+pub(crate) const PTY_RENAMED_EVENT: &str = "pty_renamed";
+
+/// The shell tabs that are open, in every session: a window loaded after
+/// they were opened (the floating one, a reload) lists them from this.
+#[tauri::command]
+pub fn pty_shells(state: State<'_, AppState>) -> Vec<crate::pty::ShellPane> {
+    state.terminals.shells()
+}
+
+#[tauri::command]
+pub fn pty_rename(app: AppHandle, state: State<'_, AppState>, id: String, title: String) {
+    state.terminals.set_title(&id, &title);
+    if let Some(shell) = state.terminals.shell(&id) {
+        let _ = app.emit(PTY_RENAMED_EVENT, &shell);
+    }
 }
 
 #[tauri::command]
@@ -2061,8 +2333,8 @@ pub async fn pty_write(state: State<'_, AppState>, id: String, data: String) -> 
 /// scrollback so far first. No base64, no JSON, and no other listener hears it.
 /// `token` names this attachment in the acknowledgements and the detach that follow.
 #[tauri::command]
-pub fn pty_attach(state: State<'_, AppState>, id: String, token: String, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) {
-    state.terminals.attach(&id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok()));
+pub fn pty_attach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) {
+    state.terminals.attach(window.label(), &id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok()));
 }
 
 /// The window has drawn `drawn` bytes of the pane's output since it attached (flow control).
@@ -2072,9 +2344,10 @@ pub fn pty_ack(state: State<'_, AppState>, id: String, token: String, drawn: u64
 }
 
 /// A freshly loaded window: whatever its previous page was shown is gone.
+/// Only this window's views: another window goes on showing its terminals.
 #[tauri::command]
-pub fn pty_detach_all(state: State<'_, AppState>) {
-    state.terminals.detach_all();
+pub fn pty_detach_all(window: tauri::WebviewWindow, state: State<'_, AppState>) {
+    state.terminals.detach_window(window.label());
 }
 
 #[tauri::command]
@@ -2096,8 +2369,15 @@ pub fn mobile_terminal_drivers(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn pty_kill(state: State<'_, AppState>, id: String) {
+pub fn pty_kill(app: AppHandle, state: State<'_, AppState>, id: String) {
+    // By its name, not by whether it is still running: a shell whose process
+    // has already gone is still a tab in the other window, to be dropped there.
+    let shell = crate::pty::is_shell_id(&id);
     state.terminals.kill(&id);
+    // Closed for everyone: the other window drops its tab for it too.
+    if shell {
+        let _ = app.emit(PTY_CLOSED_EVENT, &id);
+    }
 }
 
 /// The webview's answer to a `terminal_perf_request` event.
@@ -2541,22 +2821,39 @@ mod command_tests {
     // PRO-79: the app's own confirmation before a local sign-in is uploaded.
     #[test]
     fn the_local_sign_in_confirmation_names_the_organization_the_account_and_the_expiry() {
-        use crate::cloud_workspaces::AgentLoginKind;
-        let text = super::local_login_confirmation("Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", None);
+        use crate::cloud_workspaces::{AgentLoginKind, AgentLoginReach};
+        let new = AgentLoginReach::ServiceDefault;
+        let text = super::local_login_confirmation("Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", None, &new);
         assert!(text.starts_with("Organization: Acme Robotics\nAccount (as Claude Code on this Mac records it): ada@example.com\n"));
         assert!(!text.contains("REPLACES") && !text.contains("sign out of Claude Code"));
         // Review of #293: replacing a stored login is said, in the dialog too.
-        let replacing = super::local_login_confirmation("Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", Some(AgentLoginKind::ApiKey));
+        let replacing = super::local_login_confirmation("Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", Some(AgentLoginKind::ApiKey), &new);
         assert!(replacing.contains("THIS REPLACES the API key now stored for Claude Code in Acme Robotics"));
         assert!(replacing.contains("agents in every workspace of the organization stop"));
-        assert!(super::local_login_confirmation("Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument)).contains("THIS REPLACES the login now stored"));
+        assert!(super::local_login_confirmation("Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument), &new).contains("THIS REPLACES the login now stored"));
+        // Review of #293: the API-key and the sign-in dialogs say it too.
+        assert_eq!(super::replacement_notice("Claude Code", "Acme", Some(AgentLoginKind::ApiKey)), "THIS REPLACES the API key now stored for Claude Code in Acme.\n\n");
+        assert_eq!(super::replacement_notice("Cursor", "Acme", Some(AgentLoginKind::LoginDocument)), "THIS REPLACES the login now stored for Cursor in Acme.\n\n");
+        assert_eq!(super::replacement_notice("Cursor", "Acme", None), "");
         // The expiry is stored as a UTC time, and dialog text is cleaned.
         assert_eq!(super::lent_identity(Some("ada@example.com"), 1_790_000_000_000), "ada@example.com · lent until 2026-09-21T14:13:20Z");
         assert_eq!(super::dialog_text(" Acme\u{202E}\n Robotics "), "Acme Robotics");
         assert!(text.contains("stops working on 3 Oct 2026, 21:40"));
         assert!(text.contains("The refresh token stays on this Mac"));
-        assert!(text.contains("every member's workspaces"));
-        assert!(text.contains("anyone who can drive one of those workspaces can read the token"));
+        // A new login: every member's workspaces, said as the service's default.
+        assert!(text.contains("By default, agents in every member's cloud workspaces of the organization may run on it"));
+        // Review of #429: a login narrowed to managers keeps that scope when it is replaced, and no dialog says otherwise.
+        let narrowed = AgentLoginReach::Kept("managers".into());
+        let kept = super::local_login_confirmation("Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument), &narrowed);
+        assert!(kept.contains("This keeps who can use the login now: only workspaces that nobody but owners and admins can drive."));
+        assert!(!kept.contains("every member"));
+        let code = super::claude_code_prompt("Acme", Some(AgentLoginKind::LoginDocument), &narrowed);
+        assert!(code.starts_with("THIS REPLACES the login now stored for Claude Code in Acme.\n\nPaste the code"));
+        assert!(code.ends_with("This keeps who can use the login now: only workspaces that nobody but owners and admins can drive."));
+        assert!(!code.contains("every member"));
+        let first = super::claude_code_prompt("Acme", None, &new);
+        assert!(first.starts_with("Paste the code") && first.contains("By default, agents in every member's cloud workspaces"));
+        assert!(text.contains("Anyone who can drive one of those workspaces can read the token"));
         assert!(text.contains("the service refuses while a workspace still uses the login"));
     }
     use crate::session_ops::{
@@ -2594,7 +2891,7 @@ mod command_tests {
     fn folder_sessions_and_workspaces_survive_reload_without_git() {
         let _home = crate::store::temp_home();
         let dir = tempfile::tempdir().unwrap();
-        let project = super::add_project(dir.path().to_string_lossy().into_owned()).unwrap();
+        let project = crate::store::projects::add(&dir.path().to_string_lossy()).unwrap();
         assert_eq!(project.kind, crate::store::projects::ProjectKind::Folder);
         let workspaces = crate::workspaces::list(dir.path()).unwrap();
         assert_eq!(workspaces.len(), 1);
@@ -2613,7 +2910,7 @@ mod command_tests {
             assert_eq!(crate::store::index::get(&session.id).unwrap().cwd, project.path);
         }
         assert_eq!(super::list_projects().unwrap().projects, vec![project.clone()]);
-        assert_eq!(super::add_project(format!("{}/", project.path)).unwrap().path, project.path);
+        assert_eq!(crate::store::projects::add(&format!("{}/", project.path)).unwrap().path, project.path);
         assert_eq!(super::list_projects().unwrap().projects.len(), 1);
         assert!(!dir.path().join(".git").exists());
         assert!(!dir.path().join(".raccoon").exists());
@@ -2627,7 +2924,7 @@ mod command_tests {
         let file = dir.path().join("file");
         std::fs::write(&file, "hello").unwrap();
         for target in [&file, &dir.path().join("missing")] {
-            assert!(super::add_project(target.to_string_lossy().into_owned()).is_err());
+            assert!(crate::store::projects::add(&target.to_string_lossy()).is_err());
             assert!(crate::workspaces::list(target).is_err());
             for override_cwd in [false, true] {
                 let req = serde_json::from_value(serde_json::json!({
@@ -2896,6 +3193,7 @@ mod command_tests {
         });
         let removed = crate::store::index::SessionEntry {
             id: "removed-session".into(),
+            kind: crate::store::index::SessionKind::Project,
             project_path: "/repo".into(),
             cwd: "/repo/.raccoon/worktrees/gone".into(),
             worktree_name: Some("gone".into()),
@@ -2942,8 +3240,10 @@ mod command_tests {
 // ------------------------------------------------------------------ projects & workspaces
 
 #[tauri::command]
-pub fn update_project(path: String, patch: projects::ProjectPatch) -> CmdResult<Project> {
-    projects::update(&path, patch).map_err(err)
+pub fn update_project(app: AppHandle, path: String, patch: projects::ProjectPatch) -> CmdResult<Project> {
+    let project = projects::update(&path, patch).map_err(err)?;
+    let _ = app.emit(PROJECTS_CHANGED_EVENT, &());
+    Ok(project)
 }
 
 /// Copy a chosen image into the store so the project keeps it even if the
@@ -3005,6 +3305,64 @@ pub async fn remove_leftovers(app: AppHandle, ids: Vec<String>) -> CmdResult<cra
     .map_err(err)?
 }
 
+/// Run `f` with what the worktree clean-up reads about this machine: the
+/// open projects, and what is running now (asked again at every check).
+fn with_cleanup_host<R>(state: &crate::AppState, f: impl FnOnce(&crate::worktree_cleanup::Host<'_>) -> R) -> CmdResult<R> {
+    let (all, _) = projects::list().map_err(err)?;
+    let (open, archived): (Vec<Project>, Vec<Project>) = all.into_iter().partition(|project| !project.archived);
+    // An archived project is not cleaned, and its folder is not removable either.
+    let protected: Vec<std::path::PathBuf> = archived.iter().map(|project| std::path::PathBuf::from(&project.path)).collect();
+    let manager = state.manager();
+    let running = |session: &str, tab: &str| manager.as_ref().is_some_and(|manager| manager.is_running(session, tab)) || state.host.is_live(&format!("{session}/{tab}"));
+    let live = |sessions: &[SessionEntry]| crate::worktree_cleanup::Live::observe(&state.terminals, sessions, &running);
+    Ok(f(&crate::worktree_cleanup::Host { projects: &open, protected: &protected, confine: None, live: &live, fetch: crate::landed::Fetch::Fresh }))
+}
+
+/// Every worktree of the open projects on this machine with whether the
+/// clean-up may remove it, and why not. Reads only.
+#[tauri::command]
+pub async fn worktree_cleanup_scan(app: AppHandle, project_paths: Option<Vec<String>>) -> CmdResult<Vec<crate::worktree_cleanup::ProjectScan>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        with_cleanup_host(&state, |host| crate::worktree_cleanup::scan(host, project_paths.as_deref()).map_err(err))?
+    })
+    .await
+    .map_err(err)?
+}
+
+/// What removing one worktree would free. `None` when `job` was cancelled.
+#[tauri::command]
+pub async fn worktree_cleanup_size(app: AppHandle, job: String, project_path: String, path: String) -> CmdResult<Option<u64>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        with_cleanup_host(&state, |host| crate::worktree_cleanup::estimate_size(host, crate::worktree_cleanup::SizeJobs::global(), &format!("local:{job}"), &project_path, &path).map_err(err))?
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Stop the size estimates whose job id starts with `prefix`.
+#[tauri::command]
+pub fn worktree_cleanup_cancel_sizes(prefix: String) {
+    crate::worktree_cleanup::SizeJobs::global().cancel(&format!("local:{prefix}"));
+}
+
+/// Remove the worktrees the person confirmed. Each is checked again on the
+/// spot; one that changed, is in use or is protected is left and reported.
+#[tauri::command]
+pub async fn worktree_cleanup_remove(app: AppHandle, items: Vec<crate::worktree_cleanup::RemoveItem>) -> CmdResult<Vec<crate::worktree_cleanup::ItemResult>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        let results = with_cleanup_host(&state, |host| crate::worktree_cleanup::remove(host, &app, &items))?;
+        for done in results.iter().filter(|done| matches!(done.outcome, crate::worktree_cleanup::Outcome::Removed | crate::worktree_cleanup::Outcome::AlreadyRemoved)) {
+            state.browser.forget_workspace(&crate::browser::control::canonical(&done.path));
+        }
+        Ok(results)
+    })
+    .await
+    .map_err(err)?
+}
+
 /// What a workspace takes on disk. Asked for one workspace at a time, after
 /// the list is shown, because walking a large checkout takes a while.
 #[tauri::command]
@@ -3044,23 +3402,7 @@ pub async fn rename_workspace(app: AppHandle, project_path: String, path: String
 /// many sessions (and transcripts) would go with it.
 #[tauri::command]
 pub async fn workspace_disposition(project_path: String, path: String, fetch: Option<bool>) -> CmdResult<crate::workspaces::WorkspaceDisposition> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut disposition = crate::workspaces::disposition(Path::new(&project_path), Path::new(&path));
-        // The fetch is for the dialog that is about to delete the workspace,
-        // which asks for it. Everything else that reads the disposition (the
-        // pull request panel does so every 30 seconds) stays off the network
-        // and gets no clean-and-merged verdict at all.
-        // A folder that is not on disk gets a verdict too ("cannot be
-        // checked"), so the dialog can ask about it rather than wave it through.
-        if fetch == Some(true) && !disposition.is_main {
-            disposition.landed = Some(crate::landed::check(Path::new(&project_path), Path::new(&path), crate::landed::Fetch::Fresh));
-        }
-        let sessions = sessions_in_workspace(Path::new(&path))?;
-        disposition.sessions = sessions.len();
-        disposition.session_ids = sessions.iter().map(|session| session.id.clone()).collect();
-        disposition.session_titles = sessions.into_iter().map(|session| session.title).collect();
-        Ok(disposition)
-    })
+    tauri::async_runtime::spawn_blocking(move || crate::session_ops::workspace_disposition(Path::new(&project_path), Path::new(&path), fetch == Some(true)))
     .await
     .map_err(err)?
 }

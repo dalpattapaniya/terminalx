@@ -16,6 +16,11 @@ TerminalX brings no compute of its own: it drives the `claude` and `codex` CLIs 
 - **Sessions are worktrees.** Creating a session creates a branch and a
   checkout under `.raccoon/worktrees/`; settling one offers to remove it, and
   deleting is guarded by unpushed commits and open pull requests.
+- **Quick chats need no project.** A floating chat window opens from any app
+  with a system-wide shortcut (⌥⇧Space, changeable) for a question or a
+  one-off command. Each quick chat runs in a scratch folder of its own and is
+  a full session; move it into a project when it turns into real work. See
+  [docs/FLOATING-WINDOW.md](docs/FLOATING-WINDOW.md).
 - **Chat and terminal are the same process.** Switch views mid-turn; nothing is
   resumed or reconciled.
 - **Permission cards and status from the CLI's own hooks** — approvals asked in
@@ -76,7 +81,7 @@ app. The outbound connections are these nine:
 | TerminalX cloud API | Signed in with an organization, when you open organization settings or cloud workspaces, or act on them | Organization, member, compute, provider-connection, GitHub App, workspace and diagnostics requests to `login.terminalx.ai` under `/v1/desktop/orgs/…`, authorized with your account session |
 | GitHub | You open the Issues view or a PR panel, or become eligible for the local star reminder | Uses your existing `gh` credentials; the reminder checks only whether you starred `terminalx-ai/raccoon`. It stars only when you press **Star on GitHub**; **Open GitHub** opens that repository in your system browser |
 | Linear | You open the Issues view with a Linear key configured | A GraphQL query to `api.linear.app`, authorized with the key you pasted |
-| Anthropic usage | The focused status bar lacks a Claude model limit, no more than once every 15 minutes | A GET to `api.anthropic.com/api/oauth/usage`, authorized with the OAuth token Claude Code already stores; no prompts, transcripts or files |
+| Anthropic usage | While the status bar shows usage and the window is on screen, at the **Usage auto-refresh interval** in Settings (one minute by default; Off leaves returning to the app, Refresh and window resets), and less often while Anthropic asks the app to wait | A GET to `api.anthropic.com/api/oauth/usage`, authorized with the OAuth token Claude Code already stores; no prompts, transcripts or files |
 | Hugging Face | You press Download on a transcription model | A plain GET for the weights, at a pinned revision |
 | The update endpoint | You press "Check for updates" | The current version and your channel |
 
@@ -197,6 +202,10 @@ All of them, in full:
   and paired-device records containing credential hashes rather than credentials.
   Created `0700`; the account session, host private key and device credentials
   remain in macOS Keychain.
+- **`$TERMINALX_HOME/quick/<session id>/`** — the scratch folder of a quick
+  chat: where its agents and terminals run when it has no project. It is
+  removed when the chat is deleted, and after the retention period you set
+  for idle quick chats (30 days by default).
 - **`<repo>/.raccoon/worktrees/`** — inside your repository, but outside your
   working tree: the checkouts sessions run in.
 

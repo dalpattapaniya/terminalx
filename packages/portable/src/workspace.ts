@@ -35,11 +35,16 @@ export const WORKSPACE_PROTOCOL = "terminalx-workspace-rpc/1";
  *   private previews (docs/CLOUD-PREVIEWS.md): `listPorts` here; the streams
  *   themselves are carried by the desktop's native forwarder;
  * - `mirror/1` (PRO-25): `mirror.manifest`, the files a desktop may copy
- *   into its local mirror of the workspace.
+ *   into its local mirror of the workspace;
+ * - `cleanup/1`: the bulk worktree clean-up. The runtime inspects and removes
+ *   its own worktrees; this client only names them;
+ * - `workspace/1`: one session's worktree, for the removal dialog:
+ *   `workspace.disposition` and `workspace.remove`. The worktree is named by
+ *   its session, never by a path.
  * An older runtime grants none of them; check `hasCapability` before offering
  * the matching action.
  */
-export const WORKSPACE_CAPABILITIES = ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1"] as const;
+export const WORKSPACE_CAPABILITIES = ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1", "cleanup/1", "workspace/1"] as const;
 export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number];
 
 /**
@@ -86,6 +91,8 @@ export const MUTATING_METHODS = new Set([
   "session.update",
   "session.addTab",
   "session.delete",
+  "cleanup.remove",
+  "workspace.remove",
   "pty.create",
   "fs.write",
   "fs.writePart",
@@ -149,9 +156,14 @@ export interface AgentTabInfo {
   tabId: string;
   title: string | null;
   harness: string;
+  /** What the agent is running. */
   model: string;
   effort: string | null;
+  /** Asked for and not confirmed by the agent yet; absent from a runtime that does not track it. */
+  requestedModel?: string | null;
+  requestedEffort?: string | null;
   permissionMode: string;
+  requestedPermissionMode?: string | null;
   status: AgentTabStatus;
   process: AgentProcessState;
   pendingPermissions: { requestId: string; toolName: string; input: unknown; options: unknown[] }[];
@@ -182,6 +194,73 @@ export interface RuntimeSessionTab {
   status: AgentTabStatus;
   created: string;
   modified: string;
+}
+
+/** `workspace.remove`: the sessions that went with the worktree, and what became of its branch. */
+export interface RuntimeWorkspaceRemoved {
+  deleted: string[];
+  keptBranch?: string | null;
+  rescuedBranch?: string | null;
+}
+
+/** What the clean-up decided about one worktree (`worktree_cleanup.rs`). */
+export type CleanupVerdict = "eligible" | "ignoredData" | "protected" | "active" | "inProgress" | "dirty" | "unpushed" | "unverifiable";
+
+export interface CleanupSession {
+  id: string;
+  title: string;
+  modified: string;
+  /** What it is doing now, when it is doing anything. */
+  live: string | null;
+}
+
+/** One worktree on the host that was scanned. Its paths are that host's. */
+export interface CleanupCandidate {
+  projectPath: string;
+  path: string;
+  name: string;
+  branch: string | null;
+  head: string | null;
+  managed: boolean;
+  verdict: CleanupVerdict;
+  /** Why it is not eligible; null when it is. */
+  reason: string | null;
+  lastActivity: string | null;
+  sessions: CleanupSession[];
+  /** Ignored build and dependency output that goes with it. */
+  disposable: string[];
+  /** Ignored entries that may be local data. */
+  ignoredData: string[];
+  /** Stands for what was shown; a removal is refused when it no longer holds. */
+  token: string;
+}
+
+export interface CleanupProject {
+  path: string;
+  name: string;
+  note: string | null;
+  candidates: CleanupCandidate[];
+}
+
+export interface CleanupRemoveItem {
+  projectPath: string;
+  path: string;
+  token: string;
+  /** Also delete the conversations of the sessions in it. */
+  deleteSessions?: boolean;
+  /** Remove it although it holds ignored local files. */
+  acceptIgnored?: boolean;
+}
+
+export interface CleanupResult {
+  projectPath: string;
+  path: string;
+  outcome: "removed" | "alreadyRemoved" | "skipped" | "failed";
+  reason: string | null;
+  freedBytes: number;
+  keptBranch: string | null;
+  sessionsKept: string[];
+  sessionsDeleted: string[];
 }
 
 /**
@@ -815,6 +894,52 @@ export class WorkspaceRpcClient {
       ...(options.removeWorktree ? { removeWorktree: true } : {}),
       ...(options.confirmedUnsafe ? { confirmedUnsafe: true } : {}),
     });
+  }
+
+  /** `cleanup.scan`: the workspace's worktrees with what the clean-up may do with each (`cleanup/1`, manage only). Reads only. */
+  async scanCleanup(): Promise<CleanupProject[]> {
+    const result = await this.call<{ projects?: CleanupProject[] }>("cleanup.scan");
+    return result.projects ?? [];
+  }
+
+  /** `cleanup.size`: what removing one worktree would free; null when cancelled. */
+  async cleanupSize(job: string, projectPath: string, path: string): Promise<number | null> {
+    const result = await this.call<{ bytes?: number | null }>("cleanup.size", { job, projectPath, path });
+    return typeof result.bytes === "number" ? result.bytes : null;
+  }
+
+  /** `cleanup.cancel`: stop this connection's size estimates. */
+  async cancelCleanupSizes(): Promise<void> {
+    await this.call("cleanup.cancel", {});
+  }
+
+  /**
+   * `cleanup.remove`: remove the named worktrees. The runtime inspects each
+   * again and leaves alone whatever is not what its token stands for.
+   */
+  async removeCleanup(items: CleanupRemoveItem[]): Promise<CleanupResult[]> {
+    const result = await this.mutate<{ results?: CleanupResult[] }>("cleanup.remove", { items });
+    return result.results ?? [];
+  }
+
+  /**
+   * `workspace.disposition`: where the checkout a session runs in stands
+   * (`workspace/1`, manage only). `fetch` asks for the clean-and-merged
+   * verdict the removal dialog shows; without it the read stays quick. The
+   * answer is the desktop's `WorkspaceDisposition`, which this package only carries.
+   */
+  async workspaceDisposition<T = Record<string, unknown>>(sessionId: string, options: { fetch?: boolean } = {}): Promise<T> {
+    const result = await this.call<{ disposition: T }>("workspace.disposition", { sessionId, ...(options.fetch ? { fetch: true } : {}) });
+    return result.disposition;
+  }
+
+  /**
+   * `workspace.remove`: remove the worktree a session runs in, with every
+   * session in it. The runtime checks it again and removes one that is not
+   * clean and merged only with the digest of the check that was shown.
+   */
+  async removeSessionWorkspace(sessionId: string, options: { deleteBranch: boolean; confirmedDigest: string | null; expectedSessions: string[] }): Promise<RuntimeWorkspaceRemoved> {
+    return this.mutate<RuntimeWorkspaceRemoved>("workspace.remove", { sessionId, ...options });
   }
 
   /** The agents installed on the runtime, with their models, efforts and modes (`agents/1`). */

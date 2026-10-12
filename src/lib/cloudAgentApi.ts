@@ -79,7 +79,11 @@ export interface Projection {
   harness: string;
   model: string;
   effort: string | null;
+  /** Asked for and not running yet; absent when nothing is waiting, and from older runtimes. */
+  requestedModel?: string | null;
+  requestedEffort?: string | null;
   permissionMode: string;
+  requestedPermissionMode?: string | null;
   status: AgentTabStatus;
   process: AgentProcessState;
   events: AgentEvent[];

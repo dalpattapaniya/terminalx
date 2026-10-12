@@ -16,7 +16,7 @@ import { AgentMark } from "@/components/AgentMark";
 import { cn } from "@/lib/cn";
 import { useShortcutKeycaps } from "@/lib/hotkeys";
 import { matchesShortcut } from "@/lib/shortcuts";
-import { EFFORT_LABEL, PERMISSION_MODES, aliasRuns, modeLabel, modelForTab, modelGroups, modelNote, prettyModelId, runningModelName, useModels } from "@/lib/models";
+import { EFFORT_LABEL, PERMISSION_MODES, aliasRuns, modeIsUnguarded, modeLabel, modelForTab, modelGroups, modelNote, pendingSettingsNote, pickerMode, prettyModelId, runningModelName, useModels } from "@/lib/models";
 import { usePickerModels } from "@/lib/cloudModels";
 import type { WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import { chooseMode } from "@/lib/dialogs";
@@ -73,6 +73,9 @@ const MAX_HEIGHT = 240;
 const NO_HISTORY: string[] = [];
 /** The least of its label the permission picker shows: about a first word ("Bypass…"). With less room it shows none. */
 const PERMISSION_LABEL_MIN_CHARS = 9;
+
+/** A one-click next step above the input. */
+export type Handoff = { label: string; prompt: string } | { label: string; run: () => void };
 
 /**
  * The composer inside a session. Enter sends, Shift+Enter breaks a line.
@@ -136,8 +139,8 @@ export function Composer({
   /** The workspace that supplies cloud model choices, while connected. */
   modelClient?: WorkspaceRpcClient | null;
   contextMax?: number;
-  /** Next-step prompts offered after a turn lands (commit, PR, run). */
-  handoffs?: { label: string; prompt: string }[];
+  /** One-click next steps above the input: a prompt put in the composer for the reader to send, or (`run`) something the app does itself. */
+  handoffs?: Handoff[];
   disabledReason?: string | null;
   /** Nothing can be typed or sent (shown with `disabledReason`); stopping stays with the owner. */
   disabled?: boolean;
@@ -419,8 +422,14 @@ export function Composer({
   const modelName = model ? runningModelName(model, reportedModel) : tab.model ? prettyModelId(tab.model) : "Model";
   const runs = model ? aliasRuns(model, reportedModel) : null;
   const effortName = tab.effort && model?.efforts.length ? (EFFORT_LABEL[tab.effort] ?? tab.effort) : null;
+  // A level the agent reported that this model's list does not carry is still the one in use.
+  const efforts = model?.efforts.length && tab.effort && !model.efforts.includes(tab.effort) ? [...model.efforts, tab.effort] : (model?.efforts ?? []);
+  // The pickers show what the agent is running. A choice it has not confirmed yet is said beside them, not shown as made.
+  const pendingNote = pendingSettingsNote(tab, models, busy);
   const modelTitle = `Model: ${model?.alias ? `${model.label} (latest${runs ? `, running ${prettyModelId(runs)}` : ""})` : modelName}${effortName ? ` · ${effortName}` : ""}`;
   const permissionLabel = modeLabel(tab.permissionMode);
+  // The picker's own id for the tab's mode; none when the agent reported one the picker does not offer (#417).
+  const pickedMode = pickerMode(tab.permissionMode)?.id;
   const pct = contextUsed && contextMax ? Math.min(100, Math.round((contextUsed / contextMax) * 100)) : null;
 
   return (
@@ -453,6 +462,7 @@ export function Composer({
                 key={h.label}
                 type="button"
                 onClick={() => {
+                  if ("run" in h) return h.run();
                   onDraftChange(h.prompt);
                   requestAnimationFrame(() => ref.current?.focus({ preventScroll: true }));
                 }}
@@ -533,7 +543,7 @@ export function Composer({
                     {group.title ? <DropdownMenuLabel className="pt-2">{group.title}</DropdownMenuLabel> : null}
                     {group.models.map((m) => {
                       // The ticked alias says what this session reported; the rest, what the CLI listed.
-                      const note = m.id === model?.id && runs ? `latest · ${prettyModelId(runs)}` : modelNote(m, models);
+                      const note = m.id === tab.requestedModel ? "switching…" : m.id === model?.id && runs ? `latest · ${prettyModelId(runs)}` : modelNote(m, models);
                       return (
                         <DropdownMenuRadioItem key={m.id} value={m.id} disabled={!modelsAreLocal && !listed.some((choice) => choice.id === m.id)}>
                           {m.label}
@@ -544,14 +554,15 @@ export function Composer({
                   </Fragment>
                 ))}
               </DropdownMenuRadioGroup>
-              {model?.efforts.length ? (
+              {model && efforts.length ? (
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuLabel>Effort</DropdownMenuLabel>
                   <DropdownMenuRadioGroup value={tab.effort ?? model.defaultEffort ?? ""} onValueChange={(v) => onSetEffort(v)}>
-                    {model.efforts.map((e) => (
+                    {efforts.map((e) => (
                       <DropdownMenuRadioItem key={e} value={e}>
                         {EFFORT_LABEL[e] ?? e}
+                        {e === tab.requestedEffort ? <span className="ml-1.5 text-faint">switching…</span> : null}
                       </DropdownMenuRadioItem>
                     ))}
                   </DropdownMenuRadioGroup>
@@ -571,7 +582,7 @@ export function Composer({
                 <span
                   className={cn(
                     "size-2 shrink-0 rounded-full",
-                    tab.permissionMode === "bypassPermissions" ? "bg-destructive" : tab.permissionMode === "plan" ? "bg-info" : "bg-add",
+                    modeIsUnguarded(tab.permissionMode) ? "bg-destructive" : pickedMode === "plan" ? "bg-info" : "bg-add",
                   )}
                 />
                 <span className="flex h-5 min-w-0 flex-wrap content-start overflow-hidden leading-5">
@@ -586,10 +597,20 @@ export function Composer({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-[16rem]">
               <DropdownMenuLabel>Permissions</DropdownMenuLabel>
-              <DropdownMenuRadioGroup value={tab.permissionMode} onValueChange={(v) => chooseMode(tab.harness, v, onSetMode)}>
+              <DropdownMenuRadioGroup value={pickedMode ?? tab.permissionMode} onValueChange={(v) => chooseMode(tab.harness, v, onSetMode)}>
+                {/* A mode set in the terminal that the picker does not offer is still the one in force. */}
+                {!pickedMode && (
+                  <DropdownMenuRadioItem value={tab.permissionMode} className="flex-col items-start gap-0" data-testid="permission-mode-reported">
+                    <span>{permissionLabel}</span>
+                    <span className="text-[11px] text-faint">Set in the terminal.</span>
+                  </DropdownMenuRadioItem>
+                )}
                 {PERMISSION_MODES.map((m) => (
                   <DropdownMenuRadioItem key={m.id} value={m.id} className="flex-col items-start gap-0">
-                    <span>{m.label}</span>
+                    <span>
+                      {m.label}
+                      {m.id === tab.requestedPermissionMode ? <span className="ml-1.5 text-faint">switching…</span> : null}
+                    </span>
                     <span className="text-[11px] text-faint">{m.hint}</span>
                   </DropdownMenuRadioItem>
                 ))}
@@ -638,6 +659,11 @@ export function Composer({
           </div>
         </div>
       </div>
+      {pendingNote && (
+        <div className="mt-1.5 px-2 text-[11px] text-muted-foreground" role="status" data-testid="composer-settings-pending">
+          {pendingNote}
+        </div>
+      )}
       {settingsNote && (
         <div className={cn("mt-1.5 px-2 text-[11px]", settingsNoteWarning ? "text-warning" : "text-muted-foreground")} role="status" data-testid="composer-settings-note">
           {settingsNote}

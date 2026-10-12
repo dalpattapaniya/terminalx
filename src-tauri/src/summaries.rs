@@ -471,7 +471,7 @@ mod tests {
             harness: "claude".into(),
             title: None,
             model: String::new(),
-            effort: None,
+            effort: None, requested_model: None, requested_effort: None, requested_permission_mode: None,
             permission_mode: "auto".into(),
             provider_session_id: None,
             status,
@@ -488,6 +488,7 @@ mod tests {
     fn a_session(id: &str, tabs: Vec<TabEntry>) -> SessionEntry {
         SessionEntry {
             id: id.into(),
+            kind: crate::store::index::SessionKind::Project,
             project_path: "/p".into(),
             cwd: "/p".into(),
             worktree_name: None,

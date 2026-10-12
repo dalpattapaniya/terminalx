@@ -36,11 +36,21 @@ const HELP: &str = r#"terminalx — control a running TerminalX app
 Usage:
   terminalx status [--json]
   terminalx projects list [--json]
-  terminalx sessions list [--project PROJECT] [--json]
+  terminalx sessions list [--project PROJECT|--quick] [--json]
   terminalx sessions create --project PROJECT --agent AGENT --prompt TEXT
       [--title TEXT] [--name NAME]
       [--worktree|--on-main] [--model MODEL] [--effort EFFORT] [--mode MODE] [--json]
+  terminalx sessions create --quick --agent AGENT --prompt TEXT
+      [--title TEXT] [--cwd DIRECTORY] [--model MODEL] [--effort EFFORT] [--mode MODE] [--json]
+  terminalx floating show|hide|toggle [--session SESSION] [--json]
   terminalx sessions show SESSION [--json]
+  terminalx share create SESSION [--read-only] [--people EMAIL,EMAIL]
+      [--expires-in SECONDS] [--approve] [--can-approve] [--max-people COUNT]
+      [--single-use] [--local-only] [--json]
+  terminalx share list SESSION [--json]
+  terminalx share edit SESSION LINK --settings JSON [--json]
+  terminalx share revoke SESSION LINK [--keep-guests] [--json]
+  terminalx share stop SESSION [--json]
   terminalx sessions rename SESSION --title TEXT [--json]
   terminalx tabs list SESSION [--json]
   terminalx send SESSION_OR_TAB TEXT [--json]
@@ -308,6 +318,15 @@ fn parse_with_stdin(
         }
         "cloud" => parse_cloud(&mut tokens),
         "sessions" => parse_sessions(&mut tokens),
+        "floating" => {
+            let action = tokens.required_front("floating command")?;
+            if !matches!(action.as_str(), "show" | "hide" | "toggle") {
+                return Err(invalid(format!("Unknown floating command {action}. Use show, hide or toggle.")));
+            }
+            let session = tokens.option("--session")?;
+            rpc(&format!("floating.{action}"), json!({"session": session}), &mut tokens)
+        }
+        "share" => parse_share(&mut tokens),
         "tabs" => {
             expect_word(&mut tokens, "list", "tabs")?;
             let session = tokens.required_front("session")?;
@@ -392,16 +411,51 @@ fn parse_with_stdin(
     Ok(Parsed { json, action })
 }
 
+fn parse_share(tokens: &mut Tokens) -> Result<Action, ControlError> {
+    let action = tokens.required_front("share action")?;
+    let session = tokens.required_front("session")?;
+    let mut params = json!({ "sessionId": session });
+    match action.as_str() {
+        "create" => {
+            let role = if tokens.flag("--read-only")? { "viewer" } else { "driver" };
+            let people = tokens.option("--people")?;
+            let lifetime = tokens.option_u64("--expires-in")?.unwrap_or(3600);
+            params["directOnly"] = json!(tokens.flag("--local-only")?);
+            params["settings"] = json!({
+                "audience": if people.is_some() { "people" } else { "anyone" }, "role": role,
+                "people": people.map(|list| list.split(',').map(|email| json!({ "email": email, "role": role })).collect::<Vec<_>>()).unwrap_or_default(),
+                "expiresAt": chrono::Utc::now().timestamp_millis().saturating_add(i64::try_from(lifetime.saturating_mul(1000)).unwrap_or(i64::MAX)),
+                "approveEachPerson": tokens.flag("--approve")?, "canApprove": tokens.flag("--can-approve")?,
+                "maximumPeople": tokens.option_u64("--max-people")?.unwrap_or(8), "singleUse": tokens.flag("--single-use")?
+            });
+        }
+        "list" | "stop" => (),
+        "edit" | "revoke" => {
+            params["linkId"] = json!(tokens.required_front("link id")?);
+            if action == "edit" {
+                params["settings"] = serde_json::from_str(&tokens.option("--settings")?.ok_or_else(|| invalid("--settings JSON is required"))?).map_err(|_| invalid("Invalid settings JSON"))?;
+            } else { params["removeGuests"] = json!(!tokens.flag("--keep-guests")?); }
+        }
+        _ => return Err(invalid("Unknown share action")),
+    }
+    rpc(&format!("share.{action}"), params, tokens)
+}
+
 fn parse_sessions(tokens: &mut Tokens) -> Result<Action, ControlError> {
     match tokens.required_front("sessions command")?.as_str() {
         "list" => {
             let project = tokens.option("--project")?;
             let org = tokens.option("--org")?;
             let cloud = tokens.flag("--cloud")?;
-            if cloud || org.is_some() || project.as_deref().is_some_and(is_cloud_key) {
+            let quick = tokens.flag("--quick")?;
+            let in_cloud = cloud || org.is_some() || project.as_deref().is_some_and(is_cloud_key);
+            if quick && (in_cloud || project.is_some()) {
+                return Err(invalid("--quick lists the chats that have no project; it cannot be combined with --project, --cloud or --org."));
+            }
+            if in_cloud {
                 cloud_rpc("sessions.list", json!({"project": project, "org": org}), tokens)
             } else {
-                rpc("sessions.list", json!({"project": project}), tokens)
+                rpc("sessions.list", json!({"project": project, "quick": quick}), tokens)
             }
         }
         "show" => {
@@ -413,6 +467,41 @@ fn parse_sessions(tokens: &mut Tokens) -> Result<Action, ControlError> {
             let title = tokens.required_option("--title")?;
             let session = tokens.required_front("session")?;
             rpc("sessions.rename", json!({"session": session, "title": title}), tokens)
+        }
+        // A quick chat: no project, a scratch directory of its own.
+        "create" if tokens.peek_flag("--quick") => {
+            let _quick = tokens.flag("--quick")?;
+            let agent = tokens.required_option("--agent")?;
+            let prompt = tokens.required_option("--prompt")?;
+            let title = tokens.option("--title")?;
+            let cwd = tokens.option("--cwd")?;
+            let model = tokens.option("--model")?;
+            let effort = tokens.option("--effort")?;
+            let mode = tokens.option("--mode")?;
+            for refused in ["--project", "--name"] {
+                if tokens.option(refused)?.is_some() {
+                    return Err(invalid(format!("{refused} does not apply to --quick: a quick chat has no project and no worktree.")));
+                }
+            }
+            for refused in ["--worktree", "--on-main"] {
+                if tokens.flag(refused)? {
+                    return Err(invalid(format!("{refused} does not apply to --quick: a quick chat has no project and no worktree.")));
+                }
+            }
+            rpc(
+                "sessions.create",
+                json!({
+                    "quick": true,
+                    "agent": agent,
+                    "prompt": prompt,
+                    "title": title,
+                    "cwd": cwd,
+                    "model": model.unwrap_or_default(),
+                    "effort": effort,
+                    "mode": mode,
+                }),
+                tokens,
+            )
         }
         "create" => {
             let project = tokens.required_option("--project")?;
@@ -679,6 +768,11 @@ impl Tokens {
         Ok(Some(self.values.remove(position)))
     }
 
+    /// Whether the flag `name` was passed, without consuming it.
+    pub(crate) fn peek_flag(&self, name: &str) -> bool {
+        self.values.iter().any(|value| value == name)
+    }
+
     /// The value `name` would take, without consuming it.
     pub(crate) fn peek_option(&self, name: &str) -> Option<String> {
         let position = self.values.iter().position(|value| value == name)?;
@@ -722,6 +816,56 @@ mod tests {
             Action::Rpc { command, params, timeout } => (command, params, timeout),
             other => panic!("expected rpc, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_quick_chat_is_created_and_listed_without_a_project() {
+        let (command, params, _) = rpc_of(&["sessions", "create", "--quick", "--agent", "claude", "--prompt", "What is a monad?", "--cwd", "/tmp/notes", "--mode", "plan"]);
+        assert_eq!(command, "sessions.create");
+        assert_eq!(params, json!({"quick": true, "agent": "claude", "prompt": "What is a monad?", "title": null, "cwd": "/tmp/notes", "model": "", "effort": null, "mode": "plan"}));
+        // What belongs to a project or a worktree is refused rather than ignored.
+        for extra in [&["--project", "api"][..], &["--name", "fix"], &["--worktree"], &["--on-main"]] {
+            let mut values = vec!["sessions", "create", "--quick", "--agent", "claude", "--prompt", "hi"];
+            values.extend_from_slice(extra);
+            assert!(parse(&args(&values)).is_err(), "{extra:?}");
+        }
+        // Without --quick a project is still required, exactly as before.
+        assert!(parse(&args(&["sessions", "create", "--agent", "claude", "--prompt", "hi"])).is_err());
+
+        let (command, params, _) = rpc_of(&["sessions", "list", "--quick"]);
+        assert_eq!((command.as_str(), params), ("sessions.list", json!({"project": null, "quick": true})));
+        assert_eq!(rpc_of(&["sessions", "list", "--project", "api"]).1, json!({"project": "api", "quick": false}));
+        assert!(parse(&args(&["sessions", "list", "--quick", "--project", "api"])).is_err());
+        assert!(parse(&args(&["sessions", "list", "--quick", "--cloud"])).is_err());
+    }
+
+    #[test]
+    fn the_floating_window_is_shown_hidden_and_toggled_from_the_command_line() {
+        for action in ["show", "hide", "toggle"] {
+            let (command, params, _) = rpc_of(&["floating", action]);
+            assert_eq!((command, params), (format!("floating.{action}"), json!({"session": null})));
+        }
+        assert_eq!(rpc_of(&["floating", "show", "--session", "0198"]).1, json!({"session": "0198"}));
+        assert!(parse(&args(&["floating"])).is_err());
+        assert!(parse(&args(&["floating", "explode"])).is_err());
+        assert!(help_text().contains("terminalx floating show|hide|toggle"));
+        assert!(help_text().contains("terminalx sessions create --quick"));
+    }
+
+    #[test]
+    fn sharing_cli_carries_explicit_access_policy_and_revocation_semantics() {
+        let (command, params, _) = rpc_of(&["share", "create", "session", "--read-only", "--people", "alice@example.com,bob@example.com", "--approve", "--single-use", "--local-only"]);
+        assert_eq!(command, "share.create");
+        assert_eq!(params["sessionId"], "session");
+        assert_eq!(params["directOnly"], true);
+        assert_eq!(params["settings"]["role"], "viewer");
+        assert_eq!(params["settings"]["canApprove"], false);
+        assert_eq!(params["settings"]["audience"], "people");
+        assert_eq!(params["settings"]["people"][1], json!({ "email": "bob@example.com", "role": "viewer" }));
+        let (command, params, _) = rpc_of(&["share", "revoke", "session", "link", "--keep-guests"]);
+        assert_eq!(command, "share.revoke");
+        assert_eq!(params["removeGuests"], false);
+        assert!(parse(&args(&["share", "edit", "session", "link"])).is_err());
     }
 
     #[test]

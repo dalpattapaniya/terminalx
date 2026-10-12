@@ -1,3 +1,4 @@
+import { openSessionShare } from "@/lib/localSharing";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Globe,
@@ -8,6 +9,7 @@ import {
   GitBranch,
   GitFork,
   MessagesSquare,
+  PictureInPicture2,
   Pin,
   Plus,
   Sparkles,
@@ -51,6 +53,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/menu";
 import { WithTooltip } from "@/components/ui/tooltip";
+import { QuickChatMenuItems, RenameSessionItem } from "@/components/session/QuickChatMenuItems";
+import { showFloatingWindow } from "@/lib/floating";
+import { isQuickChat } from "@/lib/quickChats";
 import { confirmDeleteSession } from "@/lib/deleteSessionFlow";
 import { workspaceName as sessionWorkspaceName } from "@/lib/dashboard";
 import { openSettle, openWorkspaceDelete } from "@/lib/dialogs";
@@ -423,7 +428,8 @@ function WorkspaceNode({
   );
 }
 
-function SessionNode({
+/** One session's row with its tabs under it; a quick chat's sits directly under its section. */
+export function SessionNode({
   session,
   selected,
   expanded,
@@ -603,6 +609,13 @@ function NewTabButton({ session }: { session: SessionEntry }) {
 export function SessionMenu({ session }: { session: SessionEntry }) {
   return (
     <DropdownMenuContent align="end">
+      <RenameSessionItem session={session} />
+      <DropdownMenuItem onSelect={() => void showFloatingWindow(session.id, session.activeTab)}>
+        <PictureInPicture2 /> Open in floating window
+      </DropdownMenuItem>
+      <QuickChatMenuItems session={session} />
+      <DropdownMenuItem onSelect={() => openSessionShare(session.id)}>Share session…</DropdownMenuItem>
+      <DropdownMenuSeparator />
       <DropdownMenuItem onSelect={() => pinSession(session.id, !session.pinned)}>
         <Pin /> {session.pinned ? "Unpin" : "Pin"}
       </DropdownMenuItem>
@@ -619,7 +632,7 @@ export function SessionMenu({ session }: { session: SessionEntry }) {
       ) : null}
       <DropdownMenuSeparator />
       <DropdownMenuItem destructive onSelect={() => void confirmDeleteSession(session)}>
-        <Trash2 /> Delete session…
+        <Trash2 /> {isQuickChat(session) ? "Delete quick chat…" : "Delete session…"}
       </DropdownMenuItem>
     </DropdownMenuContent>
   );

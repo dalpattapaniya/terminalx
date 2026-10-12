@@ -32,10 +32,14 @@ export interface Prefs {
   bypassConfirmed: boolean;
   /**
    * Sidebar sections the reader expanded or collapsed, by key (`local`, or
-   * `org:<orgId>`). A section not listed uses its default: Local and the
-   * default organization expanded, other organizations collapsed.
+   * `org:<orgId>`). Local and live organizations with projects start
+   * expanded; empty organizations start collapsed until opened deliberately.
    */
   sidebarSections: Record<string, "expanded" | "collapsed">;
+  /** Organization visibility on this desktop. Local is always shown. */
+  hiddenOrganizations: string[];
+  organizationDisplay: "all" | "one";
+  selectedOrganization: string | null;
   /**
    * The sidebar's shape: "simple" lists every conversation newest first, as a
    * chat app does; "detailed" is the project, workspace and tab tree.
@@ -70,6 +74,8 @@ export interface Prefs {
    * every session. One person's choice never carries over to another.
    */
   sidebarFilters: Record<string, "unread" | "needs">;
+  /** The folder the reader last cloned or created a project in; the next one is suggested there. */
+  projectsDir: string | null;
 }
 
 const DEFAULTS: Prefs = {
@@ -97,12 +103,16 @@ const DEFAULTS: Prefs = {
   bypassConfirmed: false,
   sidebarSections: {},
   sidebarLayout: "simple",
+  hiddenOrganizations: [],
+  organizationDisplay: "all",
+  selectedOrganization: null,
   cloudProjects: {},
   cloudBlankProjects: {},
   cloudPinned: {},
   cloudCollapsed: {},
   shortcuts: {},
   sidebarFilters: {},
+  projectsDir: null,
 };
 
 const KEY = "raccoon.prefs";
@@ -113,6 +123,9 @@ function load(): Prefs {
     if (!raw) return { ...DEFAULTS };
     const parsed = JSON.parse(raw);
     const prefs = { ...DEFAULTS, ...parsed };
+    prefs.hiddenOrganizations = Array.isArray(prefs.hiddenOrganizations) ? [...new Set(prefs.hiddenOrganizations.filter((id: unknown) => typeof id === "string"))] : [];
+    prefs.organizationDisplay = prefs.organizationDisplay === "one" ? "one" : "all";
+    prefs.selectedOrganization = typeof prefs.selectedOrganization === "string" ? prefs.selectedOrganization : null;
     // Older versions saved the whole object, including the TerminalX default,
     // without recording whether it was chosen. Migrate unmarked values once;
     // choices made in Settings or remembered in the chooser survive this migration.

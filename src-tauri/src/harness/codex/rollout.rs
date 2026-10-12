@@ -17,15 +17,33 @@
 //!   command. Drawing it would show the reader the harness rather than the
 //!   conversation, so it is skipped whole.
 //!
-//! `session_meta`, `turn_context`, `world_state` and `thread_settings_applied`
-//! are configuration snapshots and carry nothing the transcript view draws.
+//! `session_meta` and `world_state` are configuration snapshots and carry
+//! nothing the transcript view draws. Two more are not drawn either, but say
+//! which model and reasoning effort the conversation is on, and that is how
+//! a change made in the terminal reaches the chat (#404):
 //!
-//! Every shape here came out of rollouts written by codex-cli 0.152.0 driven
-//! through a PTY; one of them is the fixture this module is tested on.
+//! - **`turn_context`** is written as each turn starts, with the `model` and
+//!   `effort` that turn runs on;
+//! - **`thread_settings_applied`** (an `event_msg`) is written the moment the
+//!   reader confirms the TUI's `/model` picker, with `model` and
+//!   `reasoning_effort`. A conversation that has no rollout yet — nothing
+//!   has been sent — has nowhere to write it, and the first `turn_context`
+//!   says the same thing a moment after the first prompt.
+//!
+//! Both also say what the conversation may do without asking (#417): the
+//! `approval_policy`, and the sandbox — by name in `turn_context`
+//! (`sandbox_policy.type`), as a `permission_profile` in
+//! `thread_settings_applied`, which the TUI's `/permissions` writes the
+//! moment a preset is confirmed.
+//!
+//! Every shape here came out of rollouts written by codex-cli 0.152.0 and
+//! 0.153.4 driven through a PTY; three of them are the fixtures this module
+//! is tested on.
 
 use serde_json::Value;
 
 use crate::events::{BlockRef, EditKind, FileEdit, Payload, ToolResult, ToolType, Usage};
+use crate::harness::settings::{Signal, Stance};
 use crate::harness::tui::TurnMark;
 
 fn block(id: &str) -> BlockRef {
@@ -92,6 +110,14 @@ fn plain_path(v: &Value) -> Option<String> {
 /// `skip` is the tail's list of records already logged under another id; it
 /// is a Claude fork's problem and Codex has no equivalent, since a Codex
 /// conversation is only ever appended to.
+/// The "2/5" of a reconnect notice: the attempt and how many there are.
+fn retry_count(message: &str) -> Option<(u32, u32)> {
+    message.split(|c: char| !c.is_ascii_digit() && c != '/').find_map(|word| {
+        let (attempt, max) = word.split_once('/')?;
+        Some((attempt.parse().ok()?, max.parse().ok()?))
+    })
+}
+
 pub fn decode_line(line: &str, skip: &std::collections::HashSet<String>, out: &mut Vec<Payload>) {
     decode_marked(line, skip, out);
 }
@@ -102,8 +128,15 @@ pub fn decode_line(line: &str, skip: &std::collections::HashSet<String>, out: &m
 /// evidence that the turn is over rather than stalled.
 pub fn decode_marked(line: &str, _skip: &std::collections::HashSet<String>, out: &mut Vec<Payload>) -> Option<TurnMark> {
     let v = serde_json::from_str::<Value>(line).ok()?;
-    if v["type"].as_str() != Some("event_msg") {
-        return None;
+    match v["type"].as_str() {
+        Some("event_msg") => {}
+        Some("turn_context") => {
+            let context = &v["payload"];
+            report_settings(context["model"].as_str(), context["effort"].as_str(), out);
+            report_stance(context["approval_policy"].as_str(), context["sandbox_policy"]["type"].as_str(), out);
+            return None;
+        }
+        _ => return None,
     }
     let mark = match v["payload"]["type"].as_str().unwrap_or("") {
         "task_started" => Some(TurnMark::Opened),
@@ -120,9 +153,46 @@ fn turn_mark(line: &str) -> Option<TurnMark> {
     decode_marked(line, &Default::default(), &mut Vec::new())
 }
 
+/// The model and effort a record says the conversation is on.
+fn report_settings(model: Option<&str>, effort: Option<&str>, out: &mut Vec<Payload>) {
+    if let Some(signal) = Signal::current(model, effort) {
+        out.push(Payload::ProviderSettings { signal });
+    }
+}
+
+/// The approval policy and sandbox a record says the conversation is under
+/// (#417). Both or nothing: half a stance is not one.
+fn report_stance(approval: Option<&str>, sandbox: Option<&str>, out: &mut Vec<Payload>) {
+    if let (Some(approval), Some(sandbox)) = (approval, sandbox) {
+        let stance = Stance::Sandboxed { approval: approval.into(), sandbox: sandbox.into() };
+        out.push(Payload::ProviderSettings { signal: Signal::Permissions { stance } });
+    }
+}
+
+/// The sandbox a `permission_profile` comes down to. `thread_settings_applied`
+/// carries the profile and not the sandbox's name (0.153.4): no profile at
+/// all is no sandbox, and a managed one is the workspace sandbox if it may
+/// write anywhere and the read-only one if it may not. Any other shape is
+/// left to the next `turn_context`, which names the sandbox outright.
+fn profile_sandbox(profile: &Value) -> Option<&'static str> {
+    match profile["type"].as_str()? {
+        "disabled" => Some(crate::harness::codex::NO_SANDBOX),
+        "managed" => {
+            let entries = profile["file_system"]["entries"].as_array()?;
+            Some(if entries.iter().any(|entry| entry["access"] == "write") { "workspace-write" } else { "read-only" })
+        }
+        _ => None,
+    }
+}
+
 fn decode_event(p: &Value, out: &mut Vec<Payload>) {
     match p["type"].as_str().unwrap_or("") {
         "task_started" => out.push(Payload::ModelRequestStarted),
+        "thread_settings_applied" => {
+            let settings = &p["thread_settings"];
+            report_settings(settings["model"].as_str(), settings["reasoning_effort"].as_str(), out);
+            report_stance(settings["approval_policy"].as_str(), profile_sandbox(&settings["permission_profile"]), out);
+        }
         // `task_complete` and `turn_aborted` say the turn ended, and so do the
         // `Stop` and `Interrupt` hooks — with the same reply and moments
         // apart. Two closers is one too many: the second lands as a turn with
@@ -151,7 +221,12 @@ fn decode_event(p: &Value, out: &mut Vec<Payload>) {
         "context_compacted" => out.push(Payload::ContextCompacted { pre_tokens: None, post_tokens: None }),
         "stream_error" | "error" => {
             let message = p["message"].as_str().or_else(|| p["error"]["message"].as_str()).unwrap_or("Codex reported an error");
-            out.push(Payload::Error { message: message.to_string(), fatal: false });
+            // A `stream_error` is Codex reconnecting, "Reconnecting... 2/5":
+            // a failure only once the attempts are spent.
+            match p["type"].as_str().filter(|kind| *kind == "stream_error").and_then(|_| retry_count(message)) {
+                Some((attempt, max_retries)) => out.push(Payload::ApiRetry { attempt, max_retries, reason: Some(message.to_string()) }),
+                None => out.push(Payload::Error { message: message.to_string(), fatal: false }),
+            }
         }
         "item_completed" => decode_item(&p["item"], out),
         _ => {}
@@ -164,7 +239,7 @@ fn decode_item(item: &Value, out: &mut Vec<Payload>) {
         "UserMessage" => {
             let text = text_of(&item["content"]);
             if !text.is_empty() {
-                out.push(Payload::UserMessage { text, images: Vec::new(), baseline: None, queued: false, cwd: None });
+                out.push(Payload::UserMessage { author: None, text, images: Vec::new(), baseline: None, queued: false, cwd: None });
             }
         }
         "AgentMessage" => {
@@ -321,9 +396,147 @@ mod tests {
                 Payload::TurnCompleted { .. } => "end",
                 Payload::ContextCompacted { .. } => "compacted",
                 Payload::Error { .. } => "error",
+                Payload::ProviderSettings { .. } => "settings",
                 _ => "other",
             })
             .collect()
+    }
+
+    /// What is drawn: everything but the settings records, which have tests
+    /// of their own.
+    fn drawn(payloads: &[Payload]) -> Vec<&'static str> {
+        kinds(payloads).into_iter().filter(|kind| *kind != "settings").collect()
+    }
+
+    /// Model and effort changed in codex-cli 0.153.4's own `/model` picker,
+    /// between two turns: the `turn_context` and `thread_settings_applied`
+    /// records of that rollout, whole. The working directory reads `/w/demo`,
+    /// the timezone `UTC`, and the collaboration mode's standing instructions
+    /// are trimmed; nothing else is changed.
+    const SETTINGS: &str = include_str!("fixtures/settings.jsonl");
+
+    fn reported(payloads: &[Payload]) -> Vec<(Option<&str>, Option<&str>)> {
+        payloads
+            .iter()
+            .filter_map(|p| match p {
+                Payload::ProviderSettings { signal: Signal::Current { model, effort } } => Some((model.as_deref(), effort.as_deref())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #404. The picker writes one record when the model is chosen and one
+    /// when the effort is, the moment each is confirmed; the turns either
+    /// side say what they ran on.
+    #[test]
+    fn a_change_made_in_the_tuis_model_picker_is_reported() {
+        let mut s = Streamer::at(0, decode_line);
+        let p = s.push(SETTINGS.as_bytes());
+        assert_eq!(
+            reported(&p),
+            [
+                // The turn before the change.
+                (Some("gpt-5.6-sol"), Some("high")),
+                // The picker: the model, then the effort chosen for it.
+                (Some("gpt-5.6-terra"), Some("high")),
+                (Some("gpt-5.6-terra"), Some("low")),
+                // The next prompt, and the turn it starts.
+                (Some("gpt-5.6-terra"), Some("low")),
+                (Some("gpt-5.6-terra"), Some("low")),
+            ]
+        );
+        assert!(drawn(&p).is_empty(), "and none of it is drawn");
+        // They say nothing about where a turn opens or ends.
+        assert!(SETTINGS.lines().all(|line| turn_mark(line).is_none()));
+    }
+
+    /// codex-cli 0.153.4 started with `-a on-request -s read-only`, then taken
+    /// through the three presets of its `/permissions` with a prompt after
+    /// each: the `turn_context` and `thread_settings_applied` records of that
+    /// rollout, whole but for the working directory, which reads `/w/demo`.
+    const PERMISSIONS: &str = include_str!("fixtures/permissions.jsonl");
+
+    fn stances(payloads: &[Payload]) -> Vec<(&str, &str)> {
+        payloads
+            .iter()
+            .filter_map(|p| match p {
+                Payload::ProviderSettings { signal: Signal::Permissions { stance: Stance::Sandboxed { approval, sandbox } } } => Some((approval.as_str(), sandbox.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #417. A preset is recorded the moment it is confirmed, twice over, and
+    /// the next turn says the same by the sandbox's name.
+    #[test]
+    fn a_change_made_in_the_tuis_permissions_menu_is_reported() {
+        let mut s = Streamer::at(0, decode_line);
+        let p = s.push(PERMISSIONS.as_bytes());
+        assert_eq!(
+            stances(&p),
+            [
+                // The first turn, as launched.
+                ("on-request", "read-only"),
+                // "Ask for approval".
+                ("on-request", "workspace-write"),
+                // "Approve for me": another reviewer, the same policy and sandbox.
+                ("on-request", "workspace-write"),
+                ("on-request", "workspace-write"),
+                ("on-request", "workspace-write"),
+                // "Full Access", and the turn after it.
+                ("never", "danger-full-access"),
+                ("never", "danger-full-access"),
+                ("never", "danger-full-access"),
+            ]
+        );
+        assert!(drawn(&p).is_empty());
+        // The model/effort records of #404 report a stance as well.
+        let p = Streamer::at(0, decode_line).push(SETTINGS.as_bytes());
+        assert_eq!(stances(&p), [("on-request", "workspace-write")].repeat(5));
+    }
+
+    #[test]
+    fn a_stance_is_reported_whole_or_not_at_all() {
+        let stance_of = |record: &str| {
+            let mut out = Vec::new();
+            decode_line(record, &none(), &mut out);
+            stances(&out).into_iter().map(|(a, s)| (a.to_string(), s.to_string())).collect::<Vec<_>>()
+        };
+        // A policy with no sandbox named, and a sandbox with no policy.
+        assert!(stance_of(r#"{"type":"turn_context","payload":{"approval_policy":"never"}}"#).is_empty());
+        assert!(stance_of(r#"{"type":"turn_context","payload":{"sandbox_policy":{"type":"read-only"}}}"#).is_empty());
+        // A profile of a shape this build cannot read is left to the next turn.
+        let applied = |profile: &str| format!(r#"{{"type":"event_msg","payload":{{"type":"thread_settings_applied","thread_settings":{{"approval_policy":"on-request","permission_profile":{profile}}}}}}}"#);
+        assert!(stance_of(&applied(r#"{"type":"external"}"#)).is_empty());
+        assert!(stance_of(&applied(r#"{"type":"managed","file_system":{"type":"unrestricted"}}"#)).is_empty());
+        assert_eq!(stance_of(&applied(r#"{"type":"managed","file_system":{"entries":[{"access":"read"}]}}"#)), [("on-request".to_string(), "read-only".to_string())]);
+        // A policy and sandbox this build has never heard of are still the ones in force.
+        assert_eq!(
+            stance_of(r#"{"type":"turn_context","payload":{"approval_policy":"untrusted","sandbox_policy":{"type":"seatbelt-strict"}}}"#),
+            [("untrusted".to_string(), "seatbelt-strict".to_string())]
+        );
+    }
+
+    /// The effort changes between the second and third turns of the older
+    /// rollout too, written by 0.152.0.
+    #[test]
+    fn the_effort_of_each_turn_is_reported() {
+        let mut s = Streamer::at(0, decode_line);
+        let p = s.push(FIXTURE.as_bytes());
+        let efforts: Vec<Option<&str>> = reported(&p).into_iter().map(|(_, effort)| effort).collect();
+        assert_eq!(efforts, [Some("low"), Some("low"), Some("low"), Some("medium"), Some("medium")]);
+        assert!(reported(&p).iter().all(|(model, _)| *model == Some("gpt-5.6-sol")));
+    }
+
+    #[test]
+    fn a_settings_record_that_names_nothing_reports_nothing() {
+        let mut out = Vec::new();
+        decode_line(r#"{"type":"turn_context","payload":{"turn_id":"t","model":null}}"#, &none(), &mut out);
+        decode_line(r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"approval_policy":"never"}}}"#, &none(), &mut out);
+        assert!(out.is_empty());
+        // A model with no effort named leaves the effort alone.
+        decode_line(r#"{"type":"turn_context","payload":{"model":"gpt-5.2","effort":null}}"#, &none(), &mut out);
+        assert_eq!(reported(&out), [(Some("gpt-5.2"), None)]);
     }
 
     /// The rollout read for what it says about its turns: `task_started`
@@ -341,7 +554,7 @@ mod tests {
         let mut s = Streamer::at(0, decode_line);
         let p = s.push(FIXTURE.as_bytes());
         assert_eq!(
-            kinds(&p),
+            drawn(&p),
             vec![
                 // "reply with the word ok"
                 "start", "user", "text", "usage",
@@ -351,8 +564,9 @@ mod tests {
                 "start", "user", "text", "tool", "result", "usage", "tool", "edits", "result", "usage", "text", "usage",
             ]
         );
-        assert!(matches!(&p[1], Payload::UserMessage { text, .. } if text == "reply with the word ok"));
-        assert!(matches!(&p[2], Payload::AssistantText { text, .. } if text == "ok"));
+        let p: Vec<&Payload> = p.iter().filter(|p| !matches!(p, Payload::ProviderSettings { .. })).collect();
+        assert!(matches!(p[1], Payload::UserMessage { text, .. } if text == "reply with the word ok"));
+        assert!(matches!(p[2], Payload::AssistantText { text, .. } if text == "ok"));
     }
 
     #[test]
@@ -365,7 +579,7 @@ mod tests {
         tail.retarget(&path);
 
         let payloads = tail.drain();
-        assert_eq!(kinds(&payloads), vec!["start", "user", "text"]);
+        assert_eq!(drawn(&payloads), vec!["start", "user", "text"]);
         assert!(matches!(&payloads[2], Payload::AssistantText { text, .. } if text == "ready"));
     }
 
@@ -479,7 +693,7 @@ mod tests {
             if v["type"] == "response_item" || v["type"] == "session_meta" || v["type"] == "turn_context" || v["type"] == "world_state" {
                 let mut out = Vec::new();
                 decode_line(line, &none(), &mut out);
-                assert!(out.is_empty(), "{} drew something", v["type"]);
+                assert!(drawn(&out).is_empty(), "{} drew something", v["type"]);
             }
         }
         // And nothing anywhere leaks the wrapper or the standing instructions.

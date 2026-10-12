@@ -111,6 +111,9 @@ pub struct Peer {
     closed: tokio::sync::Notify,
     /// Set once the connection has been disconnected from the runtime.
     gone: std::sync::atomic::AtomicBool,
+    /// Remembered from `rpc.hello` so role refreshes still exclude phones
+    /// from activity that holds compute.
+    phone: std::sync::atomic::AtomicBool,
     /// Held while this connection counts as use of the workspace for idle
     /// suspend: only a client that can type does (contract 9.4.1).
     attached: Mutex<Option<crate::cloud_activity::Attached>>,
@@ -169,6 +172,7 @@ impl Peer {
             presence: Mutex::new(Presence { tab_id: None, activity: "viewing", since: crate::cloud_agents::now_ms() }),
             closed: tokio::sync::Notify::new(),
             gone: std::sync::atomic::AtomicBool::new(false),
+            phone: std::sync::atomic::AtomicBool::new(false),
             attached: Mutex::new(None),
         });
         (peer, Notifications { receiver, queued })
@@ -588,11 +592,12 @@ impl WorkspaceRpc {
     /// Typing and agent turns are reported whoever is attached. Before the
     /// API has listed who has access there are no roles to go by, and every
     /// connection but a phone counts, as before.
-    fn count_attachment(&self, peer: &Peer, hello: &Value) {
-        let phone = hello["client"]["app"].as_str() == Some(MOBILE_APP);
-        let types = !self.collab.known() || self.access(peer).can_drive();
+    fn count_attachment(&self, peer: &Peer) {
+        // Read access under the attachment lock: a concurrent hello must
+        // not overwrite a role refresh with a decision from the old list.
         let mut attached = peer.attached.lock().unwrap();
-        if phone || !types || peer.gone.load(Ordering::SeqCst) {
+        let types = !self.collab.known() || self.access(peer).can_drive();
+        if peer.phone.load(Ordering::SeqCst) || !types || peer.gone.load(Ordering::SeqCst) {
             *attached = None;
         } else if attached.is_none() {
             *attached = Some(crate::cloud_activity::attached());
@@ -641,6 +646,9 @@ impl WorkspaceRpc {
             return;
         }
         for peer in &self.live_peers() {
+            // Reconcile before any early return, including revoked access
+            // and old attachments without a person. Promotions count too.
+            self.count_attachment(peer);
             let Some(user) = peer.user_id.as_deref() else {
                 // A `manage` attachment that names no person (saved before
                 // attachments carried one) cannot be matched to the list, so
@@ -806,12 +814,15 @@ impl WorkspaceRpc {
         if method == "rpc.hello" {
             let granted = protocol::negotiate(&params)?;
             *peer.granted.lock().unwrap() = Some(granted.iter().cloned().collect());
-            self.count_attachment(peer, &params);
+            peer.phone.store(params["client"]["app"].as_str() == Some(MOBILE_APP), Ordering::SeqCst);
             if self.peers.lock().unwrap().insert(peer.id, Arc::downgrade(peer)).is_none() {
                 if let Some(agents) = self.agents.get() {
                     agents.client_attached();
                 }
             }
+            // Register first so a concurrent role refresh either sees this
+            // peer, or finishes before we read its current access here.
+            self.count_attachment(peer);
             let collab = granted.iter().any(|capability| capability == "collab/1");
             if collab {
                 self.broadcast_presence();
@@ -982,6 +993,12 @@ impl WorkspaceRpc {
             "mirror.manifest" => self.mirror.manifest(&self.git, &params),
             "lifecycle.dispositionFacts" => self.disposition_facts(),
             "lifecycle.resources" => Ok(crate::cloud_resources::observe(&self.root)),
+            "cleanup.scan" => self.cleanup_scan(),
+            "cleanup.size" => self.cleanup_size(peer, params),
+            "cleanup.cancel" => self.cleanup_cancel(peer),
+            "cleanup.remove" => self.cleanup_remove(params),
+            "workspace.disposition" => self.workspace_disposition(peer, params),
+            "workspace.remove" => self.workspace_remove(peer, params),
             git if git.starts_with("git.") => self
                 .git
                 .handle(git, &params)
@@ -2107,6 +2124,88 @@ impl WorkspaceRpc {
         }))
     }
 
+    // ---- worktree clean-up ---------------------------------------------------
+
+    /// Run `f` with what the clean-up reads about this workspace: each of its
+    /// repositories is a project, and neither they nor the workspace root are
+    /// ever removable. Only worktrees inside the workspace are its to remove.
+    fn with_cleanup_host<R>(&self, f: impl FnOnce(&crate::worktree_cleanup::Host<'_>) -> R) -> Result<R, RpcError> {
+        let (names, _) = self.git.repositories();
+        let projects: Vec<crate::store::projects::Project> = names
+            .iter()
+            .map(|name| {
+                let dir = if name == "." { self.root.clone() } else { self.root.join(name) };
+                let label = dir.file_name().map(|file| file.to_string_lossy().into_owned()).unwrap_or_else(|| name.clone());
+                serde_json::from_value(json!({ "path": dir, "name": label })).map_err(RpcError::internal)
+            })
+            .collect::<Result<_, _>>()?;
+        let protected = [self.root.clone()];
+        let busy: HashSet<(String, String)> = self
+            .agents
+            .get()
+            .map(|agents| agents.tabs())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tab| tab.process == "running" || !tab.pending_permissions.is_empty() || matches!(tab.status, index::TabStatus::InProgress | index::TabStatus::Waiting))
+            .map(|tab| (tab.session_id, tab.tab_id))
+            .collect();
+        let running = |session: &str, tab: &str| busy.contains(&(session.to_string(), tab.to_string())) || self.sessions.as_ref().is_some_and(|manager| manager.is_running(session, tab));
+        let live = |sessions: &[SessionEntry]| crate::worktree_cleanup::Live::observe(&self.terminals, sessions, &running);
+        Ok(f(&crate::worktree_cleanup::Host { projects: &projects, protected: &protected, confine: Some(&self.root), live: &live, fetch: crate::landed::Fetch::Fresh }))
+    }
+
+    /// `cleanup/1`: every worktree of the workspace's repositories with
+    /// whether it may be removed, and why not. Reads only.
+    fn cleanup_scan(&self) -> Result<Value, RpcError> {
+        let projects = self.with_cleanup_host(|host| crate::worktree_cleanup::scan(host, None))?.map_err(RpcError::internal)?;
+        Ok(json!({ "projects": projects }))
+    }
+
+    /// `cleanup/1`: what removing one worktree would free; `null` when the
+    /// caller cancelled.
+    fn cleanup_size(&self, peer: &Peer, params: Value) -> Result<Value, RpcError> {
+        let job = format!("peer:{}:{}", peer.id, required_str(&params, "job")?);
+        let (project, path) = (required_str(&params, "projectPath")?, required_str(&params, "path")?);
+        let size = self
+            .with_cleanup_host(|host| crate::worktree_cleanup::estimate_size(host, crate::worktree_cleanup::SizeJobs::global(), &job, project, path))?
+            .map_err(|error| RpcError::invalid(format!("{error:#}")))?;
+        Ok(json!({ "bytes": size }))
+    }
+
+    fn cleanup_cancel(&self, peer: &Peer) -> Result<Value, RpcError> {
+        crate::worktree_cleanup::SizeJobs::global().cancel(&format!("peer:{}:", peer.id));
+        Ok(json!({}))
+    }
+
+    /// `cleanup/1`: remove the named worktrees. Each is inspected again here,
+    /// on the machine that holds it, and left alone unless it is still what
+    /// its token stands for. Nothing running is stopped.
+    fn cleanup_remove(&self, params: Value) -> Result<Value, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            items: Vec<crate::worktree_cleanup::RemoveItem>,
+        }
+        let p: Params = parse(params)?;
+        let before = index::load().map_err(RpcError::internal)?;
+        let results = self.with_cleanup_host(|host| crate::worktree_cleanup::remove(host, &*self.sink, &p.items))?;
+        // What the runtime still holds for sessions that were deleted with
+        // their worktree, as after `session.delete`.
+        let deleted: HashSet<String> = results.iter().flat_map(|done| done.sessions_deleted.iter().cloned()).collect();
+        let tabs: Vec<&String> = before.iter().filter(|session| deleted.contains(&session.id)).flat_map(|session| &session.tabs).map(|tab| &tab.id).collect();
+        if let Some(agents) = self.agents.get() {
+            for tab in &tabs {
+                let _ = agents.follow_ups.clear(tab);
+                agents.checkpoints.remove(tab);
+            }
+            agents.changed(None, false);
+        }
+        if !deleted.is_empty() {
+            self.close_session_ptys(&deleted);
+            self.close_agent_ptys(tabs.into_iter());
+        }
+        Ok(json!({ "results": results }))
+    }
+
     // ---- sessions --------------------------------------------------------
 
     fn manager(&self) -> Result<&SessionManager, RpcError> {
@@ -2337,11 +2436,12 @@ impl WorkspaceRpc {
         let session = self.visible_session(peer, &p.session_id)?;
         let mode = index::requested_mode(p.mode);
         self.check_new_tab(&p.agent, &p.model, mode.as_deref())?;
-        let tab = crate::session_ops::add_tab_entry(
-            &session.id,
-            &crate::session_ops::NewTab { harness: p.agent, model: p.model, effort: p.effort, permission_mode: mode },
-        )
-        .map_err(RpcError::internal)?;
+        let new_tab = crate::session_ops::NewTab { harness: p.agent, model: p.model, effort: p.effort, permission_mode: mode };
+        // Through the session manager where there is one: it is the one place that refuses a Bypass tab in a shared session.
+        let tab = match &self.sessions {
+            Some(manager) => manager.add_tab(&session.id, &new_tab).map_err(|error| RpcError::new("refused", error.to_string()))?,
+            None => crate::session_ops::add_tab_entry(&session.id, &new_tab).map_err(RpcError::internal)?,
+        };
         let updated = index::get(&session.id).map_err(RpcError::internal)?;
         self.sink.emit("session_updated", &updated);
         let info = self.agents.get().and_then(|agents| {
@@ -2357,19 +2457,7 @@ impl WorkspaceRpc {
     fn session_delete(&self, peer: &Peer, params: Value) -> Result<Value, RpcError> {
         let session = self.visible_session(peer, required_str(&params, "sessionId")?)?;
         let remove_worktree = params.get("removeWorktree").and_then(Value::as_bool).unwrap_or(false);
-        let stop = |doomed: &SessionEntry| {
-            for tab in &doomed.tabs {
-                let Some(manager) = &self.sessions else { break };
-                if manager.is_running(&doomed.id, &tab.id) {
-                    if let Err(error) = manager.stop(&doomed.id, &tab.id) {
-                        log::warn!("stop {}/{} before delete: {error:#}", doomed.id, tab.id);
-                    }
-                }
-            }
-            // Its shells go before the worktree does, and are waited for, so
-            // nothing holds the directory.
-            self.close_session_ptys_waiting(&HashSet::from([doomed.id.clone()]), Some(std::time::Duration::from_secs(5)));
-        };
+        let stop = |doomed: &SessionEntry| self.stop_before_removal(doomed);
         // Deleting a session deletes that session. Its worktree goes with it
         // only when asked, when no other session runs there, and through the
         // same checked path as every other workspace removal: one that is
@@ -2404,6 +2492,28 @@ impl WorkspaceRpc {
         // Said when the worktree was asked for and stayed because other
         // sessions still run in it.
         let worktree_kept = remove_worktree && workspace.is_none() && session.worktree_name.is_some() && !session.worktree_removed;
+        let deleted = self.forget_deleted_sessions(&removed);
+        Ok(json!({ "sessionId": session.id, "deleted": deleted, "keptBranch": kept_branch, "worktreeKept": worktree_kept }))
+    }
+
+    /// End what a session that is about to be deleted runs, and wait.
+    fn stop_before_removal(&self, doomed: &SessionEntry) {
+        for tab in &doomed.tabs {
+            let Some(manager) = &self.sessions else { break };
+            if manager.is_running(&doomed.id, &tab.id) {
+                if let Err(error) = manager.stop(&doomed.id, &tab.id) {
+                    log::warn!("stop {}/{} before delete: {error:#}", doomed.id, tab.id);
+                }
+            }
+        }
+        // Its shells go before the worktree does, and are waited for, so
+        // nothing holds the directory.
+        self.close_session_ptys_waiting(&HashSet::from([doomed.id.clone()]), Some(std::time::Duration::from_secs(5)));
+    }
+
+    /// Drop what the runtime still holds for sessions that were deleted, and
+    /// say which they were.
+    fn forget_deleted_sessions(&self, removed: &[SessionEntry]) -> Vec<String> {
         let removed_ids: HashSet<String> = removed.iter().map(|session| session.id.clone()).collect();
         if let Some(agents) = self.agents.get() {
             for tab in removed.iter().flat_map(|session| &session.tabs) {
@@ -2416,7 +2526,59 @@ impl WorkspaceRpc {
         self.close_agent_ptys(removed.iter().flat_map(|session| &session.tabs).map(|tab| &tab.id));
         let mut deleted: Vec<String> = removed_ids.into_iter().collect();
         deleted.sort();
-        Ok(json!({ "sessionId": session.id, "deleted": deleted, "keptBranch": kept_branch, "worktreeKept": worktree_kept }))
+        deleted
+    }
+
+    // ---- one session's worktree ----------------------------------------------
+
+    /// `workspace/1`: where the checkout a session runs in stands, as the
+    /// desktop's removal dialog reads a local one. The checkout is the
+    /// session's own `cwd` from this runtime's index: a client names a
+    /// session, never a path. A session in the repository's main directory
+    /// answers `isMain`, and nothing of it can be removed.
+    fn workspace_disposition(&self, peer: &Peer, params: Value) -> Result<Value, RpcError> {
+        let session = self.visible_session(peer, required_str(&params, "sessionId")?)?;
+        let fetch = params.get("fetch").and_then(Value::as_bool).unwrap_or(false);
+        let disposition = crate::session_ops::workspace_disposition(Path::new(&session.project_path), Path::new(&session.cwd), fetch).map_err(RpcError::internal)?;
+        Ok(json!({ "disposition": disposition }))
+    }
+
+    /// `workspace/1`: remove the worktree a session runs in, with every
+    /// session in it, through the same checked path as every other workspace
+    /// removal. `expectedSessions` are the ones the dialog named, and
+    /// `confirmedDigest` its second confirmation for exactly what it showed;
+    /// without one, only a worktree found clean and merged goes. A directory
+    /// git cannot remove is reported, never deleted directly.
+    fn workspace_remove(&self, peer: &Peer, params: Value) -> Result<Value, RpcError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Params {
+            session_id: String,
+            #[serde(default)]
+            delete_branch: bool,
+            #[serde(default)]
+            confirmed_digest: Option<String>,
+            expected_sessions: Vec<String>,
+        }
+        let p: Params = parse(params)?;
+        let session = self.visible_session(peer, &p.session_id)?;
+        if session.worktree_name.is_none() || session.worktree_removed {
+            return Err(RpcError::invalid("this session does not run in a worktree"));
+        }
+        let request = crate::session_ops::WorkspaceRemoval {
+            project_path: &session.project_path,
+            path: &session.cwd,
+            sessions: crate::session_ops::SessionsFate::Delete,
+            delete_branch: p.delete_branch,
+            confirmation: p.confirmed_digest.map(crate::session_ops::Confirmation::Shown).unwrap_or(crate::session_ops::Confirmation::Single),
+            expected_sessions: Some(&p.expected_sessions),
+            direct: crate::git::DirectDelete::Never,
+            fetch: crate::landed::Fetch::Fresh,
+        };
+        let stop = |doomed: &SessionEntry| self.stop_before_removal(doomed);
+        let removed = crate::session_ops::remove_workspace(&*self.sink, &request, &stop).map_err(RpcError::internal)?;
+        let deleted = self.forget_deleted_sessions(&removed.sessions);
+        Ok(json!({ "deleted": deleted, "keptBranch": removed.removal.kept_branch, "rescuedBranch": removed.removal.rescued_branch }))
     }
 
     /// Close the terminals opened for sessions that are gone.
@@ -2855,3 +3017,7 @@ fn required_str<'a>(params: &'a Value, name: &str) -> Result<&'a str, RpcError> 
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;

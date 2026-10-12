@@ -121,22 +121,24 @@ export function offeredOn(models: ModelInfo[], here: boolean): ModelInfo[] {
 }
 
 /**
- * The entry for the model a tab is on. A full Claude id the list does not
- * carry (a version pinned earlier, or on another machine) is still what the
- * tab runs, so it gets an entry of its own, named after the id and taking the
- * efforts of its family, rather than being shown as the default. Any other
- * unknown id reads as the default, as it always has.
+ * The entry for the model a tab is on. An id the list does not carry — a
+ * version pinned earlier or on another machine, or one the agent itself
+ * reported after it was changed in the terminal — is still what the tab
+ * runs, so it gets an entry of its own, named after the id, rather than
+ * being shown as the default. It takes the efforts of its family where it
+ * has one (a Claude id), else the default model's. Only a tab with no model
+ * at all reads as the default.
  */
 export function modelForTab(models: ModelInfo[], id: string): ModelInfo | undefined {
   const listed = models.find((m) => m.id === id);
   if (listed) return listed;
   const fallback = models.find((m) => m.isDefault);
-  if (!id.startsWith("claude-")) return fallback;
-  const family = models.find((m) => m.alias && id.includes(`-${m.id}-`)) ?? fallback;
+  if (!id) return fallback;
+  const family = (id.startsWith("claude-") ? models.find((m) => m.alias && id.includes(`-${m.id}-`)) : undefined) ?? fallback;
   return {
     id,
     label: prettyModelId(id),
-    harness: family?.harness ?? "claude",
+    harness: family?.harness ?? (id.startsWith("claude-") ? "claude" : (models[0]?.harness ?? "")),
     efforts: family?.efforts ?? [],
     defaultEffort: family?.defaultEffort ?? null,
     acceptsImages: family?.acceptsImages ?? true,
@@ -190,8 +192,27 @@ export const PERMISSION_MODES: { id: string; label: string; hint: string }[] = [
   { id: BYPASS_MODE, label: "Bypass permissions", hint: "Nothing asks. Only in a tree you can throw away." },
 ];
 
+/** Spellings of a picker mode that older tabs and other clients still carry. */
+const MODE_ALIASES: Record<string, string> = { "": BYPASS_MODE, bypass: BYPASS_MODE, default: "manual", ask: "manual", accept_edits: "acceptEdits" };
+
+/** The picker's entry for a mode, if it has one. */
+export function pickerMode(id: string): { id: string; label: string; hint: string } | undefined {
+  const known = MODE_ALIASES[id] ?? id;
+  return PERMISSION_MODES.find((m) => m.id === known);
+}
+
+/**
+ * A mode's name. One the picker does not offer is the mode the agent reported
+ * itself in (#417) — Claude Code's `dontAsk`, a Codex approval policy and
+ * sandbox no mode of ours launches — and is named exactly as reported.
+ */
 export function modeLabel(id: string): string {
-  return PERMISSION_MODES.find((m) => m.id === id)?.label ?? "Bypass permissions";
+  return pickerMode(id)?.label ?? id;
+}
+
+/** Whether nothing stands between the agent and the machine in this mode: Bypass, or any Codex stance with no sandbox. */
+export function modeIsUnguarded(id: string): boolean {
+  return pickerMode(id)?.id === BYPASS_MODE || id.endsWith("danger-full-access");
 }
 
 /**
@@ -229,6 +250,28 @@ export const EFFORT_LABEL: Record<string, string> = {
   max: "Max",
   ultra: "Ultra",
 };
+
+/**
+ * What to say while a model, effort or permission mode that was asked for is
+ * not yet what the agent is on (#404, #417); `null` when nothing is waiting.
+ * The pickers go on showing what is in force, so this is the only place the
+ * choice appears until the agent confirms it. A change made mid-turn waits
+ * for the turn: a CLI holds what is typed at it until then, and is restarted
+ * after it for a setting it only reads at startup, which a mode always is.
+ */
+export function pendingSettingsNote(
+  tab: { requestedModel?: string | null; requestedEffort?: string | null; requestedPermissionMode?: string | null },
+  models: ModelInfo[],
+  busy: boolean,
+): string | null {
+  const model = tab.requestedModel ? (models.find((m) => m.id === tab.requestedModel)?.label ?? prettyModelId(tab.requestedModel)) : null;
+  const effort = tab.requestedEffort ? (EFFORT_LABEL[tab.requestedEffort] ?? tab.requestedEffort) : null;
+  const mode = tab.requestedPermissionMode ? modeLabel(tab.requestedPermissionMode) : null;
+  const running = model && effort ? `${model} · ${effort}` : (model ?? (effort ? `${effort} effort` : null));
+  const what = [running, mode && running ? `${mode} mode` : mode].filter(Boolean).join(" and ");
+  if (!what) return null;
+  return busy ? `Switching to ${what} after this turn` : `Switching to ${what}…`;
+}
 
 // Module state lives here; a hot update would lose it, so edits reload the page.
 if (import.meta.hot) import.meta.hot.accept(() => window.location.reload());

@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { BYPASS_MODE } from "./models";
 import { getPrefs } from "./prefs";
+import type { WorkspaceHost } from "./workspaceRemoval";
 
 /** App-level dialogs opened from anywhere (menus, panels, hotkeys). */
 /**
@@ -14,14 +15,22 @@ export interface WorkspaceRemoveRequest {
   mode: "delete" | "settle";
   /** Settling was started from this session; "Move session to project" applies to it. */
   sessionId?: string;
+  /** Where the workspace is read and removed; this computer when absent. A cloud worktree is only ever deleted, not settled. */
+  host?: WorkspaceHost;
 }
 
 interface State {
   workspaceRemove: WorkspaceRemoveRequest | null;
   bypass: { harness: string; confirm: () => void } | null;
+  /** The session being renamed. */
+  renameSession: string | null;
+  /** The quick chat being moved into a project. */
+  moveToProject: string | null;
+  /** The bulk worktree clean-up is open. */
+  worktreeCleanup: boolean;
 }
 
-let state: State = { workspaceRemove: null, bypass: null };
+let state: State = { workspaceRemove: null, bypass: null, renameSession: null, moveToProject: null, worktreeCleanup: false };
 const listeners = new Set<() => void>();
 function set(patch: Partial<State>) {
   state = { ...state, ...patch };
@@ -49,8 +58,8 @@ export function openSettle(session: { id: string; projectPath: string; cwd: stri
   openWorkspaceRemove({ projectPath: session.projectPath, path: session.cwd, name: session.worktreeName ?? session.cwd, mode: "settle", sessionId: session.id });
 }
 
-export function openWorkspaceDelete(projectPath: string, path: string, name: string) {
-  openWorkspaceRemove({ projectPath, path, name, mode: "delete" });
+export function openWorkspaceDelete(projectPath: string, path: string, name: string, host?: WorkspaceHost) {
+  openWorkspaceRemove({ projectPath, path, name, mode: "delete", host });
 }
 
 export function closeWorkspaceRemove() {
@@ -77,4 +86,31 @@ export function chooseMode(harness: string, mode: string, apply: (mode: string) 
 
 export function closeBypass() {
   set({ bypass: null });
+}
+
+/** Rename a session: one dialog, in whichever window asked. */
+export function openRenameSession(sessionId: string) {
+  set({ renameSession: sessionId });
+}
+
+export function closeRenameSession() {
+  set({ renameSession: null });
+}
+
+/** Move a quick chat into a project. */
+export function openMoveToProject(sessionId: string) {
+  set({ moveToProject: sessionId });
+}
+
+export function closeMoveToProject() {
+  set({ moveToProject: null });
+}
+
+/** The bulk clean-up of worktrees across open projects. Opening it only scans. */
+export function openWorktreeCleanup() {
+  set({ worktreeCleanup: true });
+}
+
+export function closeWorktreeCleanup() {
+  set({ worktreeCleanup: false });
 }

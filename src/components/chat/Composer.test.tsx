@@ -29,7 +29,6 @@ vi.mock("@/lib/models", async (original) => ({
   ...(await original<typeof import("@/lib/models")>()),
   EFFORT_LABEL: {},
   PERMISSION_MODES: [{ id: "auto", label: "Auto", hint: "" }],
-  modeLabel: () => "Auto",
   refreshModels: vi.fn(),
   upgradeHint: () => null,
   useModels: () => listed.models,
@@ -392,6 +391,124 @@ describe("a Claude alias in the model picker (#256)", () => {
     const menu = await screen.findByRole("menu");
     expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["Opuslatest · Opus 5.5", "Opus 5.5", "Opus 5", "Opus 4.8", "low", "high"]);
     expect(within(menu).getByRole("menuitemradio", { name: "Opus 4.8" }).getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("the pickers show what the agent is running (#404)", () => {
+  const entry = (harness: string, id: string, label: string, extra: Partial<import("@/lib/api").ModelInfo> = {}) => ({ id, label, harness, efforts: ["low", "high"], defaultEffort: "low", acceptsImages: true, isDefault: false, upgrade: null, description: null, ...extra });
+  const onSol: TabEntry = { ...tab, harness: "codex", model: "gpt-5.6-sol", effort: "low" };
+  const show = (shown: TabEntry, props: Partial<Parameters<typeof Composer>[0]> = {}) =>
+    render(<Composer tab={shown} busy={false} draft="" onDraftChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} onSetModel={vi.fn()} onSetEffort={vi.fn()} onSetMode={vi.fn()} {...props} />);
+  const ticked = (menu: HTMLElement) => within(menu).getAllByRole("menuitemradio").filter((item) => item.getAttribute("aria-checked") === "true").map((item) => item.textContent);
+  const pending = () => screen.queryByTestId("composer-settings-pending")?.textContent ?? null;
+
+  beforeEach(() => {
+    listed.models = [entry("codex", "gpt-5.6-sol", "GPT-5.6 Sol", { isDefault: true }), entry("codex", "gpt-6-astra", "GPT-6 Astra")];
+  });
+  afterEach(() => {
+    listed.models = [];
+  });
+
+  it("says nothing is on its way when the tab is on what was chosen", async () => {
+    show(onSol);
+    expect(pending()).toBeNull();
+    mouseClick(screen.getByTitle("Model: GPT-5.6 Sol · low"));
+    expect(ticked(await screen.findByRole("menu"))).toEqual(["GPT-5.6 Sol", "low"]);
+  });
+
+  it("keeps showing the running model and effort while a change waits for the turn", async () => {
+    show({ ...onSol, requestedModel: "gpt-6-astra", requestedEffort: "high" }, { busy: true });
+    // Never the model the agent is not on yet.
+    const button = screen.getByTitle("Model: GPT-5.6 Sol · low");
+    expect(button.textContent).toBe("GPT-5.6 Sollow");
+    expect(pending()).toBe("Switching to GPT-6 Astra · High after this turn");
+    mouseClick(button);
+    const menu = await screen.findByRole("menu");
+    expect(ticked(menu)).toEqual(["GPT-5.6 Sol", "low"]);
+    expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["GPT-5.6 Sol", "GPT-6 Astraswitching…", "low", "highswitching…"]);
+  });
+
+  it("says a change to an idle agent is on its way, for either setting alone", () => {
+    const view = show({ ...onSol, requestedModel: "gpt-6-astra" });
+    expect(pending()).toBe("Switching to GPT-6 Astra…");
+    view.unmount();
+    show({ ...onSol, requestedEffort: "high" });
+    expect(pending()).toBe("Switching to High effort…");
+  });
+
+  it("moves to the new values once the agent runs them, and back to nothing pending when it refuses", () => {
+    const view = show({ ...onSol, requestedModel: "gpt-6-astra" }, { busy: true });
+    view.rerender(<Composer tab={{ ...onSol, model: "gpt-6-astra" }} busy={false} draft="" onDraftChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} onSetModel={vi.fn()} onSetEffort={vi.fn()} onSetMode={vi.fn()} />);
+    expect(screen.getByTitle("Model: GPT-6 Astra · low")).toBeTruthy();
+    expect(pending()).toBeNull();
+    // Refused: the request is gone and the tab is where it was.
+    view.rerender(<Composer tab={onSol} busy={false} draft="" onDraftChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} onSetModel={vi.fn()} onSetEffort={vi.fn()} onSetMode={vi.fn()} />);
+    expect(screen.getByTitle("Model: GPT-5.6 Sol · low")).toBeTruthy();
+    expect(pending()).toBeNull();
+  });
+
+  it("shows a model and an effort the app has never heard of as the agent reported them", async () => {
+    show({ ...onSol, model: "gpt-9-nova", effort: "ultra" });
+    const button = screen.getByTitle("Model: GPT-9 Nova · ultra");
+    expect(button.textContent).toBe("GPT-9 Novaultra");
+    mouseClick(button);
+    const menu = await screen.findByRole("menu");
+    expect(ticked(menu)).toEqual(["GPT-9 Nova", "ultra"]);
+    // What can be chosen instead is still offered.
+    expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["GPT-5.6 Sol", "GPT-6 Astra", "GPT-9 Nova", "low", "high", "ultra"]);
+  });
+
+  it("names a requested model it has no entry for by its id", () => {
+    show({ ...onSol, requestedModel: "gpt-9-nova", requestedEffort: "ultra" });
+    expect(pending()).toBe("Switching to GPT-9 Nova · Ultra…");
+  });
+
+  it("keeps showing the mode the agent is in while another waits for the restart (#417)", async () => {
+    show({ ...onSol, permissionMode: "plan", requestedPermissionMode: "auto" }, { busy: true });
+    const button = screen.getByTitle("Permission mode: Plan");
+    expect(screen.getByTestId("permission-mode-label").textContent).toBe("Plan");
+    expect(pending()).toBe("Switching to Auto after this turn");
+    mouseClick(button);
+    const menu = await screen.findByRole("menu");
+    expect(ticked(menu)).toEqual([]);
+    expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["Autoswitching…"]);
+  });
+
+  it("names a waiting mode alongside a waiting model", () => {
+    show({ ...onSol, requestedModel: "gpt-6-astra", requestedPermissionMode: "plan" }, { busy: true });
+    expect(pending()).toBe("Switching to GPT-6 Astra and Plan mode after this turn");
+  });
+
+  it("shows a mode set in the terminal that the picker does not offer as reported (#417)", async () => {
+    show({ ...onSol, permissionMode: "never, workspace-write" });
+    const button = screen.getByTitle("Permission mode: never, workspace-write");
+    expect(screen.getByTestId("permission-mode-label").textContent).toBe("never, workspace-write");
+    mouseClick(button);
+    const menu = await screen.findByRole("menu");
+    // It is the one ticked, and what the picker does offer is still there to choose.
+    expect(ticked(menu)).toEqual(["never, workspace-writeSet in the terminal."]);
+    expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["never, workspace-writeSet in the terminal.", "Auto"]);
+  });
+
+  it("ticks the picker's entry for a mode stored under an older spelling", async () => {
+    listed.models = [];
+    show({ ...tab, permissionMode: "auto" });
+    mouseClick(screen.getByTitle("Permission mode: Auto"));
+    const menu = await screen.findByRole("menu");
+    expect(ticked(menu)).toEqual(["Auto"]);
+    expect(screen.queryByTestId("permission-mode-reported")).toBeNull();
+  });
+
+  it("offers no effort for an agent that has none", async () => {
+    listed.models = [entry("cursor", "auto", "Auto", { isDefault: true, efforts: [], defaultEffort: null }), entry("cursor", "gpt-5", "GPT-5", { efforts: [], defaultEffort: null })];
+    // A stale effort on the tab is not shown either.
+    show({ ...tab, harness: "cursor", model: "auto", effort: "high" });
+    const button = screen.getByTitle("Model: Auto");
+    expect(button.textContent).toBe("Auto");
+    mouseClick(button);
+    const menu = await screen.findByRole("menu");
+    expect(menu.textContent).not.toContain("Effort");
+    expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["Auto", "GPT-5"]);
   });
 });
 

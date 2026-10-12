@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Archive, BarChart3, Check, CalendarClock, ChevronDown, CircleDot, Ellipsis, FolderOpen, FolderPlus, ImagePlus, LayoutGrid, MessagesSquare, Pin, Plus, PinOff, RefreshCw, Search, Settings, Sparkles, Trash2 } from "lucide-react";
+import { Archive, BarChart3, CalendarClock, Check, ChevronDown, CircleDot, Ellipsis, FolderOpen, FolderPlus, ImagePlus, LayoutGrid, MessageCircle, MessagesSquare, Pin, PinOff, Plus, RefreshCw, Search, Settings, Sparkles, Trash2 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -28,22 +28,29 @@ import {
 import { bucketSessions, COLUMNS, type ColumnId } from "@/lib/dashboard";
 import { SIDEBAR_FILTERS, setSidebarFilter, useSidebarFilter } from "@/lib/sidebarFilter";
 import { useCloudDashboard } from "@/lib/cloudDashboard";
+import { START_ACTIONS } from "@/lib/projectStart";
 import type { Project } from "@/types/session";
 import { MASCOTS, PROJECT_COLORS, PixelMascot, colorCss } from "./PixelMascot";
 import { TITLEBAR_INSET } from "./AppShell";
 import { useAutomationStore } from "@/lib/automations";
 import { AccountSidebarEntry } from "@/components/account/AccountSidebarEntry";
 import { ChatsNode, ProjectNavigation } from "./SidebarTree";
+import { QuickChatsSection } from "./QuickChatsSection";
+import { showFloatingWindow, useFloating } from "@/lib/floating";
+import { bindingText } from "@/lib/shortcuts";
+import { isQuickChat } from "@/lib/quickChats";
 import { navigateTree } from "./treeKeyboard";
 import { refreshAccountRoles } from "@/lib/accountRoles";
 import { refreshCloudCatalog } from "@/lib/cloudCatalog";
 import { TreeToggle } from "./SidebarRows";
 import { CloudSections, useCloudSections, useSectionCollapsed } from "./cloud/CloudSections";
 import { DevelopmentSection } from "@/components/cloud/DevRuntime";
+import { visibleDashboardSessions } from "@/lib/organizationSessions";
+import type { SettingsTab } from "@/components/settings/SettingsPage";
 import { SessionSidebar } from "./SessionSidebar";
 
 export interface RailProps {
-  onOpenSettings: () => void;
+  onOpenSettings: (tab?: SettingsTab) => void;
   onOpenAccount: () => void;
   onOpenIssues: () => void;
   onOpenAgents: () => void;
@@ -74,9 +81,12 @@ function DetailedRail({
   onSearch,
 }: RailProps) {
   const store = useSessionStore();
+  // The floating window's system-wide shortcut, when it has one that is registered.
+  const floating = useFloating().status;
+  const quickChatKeys = floating?.shortcut && !floating.shortcutError ? bindingText(floating.shortcut) : null;
   // Section headers appear only when an organization section exists; otherwise the sidebar is as it was.
   const cloud = useCloudSections();
-  const sectioned = cloud.orgs.length > 0;
+  const sectioned = cloud.all.length > 0;
   const [localCollapsedPref, toggleLocal] = useSectionCollapsed("local");
   const localCollapsed = sectioned && localCollapsedPref;
   const [error, setError] = useState<string | null>(null);
@@ -95,7 +105,9 @@ function DetailedRail({
   const archivedCount = store.projects.filter((p) => p.archived).length;
   // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
   const selectedSession = store.sessions.find((session) => session.id === store.selectedSessionId) ?? null;
-  const focus = store.selectedProject ?? selectedSession?.projectPath ?? store.lastProject ?? store.projects[0]?.path ?? null;
+  // A quick chat has no project: opening one leaves the project in focus where it was, and never focuses its scratch folder.
+  const sessionProject = selectedSession && !isQuickChat(selectedSession) ? selectedSession.projectPath : null;
+  const focus = store.selectedProject ?? sessionProject ?? store.lastProject ?? store.projects[0]?.path ?? null;
 
   useEffect(() => {
     if (!store.selectedProject && focus) selectProjectInSidebar(focus);
@@ -234,7 +246,7 @@ function DetailedRail({
           ) : showArchived ? (
             "Nothing archived."
           ) : (
-            "Add a project to start."
+            <StartLinks onError={setError} />
           )}
         </div>
       )}
@@ -274,6 +286,13 @@ function DetailedRail({
           <Keys shortcut="app.commandPalette" />
         </Button>
         <AppDestinations onOpenIssues={onOpenIssues} onOpenAgents={onOpenAgents} onOpenStats={onOpenStats} onOpenAutomations={onOpenAutomations} onOpenSkills={onOpenSkills} />
+        <WithTooltip label={quickChatKeys ? `Open the floating chat window (${quickChatKeys} from any app)` : "Open the floating chat window: a chat or terminal with no project"}>
+          <Button variant="ghost" className="justify-start gap-2 px-2" onClick={() => void showFloatingWindow()} data-testid="open-floating-window">
+            <MessageCircle />
+            <span className="truncate">Quick Chat</span>
+            {quickChatKeys && <span className="ml-auto shrink-0 text-[10px] text-faint">{quickChatKeys}</span>}
+          </Button>
+        </WithTooltip>
       </div>
 
       {!sectioned && (
@@ -320,7 +339,8 @@ function DetailedRail({
         ) : (
           localRows
         )}
-        {sectioned && <CloudSections onOpenAccount={onOpenAccount} />}
+        <QuickChatsSection />
+        {sectioned && <CloudSections onOpenAccount={onOpenAccount} onOpenOrganizations={() => onOpenSettings("organizations")} />}
         <DevelopmentSection />
       </div>
 
@@ -345,6 +365,30 @@ function DetailedRail({
   );
 }
 
+/** The empty sidebar points at the same three ways to a project as the start screen. */
+function StartLinks({ onError }: { onError: (message: string | null) => void }) {
+  return (
+    <div data-testid="sidebar-start">
+      Add a project to get started.
+      <div className="mt-2 flex flex-col items-center gap-1">
+        {START_ACTIONS.map((action) => (
+          <button
+            key={action.id}
+            type="button"
+            className="rounded-sm underline underline-offset-2 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+            onClick={() => {
+              onError(null);
+              void Promise.resolve(action.run()).catch((cause) => onError(errorMessage(cause)));
+            }}
+          >
+            {action.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /**
  * Issues, the dashboard, stats, automations and skills, each carrying its own
  * status: a strip of icons, or a labelled list where there is room to name them.
@@ -361,7 +405,8 @@ export function AppDestinations({
   const automationStore = useAutomationStore();
   // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
   const cloudSessions = useCloudDashboard();
-  const dashboardBuckets = useMemo(() => (cloudSessions.length ? bucketSessions([...store.sessions, ...cloudSessions]) : bucketSessions(store.sessions)), [store.sessions, cloudSessions]);
+  const cloud = useCloudSections();
+  const dashboardBuckets = useMemo(() => bucketSessions([...store.sessions, ...visibleDashboardSessions(cloudSessions, cloud.visibleIds)]), [store.sessions, cloudSessions, cloud.visibleIds]);
   const automationRunning = automationStore.automations.some((automation) => automation.lastOutcome === "pending" || automation.lastOutcome === "running");
   const automationFailures = automationStore.automations.filter((automation) => automation.lastOutcome === "failed").length;
   // A destination looks active only while it is what the main slot shows: no session and no cloud workspace selected.

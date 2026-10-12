@@ -70,6 +70,8 @@ mod transcription;
 mod events;
 mod files;
 #[cfg(feature = "desktop")]
+mod floating;
+#[cfg(feature = "desktop")]
 mod media;
 mod media_types;
 mod git;
@@ -82,11 +84,13 @@ mod installation;
 #[cfg(feature = "desktop")]
 mod keychain;
 mod landed;
+mod local_sharing;
 mod memory_baseline;
 mod models;
 mod names;
 #[cfg(feature = "desktop")]
 mod pairing;
+mod project_start;
 mod pty;
 mod relay_e2ee;
 pub mod remote;
@@ -105,6 +109,7 @@ mod star_nag;
 mod summaries;
 mod terminal_perf;
 mod workspaces;
+mod worktree_cleanup;
 
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
@@ -198,6 +203,17 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    // On the press only: the release of the same keys is not a second toggle.
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed && floating::is_toggle_shortcut(app, shortcut) {
+                        floating::later(app, "toggle", floating::toggle);
+                    }
+                })
+                .build(),
+        )
+        .manage(floating::Floating::default())
         .manage(state)
         .manage(cloud_remote.clone())
         .manage(cloud_agents)
@@ -224,11 +240,19 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 let links = desktop_links::DesktopLinks::for_identifier(&app.config().identifier);
                 let account = account.clone();
+                let joining = pairing.clone();
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    for url in urls {
+                        if links.is_join_link(&url) { let _ = joining.set_pending_join(url.to_string()); }
+                    }
+                }
                 app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
                         if links.accepts_scheme(url.scheme()) {
                             account::focus_main_window(&app_handle);
-                            if links.is_launch_link(&url) {
+                            if links.is_join_link(&url) {
+                                if joining.set_pending_join(url.to_string()).is_err() { log::warn!("ignored invalid session link"); }
+                            } else if links.is_launch_link(&url) {
                                 log::info!("received TerminalX launch link");
                             } else if account.handle_deep_link(&app_handle, &url) {
                                 log::info!("received TerminalX account callback");
@@ -243,7 +267,7 @@ pub fn run() {
             }
             status::install_menu(app)?;
             if let Ok(resources) = app.path().resource_dir() {
-                computer.set_resource_dir(resources);
+                computer.set_resource_dir(resources, &app.config().identifier);
             }
             // Recover local history before hooks/automations can publish live
             // activity. Provider cache scans are deliberately unrelated.
@@ -266,7 +290,7 @@ pub fn run() {
             // The agent CLIs' hooks reach the app through this socket; without
             // it a PTY-first tab still runs, it just cannot report or ask.
             let hooked = manager.clone();
-            let service = control::ControlService::new(sink.clone(), manager.clone(), control_endpoint.clone(), computer.clone(), browser.clone());
+            let service = control::ControlService::new(sink.clone(), manager.clone(), control_endpoint.clone(), computer.clone(), browser.clone()).with_pairing(pairing.clone());
             match hooks::serve(control_endpoint, move |frame| hooked.on_hook(frame), move |request| service.handle(request)) {
                 Ok(path) => log::info!("hook socket at {}", path.display()),
                 Err(e) => log::warn!("hook socket: {e:#}"),
@@ -300,6 +324,8 @@ pub fn run() {
             browser.attach(app.handle().clone());
             browser.sweep_orphans();
             browser.start_keepalive();
+            floating::install(app.handle());
+            commands::start_quick_chat_retention(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -398,6 +424,13 @@ pub fn run() {
             cloud_catalog::cloud_catalog_load,
             cloud_catalog::cloud_catalog_save,
             commands::pairing_status,
+            commands::session_share_create,
+            commands::session_share_status,
+            commands::session_share_change,
+            commands::session_join_pending,
+            commands::session_guest_join,
+            commands::session_guest_send,
+            commands::session_guest_leave,
             commands::pairing_generate,
             commands::pairing_revoke,
             commands::pairing_set_host_name,
@@ -405,6 +438,11 @@ pub fn run() {
             commands::chats_dir,
             commands::remove_project,
             commands::select_project,
+            commands::github_repositories,
+            commands::project_clone,
+            commands::project_clone_cancel,
+            commands::project_start_defaults,
+            commands::project_create,
             commands::list_sessions,
             commands::automations_list,
             commands::automation_runs,
@@ -419,6 +457,17 @@ pub fn run() {
             commands::app_activity_summary,
             commands::stats_usage_refresh,
             commands::create_session,
+            commands::create_quick_chat,
+            commands::set_quick_chat_cwd,
+            commands::move_quick_chat_to_project,
+            commands::quick_chat_scratch,
+            floating::floating_status,
+            floating::set_floating_settings,
+            floating::floating_show,
+            floating::floating_hide,
+            floating::floating_visible,
+            floating::floating_take_pending,
+            floating::floating_open_in_main,
             commands::add_tab,
             commands::remove_tab,
             commands::rename_session,
@@ -494,6 +543,8 @@ pub fn run() {
             star_nag::star_nag_dismiss,
             star_nag::star_nag_act,
             commands::pty_spawn,
+            commands::pty_shells,
+            commands::pty_rename,
             commands::pty_write,
             commands::pty_attach,
             commands::pty_detach,
@@ -531,6 +582,10 @@ pub fn run() {
             commands::workspace_size,
             commands::scan_leftovers,
             commands::remove_leftovers,
+            commands::worktree_cleanup_scan,
+            commands::worktree_cleanup_size,
+            commands::worktree_cleanup_cancel_sizes,
+            commands::worktree_cleanup_remove,
             commands::issues_list,
             commands::issue_details,
             commands::linear_status,
@@ -580,12 +635,27 @@ pub fn run() {
             if let tauri::WindowEvent::DragDrop(drag) = event {
                 drag_text::on_drag_drop(drag);
             }
+            // The floating window is a view, not the app: closing it puts it
+            // away, and what it showed carries on.
+            if window.label() == floating::LABEL {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    floating::hide(window.app_handle());
+                }
+                return;
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 if let Some(state) = window.try_state::<AppState>() {
                     state.pairing.stop();
                     if window.label() == "main" {
                         if let Err(error) = store::activity::shutdown() {
                             log::error!("flush activity on window teardown: {error:#}");
+                        }
+                        // The app goes with its main window, as it always
+                        // has: a hidden floating window must not keep it
+                        // running with every agent stopped.
+                        if let Some(floating) = window.app_handle().get_webview_window(floating::LABEL) {
+                            let _ = floating.destroy();
                         }
                     }
                     state.host.kill_all();

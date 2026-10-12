@@ -3,6 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import {
   WorkspaceRpcClient,
   type Activation,
+  type CleanupProject,
+  type CleanupRemoveItem,
+  type CleanupResult,
   type WorkspaceConnectionState,
   type WorkspaceTransport,
 } from "@terminalx/portable/workspace";
@@ -151,6 +154,47 @@ export interface WorkspaceRename {
   path: string;
   branch: string;
   sessions: SessionEntry[];
+}
+
+export interface NewQuickChat {
+  title?: string | null;
+  cwd?: string | null;
+  tab?: NewTab | null;
+}
+
+export interface QuickChatScratch {
+  path: string;
+  /** Files in it, counted up to a limit. */
+  files: number;
+  /** The count stopped at the limit: there are at least `files`. */
+  more: boolean;
+  /** The session runs there now, rather than in a folder it was pointed at. */
+  inUse: boolean;
+}
+
+/** The floating chat window's settings, and why its shortcut is not registered when it is not. */
+export interface FloatingStatus {
+  /** The system-wide shortcut, as the app writes bindings (`alt+shift+space`); null when turned off. */
+  shortcut: string | null;
+  alwaysOnTop: boolean;
+  /** Days an idle quick chat is kept; 0 keeps them until deleted by hand. */
+  retentionDays: number;
+  shortcutError: string | null;
+}
+
+/** A session one window asks the other to show, and the tab of it when one is meant. */
+export interface OpenTarget {
+  sessionId: string;
+  tabId?: string | null;
+}
+
+/** A shell tab as the backend lists it for every window. */
+export interface ShellPane {
+  id: string;
+  sessionId: string;
+  title: string | null;
+  cwd: string;
+  exited: boolean;
 }
 
 /** How a workspace is removed. */
@@ -341,6 +385,13 @@ export const api = {
   scanLeftovers: () => invoke<Leftover[]>("scan_leftovers"),
   /** Delete the confirmed leftovers; each is checked again first. */
   removeLeftovers: (ids: string[]) => invoke<LeftoverRemoval>("remove_leftovers", { ids }),
+  /** Every worktree of the open local projects with what the clean-up may do with it. Reads only. */
+  worktreeCleanupScan: (projectPaths?: string[]) => invoke<CleanupProject[]>("worktree_cleanup_scan", { projectPaths: projectPaths ?? null }),
+  /** What removing one worktree would free; null when `job` was cancelled. */
+  worktreeCleanupSize: (job: string, projectPath: string, path: string) => invoke<number | null>("worktree_cleanup_size", { job, projectPath, path }),
+  worktreeCleanupCancelSizes: (prefix: string) => invoke<void>("worktree_cleanup_cancel_sizes", { prefix }),
+  /** Remove the confirmed worktrees; each is checked again first. */
+  worktreeCleanupRemove: (items: CleanupRemoveItem[]) => invoke<CleanupResult[]>("worktree_cleanup_remove", { items }),
   workspaceSize: (projectPath: string, path: string) => invoke<number>("workspace_size", { projectPath, path }),
   /**
    * What a workspace holds. With `fetch`, the default branch is fetched and
@@ -361,6 +412,14 @@ export const api = {
   statsUsageRefresh: (scope: string, generation: number) => invoke<StatsUsageState>("stats_usage_refresh", { scope, generation }),
   appActivitySummary: () => invoke<AppStats>("app_activity_summary"),
   createSession: (req: NewSession) => invoke<SessionEntry>("create_session", { req }),
+  /** A session with no project, in a scratch directory of its own (or in `cwd`, which does not become a project). */
+  createQuickChat: (req: NewQuickChat) => invoke<SessionEntry>("create_quick_chat", { req }),
+  /** Run a quick chat in another folder; `null` returns it to its scratch directory. Its agents restart there. */
+  setQuickChatCwd: (sessionId: string, cwd: string | null) => invoke<SessionEntry>("set_quick_chat_cwd", { sessionId, cwd }),
+  /** Turn a quick chat into an ordinary session of a project (added if it is not attached yet), keeping its history. */
+  moveQuickChatToProject: (sessionId: string, projectPath: string) => invoke<SessionEntry>("move_quick_chat_to_project", { sessionId, projectPath }),
+  /** What a session's scratch directory holds, for the delete confirmation. */
+  quickChatScratch: (sessionId: string) => invoke<QuickChatScratch>("quick_chat_scratch", { sessionId }),
   addTab: (sessionId: string, tab: NewTab) => invoke<TabEntry>("add_tab", { sessionId, tab }),
   removeTab: (sessionId: string, tabId: string) => invoke<void>("remove_tab", { sessionId, tabId }),
   renameSession: (sessionId: string, title: string) => invoke<void>("rename_session", { sessionId, title }),
@@ -1139,6 +1198,12 @@ export interface ComputerPermissionStatus {
   platform: string;
   helperAppPath: string | null;
   helperUnavailableReason: string | null;
+  /**
+   * What this launch's removal of older computer-use helpers' permissions
+   * reported (PRO-90); absent until it has run. `removed: false` means macOS
+   * would not clear them and the person has to remove the old entry.
+   */
+  legacyHelper?: { removed: boolean; bundleIds: string[] } | null;
   permissions: ComputerPermissionState[];
 }
 
@@ -1174,7 +1239,12 @@ export interface StatusBarSettings {
   resources: boolean;
   percent: "used" | "remaining";
   usageMode: "detailed" | "compact";
+  /** Minutes between automatic usage refreshes; 0 turns the timer off. */
+  usageRefreshMinutes: number;
 }
+
+/** What Settings offers for `usageRefreshMinutes`; the backend accepts no others. */
+export const USAGE_REFRESH_MINUTES = [0, 1, 2, 5, 15] as const;
 
 export interface UsageWindow {
   agent: "claude" | "codex";
@@ -1191,7 +1261,8 @@ export interface UsageWindow {
 export interface UsageSnapshot {
   revision?: number;
   claudeAccount?: string | null;
-  claude?: { retryAt: number | null; revalidateAt: number | null; error: string | null };
+  claude?: { retryAt: number | null; revalidateAt: number | null; error: string | null; lastSuccessAt?: number | null };
+  codexRefresh?: { retryAt: number | null; error: string | null; lastSuccessAt: number | null };
   windows: UsageWindow[];
   codex?: {
     credits?: {
@@ -1470,13 +1541,36 @@ export const browser = {
   profiles: () => invoke<BrowserProfile[]>("browser_profiles"),
 };
 
+// ---- the floating chat window
+export const floatingWindow = {
+  status: () => invoke<FloatingStatus>("floating_status"),
+  /** `shortcut: ""` turns the system-wide shortcut off. A binding the system cannot register is refused. */
+  setSettings: (patch: { shortcut?: string; alwaysOnTop?: boolean; retentionDays?: number }) => invoke<FloatingStatus>("set_floating_settings", { patch }),
+  /** Show the window (made on first use) and focus it; with a session, it opens on that one. */
+  show: (sessionId?: string | null, tabId?: string | null) => invoke<void>("floating_show", { sessionId: sessionId ?? null, tabId: tabId ?? null }),
+  /** Whether it is on screen now. */
+  visible: () => invoke<boolean>("floating_visible"),
+  /** Hide it. Nothing it shows is stopped. */
+  hide: () => invoke<void>("floating_hide"),
+  /** The session the window was asked to open on before its page had loaded, once. */
+  takePending: () => invoke<OpenTarget | null>("floating_take_pending"),
+  /** Show a session in the main window and hide the floating one. */
+  openInMain: (sessionId: string, tabId?: string | null) => invoke<void>("floating_open_in_main", { sessionId, tabId: tabId ?? null }),
+};
+
 // ---- terminals
 export const pty = {
-  spawn: (id: string, cwd: string, cols: number, rows: number, command?: string) => invoke<void>("pty_spawn", { id, cwd, cols, rows, command: command ?? null }),
+  /** `title` names a shell tab for every window that lists it. */
+  spawn: (id: string, cwd: string, cols: number, rows: number, command?: string, title?: string) =>
+    invoke<void>("pty_spawn", { id, cwd, cols, rows, command: command ?? null, title: title ?? null }),
+  /** The shell tabs open in every session, for a window that was not there when they were opened. */
+  shells: () => invoke<ShellPane[]>("pty_shells"),
+  rename: (id: string, title: string) => invoke<void>("pty_rename", { id, title }),
   write: (id: string, data: string) => invoke<void>("pty_write", { id, data }),
   /**
    * Receive pane `id`'s output as raw bytes, starting with what it has
-   * printed so far. One attachment per pane: a later one replaces it.
+   * printed so far. One attachment per pane and window: a later one from the
+   * same window replaces it, and another window's is left as it is.
    * `token` names this attachment; its acknowledgements and its detach carry
    * it, so they cannot act on an attachment that has replaced it.
    */

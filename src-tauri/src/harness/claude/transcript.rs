@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::events::{Payload, ToolResult, ToolType, TurnStatus, Usage};
+use crate::harness::settings::{Setting, Signal, Stance};
 use crate::harness::tui::TurnMark;
 
 /// Where a session's transcript actually is.
@@ -61,6 +62,45 @@ pub fn locate_in(projects: &Path, cwd: &str, session_id: &str) -> PathBuf {
         // the copy it is still writing is the newer.
         .max_by_key(|candidate| modified(candidate))
         .unwrap_or(derived)
+}
+
+/// Put a conversation's transcript where the CLI will look for it when it is
+/// resumed in `to`.
+///
+/// `--resume <id>` reads the folder named for the directory it is run in.
+/// That is the same folder for a renamed checkout or another worktree of the
+/// repository, but not when a session moves to an unrelated directory: a
+/// quick chat pointed at a folder, or moved into a project. `keep_source`
+/// leaves the original where it was, for a fork, whose parent goes on being
+/// used from there.
+///
+/// Returns whether anything was put there. A conversation with no file yet,
+/// or one that is already in `to`'s folder, needs nothing.
+pub fn rehome_in(projects: &Path, from: &str, to: &str, session_id: &str, keep_source: bool) -> std::io::Result<bool> {
+    let source = locate_in(projects, from, session_id);
+    let target = transcript_in(projects, to, session_id);
+    let is_file = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    if source == target || !is_file(&source) || std::fs::symlink_metadata(&target).is_ok() {
+        return Ok(false);
+    }
+    let folder = target.parent().expect("a transcript is in a folder");
+    std::fs::create_dir_all(folder)?;
+    // What the CLI keeps beside a transcript (subagent logs, tool results) is
+    // in a directory named for the conversation.
+    let side = source.with_extension("");
+    let side_target = target.with_extension("");
+    if keep_source {
+        std::fs::copy(&source, &target)?;
+    } else if std::fs::rename(&source, &target).is_err() {
+        // Another volume: copy, then let go of the original.
+        std::fs::copy(&source, &target)?;
+        let _ = std::fs::remove_file(&source);
+    }
+    if !keep_source && std::fs::symlink_metadata(&side).is_ok_and(|meta| meta.is_dir()) && std::fs::symlink_metadata(&side_target).is_err() {
+        // Best effort: the conversation resumes without it.
+        let _ = std::fs::rename(&side, &side_target);
+    }
+    Ok(true)
 }
 
 /// Where the CLI keeps every project's transcripts: `projects` under
@@ -131,6 +171,57 @@ fn interruption(text: &str) -> bool {
 fn command_output(text: &str) -> bool {
     let text = text.trim_start();
     ["<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"].iter().any(|tag| text.starts_with(tag))
+}
+
+/// What `/model` and `/effort` printed, as a word about the session's
+/// settings (#404). The status line is what names the model in use (see
+/// `status_settings`); this is the CLI's answer to the command itself, which
+/// is how a change the app typed is known to have been taken or turned down.
+///
+/// The wording is the CLI's (2.1.295):
+/// "Set model to `Sonnet 5.5` and saved as your default for new sessions",
+/// the same "… with `medium` effort" out of the `/model` picker, and
+/// "Set effort level to xhigh (this session only): …". `command` is which
+/// command printed it, where the record says; anything it printed that is
+/// not one of these is its reason for not doing as asked.
+fn command_result(command: Option<(&str, &str)>, stdout: &str, out: &mut Vec<Payload>) {
+    let mut say = |signal| out.push(Payload::ProviderSettings { signal });
+    let ticked = |text: &str| text.split('`').nth(1).map(str::trim).filter(|word| !word.is_empty()).map(String::from);
+    if let Some(rest) = stdout.strip_prefix("Set model to ") {
+        say(Signal::Accepted { setting: Setting::Model });
+        // The picker sets both at once: "… with `medium` effort".
+        if let Some(effort) = rest.rsplit_once(" with ").filter(|(_, tail)| tail.trim_end().ends_with("effort")).and_then(|(_, tail)| ticked(tail)) {
+            say(Signal::Current { model: None, effort: Some(effort) });
+        }
+    } else if let Some(rest) = stdout.strip_prefix("Set effort level to ") {
+        // The level it names is the level in force, whatever was asked for
+        // (it may have clamped it): that alone settles a matching request.
+        let level: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        if level.is_empty() {
+            say(Signal::Accepted { setting: Setting::Effort });
+        } else {
+            say(Signal::Current { model: None, effort: Some(level) });
+        }
+    } else {
+        let Some((name, args)) = command else { return };
+        let setting = match name {
+            "model" => Setting::Model,
+            "effort" => Setting::Effort,
+            _ => return,
+        };
+        let value = Some(args.trim()).filter(|args| !args.is_empty()).map(String::from);
+        say(Signal::Refused { setting, value, message: stdout.to_string() });
+    }
+}
+
+/// A command the CLI ran and kept out of the conversation: a `system` record
+/// that names the command beside what it printed. `/model` and `/effort` are
+/// written this way when they fail.
+fn decode_local_command(v: &Value, out: &mut Vec<Payload>) {
+    let Some(command) = v["commandRun"]["command"].as_str() else { return };
+    if let Some(stdout) = v["content"].as_str().and_then(|content| tagged(content, "local-command-stdout")) {
+        command_result(Some((command.trim_start_matches('/'), v["commandRun"]["args"].as_str().unwrap_or(""))), stdout, out);
+    }
 }
 
 /// The text of a prompt without the wrapper the CLI puts round a large
@@ -252,7 +343,12 @@ pub fn decode_marked(line: &str, skip: &HashSet<String>, out: &mut Vec<Payload>)
         "assistant" => decode_assistant(&v, out),
         "system" if v["subtype"] == "api_error" => {
             let message = v["error"]["message"].as_str().or_else(|| v["message"].as_str()).unwrap_or("Provider request failed");
-            out.push(Payload::Error { message: message.into(), fatal: false });
+            // The CLI writes one of these per failed attempt and keeps
+            // retrying; only the last attempt is the request failing.
+            match (v["retryAttempt"].as_u64(), v["maxRetries"].as_u64()) {
+                (Some(attempt), Some(max_retries)) => out.push(Payload::ApiRetry { attempt: attempt as u32, max_retries: max_retries as u32, reason: Some(message.into()) }),
+                _ => out.push(Payload::Error { message: message.into(), fatal: false }),
+            }
         }
         "system" if v["subtype"] == "compact_boundary" => {
             let meta = &v["compactMetadata"];
@@ -262,6 +358,7 @@ pub fn decode_marked(line: &str, skip: &HashSet<String>, out: &mut Vec<Payload>)
             });
         }
         "system" if v["subtype"] == "turn_duration" => return Some(TurnMark::Ended),
+        "system" if v["subtype"] == "local_command" => decode_local_command(&v, out),
         _ => {}
     }
     None
@@ -295,10 +392,43 @@ fn decode_user(v: &Value, out: &mut Vec<Payload>) {
         return;
     }
     if command_output(&prompt) {
+        // Nobody said it, but `/model` and `/effort` say here what they did.
+        if let Some(stdout) = tagged(&prompt, "local-command-stdout") {
+            command_result(None, stdout, out);
+        }
         return;
     }
     let text = as_typed(prompt);
-    out.push(Payload::UserMessage { text, images: Vec::new(), baseline: None, queued: false, cwd: v["cwd"].as_str().map(String::from) });
+    out.push(Payload::UserMessage { author: None, text, images: Vec::new(), baseline: None, queued: false, cwd: v["cwd"].as_str().map(String::from) });
+}
+
+/// The model and effort in a status line frame: the JSON the CLI hands its
+/// `statusLine` command, which it runs again whenever either changes — from
+/// `/model <name>`, from the `/model` picker, from `/effort`, or at startup
+/// with whatever it resolved its default to. `model.id` is the full id and
+/// `effort.level` the level in force (2.1.295); a CLI that sends neither
+/// reports nothing.
+pub fn status_settings(frame: &Value) -> Option<Signal> {
+    Signal::current(frame["model"]["id"].as_str(), frame["effort"]["level"].as_str())
+}
+
+/// The permission mode a hook frame says the CLI is in (#417).
+///
+/// Nothing is sent when the reader cycles the mode with Shift+Tab: the status
+/// line is run again but does not carry the mode, and the transcript's own
+/// `permission-mode` record is written some time later. What does carry it,
+/// as `permission_mode`, is every hook that fires around work — the next
+/// prompt, the next tool call — and that is before the mode is used to judge
+/// anything (2.1.295). `SessionStart` has no such field.
+///
+/// A frame from inside a subagent is not read: an agent can be defined with
+/// a mode of its own, which is not the session's.
+pub fn hook_permissions(frame: &Value) -> Option<Signal> {
+    if frame.get("agent_id").is_some_and(|id| !id.is_null()) {
+        return None;
+    }
+    let mode = frame["permission_mode"].as_str().map(str::trim).filter(|mode| !mode.is_empty())?;
+    Some(Signal::Permissions { stance: Stance::Mode { mode: mode.into() } })
 }
 
 /// A prompt typed while a turn was running. The CLI queues it, hands it to
@@ -323,7 +453,7 @@ fn decode_queued_prompt(v: &Value, out: &mut Vec<Payload>) {
         return;
     }
     let text = as_typed(prompt);
-    out.push(Payload::UserMessage { text, images: Vec::new(), baseline: None, queued: false, cwd: v["cwd"].as_str().map(String::from) });
+    out.push(Payload::UserMessage { author: None, text, images: Vec::new(), baseline: None, queued: false, cwd: v["cwd"].as_str().map(String::from) });
 }
 
 fn decode_assistant(v: &Value, out: &mut Vec<Payload>) {
@@ -562,9 +692,161 @@ mod tests {
         // Prose that merely mentions a tag is prose.
         assert_eq!(typed(user("what does <command-name> mean?")), "what does <command-name> mean?");
 
-        assert!(decode(user(r"<local-command-stdout>Set model to opus</local-command-stdout>")).is_empty());
+        assert!(decode(user(r"<local-command-stdout>Compacted the conversation</local-command-stdout>")).is_empty());
         assert!(decode(user(r"<local-command-stderr>no such model</local-command-stderr>")).is_empty());
         assert!(decode(user(r"<local-command-caveat>Caveat: the messages below were generated by the user while running local commands.</local-command-caveat>")).is_empty());
+    }
+
+    /// Everything Claude Code 2.1.295 wrote for `/model sonnet`, `/effort
+    /// high`, a pick in the `/model` picker, a move of the `/effort` slider,
+    /// `/model default`, and two `/model` commands it turned down — captured
+    /// from a real interactive session, whole, with only the working
+    /// directory replaced.
+    const COMMANDS: &str = include_str!("fixtures/model_and_effort_commands.jsonl");
+
+    fn signals(payloads: &[Payload]) -> Vec<Signal> {
+        payloads
+            .iter()
+            .filter_map(|p| match p {
+                Payload::ProviderSettings { signal } => Some(signal.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #404. The commands read as typed, as before; what they printed is
+    /// still nobody's message, and now says what became of the change.
+    #[test]
+    fn what_model_and_effort_commands_printed_says_what_became_of_them() {
+        let mut s = Streamer::at(0, decode_line);
+        let p = s.push(COMMANDS.as_bytes());
+        let typed: Vec<&str> = p.iter().filter_map(|p| match p { Payload::UserMessage { text, .. } => Some(text.as_str()), _ => None }).collect();
+        assert_eq!(typed, ["/model sonnet", "/effort high", "/model", "/effort", "/model default"]);
+        assert_eq!(p.len(), typed.len() + signals(&p).len(), "nothing else is drawn");
+
+        let effort = |level: &str| Signal::Current { model: None, effort: Some(level.into()) };
+        let refused = |value: &str, message: &str| Signal::Refused { setting: Setting::Model, value: Some(value.into()), message: message.into() };
+        assert_eq!(
+            signals(&p),
+            [
+                // /model sonnet
+                Signal::Accepted { setting: Setting::Model },
+                // /effort high
+                effort("high"),
+                // The /model picker: Opus, and the effort chosen beside it.
+                Signal::Accepted { setting: Setting::Model },
+                effort("medium"),
+                // The /effort slider, with no argument typed.
+                effort("xhigh"),
+                // /model default
+                Signal::Accepted { setting: Setting::Model },
+                // /model claude-haiku-5-5 and /model nonsense-model, both
+                // turned down (this capture had no working credentials).
+                refused("claude-haiku-5-5", "Authentication failed. Please check your API credentials."),
+                refused("nonsense-model", "Authentication failed. Please check your API credentials."),
+            ]
+        );
+        // None of it opens or ends a turn but the commands themselves.
+        let marks = COMMANDS.lines().filter_map(turn_mark).count();
+        assert_eq!(marks, typed.len());
+    }
+
+    #[test]
+    fn a_command_result_is_read_for_what_it_says_and_no_more() {
+        let result = |command: Option<(&str, &str)>, stdout: &str| {
+            let mut out = Vec::new();
+            command_result(command, stdout, &mut out);
+            signals(&out)
+        };
+        // Another command's output is not about the settings, whoever ran it.
+        assert!(result(None, "Compacted the conversation").is_empty());
+        assert!(result(Some(("compact", "")), "Compacted the conversation").is_empty());
+        // A failure only counts where the record says which command failed.
+        assert!(result(None, "Model 'x' not found").is_empty());
+        assert_eq!(
+            result(Some(("effort", "ultra")), "Invalid effort level: ultra"),
+            [Signal::Refused { setting: Setting::Effort, value: Some("ultra".into()), message: "Invalid effort level: ultra".into() }]
+        );
+        // A level this app has no name for is reported as it is. The level
+        // printed is the answer: asking for one and being given another must
+        // not read as the one asked for.
+        assert_eq!(result(None, "Set effort level to ultra (this session only): More"), [Signal::Current { model: None, effort: Some("ultra".into()) }]);
+        assert_eq!(result(None, "Set effort level to (auto)"), [Signal::Accepted { setting: Setting::Effort }]);
+        // "with" in a model's name is not an effort.
+        assert_eq!(result(None, "Set model to `Opus with tools`"), [Signal::Accepted { setting: Setting::Model }]);
+    }
+
+    /// The status line frames of the same session: the CLI ran its status
+    /// command again after each change, the picker's and the slider's
+    /// included, and at startup with the default it had resolved.
+    #[test]
+    fn a_status_line_frame_names_the_model_and_effort_in_force() {
+        const FRAMES: &str = include_str!("fixtures/status_line.jsonl");
+        let read: Vec<Signal> = FRAMES.lines().filter_map(|line| status_settings(&serde_json::from_str(line).unwrap())).collect();
+        let now = |model: &str, effort: &str| Signal::Current { model: Some(model.into()), effort: Some(effort.into()) };
+        assert_eq!(
+            read,
+            [
+                now("claude-opus-5-5", "medium"),
+                now("claude-sonnet-5-5", "medium"),
+                now("claude-sonnet-5-5", "high"),
+                now("claude-opus-5-5", "medium"),
+                now("claude-opus-5-5", "xhigh"),
+            ]
+        );
+        // An older CLI's frame carries no effort, and one with neither says nothing.
+        let old = serde_json::json!({"model": {"id": "claude-opus-5", "display_name": "Opus 5"}, "rate_limits": {}});
+        assert_eq!(status_settings(&old), Some(Signal::Current { model: Some("claude-opus-5".into()), effort: None }));
+        assert_eq!(status_settings(&serde_json::json!({"rate_limits": {}})), None);
+    }
+
+    /// Claude Code 2.1.295, started with `--permission-mode manual` and taken
+    /// round its Shift+Tab cycle twice with a prompt after each press: the
+    /// hook frames it sent, whole but for the paths.
+    const MODE_FRAMES: &str = include_str!("fixtures/permission_mode_hooks.jsonl");
+
+    #[test]
+    fn a_hook_frame_names_the_permission_mode_in_force() {
+        let read: Vec<(String, Option<String>)> = MODE_FRAMES
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .map(|frame| {
+                let mode = hook_permissions(&frame["payload"]).map(|signal| match signal {
+                    Signal::Permissions { stance: Stance::Mode { mode } } => mode,
+                    other => panic!("{other:?}"),
+                });
+                (frame["event"].as_str().unwrap().to_string(), mode)
+            })
+            .collect();
+        let prompt = |mode: &str| ("UserPromptSubmit".to_string(), Some(mode.to_string()));
+        assert_eq!(
+            read,
+            [
+                ("SessionStart".to_string(), None),
+                prompt("acceptEdits"),
+                prompt("plan"),
+                prompt("auto"),
+                // What the CLI takes as `manual` it reports as `default`.
+                prompt("default"),
+                prompt("acceptEdits"),
+                prompt("plan"),
+                prompt("auto"),
+                ("SessionEnd".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_from_a_subagent_or_with_no_mode_says_nothing() {
+        let tool = |extra: Value| {
+            let mut frame = serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "permission_mode": "bypassPermissions"});
+            frame.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            hook_permissions(&frame)
+        };
+        assert!(tool(serde_json::json!({})).is_some());
+        assert_eq!(tool(serde_json::json!({"agent_id": "a1b2", "agent_type": "Explore"})), None);
+        assert_eq!(hook_permissions(&serde_json::json!({"hook_event_name": "Stop", "permission_mode": " "})), None);
+        assert_eq!(hook_permissions(&serde_json::json!({"hook_event_name": "SessionStart"})), None);
     }
 
     /// #250. The CLI files a transcript under the folder the conversation
@@ -606,6 +888,46 @@ mod tests {
         for id in ["../other", "a/b", "", ".."] {
             assert_eq!(locate_in(home, now, id), transcript_in(home, now, id));
         }
+    }
+
+    #[test]
+    fn a_transcript_follows_its_conversation_to_an_unrelated_directory() {
+        let config = tempfile::tempdir().unwrap();
+        let home = &config.path().join("projects");
+        let (scratch, project) = ("/Users/dev/.raccoon/quick/0198", "/Users/dev/code/api");
+        // Nothing written yet: nothing to carry.
+        assert!(!rehome_in(home, scratch, project, "abc", false).unwrap());
+
+        let began = transcript_in(home, scratch, "abc");
+        std::fs::create_dir_all(began.with_extension("")).unwrap();
+        std::fs::write(&began, "{\"type\":\"user\"}\n").unwrap();
+        std::fs::write(began.with_extension("").join("subagent.jsonl"), "{}\n").unwrap();
+
+        // A fork leaves its parent where the parent is still used from.
+        assert!(rehome_in(home, scratch, "/Users/dev/.raccoon/quick/0199", "abc", true).unwrap());
+        assert!(began.exists());
+        assert_eq!(std::fs::read_to_string(transcript_in(home, "/Users/dev/.raccoon/quick/0199", "abc")).unwrap(), "{\"type\":\"user\"}\n");
+        std::fs::remove_file(transcript_in(home, "/Users/dev/.raccoon/quick/0199", "abc")).unwrap();
+
+        // A move takes the file, and what the CLI kept beside it, along.
+        assert!(rehome_in(home, scratch, project, "abc", false).unwrap());
+        let moved = transcript_in(home, project, "abc");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "{\"type\":\"user\"}\n");
+        assert!(moved.with_extension("").join("subagent.jsonl").exists());
+        assert!(!began.exists());
+        assert_eq!(locate_in(home, project, "abc"), moved);
+
+        // Already where it is wanted, or asked for under a name that is a path: nothing happens.
+        assert!(!rehome_in(home, scratch, project, "abc", false).unwrap());
+        assert!(!rehome_in(home, project, project, "abc", false).unwrap());
+        assert!(!rehome_in(home, project, scratch, "../abc", false).unwrap());
+        assert!(moved.exists());
+
+        // What is already in the destination is never overwritten.
+        std::fs::create_dir_all(began.parent().unwrap()).unwrap();
+        std::fs::write(&began, "other\n").unwrap();
+        assert!(!rehome_in(home, project, scratch, "abc", false).unwrap());
+        assert_eq!(std::fs::read_to_string(&began).unwrap(), "other\n");
     }
 
     /// The CLI wraps a large paste in a tag of its own. The reader pasted

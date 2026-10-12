@@ -10,9 +10,16 @@ export interface TabEntry {
   id: string;
   harness: string;
   title?: string | null;
+  /** The model the agent is running: what the next prompt runs on. */
   model: string;
   effort?: string | null;
+  /** A model asked for that the agent has not confirmed yet. Drawn as pending, never as current. */
+  requestedModel?: string | null;
+  requestedEffort?: string | null;
+  /** The mode the agent is in: what its next tool call is judged under. */
   permissionMode: string;
+  /** A mode asked for that waits for the restart that applies it. Drawn as pending, never as current. */
+  requestedPermissionMode?: string | null;
   providerSessionId?: string | null;
   status: TabStatus;
   created: string;
@@ -35,8 +42,21 @@ export interface RemovedWorkspace {
   branch?: string | null;
 }
 
+/**
+ * What a session belongs to. `project`, or absent as every session stored
+ * before quick chats is, is a session of a project the reader attached.
+ * `quick` is a quick chat: it has no project.
+ */
+export type SessionKind = "project" | "quick";
+
 export interface SessionEntry {
   id: string;
+  kind?: SessionKind;
+  /**
+   * The session's project. A quick chat has none: this is then its scratch
+   * directory under the TerminalX home, which is in no project list. Ask
+   * `isQuickChat` (`@/lib/quickChats`) before treating it as a project.
+   */
   projectPath: string;
   cwd: string;
   worktreeName?: string | null;

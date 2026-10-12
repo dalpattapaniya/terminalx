@@ -14,7 +14,9 @@ import {
   CircleDot,
   Command as CommandIcon,
   FileText,
+  FolderGit2,
   FolderOpen,
+  FolderPlus,
   Gauge,
   GitBranch,
   GitPullRequest,
@@ -33,6 +35,7 @@ import {
   Terminal,
   Cloud,
   type LucideIcon,
+  Trash2,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { AgentMark } from "@/components/AgentMark";
@@ -57,6 +60,9 @@ import { openFile } from "@/lib/editors";
 import { runShortcut, useHotkey } from "@/lib/hotkeys";
 import { issuePrompt, issueWorktreeName, pullRequestPrompt } from "@/lib/issueSession";
 import { getPrefs } from "@/lib/prefs";
+import { START_ACTIONS, type StartAction } from "@/lib/projectStart";
+import { useOrganizationVisibility } from "@/lib/organizationVisibility";
+import { visiblePaletteSessions } from "@/lib/organizationSessions";
 import {
   openWorkspace,
   refreshWorkspaces,
@@ -76,6 +82,7 @@ import { setStatusSettings, useStatus } from "@/lib/status";
 import { THEMES, setMode, setTheme, useTheme } from "@/lib/theme";
 import { relativeTime } from "@/lib/time";
 import type { SettingsTab } from "@/components/settings/SettingsPage";
+import { openWorktreeCleanup } from "@/lib/dialogs";
 import type { Project, SessionEntry } from "@/types/session";
 
 const GROUP_CAPS: Record<string, number> = {
@@ -135,9 +142,11 @@ interface ResolvedWorkItem {
   pullRequest?: PullRequest;
 }
 
+const START_ACTION_ICONS: Record<StartAction["id"], LucideIcon> = { local: FolderOpen, github: FolderGit2, quick: FolderPlus };
+
 function shortcutIcon(shortcut: ShortcutAction): LucideIcon {
   const label = shortcut.label.toLowerCase();
-  if (label.includes("session") || label === "send") return MessageSquare;
+  if (label.includes("session") || label === "send" || label.includes("chat")) return MessageSquare;
   if (label.includes("issue")) return CircleDot;
   if (label.includes("dashboard")) return LayoutGrid;
   if (label.includes("usage")) return BarChart3;
@@ -393,7 +402,7 @@ export function CommandPalette({
       setFileLoading(true);
       void files
         .search(fileRoot, deferredQuery.trim(), 80)
-        .then((hits) => live && setFileHits(hits))
+        .then((hits) => live && setFileHits(hits ?? []))
         .catch(() => live && setFileHits([]))
         .finally(() => live && setFileLoading(false));
     }, 45);
@@ -477,6 +486,20 @@ export function CommandPalette({
       indexPaletteItem({ id: "command:mode:light", group: "commands" as const, primary: "Appearance: Light", secondary: theme.mode === "light" ? "Current appearance" : "Use the light appearance", recentAt: 4, icon: Sun, run: () => setMode("light") }),
       indexPaletteItem({ id: "command:mode:dark", group: "commands" as const, primary: "Appearance: Dark", secondary: theme.mode === "dark" ? "Current appearance" : "Use the dark appearance", recentAt: 3, icon: Moon, run: () => setMode("dark") }),
       indexPaletteItem({ id: "command:settings:appearance", group: "commands" as const, primary: "Open Appearance settings", secondary: "Themes, type and transcript layout", recentAt: 2, icon: Settings, run: () => onOpenSettings("appearance") }),
+      indexPaletteItem({ id: "command:worktree-cleanup", group: "commands" as const, primary: "Clean up worktrees…", secondary: "Review and remove safe worktrees across open projects, here and on cloud workspaces", recentAt: 2, icon: Trash2, run: () => openWorktreeCleanup() }, ["worktree workspace cleanup disk space remove delete prune"]),
+      // The start screen's three ways to a project, for after the first one exists.
+      ...START_ACTIONS.map((action, index) =>
+        indexPaletteItem({
+          id: `command:add-project:${action.id}`,
+          group: "commands" as const,
+          primary: `Add a project: ${action.label}`,
+          secondary: action.hint,
+          recentAt: 3 - index,
+          icon: START_ACTION_ICONS[action.id],
+          // The palette is closed by then, so a failed folder picker has nowhere to be shown.
+          run: () => Promise.resolve(action.run()).then(() => {}, (cause) => console.error("add project failed", cause)),
+        }, ["add project new open clone create folder repository github quick start"]),
+      ),
       // Narrows the palette to cloud sessions (by kind, not by the word "cloud"). Choosing one only selects it.
       ...(cloud.live
         ? [indexPaletteItem({ id: "command:cloud-go", group: "commands" as const, primary: "Go to cloud session…", secondary: "List the sessions in your organizations' cloud workspaces", recentAt: 1, icon: Cloud, keepOpen: true, run: () => { setCloudOnly(true); setQuery(""); setSelected(0); } }, ["cloud workspace session open"])]
@@ -503,9 +526,13 @@ export function CommandPalette({
 
   const openFileHit = useCallback(
     async (hit: FileHit) => {
-      if (!fileRoot || !activeProject) return;
+      if (!fileRoot) return;
       let session = selectedSession;
-      if (!session || cleanPath(session.cwd) !== cleanPath(fileRoot)) session = await openWorkspace(activeProject.path, fileRoot);
+      if (!session || cleanPath(session.cwd) !== cleanPath(fileRoot)) {
+        // A quick chat has no project to open a workspace in; its own folder is the session on screen, handled above.
+        if (!activeProject) return;
+        session = await openWorkspace(activeProject.path, fileRoot);
+      }
       openFile(session.id, fileRoot, hit.path);
     },
     [activeProject, fileRoot, selectedSession],
@@ -552,9 +579,10 @@ export function CommandPalette({
 
   // Cloud sessions of every live organization sit among the sessions (PRO-23 CS-19).
   const cloudSessions = useCloudDashboard();
+  const { visibleIds } = useOrganizationVisibility();
   const paletteIndex = useMemo(
-    () => withCloudSessions(store.paletteIndex, buildCloudPaletteSessions(cloudSessions, store.harnesses)),
-    [store.paletteIndex, cloudSessions, store.harnesses],
+    () => withCloudSessions(store.paletteIndex, buildCloudPaletteSessions(visiblePaletteSessions(cloudSessions, visibleIds, deferredQuery), store.harnesses)),
+    [store.paletteIndex, cloudSessions, store.harnesses, visibleIds, deferredQuery],
   );
 
   const groups = useMemo<PaletteGroup[]>(() => {

@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, type AgentLogin } from "@/lib/api";
-import { agentLoginStatus, lentUntil, OrganizationAgentLogins, signInOutcome } from "./OrganizationAgentLogins";
+import { agentLoginReach, agentLoginStatus, connectedNotice, lentUntil, OrganizationAgentLogins, signInOutcome } from "./OrganizationAgentLogins";
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -166,6 +166,90 @@ describe("agent logins in Settings (PRO-79)", () => {
   });
 
   // Review of #293: the row said Connected after the lent sign-in had expired.
+  it("says who a restricted login reaches by who can drive, as the service decides it", () => {
+    expect(agentLoginStatus(login({ sharedUse: "managers" })).text).toContain(" · only workspaces that nobody but owners and admins can drive · ");
+    expect(agentLoginStatus(login({ sharedUse: "managers" })).text).not.toContain("created by");
+  });
+
+  // Review of #429: the app sent `sharedUse: organization` with every sign-in and said "every member's" in every
+  // dialog. It now sends no scope (nobody chooses one here), so the service keeps a replaced login's; the text follows.
+  describe("who a login will reach", () => {
+    const text = (reach: ReturnType<typeof agentLoginReach>) => `${reach.lead}${reach.who}${reach.tail}`;
+
+    it("is the service's default for a first login, the stored scope for the same kind, and no wider for another kind", () => {
+      expect(text(agentLoginReach(undefined, "oauth-credentials-json", "Acme"))).toBe("By default, agents in every member's cloud workspaces of Acme may run on this login.");
+      expect(agentLoginReach(login({ state: "disconnected", sharedUse: "managers" }), "oauth-credentials-json", "Acme").rule).toBe("default");
+
+      const narrowed = agentLoginReach(login({ sharedUse: "managers" }), "oauth-credentials-json", "Acme");
+      expect(text(narrowed)).toBe("This keeps who can use the login now: only workspaces that nobody but owners and admins can drive in Acme.");
+      expect(text(narrowed)).not.toMatch(/every member|by default/i);
+      expect(text(agentLoginReach(login({ sharedUse: "organization" }), "oauth-credentials-json", "Acme"))).toBe("This keeps who can use the login now: agents in every member's cloud workspaces of Acme.");
+      // A revoked login is still the stored one; an older server names no scope; an unknown scope is not described.
+      expect(agentLoginReach(login({ state: "revoked", sharedUse: "managers" }), "oauth-credentials-json", "Acme").rule).toBe("kept");
+      expect(text(agentLoginReach(login({ sharedUse: undefined }), "oauth-credentials-json", "Acme"))).toContain("every member's");
+      expect(text(agentLoginReach(login({ sharedUse: "teams" }), "oauth-credentials-json", "Acme"))).not.toContain("every member");
+      // Another kind of login never reaches more than the stored one, and may reach fewer (the service's default for
+      // its kind can be narrower). It is not described as a first login, and the row is where to see what was stored.
+      for (const [was, becomes] of [["oauth-credentials-json", "api-key"], ["api-key", "oauth-credentials-json"]] as const) {
+        const narrowedOther = agentLoginReach(login({ authKind: was, sharedUse: "managers" }), becomes, "Acme");
+        expect(narrowedOther.rule).toBe("no-wider");
+        expect(text(narrowedOther)).toBe("This keeps who can use the login now, or fewer: at most workspaces that nobody but owners and admins can drive in Acme.");
+        expect(text(narrowedOther)).not.toMatch(/every member|by default/i);
+        expect(narrowedOther.note).toBe(" The row above says who the login reaches once it is stored.");
+        const wideOther = agentLoginReach(login({ authKind: was, sharedUse: "organization" }), becomes, "Acme");
+        expect(text(wideOther)).toBe("This keeps who can use the login now, or fewer: at most agents in every member's cloud workspaces of Acme.");
+        expect(text(wideOther)).not.toMatch(/by default/i);
+      }
+      expect(text(agentLoginReach(login({ authKind: "api-key", sharedUse: "teams" }), "oauth-credentials-json", "Acme"))).toBe("This keeps who can use the login now, or fewer, as the account service has it for Acme.");
+      expect(narrowed.note).toBe("");
+    });
+
+    it("does not claim every member when a managers-only login is replaced by logging in again", async () => {
+      stored = [login({ sharedUse: "managers", displayIdentity: "ada@example.com" })];
+      const started = { attemptId: "attempt_1", authorizeUrl: "https://claude.com/cai/oauth/authorize?state=s", expiresInSeconds: 600, opened: true };
+      vi.mocked(api.cloudAgentClaudeLoginStart).mockResolvedValue(started);
+      vi.mocked(api.cloudAgentClaudeLoginComplete).mockImplementation(async () => {
+        stored = [login({ sharedUse: "managers", displayIdentity: "grace@example.com", version: 2 })];
+        return { status: "complete", credential: stored[0] };
+      });
+      await show();
+      fireEvent.click(within(row("claude")).getByRole("button", { name: "Replace by logging in with Claude" }));
+      const panel = within(row("claude")).getByTestId("agent-login-consent");
+      expect(within(panel).getByTestId("agent-login-reach").textContent).toBe("This keeps who can use the login now: only workspaces that nobody but owners and admins can drive in Acme Robotics.");
+      expect(panel.textContent).not.toContain("every member");
+      consent(panel);
+      fireEvent.click(within(panel).getByRole("button", { name: "Open Claude to sign in" }));
+      fireEvent.click(within(await within(row("claude")).findByTestId("agent-login-code")).getByRole("button", { name: "Enter the code" }));
+      // The consent carries no scope, so the app has none to send; the notice and the row say what the service kept.
+      const agreed = { contextRevision: "org-revision", organizationSharing: true, machineInstallation: true, replaceExisting: true };
+      await waitFor(() => expect(api.cloudAgentClaudeLoginComplete).toHaveBeenCalledWith("attempt_1", agreed));
+      await waitFor(() => expect(screen.getByTestId("agent-logins-notice").textContent).toBe("Claude Code is connected for this organization's cloud workspaces: only workspaces that nobody but owners and admins can drive. The account service keeps this login and renews it."));
+      expect(within(row("claude")).getByTestId("agent-login-status").textContent).toContain("grace@example.com · only workspaces that nobody but owners and admins can drive");
+    });
+
+    it("says the default as a default for a first login, and no wider for an API key over a narrowed subscription login", async () => {
+      await show();
+      fireEvent.click(within(row("cursor")).getByRole("button", { name: "Connect with an API key" }));
+      expect(within(row("cursor")).getByTestId("agent-login-reach").textContent).toBe(
+        "By default, agents in every member's cloud workspaces of Acme Robotics may run on this login. The account service decides this, and the row above says who the login reaches once it is stored.",
+      );
+      cleanup();
+      stored = [login({ sharedUse: "managers" })];
+      vi.mocked(api.cloudAgentLoginConnect).mockImplementation(async () => login({ authKind: "api-key", sharedUse: "managers" }));
+      await show();
+      fireEvent.click(within(row("claude")).getByRole("button", { name: "Replace with an API key" }));
+      expect(within(row("claude")).getByTestId("agent-login-reach").textContent).toBe(
+        "This keeps who can use the login now, or fewer: at most workspaces that nobody but owners and admins can drive in Acme Robotics. The row above says who the login reaches once it is stored.",
+      );
+      // Whatever the service answers is what the notice says.
+      consent(within(row("claude")).getByTestId("agent-login-consent"));
+      fireEvent.click(within(row("claude")).getByRole("button", { name: "Enter the key" }));
+      await waitFor(() => expect(screen.getByTestId("agent-logins-notice").textContent).toBe("Claude Code is connected for this organization's cloud workspaces: only workspaces that nobody but owners and admins can drive."));
+      expect(connectedNotice("Codex", login({}))).toBe("Codex is connected for this organization's cloud workspaces.");
+      expect(connectedNotice("Codex", undefined)).toBe("Codex is connected for this organization's cloud workspaces.");
+    });
+  });
+
   it("shows a lent sign-in's expiry as a time, and Expired once it has passed", () => {
     const lent = login({ displayIdentity: "ada@example.com · lent until 2026-10-03T21:40:00Z" });
     const at = Date.parse("2026-10-03T21:40:00Z");
@@ -262,6 +346,26 @@ describe("agent logins in Settings (PRO-79)", () => {
       await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("expired"));
       expect(within(row("claude")).queryByTestId("agent-login-code")).toBeNull();
       expect(within(row("claude")).getByTestId("agent-login-status").textContent).toBe("Not connected");
+    });
+
+    // Review of #293: another admin stores a login during the ten minutes; the panel had no way to choose Replace.
+    it("asks for the replace choice in the open sign-in when a login was stored meanwhile", async () => {
+      const code = await begin();
+      vi.mocked(api.cloudAgentClaudeLoginComplete).mockImplementationOnce(async () => {
+        stored = [login({ authKind: "api-key" })];
+        throw { code: "cloud_agent_login_replace_unconfirmed" };
+      });
+      fireEvent.click(code.getByRole("button", { name: "Enter the code" }));
+      expect((await screen.findByRole("alert")).textContent).toContain("A login was stored for this agent after you started");
+      // The sign-in is still open, with the choice in it, and cannot be finished without making it.
+      const choice = await code.findByTestId("agent-login-replace");
+      expect(choice.textContent).toContain("Replace the API key now stored for Claude Code.");
+      expect(code.getByRole("button", { name: "Enter the code" }).hasAttribute("disabled")).toBe(true);
+      vi.mocked(api.cloudAgentClaudeLoginComplete).mockResolvedValueOnce({ status: "complete" });
+      fireEvent.click(within(choice).getByRole("checkbox"));
+      fireEvent.click(code.getByRole("button", { name: "Enter the code" }));
+      await waitFor(() => expect(api.cloudAgentClaudeLoginComplete).toHaveBeenLastCalledWith("attempt_1", expect.objectContaining({ replaceExisting: true })));
+      await waitFor(() => expect(within(row("claude")).queryByTestId("agent-login-code")).toBeNull());
     });
 
     it("opens the page again and cancels the sign-in", async () => {

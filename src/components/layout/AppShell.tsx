@@ -5,6 +5,8 @@ import { WithTooltip } from "@/components/ui/tooltip";
 import type { SettingsTab } from "@/components/settings/SettingsPage";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { NewSessionView } from "@/components/session/NewSessionView";
+import { StartScreen } from "@/components/start/StartScreen";
+import { ProjectStartDialogHost } from "@/components/start/ProjectStartDialogs";
 import { IssuesView } from "@/components/issues/IssuesView";
 import { AgentDashboard } from "@/components/dashboard/AgentDashboard";
 import { SkillsView } from "@/components/skills/SkillsView";
@@ -22,11 +24,16 @@ import { startNotifications } from "@/lib/notify";
 import { subscribeTabPty } from "@/lib/tabViews";
 import { StarReminder } from "@/components/ui/StarReminder";
 import { Toasts } from "@/components/ui/Toasts";
+import { ShareSessionDialogHost } from "@/components/session/ShareSessionDialog";
+import { GuestSessionHost } from "@/components/session/GuestSession";
 import { CloudShareDialogHost } from "@/components/cloud/CloudShareDialog";
 import { NewCloudWorkspaceDialogHost } from "@/components/cloud/NewCloudWorkspaceDialog";
 import { DEV_RUNTIME_KEY } from "@/lib/devRuntime";
 import { BypassDialog } from "@/components/session/BypassDialog";
+import { SessionDialogs } from "@/components/session/SessionDialogs";
+import { bootFloating, showFloatingWindow } from "@/lib/floating";
 import { WorkspaceRemoveDialog } from "@/components/session/WorkspaceRemoveDialog";
+import { WorktreeCleanupDialog } from "@/components/cleanup/WorktreeCleanupDialog";
 import { bootStatus, useStatus } from "@/lib/status";
 import { AutomationsView } from "@/components/automations/AutomationsView";
 import { bootAutomations } from "@/lib/automations";
@@ -87,6 +94,7 @@ export function AppShell() {
     void bootPairing();
     void bootTerminalPerf();
     void bootCloudControl();
+    void bootFloating();
   }, []);
 
   // The first prompt of a new session is sent right after the worktree exists.
@@ -124,6 +132,7 @@ export function AppShell() {
   const showStats = useCallback(() => openStats(), []);
   const showSkills = useCallback(() => openSkills(), []);
   const showAutomations = useCallback(() => openAutomations(), []);
+  const showQuickChat = useCallback(() => void showFloatingWindow().catch((e) => console.error("floating window", e)), []);
 
   useShortcut("app.toggleSidebar", toggleSidebar);
   useShortcut("app.togglePanel", togglePanel);
@@ -134,6 +143,7 @@ export function AppShell() {
   useShortcut("app.stats", showStats);
   useShortcut("app.skills", showSkills);
   useShortcut("app.automations", showAutomations);
+  useShortcut("app.quickChat", showQuickChat);
   useShortcut("app.commandPalette", () => setPaletteOpen(true), { global: true });
 
   const sidebarOpen = prefs.sidebarOpen;
@@ -150,9 +160,14 @@ export function AppShell() {
         <Toasts />
       </div>
       <BypassDialog />
+      <SessionDialogs />
       <CloudShareDialogHost />
+      <ShareSessionDialogHost />
+      <GuestSessionHost />
       <NewCloudWorkspaceDialogHost />
       <WorkspaceRemoveDialog />
+      <WorktreeCleanupDialog />
+      <ProjectStartDialogHost />
       <div className="flex min-h-0 flex-1">
         {settingsOpen ? (
           <Suspense fallback={viewFallback}>
@@ -202,6 +217,7 @@ export function AppShell() {
                 sidebarOpen={sidebarOpen}
                 onToggleSidebar={toggleSidebar}
                 onTogglePanel={togglePanel}
+                onOpenSettings={openSettings}
                 onCreated={onCreated}
               />
             )}
@@ -227,11 +243,13 @@ function UnselectedWorkspace({
   sidebarOpen,
   onToggleSidebar,
   onTogglePanel,
+  onOpenSettings,
   onCreated,
 }: {
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
   onTogglePanel: () => void;
+  onOpenSettings: (tab?: SettingsTab) => void;
   onCreated: (sessionId: string, tabId: string, text: string, images?: ImageInput[]) => void;
 }) {
   const prefs = usePrefs();
@@ -252,6 +270,9 @@ function UnselectedWorkspace({
   const checkoutEditorId = cwd ? `checkout:${cwd}` : null;
   const hasCheckoutEditors = !!checkoutEditorId && editors.editors.some((editor) => editor.sessionId === checkoutEditorId);
   const labelMode = preset?.cwd && store.view === "new" ? "branch" : useWorktree ? "base" : "branch";
+  // With no local project there is nothing to start a session in: the start screen offers the ways to get one.
+  // Not before the projects are read, and not over a cloud draft, which needs no local project.
+  const startScreen = store.view === "new" && store.loaded && store.projects.length === 0 && !store.cloudSessionPreset;
 
   return (
     <>
@@ -276,7 +297,9 @@ function UnselectedWorkspace({
                 ? ""
                 : store.view === "automations"
                   ? "Automations"
-                  : "New session"}
+                  : startScreen
+                    ? ""
+                    : "New session"}
           </span>
           {panelAvailable && (
             <WithTooltip label={prefs.panelOpen ? "Hide panel" : "Show panel"} shortcut="app.togglePanel">
@@ -309,6 +332,8 @@ function UnselectedWorkspace({
                 projectPath={store.skillsFilter?.projectPath ?? store.selectedProject}
                 initialAgent={store.skillsFilter?.agent ?? null}
               />
+            ) : startScreen ? (
+              <StartScreen onOpenSettings={onOpenSettings} />
             ) : (
               <NewSessionView onCreated={onCreated} useWorktree={useWorktree} onUseWorktreeChange={setUseWorktree} />
             )}

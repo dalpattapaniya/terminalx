@@ -1,5 +1,202 @@
 # TerminalX changelog
 
+## Unreleased
+
+### Dictation
+
+- Text deleted from the composer while dictating stays deleted. Selecting
+  dictated words and pressing Backspace or Delete, or cutting them, used to
+  look as if nothing had happened: dictation wrote the words straight back,
+  and went on doing so after the mic had closed. Whatever is typed, deleted,
+  cut, pasted or undone in the composer now wins, with the mic toggled on or
+  a key held to talk; dictation carries on from the caret with what is said
+  next. (#428)
+- A dictated message no longer comes back into the composer after it is
+  sent. (#428)
+- An edit made before the first words arrive is kept. With a local model,
+  whose words all arrive when the mic closes, it used to be overwritten.
+  (#428)
+- When an utterance settles after an edit (a comma added, a word corrected),
+  words already in the draft or already deleted are not added again, and no
+  stray piece of a word is left behind. (#428)
+- A composer stops following the recogniser once its own dictation has
+  ended, so a later dictation in the other window (main or floating) cannot
+  add its words to it as well. (#428)
+
+## 0.2.10
+
+Dialogs that keep their buttons in reach, and cloud workspaces that stay awake
+through a silent turn and follow role changes.
+
+### Dialogs with long lists
+
+- A dialog can no longer grow past the window and take its buttons out of
+  reach. Deleting many leftovers in Settings → Storage now asks in the app
+  instead of in a system alert that listed every item and ran off the screen:
+  the list scrolls on its own, each item shows its project and size, and
+  Cancel and Delete stay in view. Cancel holds the focus, so Enter does not
+  delete. What can be deleted, and the check made before each deletion, are
+  unchanged. (#424)
+- The worktree clean-up keeps its buttons in view the same way in short
+  windows, in its list, its review and its results, and every other dialog
+  now ends at the window's edge and scrolls if it is taller. (#424)
+
+### Cloud workspaces
+
+- A cloud turn that has been silent for five minutes is still shown as "Needs
+  attention", but it no longer lets the workspace suspend underneath it. The
+  turn keeps the workspace awake for up to an hour without agent events or
+  terminal output; new output renews that hour. After an hour of silence the
+  runtime reports the turn as inactive and the workspace may suspend under its
+  idle policy; the agent is not killed and the turn is not marked complete.
+  (#422)
+- A connected user who changes role is counted correctly for idle suspension:
+  a driver demoted to viewer stops holding the workspace awake, and a viewer
+  promoted to driver starts holding it without reconnecting. Phones are still
+  not counted, and revoking access or the first member list revalidates the
+  connections already open. (#423)
+
+## 0.2.9
+
+A start screen and floating quick chats, chat settings that follow the agent
+CLI, link sharing for local sessions, bulk worktree clean-up, a renamed
+computer-use helper, and mobile pairing and transcript fixes.
+
+### Start and chat
+
+- A first-run start screen offers Open local project, Open GitHub project and
+  Quick start. Its dialogs fit a short window, and a failed clone leaves a
+  tidy folder. (#405, #410)
+- A floating chat window and quick chats that need no project. (#408)
+- Chat prompts are submitted only after the CLI has read them, and
+  unacknowledged prompts are flagged. The chat's model, reasoning effort and
+  permission mode stay in step with the agent CLI. (#416, #418, #421)
+- A failed tool in a running turn no longer raises "Needs attention", and
+  Delete workspace appears in the chat once the session's pull request is
+  merged. (#413, #414)
+- The status bar's usage stays fresh, and the App resources popover is no
+  longer transparent. (#380, #415)
+
+### Sharing and organizations
+
+- Share a local session with signed-in guests by link. (#402)
+- Choose which organizations the sidebar shows. (#399)
+- A local mirror belongs to the account that made it, an unreadable session
+  removes nothing, and nothing syncs until the owner is confirmed. (#375)
+- The phone and the CLI ask before waking a workspace, and a viewer or a
+  phone no longer counts as attached. (#383)
+
+### Worktrees
+
+- Clean up safe worktrees in bulk across open local and cloud projects, and
+  remove what earlier deletes left on disk, with sizes shown. (#322, #406)
+
+### Computer use
+
+- The computer-use helper has a new identity and name, "TerminalX Computer
+  Use Helper". It serves only the app, never operates TerminalX's own
+  windows, and the old helper's grant is removed at every launch. macOS asks
+  for Accessibility and Screen Recording again for the new helper. (#382,
+  #409, #412)
+
+### Mobile companion
+
+These source changes require a separately updated mobile app.
+
+- A paired phone reconnects after the app restarts, and pairing works when
+  the direct port is busy. (#381, #390)
+- Transcripts load correctly, keep earlier history during catch-up, order
+  unfinished turns, and scroll long histories smoothly. Markdown renders and
+  chat links can be opened. (#389, #391, #392, #393, #394)
+
+### Chat messages that reached the terminal but were not sent
+
+- A message sent from chat is submitted only after the agent CLI has read it.
+  The Enter used to follow the pasted text after a fixed pause; a CLI too busy
+  to look at its input for that long could take both at once and leave the
+  message sitting in its input. (macOS and Linux; Windows keeps the pause.)
+  (#403)
+- A message the agent has not acknowledged within 20 seconds is flagged as
+  "delivery could not be confirmed" instead of showing as working for five
+  minutes, and a follow-up queued behind a turn is flagged if the agent never
+  takes it once that turn ends. The terminal redrawing is no longer taken as
+  proof the message was accepted. Nothing is typed or submitted again on its
+  own: the notice says to press Enter in the terminal if the message is still
+  there. (#403)
+- Each stage of a message's delivery (ready, text written, Enter written,
+  accepted or unconfirmed) is recorded with its timing in the tab's
+  diagnostics file. No message text, paths or commands are recorded. (#403)
+
+### Model and effort
+
+- The chat's model and effort pickers now always show what the agent is
+  really running. A change made in the terminal — Claude Code's `/model`
+  (with a name or through its picker) and `/effort`, or Codex's `/model`
+  picker — shows in the chat straight away, and in the session header,
+  sidebar and dashboard with it. (#404)
+- A change made in the chat is shown as "Switching to …" until the agent
+  confirms it. For Codex mid-turn that is when the turn ends; the chat no
+  longer shows the new model while the old one is still answering. A change
+  the agent refuses goes back to what is running, with the reason. (#404)
+- A model or effort level TerminalX does not know is shown as the agent
+  reported it instead of as the default, and a tab on the agent's own default
+  shows which model that is. (#404)
+
+### Permission mode
+
+- The chat's permission picker now shows the mode the agent is really in. A
+  mode cycled with Shift+Tab in Claude Code's terminal shows in the chat with
+  the next prompt or tool call, and a preset chosen in Codex's `/permissions`
+  shows straight away. (#417)
+- A mode chosen in the chat while a turn is running is shown as "Switching to
+  … after this turn" until the restart that applies it; the picker keeps
+  showing the mode the running turn is under. (#417)
+- A mode TerminalX has no entry for (Claude Code's `dontAsk`, an unusual
+  Codex approval policy and sandbox) is shown as the agent reported it
+  instead of as Bypass. (#417)
+- A shared session still cannot be in Bypass: if the agent is switched to it
+  in the terminal, the agent is restarted in the mode it was in and the chat
+  says why. A session with a tab waiting to switch to Bypass cannot be
+  shared. (#417)
+
+### Delete workspace from the chat
+
+- Once a worktree's pull request has merged, the chat offers **Delete
+  workspace** next to Commit, Create PR and Run it. It appears when the merge
+  is noticed, with no new turn, and opens the same removal dialog as every
+  other way of removing a workspace; nothing is removed from the chat. It is
+  not offered in a project's main directory, for a pull request that is open,
+  closed or could not be checked, with uncommitted or unpushed work, or while
+  an agent turn runs in the workspace. Cloud sessions have it too, for a
+  manager of the workspace: the worktree is read and removed by its own
+  runtime (`workspace/1`), so a stopped or older workspace does not offer it
+  until it is restarted. (#411)
+
+### Floating chat window and quick chats
+
+- A floating chat window: a small TerminalX window for asking an agent
+  something, or opening a terminal, without attaching or choosing a project.
+  It opens from any app with a system-wide shortcut (⌥⇧Space by default,
+  changeable or off in Settings → Shortcuts), from the tray icon, from the
+  main window and with `terminalx floating show`. It stays on top when
+  pinned, remembers its size and position, and hides on Escape. Hiding it
+  stops nothing. (#395)
+- Quick chats: sessions with no project. Each runs in a scratch folder of its
+  own, with no worktree or branch, and has everything a project session has:
+  chat and terminal view, new terminals and agent tabs, attachments,
+  dictation, permissions, and Continue in New Session. They are listed under
+  Quick chats in the sidebar, in the Agent Dashboard and in the command
+  palette. (#395)
+- Point a quick chat at any folder without making it a project, or move it
+  into a project with its history. Idle quick chats are deleted after 30 days
+  by default (Settings → General). (#395)
+- `terminalx sessions create --quick` starts a quick chat, and
+  `sessions list --quick` lists them. (#395)
+- A session open in both windows stays the same in both: rename, pin, archive
+  and tab changes, terminals and their names, permission and question cards.
+  Only one window sends a desktop notification. (#395)
+- Sessions can be renamed from their menu in the sidebar. (#395)
+
 ## 0.2.8
 
 Cloud workspaces gain a full composer, port previews, a local file mirror and

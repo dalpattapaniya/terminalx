@@ -36,8 +36,15 @@ pub const PROTOCOL: &str = "terminalx-workspace-rpc/1";
 ///   for private previews (`remote/ports.rs`, docs/CLOUD-PREVIEWS.md).
 /// - `mirror/1` (PRO-25): `mirror.manifest`, the files a desktop may copy
 ///   into its local mirror. Read-only; the copies are read with `fs.read`.
-pub const CAPABILITIES: [&str; 16] =
-    ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1"];
+/// - `cleanup/1`: the bulk worktree clean-up (`worktree_cleanup.rs`). The
+///   runtime inspects and removes its own worktrees; a client only names them.
+/// - `workspace/1`: one session's worktree, for the removal dialog a desktop
+///   shows: `workspace.disposition` and `workspace.remove`. The worktree is
+///   named by its session, never by a path.
+pub const CAPABILITIES: [&str; 18] = [
+    "pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1",
+    "cleanup/1", "workspace/1",
+];
 
 /// The namespace that lets a connection address an agent tab's own terminal
 /// (spelled out in [`CAPABILITIES`], which the client's tests read).
@@ -159,6 +166,19 @@ pub const METHODS: &[Method] = &[
     method("git.prCreate", "git/1", Manage, true),
     method("git.prReady", "git/1", Manage, true),
     method("git.prMerge", "git/1", Manage, true),
+    // The bulk worktree clean-up. The scan fetches and names every session,
+    // and the removal deletes checkouts: both are the manager's. A resent
+    // removal is answered from the idempotency cache, and one that arrives
+    // after it finds the worktrees gone and says so.
+    method("cleanup.scan", "cleanup/1", Manage, false),
+    method("cleanup.size", "cleanup/1", Manage, false),
+    method("cleanup.cancel", "cleanup/1", Manage, false),
+    method("cleanup.remove", "cleanup/1", Manage, true),
+    // One session's worktree, as the desktop's removal dialog reads and
+    // removes it. The read names every session in the worktree and the
+    // removal deletes them with it: both are the manager's.
+    method("workspace.disposition", "workspace/1", Manage, false),
+    method("workspace.remove", "workspace/1", Manage, true),
     // PRO-34 facts before archive or delete (saas contract 10.2): read-only.
     method("lifecycle.dispositionFacts", "lifecycle/1", Participate, false),
     // PRO-33: free memory and disk of the machine; read-only. A runtime
@@ -197,6 +217,8 @@ pub fn namespace_prefixes(capability: &str) -> &'static [&'static str] {
         "keys/1" => &["keys."],
         "lifecycle/1" => &["lifecycle."],
         "mirror/1" => &["mirror."],
+        "cleanup/1" => &["cleanup."],
+        "workspace/1" => &["workspace."],
         // `composer/N` adds what an agent tab's composer asks of its session.
         "composer/1" => &["session.commands"],
         "composer/2" => &["session.files"],

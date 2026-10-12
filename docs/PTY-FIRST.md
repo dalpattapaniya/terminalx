@@ -211,6 +211,116 @@ command palette. `/model` and `/effort` reach the running CLI the same way.
 
 Interrupt writes a bare Escape. Stop kills the pane.
 
+### One model and effort, whichever side changed it
+
+The chat and the terminal are the same conversation, and its model and effort
+can be changed from either: the composer's pickers, or the CLI's own `/model`.
+So a tab holds two things (`harness/settings.rs`, #404):
+
+- the **effective** model and effort: what the provider process is running
+  now, and so what the next prompt will run with. Every view draws this: the
+  composer, the session header, the sidebar, the dashboard, a paired phone and
+  a cloud session's other participants.
+- the **requested** model and effort: what the app asked for and the provider
+  has not confirmed. The composer says "Switching to … after this turn" and
+  goes on showing the effective value. A request the provider turns down, or
+  never answers, is dropped with a line in the chat saying why.
+
+Only the provider moves the effective value while a process is up. Each
+harness says how it takes a change (`HarnessId::settings`: live, restart, or
+unsupported — the match has no catch-all, so a new harness does not compile
+until it answers) and reports through one signal (`Signal`, carried as
+`Payload::ProviderSettings`, which the session manager consumes and never
+logs).
+
+| | Takes a change | Says what it is running |
+| --- | --- | --- |
+| Claude Code | live: `/model <name>`, `/effort <level>` typed into the TUI | the **status line frame** (`model.id`, `effort.level`), which the CLI sends at startup and again after every change, from `/model <name>`, the `/model` picker, `/effort` and its slider alike; what the command printed ("Set model to …", or its reason for refusing); the model named in assistant records, until a status line has spoken |
+| Codex | restart on the same conversation, after the turn | `thread_settings_applied`, written the moment the TUI's `/model` picker is confirmed, and each turn's `turn_context` |
+| ACP | live: `session/set_model`; no effort | the reply to it, `models.currentModelId` when a session opens, `current_model_update` |
+| OpenCode | live: the model rides on each prompt; no effort | the model each reply names |
+
+Things that follow from this:
+
+- A provider reports full ids (`claude-opus-5-5`) and the pickers also offer
+  aliases (`opus`). A report keeps the alias the tab is on, or was asked for,
+  when it names the same model, so a status line never turns "latest Opus"
+  into a pinned version. An id the app has never heard of is stored and shown
+  exactly as reported, and so is an unknown effort level.
+- A tab on the CLI's own default learns what that resolved to from the first
+  report, instead of showing an empty picker.
+- With nothing running there is nobody to confirm anything: a change is simply
+  what the next launch is given, and is current at once. A request still
+  waiting when a process is started (a Codex restart, a resumed tab) rides
+  with that launch.
+- The remembered "last model / last effort" for new sessions is only ever
+  written by the new-session pickers. Reports never touch it.
+- Checked on codex-cli 0.153.4 for a live alternative to the restart: there is
+  none worth using. `/model <name>` is sent to the model as a prompt, there is
+  no `/effort`, and the picker can only be driven by pressing the number of a
+  row whose meaning is on the screen and nowhere else.
+- A Codex conversation with no rollout yet (nothing has been sent) has nowhere
+  to record a picker change; the first prompt's `turn_context` reports it a
+  moment after the prompt is sent.
+
+### One permission mode, whichever side changed it
+
+The permission mode is held the same way (#417): a tab has the **effective**
+mode, the one its next tool call is judged under and the one every view
+draws, and a **requested** mode that waits for the restart that applies it.
+
+Neither CLI takes a mode from the app while it runs, so a change from the
+chat always means replacing the process on the same conversation. With no
+turn open that happens at once. Mid-turn it waits for the turn, and until
+then the composer says "Switching to … after this turn" and the picker goes
+on showing the mode the turn is running under.
+
+| | Changed in the terminal with | Says what it is in |
+| --- | --- | --- |
+| Claude Code | Shift+Tab (manual → accept edits → plan → auto) | `permission_mode` on every hook frame that fires around work: the next `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Stop`. Nothing carries it at the moment the key is pressed: the status line is run again then, but has no mode in it, and the transcript's `permission-mode` record is written later. `SessionStart` has no mode. A frame from inside a subagent (`agent_id`) is ignored, since an agent can be defined with a mode of its own. |
+| Codex | `/permissions` (Ask for approval, Approve for me, Full Access) | `thread_settings_applied`, written the moment a preset is confirmed, with `approval_policy` and a `permission_profile`; each turn's `turn_context`, with `approval_policy` and `sandbox_policy.type` |
+
+What a CLI reports is its own stance (`settings::Stance`), not one of the
+app's modes, and the two do not map one-to-one. Each harness reads a report
+back against the mode the tab is in (`claude::mode_reported`,
+`codex::mode_reported`):
+
+- **The tab keeps its mode when that is one way of saying what was reported.**
+  Claude Code reports "ask every time" as `default` and takes it as `manual`;
+  an older tab may hold `ask`. On Codex, "Ask every time", "Auto" and "Accept
+  edits" all launch `on-request` in the workspace sandbox ("ask every time"
+  is the app's own `PreToolUse` gate on top), so a report of that stance
+  cannot say which of them the tab is in, and does not need to: the app
+  knows. A profile is read as the sandbox it comes down to (none when it is
+  `disabled`, the workspace sandbox when it may write anywhere, read-only
+  when it may not).
+- **Otherwise the report names the mode.** Codex's read-only sandbox is Plan,
+  `on-request` in the workspace is Auto, and `never` with no sandbox is
+  Bypass. When the reader leaves "ask every time" in the Codex terminal, the
+  app's gate goes with it: the gate follows the effective mode.
+- **A mode the app has no entry for is stored and shown as reported**: Claude
+  Code's `dontAsk`, a mode from a newer CLI, or a Codex pair no mode launches
+  (`never, workspace-write`). The picker lists it as "Set in the terminal".
+  If the tab is later restarted it launches the way an unknown mode always
+  has (asking), and the next report says so.
+- "Approve for me" changes who reviews an approval (`approvals_reviewer`),
+  not the policy or the sandbox, and is not told apart from "Ask for
+  approval".
+
+**A shared session may not be in Bypass**, nor in any Codex stance with no
+sandbox (`settings::allowed_while_shared`). Choosing one in the chat is
+refused, as before. One reported from the terminal is never stored: the CLI
+is let go of at once, under the sharing lock, so no guest's prompt can be
+typed into it, any open turn is closed as aborted, and the CLI is started
+again in the mode the tab was in, with a line in the chat saying what
+happened and that the share has to be stopped first. A session cannot be
+shared while a tab is in such a mode or waiting to switch into one.
+
+Limits: Claude Code's mode is only known as of its last hook frame, so a
+Shift+Tab in an idle terminal shows in the chat with the next prompt. For
+that reason choosing a mode in the chat for an idle tab always restarts the
+CLI, even when it is the mode shown.
+
 ### Replacing the process in a pane
 
 A restart keeps the pane and swaps what runs inside it, so the reader sees the
@@ -533,7 +643,8 @@ rule at click time rather than trusting the rendered row.
   the TUI only cycles modes on a key with no way to read the result back and
   the CLI reads `--permission-mode` at startup alone. A change made mid-turn
   waits for the turn to end. Model and effort change in place through the CLI's
-  own `/model` and `/effort`.
+  own `/model` and `/effort`, and are shown as current once the CLI says it is
+  running them (see "One model and effort, whichever side changed it").
 - **One permission surface.** While the hook answers, the CLI never shows its
   own prompt. If the hook lapses it does, and the answer has to be given there.
 - **One CLI per visited tab.** Opening a PTY-first tab starts a real `claude`
@@ -552,7 +663,8 @@ rule at click time rather than trusting the rendered row.
   accepts is a bare allow or deny, and anything richer fails the hook closed.
 - **A Codex model or effort change restarts the tab**, because the TUI's
   `/model` opens a picker rather than taking an argument and there is no
-  `/effort` at all. Mid-turn, the restart waits for the turn to end.
+  `/effort` at all. Mid-turn, the restart waits for the turn to end, and until
+  then the chat shows the change as pending, not as made.
 - **A Codex tab has no fork.** `codex fork` exists but nothing is wired to it.
 - **The managed Codex home mirrors an allowlist**, so a `config.toml` key the
   reader adds that is not on that list does not reach a TerminalX tab.
