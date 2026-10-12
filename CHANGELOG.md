@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.10
+
+Dialogs that keep their buttons in reach, and cloud workspaces that stay awake
+through a silent turn and follow role changes.
+
 ### Dialogs with long lists
 
 - A dialog can no longer grow past the window and take its buttons out of
@@ -14,6 +19,74 @@
 - The worktree clean-up keeps its buttons in view the same way in short
   windows, in its list, its review and its results, and every other dialog
   now ends at the window's edge and scrolls if it is taller. (#424)
+
+### Cloud workspaces
+
+- A cloud turn that has been silent for five minutes is still shown as "Needs
+  attention", but it no longer lets the workspace suspend underneath it. The
+  turn keeps the workspace awake for up to an hour without agent events or
+  terminal output; new output renews that hour. After an hour of silence the
+  runtime reports the turn as inactive and the workspace may suspend under its
+  idle policy; the agent is not killed and the turn is not marked complete.
+  (#422)
+- A connected user who changes role is counted correctly for idle suspension:
+  a driver demoted to viewer stops holding the workspace awake, and a viewer
+  promoted to driver starts holding it without reconnecting. Phones are still
+  not counted, and revoking access or the first member list revalidates the
+  connections already open. (#423)
+
+## 0.2.9
+
+A start screen and floating quick chats, chat settings that follow the agent
+CLI, link sharing for local sessions, bulk worktree clean-up, a renamed
+computer-use helper, and mobile pairing and transcript fixes.
+
+### Start and chat
+
+- A first-run start screen offers Open local project, Open GitHub project and
+  Quick start. Its dialogs fit a short window, and a failed clone leaves a
+  tidy folder. (#405, #410)
+- A floating chat window and quick chats that need no project. (#408)
+- Chat prompts are submitted only after the CLI has read them, and
+  unacknowledged prompts are flagged. The chat's model, reasoning effort and
+  permission mode stay in step with the agent CLI. (#416, #418, #421)
+- A failed tool in a running turn no longer raises "Needs attention", and
+  Delete workspace appears in the chat once the session's pull request is
+  merged. (#413, #414)
+- The status bar's usage stays fresh, and the App resources popover is no
+  longer transparent. (#380, #415)
+
+### Sharing and organizations
+
+- Share a local session with signed-in guests by link. (#402)
+- Choose which organizations the sidebar shows. (#399)
+- A local mirror belongs to the account that made it, an unreadable session
+  removes nothing, and nothing syncs until the owner is confirmed. (#375)
+- The phone and the CLI ask before waking a workspace, and a viewer or a
+  phone no longer counts as attached. (#383)
+
+### Worktrees
+
+- Clean up safe worktrees in bulk across open local and cloud projects, and
+  remove what earlier deletes left on disk, with sizes shown. (#322, #406)
+
+### Computer use
+
+- The computer-use helper has a new identity and name, "TerminalX Computer
+  Use Helper". It serves only the app, never operates TerminalX's own
+  windows, and the old helper's grant is removed at every launch. macOS asks
+  for Accessibility and Screen Recording again for the new helper. (#382,
+  #409, #412)
+
+### Mobile companion
+
+These source changes require a separately updated mobile app.
+
+- A paired phone reconnects after the app restarts, and pairing works when
+  the direct port is busy. (#381, #390)
+- Transcripts load correctly, keep earlier history during catch-up, order
+  unfinished turns, and scroll long histories smoothly. Markdown renders and
+  chat links can be opened. (#389, #391, #392, #393, #394)
 
 ### Chat messages that reached the terminal but were not sent
 
@@ -102,59 +175,6 @@
   and tab changes, terminals and their names, permission and question cards.
   Only one window sends a desktop notification. (#395)
 - Sessions can be renamed from their menu in the sidebar. (#395)
-
-## 0.2.9
-
-A start screen and floating quick chats, chat settings that follow the agent
-CLI, link sharing for local sessions, bulk worktree clean-up, a renamed
-computer-use helper, and mobile pairing and transcript fixes.
-
-### Start and chat
-
-- A first-run start screen offers Open local project, Open GitHub project and
-  Quick start. Its dialogs fit a short window, and a failed clone leaves a
-  tidy folder. (#405, #410)
-- A floating chat window and quick chats that need no project. (#408)
-- Chat prompts are submitted only after the CLI has read them, and
-  unacknowledged prompts are flagged. The chat's model, reasoning effort and
-  permission mode stay in step with the agent CLI. (#416, #418, #421)
-- A failed tool in a running turn no longer raises "Needs attention", and
-  Delete workspace appears in the chat once the session's pull request is
-  merged. (#413, #414)
-- The status bar's usage stays fresh, and the App resources popover is no
-  longer transparent. (#380, #415)
-
-### Sharing and organizations
-
-- Share a local session with signed-in guests by link. (#402)
-- Choose which organizations the sidebar shows. (#399)
-- A local mirror belongs to the account that made it, an unreadable session
-  removes nothing, and nothing syncs until the owner is confirmed. (#375)
-- The phone and the CLI ask before waking a workspace, and a viewer or a
-  phone no longer counts as attached. (#383)
-
-### Worktrees
-
-- Clean up safe worktrees in bulk across open local and cloud projects, and
-  remove what earlier deletes left on disk, with sizes shown. (#322, #406)
-
-### Computer use
-
-- The computer-use helper has a new identity and name, "TerminalX Computer
-  Use Helper". It serves only the app, never operates TerminalX's own
-  windows, and the old helper's grant is removed at every launch. macOS asks
-  for Accessibility and Screen Recording again for the new helper. (#382,
-  #409, #412)
-
-### Mobile companion
-
-These source changes require a separately updated mobile app.
-
-- A paired phone reconnects after the app restarts, and pairing works when
-  the direct port is busy. (#381, #390)
-- Transcripts load correctly, keep earlier history during catch-up, order
-  unfinished turns, and scroll long histories smoothly. Markdown renders and
-  chat links can be opened. (#389, #391, #392, #393, #394)
 
 ## 0.2.8
 
