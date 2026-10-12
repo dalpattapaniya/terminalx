@@ -335,6 +335,90 @@ pub fn organization_github_app_open(url: String, app: tauri::AppHandle) -> Githu
         .map_err(|_| crate::organization_github_app::GithubAppError::local("github_app_browser_failed"))
 }
 
+// ------------------------------------------------ organization environment
+
+async fn environment_call(
+    state: tauri::State<'_, crate::AppState>,
+    operation: impl FnOnce(&crate::organization_environment::OrganizationEnvironmentService) -> ComputeResult + Send + 'static,
+) -> ComputeResult {
+    let service = state.organization_environment.clone();
+    tauri::async_runtime::spawn_blocking(move || operation(&service))
+        .await
+        .map_err(|_| crate::organization_compute::OrganizationComputeError::local("cloud_environment_unavailable"))?
+}
+
+#[tauri::command]
+pub async fn organization_environment_status(provider: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.status(&provider)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_update(
+    provider: String,
+    expected_revision: u64,
+    definition: serde_json::Value,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.update(&provider, expected_revision, &definition, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_build(
+    provider: String,
+    idempotency_key: String,
+    confirm_provider_spend: bool,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.build(&provider, &idempotency_key, confirm_provider_spend, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version(version_id: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.version(&version_id)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version_retry(
+    version_id: String,
+    confirm_provider_spend: bool,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.retry(&version_id, confirm_provider_spend, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version_cancel(version_id: String, context_revision: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.cancel(&version_id, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version_rollback(version_id: String, context_revision: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.rollback(&version_id, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipes(provider: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.recipes(&provider)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipe_apply(
+    recipe_id: String,
+    confirm_apply: bool,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.apply_recipe(&recipe_id, confirm_apply, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipe_dismiss(recipe_id: String, context_revision: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.dismiss_recipe(&recipe_id, &context_revision)).await
+}
+
 // ------------------------------------------- cloud workspace configuration
 
 async fn config_call(
