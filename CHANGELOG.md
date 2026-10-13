@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Cloud
+
+- Settings → Account → Agent logins now flags a login whose configurer is no
+  longer an owner or admin of the organization, and says that logging in
+  again takes it over. A member sees, per agent, whether a login their
+  workspaces can use is connected. The text about Disconnect matches what
+  the service does: it reaches running workspaces too. A first prompt
+  refused for lack of a login says which cases it can be and opens the
+  desktop's Agent logins instead of pointing at the web console. (#450)
+
 ## 0.2.11
 
 Issue sessions that carry through a pull request, review and optional merge;

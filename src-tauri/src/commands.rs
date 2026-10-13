@@ -827,7 +827,7 @@ fn local_login_confirmation(
          The refresh token stays on this Mac, so this Mac's sign-in keeps working and the uploaded token cannot be renewed: it stops working on {expires}.\n\n\
          Until then agents run on your Claude subscription. {reach} \
          Anyone who can drive one of those workspaces can read the token off its machine.\n\n\
-         To end it sooner, disconnect it in Settings (the service refuses while a workspace still uses the login)."
+         To end it sooner, disconnect it in Settings: that reaches every workspace of the organization, running ones included."
     )
 }
 
@@ -3076,7 +3076,9 @@ mod command_tests {
         let first = super::claude_code_prompt("Acme", None, &new);
         assert!(first.starts_with("Paste the code") && first.contains("By default, agents in every member's cloud workspaces"));
         assert!(text.contains("Anyone who can drive one of those workspaces can read the token"));
-        assert!(text.contains("the service refuses while a workspace still uses the login"));
+        // #450: a running workspace does not stop a disconnect.
+        assert!(text.contains("To end it sooner, disconnect it in Settings: that reaches every workspace of the organization, running ones included."));
+        assert!(!text.contains("refuses while a workspace still uses the login"));
     }
     use crate::session_ops::{
         create_session_entry, new_tab_entry, notify_workspace_deleted,
