@@ -4,6 +4,11 @@
 
 ### Cloud
 
+- Local mirror: "Discard my changes" (and "Keep a copy, then discard") now
+  puts the workspace's files back right away, and reads "Files synced" only
+  once they are back. With an unchanged workspace it used to say "Files
+  synced" at once and leave the discarded edits on disk until the workspace
+  next changed. (#451)
 - Settings → Account → Agent logins now flags a login whose configurer is no
   longer an owner or admin of the organization, and says that logging in
   again takes it over. A member sees, per agent, whether a login their
