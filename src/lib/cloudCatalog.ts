@@ -22,6 +22,7 @@ import { isArchived, isOpen, machineRunning, purgeTombstones, type PurgeNotice }
 import { noteCloudWorkspaceListed } from "@/lib/cloudConnections";
 import { purgeCloudMirrors } from "@/lib/cloudMirror";
 import { onAccessChanged } from "@/lib/cloudCollab";
+import { getPrefs, setPrefs } from "@/lib/prefs";
 import { cloudProjectKey, cloudWorkspaceKey, type CloudProject, type CloudWorkspaceNode } from "@/types/target";
 
 /**
@@ -362,6 +363,7 @@ export async function ingestCloudList(
       createMemory,
     });
     tellConnections(workspaces, requestedAt);
+    forgetCreatedBlankProjects(org, list.workspaces, createMemory);
     // A local mirror (PRO-25) of a workspace this person can no longer open,
     // or that is gone, is removed with the session lists above. Only this
     // organization's mirrors are judged by this organization's list.
@@ -370,6 +372,26 @@ export async function ingestCloudList(
   const notices = await purgeTombstones(tombstones, names);
   if (notices.length) set({ ...state, notices: [...state.notices, ...notices] }, false);
   return { workspaces, notices };
+}
+
+/**
+ * A blank project added with "New project…" is a name this desktop keeps
+ * until its workspace exists. Once the server lists that workspace (archived
+ * or not) the project is known by it, so the name is dropped: deleting the
+ * workspace then removes the project, here and on every other device, rather
+ * than leaving an empty "No sessions yet" project behind.
+ */
+function forgetCreatedBlankProjects(orgId: string, listed: readonly CloudWorkspaceListItem[], memory: Record<string, CreateMemoryEntry>) {
+  const prefs = getPrefs();
+  const pending = prefs.cloudBlankProjects[orgId];
+  if (!pending?.length) return;
+  const created = new Set(listed.filter((item) => !repositoryOf(item, memory)).map((item) => blankIdentity(item.workspace.name)));
+  const left = pending.filter((name) => !created.has(blankIdentity(name)));
+  if (left.length === pending.length) return;
+  const next = { ...prefs.cloudBlankProjects };
+  if (left.length) next[orgId] = left;
+  else delete next[orgId];
+  setPrefs({ cloudBlankProjects: next });
 }
 
 /**
