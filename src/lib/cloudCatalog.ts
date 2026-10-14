@@ -383,7 +383,7 @@ export async function ingestCloudList(
  */
 function forgetCreatedBlankProjects(orgId: string, listed: readonly CloudWorkspaceListItem[], memory: Record<string, CreateMemoryEntry>) {
   const prefs = getPrefs();
-  const pending = prefs.cloudBlankProjects[orgId];
+  const pending = prefs.cloudBlankProjects?.[orgId];
   if (!pending?.length) return;
   const created = new Set(listed.filter((item) => !repositoryOf(item, memory)).map((item) => blankIdentity(item.workspace.name)));
   const left = pending.filter((name) => !created.has(blankIdentity(name)));
