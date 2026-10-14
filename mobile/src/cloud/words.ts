@@ -70,9 +70,18 @@ export function codeText(code: string | null | undefined): string | null {
   return CODES[code] ?? "That did not work. Try again in a moment.";
 }
 
-/** One line for the banner above a workspace's conversation. */
-export function connectionLine(connection: WorkspaceConnectionState, listedState: string | null, problem: CloudLinkProblem, starting = false): { tone: "live" | "idle" | "warn"; text: string } {
-  if (connection.state === "connected") return { tone: "live", text: "Live · end-to-end encrypted" };
+/**
+ * One line for the banner above a workspace's conversation. A connection is
+ * live only for someone with a role there: with none (access taken away, or
+ * never given) or before the runtime knows (#475), nothing of it is shown, and
+ * the banner says so instead of "Live".
+ */
+export function connectionLine(connection: WorkspaceConnectionState, listedState: string | null, problem: CloudLinkProblem, starting = false, access: { role: CloudRole | null; checking: boolean } = { role: null, checking: false }): { tone: "live" | "idle" | "warn"; text: string } {
+  if (connection.state === "connected") {
+    if (access.checking) return { tone: "idle", text: "Checking your access…" };
+    if (access.role === "none") return { tone: "warn", text: "No access: this workspace is not shared with you." };
+    return { tone: "live", text: "Live · end-to-end encrypted" };
+  }
   if (connection.state === "updateRequired") return { tone: "warn", text: "Update the app to connect to this workspace." };
   if (listedState === "archived") return { tone: "idle", text: "Archived. Showing the saved conversation." };
   // Asked to start by a message, or already starting: said as long as it lasts, so a workspace that bills is never shown as stopped.

@@ -731,16 +731,25 @@ describe("a cloud workspace on the phone", () => {
       h.session.close();
     });
 
-    it("asks as before of a runtime from before sharing, which reports role none without a member list", async () => {
+    it("asks nothing until a runtime that just started knows who has access, then asks for the role it gives (#475)", async () => {
       const h = shared({ role: "driver" });
       h.each((runtime) => {
         runtime.you = { userId: "u-me", role: "none", canApprove: false, listed: false };
         runtime.methods["collab.state"] = () => undefined;
       });
+      const asked = () => h.runtimes[0].requests.map((request) => (request as { method?: string }).method).filter((method) => method === "keys.get" || method === "session.tabs");
       await h.session.start();
+      await vi.waitFor(() => expect(h.session.getSnapshot().connection.state).toBe("connected"));
+      await vi.advanceTimersByTimeAsync(100);
+      // The runtime would refuse it all: nothing is asked, no refusal is shown, and the banner does not say Live.
+      expect(asked()).toEqual([]);
+      expect(h.session.getSnapshot()).toMatchObject({ checkingAccess: true, tabs: [], error: null });
+      // The member list arrives: the runtime says so, and what the role allows is read.
+      h.runtimes[0].you = { userId: "u-me", role: "driver", canApprove: false, listed: true };
+      h.runtimes[0].encrypted({ event: "collab.you", params: { you: h.runtimes[0].you } });
       await connected(h);
-      // Keys and tabs were asked for, and the role is the list's.
-      expect(h.session.getSnapshot()).toMatchObject({ hasKey: true, role: "driver", tabs: [{ tabId: "t1" }] });
+      expect(asked()).toContain("keys.get");
+      expect(h.session.getSnapshot()).toMatchObject({ checkingAccess: false, hasKey: true, role: "driver", tabs: [{ tabId: "t1" }] });
       h.session.close();
     });
 

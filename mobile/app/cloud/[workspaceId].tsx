@@ -85,7 +85,7 @@ function Workspace({ catalog, session, orgId, workspaceId, listedState, initialT
   const tabId = tab?.tabId ?? null;
   const live = snapshot.connection.state === "connected";
   const starting = listedState === "suspended" && snapshot.outbox.some((entry) => (entry.state === "queued" || entry.state === "leased") && (entry.wake === "queued" || entry.wake === "in-progress"));
-  const banner = connectionLine(snapshot.connection, listedState, snapshot.problem, starting);
+  const banner = connectionLine(snapshot.connection, listedState, snapshot.problem, starting, { role: snapshot.role, checking: snapshot.checkingAccess });
   // The link stopped trying by itself, or was refused: it tries again only when asked.
   const canReconnect = snapshot.connection.state === "stopped" && listedState === "ready";
   const role = roleLabel(snapshot.role);

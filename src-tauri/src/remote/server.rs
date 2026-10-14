@@ -71,9 +71,6 @@ pub const MAX_QUEUED_OUTPUT: usize = 4 * 1024 * 1024;
 const REPLAY_CHUNK: usize = 256 * 1024;
 /// Distinct writers remembered per terminal for resend detection.
 const MAX_WRITERS: usize = 64;
-/// Methods a `participate` attachment could not call before PRO-30. With no
-/// member list from the API (an older API) they stay closed to it.
-const SHARED_ONLY: &[&str] = &["keys.get", "pty.write", "pty.resize", "pty.control", "ports.list", "ports.open", "ports.write"];
 /// Longest session title `session.update` accepts, in characters.
 const MAX_TITLE_CHARS: usize = 200;
 /// Launch modes a tab may be given (`src/lib/models.ts` `PERMISSION_MODES`).
@@ -634,8 +631,8 @@ impl WorkspaceRpc {
     }
 
     /// `listed` is false until the API has said who has access: the runtime
-    /// then serves participants what it did before sharing existed, and
-    /// clients must not read the role as "not shared".
+    /// then refuses participants everything until it knows, and clients must
+    /// not read the role as "not shared".
     fn you(&self, peer: &Peer) -> Value {
         let access = self.access(peer);
         json!({ "userId": peer.user_id, "role": access.role, "canApprove": access.can_approve, "listed": self.collab.known() })
@@ -907,13 +904,17 @@ impl WorkspaceRpc {
         result
     }
 
-    /// What a participant's role allows (contract §21.1). Before the API
-    /// has listed members, participants keep exactly what they had before
-    /// sharing existed.
+    /// What a participant's role allows (contract §21.1). Until the API has
+    /// listed members (after a restart, before the first list), nobody's
+    /// role is known, so a participant is refused everything: a member whose
+    /// share was revoked must not read the workspace in that window (#475).
+    /// The list comes with the runtime's session, before any client can
+    /// connect, and `collab.you` tells every connection when it arrives.
     fn authorize_participant(&self, peer: &Peer, spec: &protocol::Method) -> Result<(), RpcError> {
         let method = spec.name;
-        if !self.collab.known() && spec.capability != "collab/1" && !SHARED_ONLY.contains(&method) {
-            return Ok(());
+        if !self.collab.known() {
+            return Err(RpcError::forbidden(format!("{method} needs the workspace's member list, which has not arrived yet"))
+                .with_data(json!({ "role": Role::None, "reason": "access-unknown" })));
         }
         let needed = match method {
             "pty.write" | "pty.resize" | "pty.control" | "lease.acquire" | "lease.release" => Role::Driver,
