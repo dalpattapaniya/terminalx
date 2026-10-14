@@ -82,6 +82,9 @@ for (const colorScheme of shots ? ["light", "dark"] : ["light"]) {
   );
   await page.mouse.move(700, 300);
   await shot("sidebar-sections");
+  await failedLine.scrollIntoViewIfNeeded();
+  await shot("org-failed-and-loading");
+  await tree.evaluate((element) => element.scrollTo(0, 0));
 
   failed += report(`cloud sections (${colorScheme})`, {
     "the tree does not scroll sideways": !sideways,
