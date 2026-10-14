@@ -5,14 +5,13 @@ import type { WorkspaceConnectionState, WorkspaceRpcClient } from "@terminalx/po
 import { Button } from "@/components/ui/button";
 import { api, type CloudPortForward } from "@/lib/api";
 
-/** How often the list is read while the panel is on screen and something listens. */
-const POLL_MS = 5_000;
 /**
- * How often while nothing is listed yet: an application just started shows
- * within a second or two. `ports.list` is one read of `/proc/net/tcp` on the
- * runtime, so this costs next to nothing.
+ * How often the list is read while the panel is on screen, so an application
+ * that has just started shows within a couple of seconds. `ports.list` is one
+ * read of `/proc/net/tcp` on the runtime, which always has listeners of its
+ * own, so the list is never empty to wait on: it is read at one steady pace.
  */
-export const LOOKING_POLL_MS = 1_500;
+export const POLL_MS = 2_000;
 
 const STOPPED = "Previews work while the workspace is running. Looking here never starts it.";
 /** Said beside a state with no connection when previews were open here: they ended with it. */
@@ -151,28 +150,24 @@ export function CloudPortsView({
     [expire],
   );
 
-  /** Reads the list and the open forwards; says whether to keep looking quickly (nothing found yet). */
-  const read = useCallback(async (): Promise<boolean> => {
-    if (!usable || !connectionId || !client) return false;
+  const read = useCallback(async () => {
+    if (!usable || !connectionId || !client) return;
     const [ports, open] = await Promise.all([client.listPorts().catch(() => null), api.cloudPortForwards(connectionId).catch(() => null)]);
-    if (!mounted.current) return false;
+    if (!mounted.current) return;
     if (open) showForwards(open);
-    if (!ports) return true;
+    if (!ports) return;
     setListening(ports.ports.map((entry) => entry.port));
     setDetected(ports.detected);
-    return ports.detected && ports.ports.length === 0;
   }, [client, connectionId, usable, showForwards]);
 
-  // Read while shown and connected; never while hidden. Quickly until
-  // something listens (an application just started), then every 5 seconds.
+  // Read while shown and connected; never while hidden. One read at a time.
   useEffect(() => {
     if (!active || !usable) return;
     let cancelled = false;
     let timer: number | undefined;
     const tick = async () => {
-      const looking = document.visibilityState !== "hidden" && (await read());
-      if (cancelled) return;
-      timer = window.setTimeout(() => void tick(), looking ? LOOKING_POLL_MS : POLL_MS);
+      if (document.visibilityState !== "hidden") await read();
+      if (!cancelled) timer = window.setTimeout(() => void tick(), POLL_MS);
     };
     void tick();
     return () => {

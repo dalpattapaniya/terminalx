@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({ invoke: vi.fn(), openUrl: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: mocks.openUrl }));
 
-const { CloudPortsView, LOOKING_POLL_MS, connectionText, portErrorMessage, resetPortsMemory } = await import("./CloudPorts");
+const { CloudPortsView, POLL_MS, connectionText, portErrorMessage, resetPortsMemory } = await import("./CloudPorts");
 
 const live: WorkspaceConnectionState = { state: "connected", runtimeGeneration: 1, runtimeEpoch: "e1", runtimeVersion: "0.3.0", capabilities: ["pty/1", "ports/1"], authority: "manage" };
 
@@ -184,15 +184,16 @@ describe("the Ports panel (PRO-28)", () => {
     expect(screen.queryByTestId("cloud-ports-looking")).toBeNull();
   });
 
-  it("looks again quickly while nothing listens, so an application that just started shows within seconds", async () => {
-    let listed: { port: number }[] = [];
+  it("reads again every 2 seconds, so an application that just started shows within seconds", async () => {
+    // The runtime's own listeners are always there: the list is never empty to wait on.
+    let listed = [{ port: 41000 }];
     const { runtime, client } = setup(live, () => ({ detected: true, ports: listed, streams: [] }));
     render(<CloudPortsView workspaceKey="ws-1" client={client} state={live} connectionId="cloud-1" mayOpen active />);
-    expect((await screen.findByTestId("cloud-ports-empty")).textContent).toContain("Nothing is listening");
-    listed = [{ port: 5173 }];
+    await waitFor(() => expect(screen.getAllByTestId("cloud-port")).toHaveLength(1));
+    listed = [{ port: 5173 }, { port: 41000 }];
     const asked = Date.now();
-    await waitFor(() => expect(screen.getAllByTestId("cloud-port")).toHaveLength(1), { timeout: LOOKING_POLL_MS + 1_000 });
-    expect(Date.now() - asked).toBeLessThan(LOOKING_POLL_MS + 1_000);
+    await waitFor(() => expect(screen.getAllByTestId("cloud-port")).toHaveLength(2), { timeout: POLL_MS + 1_000 });
+    expect(Date.now() - asked).toBeLessThanOrEqual(POLL_MS + 500);
     expect(runtime.sent.filter((frame) => frame.method === "ports.list").length).toBe(2);
   });
 

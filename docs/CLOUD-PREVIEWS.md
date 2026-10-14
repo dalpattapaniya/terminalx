@@ -259,11 +259,10 @@ What it does:
 
 - It lists what listens in the workspace (`ports.list`) and the forwards
   that are open. Until the runtime's first answer it says it is looking
-  for ports, never that nothing listens. While nothing is listed it reads
-  again every 1.5 seconds (one read of `/proc/net/tcp` on the runtime), so
-  an application that has just started shows within a couple of seconds;
-  once something listens, every 5 seconds. It reads only while it is on
-  screen and the window is visible. What the runtime lists is checked
+  for ports, never that nothing listens. It reads again every 2 seconds
+  (one read of `/proc/net/tcp` on the runtime), so an application that has
+  just started shows within a couple of seconds. It reads only while it is
+  on screen and the window is visible. What the runtime lists is checked
   before it is shown: whole numbers from 1 to 65535, at most 256.
 - "Start preview" forwards the port to a random free port on this Mac and
   shows `http://127.0.0.1:<port>`. Nothing opens by itself: the address
