@@ -148,6 +148,34 @@ describe("the Ports panel (PRO-28)", () => {
     expect(screen.queryByTestId("cloud-port-expired")).toBeNull();
   });
 
+  // Found in the live run: Stop, with a read already under way, showed the stopped preview as expired.
+  it("never calls a preview stopped here expired, even when a read from before the Stop lands after it", async () => {
+    const { client } = setup();
+    render(<CloudPortsView workspaceKey="ws-1" client={client} state={live} connectionId="cloud-1" mayOpen active />);
+    await waitFor(() => expect(screen.getAllByTestId("cloud-port")).toHaveLength(2));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start preview" })[0]!);
+    await screen.findByRole("button", { name: "http://127.0.0.1:49000" });
+    // The next read of the open forwards is held until after the Stop.
+    let release: (() => void) | null = null;
+    const before = forwards;
+    const answer = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args: never) => {
+      if (command === "cloud_port_forwards" && !release) return new Promise((resolve) => (release = () => resolve(before)));
+      return answer(command, args);
+    });
+    await waitFor(() => expect(release).not.toBeNull(), { timeout: POLL_MS + 1_000 });
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "http://127.0.0.1:49000" })).toBeNull());
+    release!();
+    // One more read, with nothing open: still nothing reads as expired.
+    const reads = mocks.invoke.mock.calls.filter(([command]) => command === "cloud_port_forwards").length;
+    await waitFor(() => expect(mocks.invoke.mock.calls.filter(([command]) => command === "cloud_port_forwards").length).toBeGreaterThan(reads), { timeout: POLL_MS + 1_000 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByTestId("cloud-port-expired")).toBeNull();
+    expect(screen.queryByRole("button", { name: "http://127.0.0.1:49000" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Start preview" }).length).toBeGreaterThan(0);
+  }, 10_000);
+
   it("says a preview expired when its forward went while the panel was not drawn", async () => {
     const { client } = setup();
     const first = render(<CloudPortsView workspaceKey="ws-1" client={client} state={live} connectionId="cloud-1" mayOpen active />);

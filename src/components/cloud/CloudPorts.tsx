@@ -127,6 +127,10 @@ export function CloudPortsView({
   const mounted = useRef(true);
   // The previews last seen open; one that goes without a Stop here has expired.
   const seen = useRef<CloudPortForward[]>(memory.get(workspaceKey)?.seen ?? []);
+  // Counts Starts and Stops made here. A read that one overtook carries the
+  // forwards from before it, and is not taken: a preview stopped here would
+  // otherwise come back, then read as expired.
+  const changes = useRef(0);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -152,9 +156,10 @@ export function CloudPortsView({
 
   const read = useCallback(async () => {
     if (!usable || !connectionId || !client) return;
+    const at = changes.current;
     const [ports, open] = await Promise.all([client.listPorts().catch(() => null), api.cloudPortForwards(connectionId).catch(() => null)]);
     if (!mounted.current) return;
-    if (open) showForwards(open);
+    if (open && at === changes.current) showForwards(open);
     if (!ports) return;
     setListening(ports.ports.map((entry) => entry.port));
     setDetected(ports.detected);
@@ -191,6 +196,7 @@ export function CloudPortsView({
     setError(null);
     try {
       const forward = await api.cloudPortForward(connectionId, port, sameNumber ? { localPort: port, exact: true } : {});
+      changes.current += 1;
       if (!mounted.current) return;
       const next = [...seen.current.filter((other) => other.port !== port), forward].sort((a, b) => a.port - b.port);
       seen.current = next;
@@ -209,6 +215,7 @@ export function CloudPortsView({
     setError(null);
     try {
       await api.cloudPortUnforward(connectionId, port);
+      changes.current += 1;
       if (!mounted.current) return;
       seen.current = seen.current.filter((other) => other.port !== port);
       setForwards(seen.current);
