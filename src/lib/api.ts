@@ -751,6 +751,8 @@ export interface AgentLogin {
   updatedAt: number;
   state?: "connected" | "revoked" | "disconnected" | (string & {});
   sharedUse?: "organization" | "managers" | (string & {});
+  /** In the list only: the person who connected this subscription login no longer owns or administers the organization. */
+  configurerLeft?: boolean;
 }
 
 export interface ClaudeLoginStarted {

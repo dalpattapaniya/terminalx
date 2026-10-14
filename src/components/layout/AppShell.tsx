@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { onOpenAgentLogins } from "@/lib/settingsLinks";
 import { PanelLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
@@ -128,6 +129,8 @@ export function AppShell() {
     setSettingsOpen(true);
     setSettingsRequest((count) => count + 1);
   }, []);
+  // A message that names Settings → Account → Agent logins offers the way there; the section scrolls itself into view.
+  useEffect(() => onOpenAgentLogins(openAccountSettings), [openAccountSettings]);
   const openAgentSettings = useCallback(() => {
     setSettingsTab("agents");
     setSettingsOpen(true);
