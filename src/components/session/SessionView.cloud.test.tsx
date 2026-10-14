@@ -124,6 +124,7 @@ import { getSessionStore, selectCloudSession, upsertSession } from "@/lib/sessio
 import { api } from "@/lib/api";
 import { LocalPathLeakError, cloudSessionKey } from "@/types/target";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { resetPanelTabs } from "@/lib/panelTab";
 
 mocks.guard = guardedApi();
 // jsdom lays nothing out; the file tree scrolls its focused row into view.
@@ -419,6 +420,7 @@ afterEach(() => {
   resetCloudWakes();
   resetCloudConnections();
   resetCollab();
+  resetPanelTabs();
   client.close();
 });
 
@@ -1574,6 +1576,18 @@ describe("Ports and previews in a cloud session (PRO-28)", () => {
       expect(within(workspace).queryByRole("menuitem", { name: /Ports and previews/ })).toBeNull();
       cleanup();
     }
+  });
+
+  // Found in the live run: after a stop and resume the panel came back on Changes, so the closed preview went unseen.
+  it("keeps the side panel on Ports when the connection drops and comes back", async () => {
+    await openConnected();
+    fireEvent.click(screen.getByRole("button", { name: "Ports", hidden: true }));
+    expect(await screen.findByTestId("panel-ports")).toBeTruthy();
+    await act(async () => runtime.emit({ state: "reconnecting", attempt: 1, reason: "closed", retryInMs: 1000 }));
+    const offline = await screen.findByTestId("cloud-panel-offline-ports");
+    expect(within(offline).getByTestId("cloud-ports-restarting").textContent).toContain("Reconnecting");
+    await act(async () => runtime.connect());
+    expect(await screen.findByTestId("panel-ports")).toBeTruthy();
   });
 
   it("says where previews stand while the workspace is stopped, and wakes nothing", async () => {

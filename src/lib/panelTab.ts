@@ -28,3 +28,25 @@ export function onPanelTab(listener: (tab: PanelTab) => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
+
+/**
+ * The tab a cloud session's panel last showed, per session. That panel is
+ * replaced while the workspace is not connected and drawn anew when it is
+ * back; it reopens on the tab that was shown (Ports included) instead of
+ * Changes.
+ */
+const shown = new Map<string, PanelTab>();
+
+export function rememberPanelTab(sessionId: string, tab: PanelTab) {
+  shown.set(sessionId, tab);
+}
+
+export function rememberedPanelTab(sessionId: string): PanelTab | null {
+  return shown.get(sessionId) ?? null;
+}
+
+/** Forgets every remembered and asked-for tab (tests). */
+export function resetPanelTabs() {
+  shown.clear();
+  pending = null;
+}

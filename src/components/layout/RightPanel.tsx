@@ -16,7 +16,7 @@ import type { GitSource } from "@/lib/gitSource";
 import type { FileSource } from "@/lib/workspaceFiles";
 import type { AgentEvent } from "@/types/events";
 import type { WorkStatus } from "@/types/session";
-import { onPanelTab, takePanelTab, type PanelTab } from "@/lib/panelTab";
+import { onPanelTab, rememberPanelTab, rememberedPanelTab, takePanelTab, type PanelTab } from "@/lib/panelTab";
 
 export type { PanelTab };
 const TABS: { id: PanelTab; label: string; shortcut?: ShortcutId }[] = [
@@ -86,7 +86,12 @@ export function RightPanel({
   ports?: () => ReactNode;
 }) {
   const prefs = usePrefs();
-  const [selectedTab, setTab] = useState<PanelTab>(() => takePanelTab() ?? "changes");
+  // A cloud session's panel (the one with Ports) reopens on the tab it last showed.
+  const remembers = !!ports && !!sessionId;
+  const [selectedTab, setTab] = useState<PanelTab>(() => takePanelTab() ?? (remembers ? rememberedPanelTab(sessionId!) : null) ?? "changes");
+  useEffect(() => {
+    if (remembers) rememberPanelTab(sessionId!, selectedTab);
+  }, [remembers, sessionId, selectedTab]);
   // A menu elsewhere asked for a tab (the session's "Ports and previews").
   useEffect(
     () =>

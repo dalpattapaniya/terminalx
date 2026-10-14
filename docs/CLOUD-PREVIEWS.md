@@ -252,7 +252,8 @@ may approve; the same rule as above):
 For anyone else the tab and both menu entries are left out, not shown and
 refused. While the workspace is not connected the side panel keeps a
 small Ports section under its "appear once connected" text, which says
-where previews stand. None of these entries connects or wakes the
+where previews stand, and when the connection is back the panel reopens
+on the tab it showed before. None of these entries connects or wakes the
 workspace.
 
 What it does:
