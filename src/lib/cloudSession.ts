@@ -267,6 +267,8 @@ function tabEntry(tab: CloudAgentTab, asleep: boolean): TabEntry {
     status: statusShown(tab, asleep),
     created: info.created,
     modified: info.modified,
+    // A stopped workspace is read only from what was saved; nothing more is on its way.
+    loadingHistory: !tab.historyRead && !asleep,
   };
 }
 
