@@ -5,6 +5,7 @@ import {
   ArrowLeftRight,
   ArrowUp,
   BookOpen,
+  Check,
   Cloud,
   Ellipsis,
   EyeOff,
@@ -698,6 +699,7 @@ function MoveToSectionItems({ project }: { project: CloudProject }) {
             disabled={current?.id === section.id}
             onSelect={() => moveProjectToSection(project.orgId, project.identity, section.id)}
           >
+            {current?.id === section.id ? <Check /> : <span aria-hidden className="size-4 shrink-0" />}
             <span className="truncate">{section.name}</span>
           </DropdownMenuItem>
         ))}
@@ -707,7 +709,7 @@ function MoveToSectionItems({ project }: { project: CloudProject }) {
         </DropdownMenuItem>
         {current && (
           <DropdownMenuItem onSelect={() => moveProjectToSection(project.orgId, project.identity, null)}>
-            <X /> Remove from {current.name}
+            <X /> <span className="min-w-0 truncate">Remove from {current.name}</span>
           </DropdownMenuItem>
         )}
       </DropdownMenuSubContent>
