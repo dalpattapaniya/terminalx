@@ -39,11 +39,21 @@ async fn call(rpc: &Arc<WorkspaceRpc>, peer: &Arc<Peer>, method: &str, params: V
 }
 
 async fn manager_peer(rpc: &Arc<WorkspaceRpc>) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new("device-manage".into(), Authority::Manage);
+    let (peer, events) = Peer::for_user("device-manage".into(), Authority::Manage, person_for(Authority::Manage));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["pty/1", "fs/1", "git/1", "session/1"] }))
         .await
         .unwrap();
     (peer, events)
+}
+
+/// Who the API lists, as it does before any client connects (#475): the
+/// manager and one viewer, the people `person_for` names.
+fn listed(rpc: &WorkspaceRpc) {
+    rpc.set_collaboration(members(json!([{ "userId": "admin", "role": "manager" }, { "userId": "viewer", "role": "viewer" }])));
+}
+
+fn person_for(authority: Authority) -> Option<String> {
+    Some(if authority == Authority::Manage { "admin" } else { "viewer" }.into())
 }
 
 fn code(result: Result<Value, (String, String)>) -> String {
@@ -247,7 +257,7 @@ async fn hello_and_cursors_follow_a_newer_registered_generation() {
 }
 
 async fn peer_for(rpc: &Arc<WorkspaceRpc>, device: &str, authority: Authority) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new(device.into(), authority);
+    let (peer, events) = Peer::for_user(device.into(), authority, person_for(authority));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["pty/1"] })).await.unwrap();
     (peer, events)
 }
@@ -340,6 +350,7 @@ async fn input_is_applied_once_in_order_and_backpressure_keeps_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn one_controller_owns_input_and_size_and_viewers_follow() {
     let f = fixture();
+    listed(&f.rpc);
     let (desk, mut desk_events) = peer_for(&f.rpc, "device-desk", Authority::Manage).await;
     let (laptop, mut laptop_events) = peer_for(&f.rpc, "device-laptop", Authority::Manage).await;
     let (phone, _phone_events) = peer_for(&f.rpc, "device-phone", Authority::Participate).await;
@@ -381,6 +392,7 @@ async fn one_controller_owns_input_and_size_and_viewers_follow() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exit_and_close_are_reported_and_nothing_targets_a_closed_terminal() {
     let f = fixture();
+    listed(&f.rpc);
     let (peer, mut events) = manager_peer(&f.rpc).await;
     let pty_id = call(&f.rpc, &peer, "pty.create", json!({ "clientRequestId": "request-exit-1" })).await.unwrap()["ptyId"].as_str().unwrap().to_string();
     call(&f.rpc, &peer, "pty.attach", json!({ "ptyId": pty_id })).await.unwrap();
@@ -524,26 +536,28 @@ impl crate::cloud_agents::AgentOps for NoAgents {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_workspace_key_is_handed_out_over_keys_1_and_only_managers_rotate_it() {
     let f = fixture();
+    listed(&f.rpc);
     let agents = crate::cloud_agents::CloudAgents::open(&f._dir.path().join("agents"), Arc::new(NoAgents), None, None, 7).unwrap();
     f.rpc.set_agents(agents.clone());
-    let (manager, _events) = Peer::new("device-manage".into(), Authority::Manage);
+    let (manager, _events) = Peer::for_user("device-manage".into(), Authority::Manage, person_for(Authority::Manage));
     call(&f.rpc, &manager, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["session/1"] })).await.unwrap();
     assert_eq!(code(call(&f.rpc, &manager, "keys.get", json!({})).await), "capability_not_granted");
-    let (participant, _events) = Peer::new("device-phone".into(), Authority::Participate);
+    // Someone the workspace is not shared with.
+    let (participant, _events) = Peer::for_user("device-phone".into(), Authority::Participate, Some("outsider".into()));
     let hello = call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["session/1", "keys/1"] })).await.unwrap();
     assert_eq!(hello["capabilities"], json!(["session/1", "keys/1"]));
     assert_eq!(agents.attached(), 2, "each connection that said hello counts as attached");
     // The key opens every tab's checkpoint; participants see no tabs.
     assert_eq!(code(call(&f.rpc, &participant, "keys.get", json!({})).await), "forbidden");
-    let (keyholder, _events) = Peer::new("device-desk".into(), Authority::Manage);
+    let (keyholder, _events) = Peer::for_user("device-desk".into(), Authority::Manage, person_for(Authority::Manage));
     call(&f.rpc, &keyholder, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["keys/1"] })).await.unwrap();
     let handout = call(&f.rpc, &keyholder, "keys.get", json!({})).await.unwrap();
     let (current, key) = agents.keys.current().unwrap();
     assert_eq!(handout["currentKeyId"], current);
     assert_eq!(handout["keys"][0]["key"], crate::cloud_agents::crypto::b64(&key));
     assert_eq!(code(call(&f.rpc, &participant, "keys.rotate", json!({ "clientRequestId": "request-0001" })).await), "forbidden");
-    // Nothing is shared with a participant, so it sees no agent tabs.
-    assert_eq!(call(&f.rpc, &participant, "session.tabs", json!({})).await.unwrap()["tabs"], json!([]));
+    // Nothing is shared with it, so it is refused the agent tabs.
+    assert_eq!(code(call(&f.rpc, &participant, "session.tabs", json!({})).await), "forbidden");
     assert_eq!(
         code(call(&f.rpc, &participant, "session.configure", json!({ "sessionId": "s", "tabId": "t", "clientRequestId": "request-0002" })).await),
         "forbidden"
@@ -604,9 +618,10 @@ fn session_cursors_expire_with_the_runtime_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn participants_read_git_and_disposition_facts_but_never_publish() {
     let f = fixture();
+    listed(&f.rpc);
     crate::git::run(&f.root, &["init", "-q", "-b", "main"]).unwrap();
     std::fs::write(f.root.join("a.txt"), "a").unwrap();
-    let (participant, _events) = Peer::new("device-participate".into(), Authority::Participate);
+    let (participant, _events) = Peer::for_user("device-participate".into(), Authority::Participate, person_for(Authority::Participate));
     call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["git/1"] })).await.unwrap();
     assert_eq!(code(call(&f.rpc, &participant, "lifecycle.dispositionFacts", json!({})).await), "capability_not_granted");
     call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["git/1", "lifecycle/1"] })).await.unwrap();
@@ -880,17 +895,13 @@ async fn roles_decide_what_a_participant_reads_types_and_holds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn without_a_member_list_participants_keep_what_they_had() {
+async fn a_member_list_this_runtime_cannot_read_gives_participants_nothing() {
     let f = fixture();
     with_tab(&f);
+    f.rpc.set_collaboration(members(json!([{ "userId": "alice", "role": "viewer" }])));
     let (phone, _events, hello) = person(&f.rpc, "d-phone", Authority::Participate, "alice").await;
-    assert_eq!(hello["you"]["role"], "none");
+    assert_eq!(hello["you"]["role"], "viewer");
     assert!(call(&f.rpc, &phone, "pty.list", json!({})).await.is_ok());
-    assert!(call(&f.rpc, &phone, "fs.list", json!({})).await.is_ok());
-    assert_eq!(call(&f.rpc, &phone, "session.tabs", json!({})).await.unwrap()["tabs"], json!([]));
-    for method in ["keys.get", "collab.state", "notes.list"] {
-        assert_eq!(code(call(&f.rpc, &phone, method, json!({ "tabId": "tab-1" })).await), "forbidden", "{method}");
-    }
     // A list this runtime cannot read fails closed.
     f.rpc.set_collaboration(Some(collab::Members { v: 9, members: Vec::new() }));
     assert_eq!(code(call(&f.rpc, &phone, "pty.list", json!({})).await), "forbidden");
@@ -1027,6 +1038,50 @@ async fn a_manage_attachment_that_names_no_person_loses_everything_once_members_
     assert_eq!((hello["authority"].as_str(), hello["you"]["role"].as_str()), (Some("participate"), Some("none")));
 }
 
+/// #475: after a restart, until the API's member list arrives, no
+/// participant's role is known. A member whose share was revoked must not
+/// read the workspace in that window, so every participant is refused
+/// everything until the list says who they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn participants_are_refused_everything_until_the_member_list_arrives() {
+    let f = fixture();
+    let _agents = with_tab(&f);
+    std::fs::write(f.root.join("notes.txt"), "private").unwrap();
+    let (bob, _bob_events, hello) = person(&f.rpc, "d-bob", Authority::Participate, "bob").await;
+    let (revoked, _revoked_events, _) = person(&f.rpc, "p-revoked", Authority::Participate, "revoked").await;
+    assert_eq!((hello["you"]["role"].as_str(), hello["you"]["listed"].as_bool()), (Some("none"), Some(false)));
+    let reads = [
+        ("session.list", json!({})),
+        ("session.get", json!({ "sessionId": "s1" })),
+        ("session.subscribe", json!({ "sessionId": "s1" })),
+        ("session.tabs", json!({})),
+        ("keys.get", json!({})),
+        ("collab.state", json!({})),
+        ("notes.list", json!({ "tabId": "tab-1" })),
+        ("fs.list", json!({})),
+        ("fs.read", json!({ "path": "notes.txt" })),
+        ("git.status", json!({})),
+        ("pty.list", json!({})),
+        ("pty.attach", json!({ "ptyId": "p1" })),
+    ];
+    for peer in [&bob, &revoked] {
+        for (method, params) in &reads {
+            assert_eq!(code(call(&f.rpc, peer, method, params.clone()).await), "forbidden", "{method} before the member list");
+        }
+    }
+    // The manager's desktop is not held up by the missing list.
+    let (manager, _events) = manager_peer(&f.rpc).await;
+    assert!(call(&f.rpc, &manager, "fs.read", json!({ "path": "notes.txt" })).await.is_ok());
+
+    // The list arrives: Bob is a viewer, the revoked member is not listed.
+    f.rpc.set_collaboration(members(json!([{ "userId": "admin", "role": "manager" }, { "userId": "bob", "role": "viewer" }])));
+    assert!(call(&f.rpc, &bob, "session.list", json!({})).await.is_ok());
+    assert!(call(&f.rpc, &bob, "fs.read", json!({ "path": "notes.txt" })).await.is_ok());
+    for (method, params) in &reads {
+        assert_eq!(code(call(&f.rpc, &revoked, method, params.clone()).await), "forbidden", "{method} for a member with no share");
+    }
+}
+
 /// Review N3: the key is handed out only after the holder is recorded, and
 /// only if access still holds when the handout runs.
 #[tokio::test(flavor = "multi_thread")]
@@ -1056,10 +1111,10 @@ async fn the_first_member_list_stops_streams_of_people_without_access() {
     let (admin, _admin_events, _) = person(&f.rpc, "d-admin", Authority::Manage, "admin").await;
     let created = call(&f.rpc, &admin, "pty.create", json!({ "clientRequestId": "request-first-list" })).await.unwrap();
     let pty_id = created["ptyId"].as_str().unwrap().to_string();
-    // Before any list, a participant may still watch, as before PRO-30.
+    // Before any list, a participant may not even watch (#475).
     let (carol, mut carol_events, hello) = person(&f.rpc, "d-carol", Authority::Participate, "carol").await;
     assert_eq!(hello["you"]["listed"], false, "no list yet is not \"not shared\"");
-    call(&f.rpc, &carol, "pty.attach", json!({ "ptyId": pty_id })).await.unwrap();
+    assert_eq!(code(call(&f.rpc, &carol, "pty.attach", json!({ "ptyId": pty_id })).await), "forbidden");
     // The first list does not name her: her stream ends, her connection stays.
     f.rpc.set_collaboration(members(json!([{ "userId": "admin", "role": "manager" }])));
     let you = next_event(&mut carol_events, "collab.you").await;
@@ -1642,7 +1697,7 @@ async fn claude_model_validation_covers_session_creation_new_tabs_and_configurat
 }
 
 async fn hello_with(rpc: &Arc<WorkspaceRpc>, device: &str, authority: Authority, want: &[&str]) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new(device.into(), authority);
+    let (peer, events) = Peer::for_user(device.into(), authority, person_for(authority));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": want })).await.unwrap();
     (peer, events)
 }
@@ -1691,6 +1746,7 @@ async fn a_session_1_desktop_is_served_as_before_and_never_sees_the_additions() 
 async fn participants_are_refused_every_session_2_write_and_see_only_shared_sessions() {
     let _home = crate::store::temp_home();
     let f = fixture();
+    listed(&f.rpc);
     f.rpc.set_offered_for_tests(installed_agents());
     let session = seed_session(&f.root, "Fix login", None);
     let (participant, _events) = hello_with(&f.rpc, "device-phone", Authority::Participate, &protocol::CAPABILITIES).await;
@@ -1703,10 +1759,13 @@ async fn participants_are_refused_every_session_2_write_and_see_only_shared_sess
         assert_eq!(code(call(&f.rpc, &participant, method, params).await), "forbidden", "{method}");
     }
     assert_eq!(index::get(&session.id).unwrap().title, "Fix login", "nothing changed");
-    // Nothing is shared with a participant yet: it lists no sessions.
-    assert_eq!(call(&f.rpc, &participant, "session.list", json!({})).await.unwrap()["sessions"], json!([]));
-    // Reading what can run is not a write.
+    // A viewer sees the workspace's sessions; reading what can run is not a write.
+    assert_eq!(call(&f.rpc, &participant, "session.list", json!({})).await.unwrap()["sessions"][0]["id"], session.id.as_str());
     assert!(call(&f.rpc, &participant, "runtime.agents", json!({})).await.is_ok());
+    // Someone it is not shared with is refused even the list.
+    let (outsider, _outsider_events) = Peer::for_user("device-outsider".into(), Authority::Participate, Some("outsider".into()));
+    call(&f.rpc, &outsider, "rpc.hello", json!({ "protocol": PROTOCOL, "want": protocol::CAPABILITIES })).await.unwrap();
+    assert_eq!(code(call(&f.rpc, &outsider, "session.list", json!({})).await), "forbidden");
 }
 
 /// PRO-30 on top of CS-12: sharing is workspace-wide, so the session list and
@@ -1908,6 +1967,7 @@ async fn runtime_agents_lists_installed_agents_with_models_efforts_and_modes() {
 async fn a_terminal_names_its_session_only_to_pty_2_peers_that_may_see_it() {
     let _home = crate::store::temp_home();
     let f = fixture();
+    listed(&f.rpc);
     let session = seed_session(&f.root, "Fix login", None);
     let (manager, _events) = hello_with(&f.rpc, "device-desk", Authority::Manage, &protocol::CAPABILITIES).await;
     let created = call(&f.rpc, &manager, "pty.create", json!({ "sessionId": session.id, "clientRequestId": "request-scope-1" })).await.unwrap();
@@ -1923,12 +1983,11 @@ async fn a_terminal_names_its_session_only_to_pty_2_peers_that_may_see_it() {
     let controlled = call(&f.rpc, &old, "pty.control", json!({ "ptyId": pty_id })).await.unwrap();
     assert!(controlled.get("sessionId").is_none());
 
-    // A participant with pty/2 is not shown a session that is not shared with it.
-    let (participant, _part_events) = hello_with(&f.rpc, "device-phone", Authority::Participate, &protocol::CAPABILITIES).await;
-    let listed = call(&f.rpc, &participant, "pty.list", json!({})).await.unwrap();
-    assert!(listed["terminals"][0].get("sessionId").is_none());
-    let attached = call(&f.rpc, &participant, "pty.attach", json!({ "ptyId": pty_id })).await.unwrap();
-    assert!(attached.get("sessionId").is_none());
+    // A participant with pty/2 that the workspace is not shared with sees no terminal at all.
+    let (participant, _part_events) = Peer::for_user("device-phone".into(), Authority::Participate, Some("outsider".into()));
+    call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": protocol::CAPABILITIES })).await.unwrap();
+    assert_eq!(code(call(&f.rpc, &participant, "pty.list", json!({})).await), "forbidden");
+    assert_eq!(code(call(&f.rpc, &participant, "pty.attach", json!({ "ptyId": pty_id })).await), "forbidden");
 
     // The pty/2 manager, who may see the session, is told it.
     let listed = call(&f.rpc, &manager, "pty.list", json!({})).await.unwrap();
@@ -2359,14 +2418,15 @@ async fn a_terminal_does_not_come_back_while_someone_else_drives_its_tab() {
 /// back, get nothing by themselves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_does_not_come_back_to_someone_who_may_not_type() {
-    // No member list yet: a manage attachment types, a participant's does not.
+    // No member list yet: a manage attachment types, a participant's link gets nothing.
     let f = fixture();
     let (before, _before_events) = installed(&f.rpc, "device-before-stop", Authority::Manage, "admin", "admin-desk").await;
     let shell = call(&f.rpc, &before, "pty.create", json!({ "clientRequestId": "request-shell-rights" })).await.unwrap()["ptyId"].as_str().unwrap().to_string();
     f.rpc.disconnect(&before);
     let (lesser, _lesser_events) = installed(&f.rpc, "device-after-wake", Authority::Participate, "admin", "admin-desk").await;
-    assert_eq!(call(&f.rpc, &lesser, "pty.list", json!({})).await.unwrap()["terminals"][0]["control"], "other");
-    assert_eq!(call(&f.rpc, &lesser, "pty.attach", json!({ "ptyId": shell })).await.unwrap()["control"], "other");
+    // Before the member list nobody's role is known, so the participate link gets nothing (#475).
+    assert_eq!(code(call(&f.rpc, &lesser, "pty.list", json!({})).await), "forbidden");
+    assert_eq!(code(call(&f.rpc, &lesser, "pty.attach", json!({ "ptyId": shell })).await), "forbidden");
     assert!(call(&f.rpc, &lesser, "pty.write", json!({ "ptyId": shell, "data": "x", "seq": 1, "writerId": "w" })).await.is_err());
     assert_eq!(controller_of(&f, &shell).as_deref(), Some("device-before-stop"));
 
