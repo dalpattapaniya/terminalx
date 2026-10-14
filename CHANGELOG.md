@@ -111,6 +111,16 @@
   terminal or page you were on, or opens a shell you did not ask for.
   (#438)
 
+### Issues
+
+- An issue stays in the Issues view after its pull request is merged. The
+  merge closes the issue and the list holds open ones only, so its page, with
+  the record of every stage, verdict and merge, could no longer be reached in
+  the app. Issues with a pipeline that the list does not hold are now shown
+  below it, under **Pipelines on issues not listed above**, and the open
+  issue's page says *Closed* once the merge has closed it. (#433)
+- **Refresh** in the Issues view reads the open issue again too, and keeps
+  its page as it is until the answer comes. (#433)
 ### Stop from a guest or the phone interrupts too
 
 - A guest's Stop in a shared session no longer ends the host's agent and puts
