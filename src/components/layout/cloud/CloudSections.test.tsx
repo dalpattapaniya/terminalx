@@ -323,6 +323,62 @@ describe("organization sections", () => {
   });
 });
 
+describe("an organization whose list has not answered", () => {
+  it("says it is loading, then why it failed, and Retry lists it again; collapsed or not", async () => {
+    catalog.resetCloudCatalog();
+    prefs.setPrefs({ cloudProjects: {}, cloudBlankProjects: {}, cloudPinned: {}, sidebarSections: { [`org:${ORG}`]: "collapsed" } });
+    let answer: (value: unknown) => void = () => undefined;
+    let fail: (reason: unknown) => void = () => undefined;
+    mocks.api.cloudWorkspaceRepositories.mockResolvedValue({ repositories: [] });
+    mocks.api.cloudWorkspaces.mockImplementationOnce(() => new Promise((_resolve, reject) => (fail = reject)));
+    mount();
+    const section = screen.getByRole("treeitem", { name: "Acme organization" });
+    // Nothing listed yet: the section says so, in words, although it is collapsed.
+    expect(within(section).getByTestId("cloud-org-loading").textContent).toBe("Loading cloud projects…");
+    const first = act(() => catalog.refreshCloudCatalog(ORG));
+    fail({ code: "cloud_workspace_unavailable" });
+    await first;
+    const failed = within(section).getByTestId("cloud-org-failed");
+    expect(failed.textContent).toContain("Couldn’t load cloud projects. The cloud service did not answer.");
+    expect(within(section).queryByTestId("cloud-org-loading")).toBeNull();
+    expect(failed.closest("[hidden]")).toBeNull();
+
+    mocks.api.cloudWorkspaces.mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)));
+    fireEvent.click(within(failed).getByRole("button", { name: "Retry loading Acme" }));
+    const retrying = within(section).getByRole("button", { name: "Retrying Acme" });
+    expect(retrying.textContent).toBe("Retrying…");
+    expect((retrying as HTMLButtonElement).disabled).toBe(true);
+    expect(mocks.api.cloudWorkspaces).toHaveBeenCalledTimes(2);
+    await act(async () => answer(list));
+    await waitFor(() => expect(within(section).queryByTestId("cloud-org-failed")).toBeNull());
+    fireEvent.click(within(section).getByRole("button", { name: "Expand Acme organization" }));
+    expect(within(section).getAllByTestId("cloud-project-row").length).toBeGreaterThan(0);
+    // Looking and retrying a list never connect or resume anything.
+    expect(mocks.workspaceConnection).not.toHaveBeenCalled();
+    expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+    act(() => prefs.setPrefs({ sidebarSections: {} }));
+  });
+
+  it("an offline organization keeps its rows and offers Retry beside 'last known'", async () => {
+    mocks.api.cloudWorkspaceRepositories.mockResolvedValue({ repositories: [] });
+    mocks.api.cloudWorkspaces.mockRejectedValueOnce({ code: "cloud_workspace_unavailable" });
+    await act(() => catalog.refreshCloudCatalog(ORG));
+    mount();
+    const offline = screen.getByTestId("cloud-org-offline");
+    expect(offline.textContent).toMatch(/^Offline · last known .+Retry$/);
+    expect(offline.getAttribute("title")).toBe("The cloud service did not answer.");
+    expect(screen.getAllByTestId("cloud-project-row").length).toBeGreaterThan(0);
+    mocks.api.cloudWorkspaces.mockResolvedValueOnce(list);
+    fireEvent.click(within(offline).getByRole("button", { name: "Retry loading Acme" }));
+    await waitFor(() => expect(screen.queryByTestId("cloud-org-offline")).toBeNull());
+  });
+
+  it("words the codes a list fails with, and names an unknown one", () => {
+    expect(catalog.catalogErrorText("cloud_organization_unavailable")).toBe("Cloud workspaces are turned off for this organization.");
+    expect(catalog.catalogErrorText("cloud_mystery")).toBe("Something went wrong (cloud_mystery).");
+  });
+});
+
 describe("lifecycle menu", () => {
   it("offers Stop, Archive and Delete on a running workspace, through the existing dialog", async () => {
     mount();

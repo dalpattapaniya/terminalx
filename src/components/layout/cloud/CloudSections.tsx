@@ -8,6 +8,7 @@ import {
   EyeOff,
   Folder,
   FolderGit2,
+  Loader2,
   Pencil,
   Pin,
   PinOff,
@@ -40,6 +41,7 @@ import { openNewCloudWorkspace } from "@/components/cloud/NewCloudWorkspaceDialo
 import { api, errorMessage, type CloudWorkspaceListItem, type OrganizationSummary } from "@/lib/api";
 import { refreshAccount, useAccount } from "@/lib/account";
 import {
+  catalogErrorText,
   dismissCloudNotice,
   placeCloudProjects,
   refreshCloudWorkspaces,
@@ -232,6 +234,8 @@ function OrgSection({
   const pickerMenu = useRowMenu();
   const name = sectionName(org);
   const offline = live && !!cached?.error && cached.fetchedAt !== null;
+  // Never listed yet: loading, or failed with nothing to show. Said under the header, collapsed or not.
+  const unloaded = live && (!cached || (cached.fetchedAt === null && !cached.workspaces.length && !placed.projects.length));
   // Creating a workspace is the API's owner-or-admin action, the same rule as
   // a project's "+": true for them, false for a member, null while this
   // account's role here is not known yet (nothing is offered until it is).
@@ -381,11 +385,13 @@ function OrgSection({
       </div>
       {switchError && <div className="pl-5 text-[10px] text-destructive">{switchError}</div>}
       {offline && (
-        <div className="pl-5 text-[10px] text-faint" data-testid="cloud-org-offline" title={cached!.error ?? undefined}>
-          Offline · last known {timeText(cached!.fetchedAt!)}
+        <div className="flex min-w-0 items-center gap-1 pl-5 text-[10px] text-faint" data-testid="cloud-org-offline" title={catalogErrorText(cached!.error!)}>
+          <span className="min-w-0 truncate">Offline · last known {timeText(cached!.fetchedAt!)}</span>
+          <RetryButton orgId={org.id} name={name} />
         </div>
       )}
-      {live && (
+      {unloaded && <OrgLoadState orgId={org.id} name={name} error={cached?.error ?? null} />}
+      {live && !unloaded && (
         <TreeGroup expanded={!collapsed} className={cn("min-w-0", offline && "opacity-70")}>
           <OrgTree org={cached} orgId={org.id} mayCreate={mayCreate} onLifecycle={onLifecycle} />
         </TreeGroup>
@@ -417,13 +423,8 @@ function OrgTree({ org, orgId, mayCreate, onLifecycle }: { org: OrgCatalog | und
   const [archivedOpen, setArchivedOpen] = useState(false);
   const filter = useSidebarFilter();
 
-  if (!org || (org.fetchedAt === null && !org.workspaces.length && !placed.projects.length)) {
-    return (
-      <div className="pl-5 text-[11px] text-faint" data-testid="cloud-org-loading">
-        {org?.error ? `Cloud workspaces are unavailable (${org.error}).` : "Loading cloud workspaces…"}
-      </div>
-    );
-  }
+  // The section says it is loading, or why it could not (OrgLoadState).
+  if (!org) return null;
   // Unread or Needs you: only the projects with such a session, and no archive (nothing archived runs or answers).
   if (filter.active) {
     const projects = placed.projects.filter((project) => filter.showsProject(project.key));
@@ -472,6 +473,47 @@ function OrgTree({ org, orgId, mayCreate, onLifecycle }: { org: OrgCatalog | und
         </TreeNode>
       )}
     </>
+  );
+}
+
+/** An organization whose list has never answered: loading, or why it failed and a way to ask again. */
+function OrgLoadState({ orgId, name, error }: { orgId: string; name: string; error: string | null }) {
+  if (!error) {
+    return (
+      <div role="status" className="flex items-center gap-1.5 pl-5 text-[11px] text-faint" data-testid="cloud-org-loading">
+        <Loader2 className="size-3 animate-spin" aria-hidden />
+        Loading cloud projects…
+      </div>
+    );
+  }
+  return (
+    <div role="status" className="pl-5 pr-1 text-[11px] text-faint" data-testid="cloud-org-failed">
+      <p>
+        Couldn’t load cloud projects. <span data-testid="cloud-org-failed-reason">{catalogErrorText(error)}</span>
+      </p>
+      <RetryButton orgId={orgId} name={name} />
+    </div>
+  );
+}
+
+/** Lists the organization again now; says so while it does. */
+function RetryButton({ orgId, name }: { orgId: string; name: string }) {
+  const [retrying, setRetrying] = useState(false);
+  const retry = () => {
+    setRetrying(true);
+    void refreshCloudWorkspaces(orgId).finally(() => setRetrying(false));
+  };
+  return (
+    <button
+      type="button"
+      onClick={retry}
+      disabled={retrying}
+      aria-label={retrying ? `Retrying ${name}` : `Retry loading ${name}`}
+      className="shrink-0 rounded-sm underline underline-offset-2 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 disabled:no-underline"
+      data-testid="cloud-org-retry"
+    >
+      {retrying ? "Retrying…" : "Retry"}
+    </button>
   );
 }
 

@@ -467,6 +467,21 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const LIST_ERRORS: Record<string, string> = {
+  cloud_workspace_unavailable: "The cloud service did not answer.",
+  cloud_catalog_feed_unavailable: "The cloud service did not answer.",
+  cloud_organization_unavailable: "Cloud workspaces are turned off for this organization.",
+  cloud_workspace_invalid_response: "The cloud service sent an answer this app could not read.",
+  cloud_workspace_not_found: "You may no longer be a member of this organization.",
+  account_signed_out: "You are signed out.",
+  account_context_changed: "Your account changed while loading.",
+};
+
+/** Why an organization's list could not be read, in words; `error` is the code a failed refresh kept. */
+export function catalogErrorText(error: string): string {
+  return LIST_ERRORS[error] ?? `Something went wrong (${error}).`;
+}
+
 /**
  * List an organization's workspaces (and, every few minutes, its selected
  * repositories). Only a live organization is listed: every cloud-enabled one
