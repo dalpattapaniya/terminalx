@@ -24,6 +24,14 @@ terminalx computer … ──control socket──▶ TerminalX app ──unix so
   is what lets a plain agent shell, whose own `screencapture` would be
   refused, drive desktop apps. Nothing in the app or the CLI needs the
   permissions itself, and no restart is required after a grant.
+- The helper runs from a copy outside the app, at
+  `~/Library/Application Support/TerminalX/computer-use-helper/<key>/TerminalX Computer Use Helper.app`
+  (`<key>` is derived from where the bundled helper is, so each build on a
+  Mac has its own). macOS charges a Screen Recording check to the outermost
+  app bundle around the executable, so a helper inside `TerminalX.app`
+  could take screenshots only while TerminalX itself held Screen Recording,
+  and its Grant button asked for TerminalX (#480). See
+  [Where the helper runs](#where-the-helper-runs).
 - The app spawns the helper on first use with `--agent <socket> --token-fd 3`,
   hands it a per-launch token on an inherited pipe (never a file), connects
   over a private unix socket, checks the handshake (`protocolVersion` 1 plus
@@ -227,6 +235,42 @@ Linux and Windows have no privileged helper: the provider runs the platform
 accessibility API as the user, which an agent can call just as well. Only the
 `pid:<own pid>` refusal and the confirmation pause apply there.
 
+## Where the helper runs
+
+tccd decides whose permission a check is with two different rules
+(measured on macOS 27 with scratch bundles; tccd's `AUTHREQ_SUBJECT` log
+line names the subject):
+
+| Check from a disclaimed helper inside `Outer.app` | Subject |
+|---|---|
+| Accessibility (`AXIsProcessTrusted`) | the helper's own bundle id |
+| Screen Recording (`CGPreflightScreenCaptureAccess`, and the request behind Grant) | `Outer.app`'s bundle id (`BUNDLE_ATTRIBUTION: … resolves to attributed bundle: …/Outer.app/`) |
+
+The responsibility disclaim is honoured (an undisclaimed child is charged to
+the app that runs the terminal; a disclaimed one is not), but for Screen
+Recording tccd then resolves the executable to the outermost enclosing app.
+It does so for every place inside a bundle that was tried: `Contents/Resources`,
+`Contents/Helpers`, `Contents/Library/LoginItems` (where `SMAppService` login
+items live), `Contents/Library/Helpers`, `Contents/MacOS`, `Contents/Frameworks`
+and `Contents/XPCServices`, and for a launch through LaunchServices (`open`)
+as well. A helper outside any app bundle is charged to itself for both.
+
+So the app copies the bundled helper to Application Support and runs the
+copy, for the agent session, the status probe and the Grant and Reset
+buttons alike. Before every use the copy is compared with the bundled helper
+(names, kinds, modes, contents and symlink targets) and replaced when they
+differ, by writing a new copy beside it and renaming it into place. The
+folders it lives in must be plain folders (a symlink is refused), and a copy
+location inside an app bundle is refused. A helper that is not inside an app
+(`pnpm tauri:dev`, `.build/release-dev`) runs where it is.
+
+The copy is the same signed code, so it has the helper's TCC rows; an
+existing grant to "TerminalX Computer Use Helper" applies to it unchanged.
+It is in a folder the person's user, and so an agent, can write to. That
+gives an agent nothing: TCC grants only code that satisfies the helper's
+signing requirement, a helper the agent starts itself refuses it (see
+Security), and the next use replaces whatever was put there.
+
 ## Permissions
 
 Settings → General → Computer use shows the Accessibility and Screen
@@ -288,11 +332,45 @@ cannot be checked without one. On the first signed build, on a Mac where
 8. `terminalx computer get-app-state --app TerminalX` returns no tree, no
    elements and no screenshot, and does not raise the window.
 
+## Signed-build checklist (#480)
+
+Screen Recording attribution can only be shown on a Developer ID build. On
+the owner's Mac, without granting anything to TerminalX itself:
+
+1. In System Settings → Privacy & Security → Screen & System Audio Recording,
+   remove **TerminalX** if it is listed. Leave "TerminalX Computer Use
+   Helper" as it is. Accessibility lists only the helper.
+2. Install the build and start TerminalX. In a TerminalX terminal run
+   `terminalx computer capabilities --json`.
+3. Check the copy exists and is the bundled code:
+   `ls ~/Library/Application\ Support/TerminalX/computer-use-helper/*/` shows
+   one "TerminalX Computer Use Helper.app", and `codesign -dr - <that app>`
+   prints the same designated requirement as
+   `codesign -dr - "/Applications/TerminalX.app/Contents/Resources/TerminalX Computer Use Helper.app"`.
+4. `ps -o pid,command -ax | grep terminalx-computer-use-macos` shows the
+   agent helper running from the Application Support path.
+5. If the helper row is on: step 2 reports Accessibility and screenshots both
+   `granted`, no `nextStep`; `terminalx computer get-app-state --app Finder`
+   returns a screenshot.
+6. If screenshots say `not-granted` (the row is off, or absent), open
+   Settings → General → Computer use and press Grant… for Screen Recording.
+   The macOS prompt must name **"TerminalX Computer Use Helper"**, not
+   "TerminalX", and no TerminalX row may appear in Screen & System Audio
+   Recording afterwards. Turn the helper row on yourself, then repeat step 5.
+7. From a TerminalX terminal, an unsigned probe that prints
+   `AXIsProcessTrusted()` and `CGPreflightScreenCaptureAccess()` reports
+   `false` and `false`.
+8. Optional, to see the attribution itself: run
+   `/usr/bin/log stream --level debug --predicate 'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ_SUBJECT"'`
+   while doing step 2. The screen-capture request's subject is
+   `com.terminalx.next.computer-use.v2`, not `com.terminalx.next`.
+
 ## Testing
 
 - `cargo test computer` in `src-tauri`: framing, handshake, timeout and
   hang-up handling against a fake helper, argument validation, screenshot
-  export, CLI parsing and output.
+  export, CLI parsing and output, and the helper copy outside the app
+  (`helper_install`).
 - `cargo test real_helper -- --ignored --nocapture`: drives the built helper
   for real (capabilities, app listing, error codes, clean shutdown).
 - `pnpm test:computer-macos`: the Swift package's unit tests, including who

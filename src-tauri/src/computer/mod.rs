@@ -17,6 +17,8 @@
 
 pub mod cli;
 pub mod desktop_script;
+#[cfg(unix)]
+pub mod helper_install;
 pub mod macos_native;
 pub mod permissions;
 pub mod screenshot;
@@ -232,6 +234,37 @@ pub fn helper_app_path(resource_dir: Option<&Path>) -> Option<PathBuf> {
         .find(|candidate| helper_executable_in(candidate).is_some())
 }
 
+/// Where copies of a shipped helper run from: the app's own folder, not
+/// temporary and not inside any app.
+#[cfg(target_os = "macos")]
+fn helper_copy_base() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("TerminalX").join("computer-use-helper"))
+}
+
+/// macOS charges a helper's screen captures to the app around it, so a
+/// helper inside TerminalX.app runs from a copy outside it; see
+/// [`helper_install`]. Elsewhere, and for a helper that is not inside an
+/// app, this is `bundled` itself.
+pub fn helper_to_run(bundled: PathBuf) -> Result<PathBuf, ComputerError> {
+    #[cfg(target_os = "macos")]
+    {
+        let unavailable = |detail: String| {
+            ComputerError::new(
+                "unsupported_capability",
+                format!("TerminalX could not set up {HELPER_APP_NAME} outside the app, where macOS needs it to be to honour its Screen Recording permission: {detail}"),
+            )
+        };
+        let base = helper_copy_base().ok_or_else(|| unavailable("no Application Support folder".into()))?;
+        let run = helper_install::helper_to_run(&bundled, &base).map_err(|e| unavailable(e.to_string()))?;
+        if run != bundled {
+            log::debug!("computer use: running {} from {}", HELPER_APP_NAME, run.display());
+        }
+        Ok(run)
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(bundled)
+}
+
 pub fn helper_executable_in(app: &Path) -> Option<PathBuf> {
     let executable = app.join("Contents/MacOS").join(HELPER_EXECUTABLE_NAME);
     executable.is_file().then_some(executable)
@@ -275,7 +308,8 @@ impl ComputerService {
         *self.app_identifier.lock().unwrap_or_else(|p| p.into_inner()) = Some(app_identifier.to_owned());
         // Older helpers must lose their permissions before the current one
         // is started or probed (PRO-90). Off the main thread: it runs tccutil.
-        let helper = self.helper_app_path();
+        // The bundled helper declares the same id as its copy.
+        let helper = self.bundled_helper_app_path();
         let identifier = app_identifier.to_owned();
         std::thread::spawn(move || {
             permissions::legacy_cleanup(Some(&identifier), helper.as_deref());
@@ -289,9 +323,16 @@ impl ComputerService {
         }
     }
 
-    pub fn helper_app_path(&self) -> Option<PathBuf> {
+    /// The helper bundle shipped with (or built for) this app.
+    pub fn bundled_helper_app_path(&self) -> Option<PathBuf> {
         let dir = self.resource_dir.lock().unwrap_or_else(|p| p.into_inner()).clone();
         helper_app_path(dir.as_deref())
+    }
+
+    /// The helper to start, probe and ask permissions for: on macOS, a
+    /// helper inside an app runs from its copy outside it (#480).
+    pub fn helper_app_path(&self) -> Result<Option<PathBuf>, ComputerError> {
+        self.bundled_helper_app_path().map(helper_to_run).transpose()
     }
 
     /// Dispatch one control command (`computer.<method>`), validating action
@@ -330,15 +371,15 @@ impl ComputerService {
                         ))
                     }
                 };
-                return serde_json::to_value(permissions::open_setup(self.helper_app_path().as_deref(), id)?)
+                return serde_json::to_value(permissions::open_setup(self.helper_app_path()?.as_deref(), id)?)
                     .map_err(|e| ComputerError::accessibility(e.to_string()));
             }
             "permissionsStatus" => {
-                return serde_json::to_value(permissions::status(self.helper_app_path().as_deref())?)
+                return serde_json::to_value(permissions::status(self.helper_app_path()?.as_deref())?)
                     .map_err(|e| ComputerError::accessibility(e.to_string()));
             }
             "permissionsReset" => {
-                return serde_json::to_value(permissions::reset(self.helper_app_path().as_deref())?)
+                return serde_json::to_value(permissions::reset(self.helper_app_path()?.as_deref())?)
                     .map_err(|e| ComputerError::accessibility(e.to_string()));
             }
             _ => {}
@@ -358,7 +399,7 @@ impl ComputerService {
                 // A helper without its permissions answers the handshake all
                 // the same; say so here instead of at the first action.
                 if cfg!(target_os = "macos") {
-                    if let Ok(status) = permissions::status(self.helper_app_path().as_deref()) {
+                    if let Ok(status) = self.helper_app_path().and_then(|app| permissions::status(app.as_deref())) {
                         permissions::attach_to_capabilities(&mut capabilities, &status);
                     }
                 }
@@ -405,7 +446,7 @@ impl ComputerService {
         if !cfg!(target_os = "macos") || !macos_native::is_macos_14_or_newer() {
             return Ok(None);
         }
-        let Some(app) = self.helper_app_path() else {
+        let Some(app) = self.helper_app_path()? else {
             return Ok(None);
         };
         let Some(executable) = helper_executable_in(&app) else {
@@ -442,7 +483,7 @@ impl Drop for ComputerService {
 pub fn computer_permission_status(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<permissions::PermissionStatusResult, String> {
-    permissions::status(state.computer.helper_app_path().as_deref()).map_err(|e| e.to_string())
+    permissions::status(state.computer.helper_app_path().map_err(|e| e.to_string())?.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -450,14 +491,14 @@ pub fn computer_open_permission(
     state: tauri::State<'_, crate::AppState>,
     id: Option<permissions::PermissionId>,
 ) -> Result<permissions::PermissionSetupResult, String> {
-    permissions::open_setup(state.computer.helper_app_path().as_deref(), id).map_err(|e| e.to_string())
+    permissions::open_setup(state.computer.helper_app_path().map_err(|e| e.to_string())?.as_deref(), id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn computer_reset_permissions(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<permissions::PermissionResetResult, String> {
-    let result = permissions::reset(state.computer.helper_app_path().as_deref()).map_err(|e| e.to_string())?;
+    let result = permissions::reset(state.computer.helper_app_path().map_err(|e| e.to_string())?.as_deref()).map_err(|e| e.to_string())?;
     // A helper that already holds a session keeps its old TCC decision
     // cached; restart it so the next call sees the reset.
     state.computer.shutdown();
