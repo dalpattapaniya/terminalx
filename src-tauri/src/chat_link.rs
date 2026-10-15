@@ -4,9 +4,16 @@
 //! work anywhere: create a branch in one repo, edit files in another. After
 //! each tool call the CLI reports (`PostToolUse`), the folders the call
 //! worked in are read off its input (a file it wrote, a `cd`, a `git -C`),
-//! and the last one inside a git repo becomes the chat's link: that repo,
-//! registered as a project if it is not one yet, and the branch checked out
-//! there. A later call in another repo moves the link there.
+//! and the last one inside a project becomes the chat's link: a project
+//! already registered that holds the folder, else the folder's git repo,
+//! registered as a project if it is not one yet, with the branch checked
+//! out there. A later call in another project moves the link there.
+//!
+//! A repository is not always the project. A `git init` run in Documents
+//! or the home folder by mistake makes every folder under it "in a repo",
+//! and a chat working on a project there must not be filed under Documents.
+//! Such a repo tracks nothing under the project and has no project files of
+//! its own, so the folder that has them is the project, as a plain folder.
 //!
 //! A conversation started in a project's own checkout (no worktree) keeps
 //! its project, but records the branch its agent last worked on: the
@@ -19,7 +26,22 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::git;
+use crate::store::projects::{Project, ProjectKind};
 use crate::store::{self, index::ChatLink, index::SessionEntry};
+
+/// Where a call's work belongs: a project folder, and whether git has a say
+/// there (a repository's branch is recorded; a plain folder has none).
+#[derive(Debug, PartialEq, Eq)]
+struct Place {
+    path: PathBuf,
+    git: bool,
+}
+
+/// What marks a folder as a project of its own when git cannot say.
+const PROJECT_MARKERS: &[&str] = &[
+    "package.json", "manifest.json", "Cargo.toml", "pyproject.toml", "setup.py", "requirements.txt", "go.mod", "pom.xml", "build.gradle",
+    "Gemfile", "composer.json", "deno.json", "Package.swift", "CMakeLists.txt", "Makefile", "README.md", "readme.md", "README",
+];
 
 /// Follow one tool call: the chat's entry when its link changed, else nothing.
 pub fn follow(session_id: &str, payload: &Value) -> Result<Option<SessionEntry>> {
@@ -34,19 +56,24 @@ pub fn follow(session_id: &str, payload: &Value) -> Result<Option<SessionEntry>>
     }
     let cwd = payload["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&entry.cwd));
     let input = &payload["tool_input"];
+    let projects = store::projects::list()?.0;
     let found = targets(input)
         .iter()
         .rev()
         .map(|target| resolve(target, &cwd))
-        .filter_map(|path| repo_of(&path).map(|repo| (repo, path)))
-        .find(|(repo, _)| !repo.starts_with(&root));
+        .filter_map(|path| place_of(&path, &projects).map(|place| (place, path)))
+        .find(|(place, _)| !place.path.starts_with(&root));
     let link = match (found, &entry.link) {
-        (Some((repo, at)), _) => {
+        (Some((Place { path: repo, git: true }, at)), _) => {
             store::projects::ensure(&repo.to_string_lossy())?;
             if at.starts_with(git::worktree_root(&repo)) {
                 git::ensure_worktree_dir_ignored(&repo);
             }
             ChatLink { path: repo.to_string_lossy().into_owned(), branch: branch_at(&at) }
+        }
+        (Some((Place { path: folder, git: false }, _)), _) => {
+            store::projects::ensure_folder(&folder.to_string_lossy())?;
+            ChatLink { path: folder.to_string_lossy().into_owned(), branch: None }
         }
         // No folder named, but a git command in the linked repo's shell may
         // still have switched its branch.
@@ -142,6 +169,46 @@ fn resolve(target: &str, cwd: &Path) -> PathBuf {
     cwd.join(target)
 }
 
+/// The project a path's work belongs to. A registered project holding the
+/// path comes first (the deepest, in a monorepo of projects); then the path's
+/// repository, unless that repository is only an accident of where the
+/// folder sits, in which case the folder with the project files.
+fn place_of(path: &Path, projects: &[Project]) -> Option<Place> {
+    let dir = canonical(path.ancestors().find(|candidate| candidate.is_dir())?);
+    let registered = projects
+        .iter()
+        .filter(|project| dir.starts_with(&project.path))
+        .max_by_key(|project| project.path.len());
+    if let Some(project) = registered {
+        return Some(Place { path: PathBuf::from(&project.path), git: matches!(project.kind, ProjectKind::Git) });
+    }
+    let repo = repo_of(path)?;
+    match island_in(&repo, &dir) {
+        Some(folder) => Some(Place { path: folder, git: false }),
+        None => Some(Place { path: repo, git: true }),
+    }
+}
+
+/// The project folder inside a repository that does not own it: the
+/// repository has no project files at its root and tracks nothing under the
+/// folder's top-level part, while a folder on the way down has project files.
+/// `None` when the repository is the project after all.
+fn island_in(repo: &Path, dir: &Path) -> Option<PathBuf> {
+    if dir == repo || has_project_marker(repo) {
+        return None;
+    }
+    let first = repo.join(dir.strip_prefix(repo).ok()?.components().next()?);
+    let tracked = git::run(repo, &["ls-files", "--", first.to_str()?]).ok()?;
+    if !tracked.trim().is_empty() {
+        return None;
+    }
+    dir.ancestors().take_while(|ancestor| *ancestor != repo).find(|ancestor| has_project_marker(ancestor)).map(Path::to_path_buf)
+}
+
+fn has_project_marker(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|marker| dir.join(marker).exists())
+}
+
 /// The repo a path is in, from its nearest folder that exists: the main
 /// checkout's root, so work in one of its worktrees is work in the project.
 fn repo_of(path: &Path) -> Option<PathBuf> {
@@ -232,6 +299,50 @@ mod tests {
         let repo = repo_of(&dir.path().join("src/new/file.rs")).unwrap();
         assert_eq!(repo, canonical(dir.path()));
         assert!(repo_of(Path::new("/")).is_none());
+    }
+
+    fn project(path: &Path, kind: ProjectKind) -> Project {
+        Project { kind, name: "p".into(), path: canonical(path).to_string_lossy().into_owned(), last_opened: None, color: None, mascot: None, logo: None, pinned: false, archived: false }
+    }
+
+    #[test]
+    fn a_project_inside_a_repo_that_only_happens_to_enclose_it_is_the_project_not_the_repo() {
+        // A `git init` run in Documents by mistake: it tracks nothing, and has no project files of its own.
+        let dir = tempfile::tempdir().unwrap();
+        let documents = dir.path();
+        git::run(documents, &["init", "-q", "-b", "main"]).unwrap();
+        git::run(documents, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "Initial commit"]).unwrap();
+        let fomo = documents.join("github-personal/fomo-cheat-code");
+        std::fs::create_dir_all(fomo.join("src")).unwrap();
+        std::fs::write(fomo.join("manifest.json"), "{}").unwrap();
+        let fomo = canonical(&fomo);
+        // A file in it, a file deeper in it, and a `cd` to it all belong to the folder, with no branch to speak of.
+        assert_eq!(place_of(&fomo.join("drawer.js"), &[]), Some(Place { path: fomo.clone(), git: false }));
+        assert_eq!(place_of(&fomo.join("src/new.js"), &[]), Some(Place { path: fomo.clone(), git: false }));
+        assert_eq!(place_of(&fomo, &[]), Some(Place { path: fomo.clone(), git: false }));
+        // A folder with no project files under such a repo is still the repo's, as before.
+        let notes = documents.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        assert_eq!(place_of(&notes.join("a.txt"), &[]), Some(Place { path: canonical(documents), git: true }));
+    }
+
+    #[test]
+    fn a_real_repo_keeps_its_new_untracked_folders_and_a_registered_project_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git::run(repo, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(repo.join("package.json"), "{}").unwrap();
+        git::run(repo, &["add", "."]).unwrap();
+        git::run(repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]).unwrap();
+        // A new module, not added yet, with a README of its own: still the repo's work.
+        let module = repo.join("packages/new");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("README.md"), "# new").unwrap();
+        assert_eq!(place_of(&module.join("index.ts"), &[]), Some(Place { path: canonical(repo), git: true }));
+        // Registered as a project of its own, the module wins over the repo around it.
+        let registered = [project(repo, ProjectKind::Git), project(&module, ProjectKind::Folder)];
+        assert_eq!(place_of(&module.join("index.ts"), &registered), Some(Place { path: canonical(&module), git: false }));
+        assert_eq!(place_of(&repo.join("package.json"), &registered), Some(Place { path: canonical(repo), git: true }));
     }
 
     #[test]
