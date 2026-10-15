@@ -40,7 +40,7 @@ beforeEach(async () => {
 });
 afterEach(cleanup);
 
-const mount = () => render(<TooltipProvider><ProjectRail onOpenSettings={() => {}} onOpenAccount={() => {}} onOpenIssues={() => {}} onOpenAgents={() => {}} onOpenStats={() => {}} onOpenAutomations={() => {}} onOpenSkills={() => {}} onSearch={() => {}} /></TooltipProvider>);
+const mount = () => render(<TooltipProvider><ProjectRail onHide={() => {}} onOpenSettings={() => {}} onOpenAccount={() => {}} onOpenIssues={() => {}} onOpenAgents={() => {}} onOpenStats={() => {}} onOpenAutomations={() => {}} onOpenSkills={() => {}} onSearch={() => {}} /></TooltipProvider>);
 const rowsIn = (element: HTMLElement) => within(element).getAllByRole("listitem").map((row) => row.querySelector("[title]")?.getAttribute("title"));
 
 async function boot(list: SessionEntry[]) {
@@ -50,6 +50,48 @@ async function boot(list: SessionEntry[]) {
     await store.refreshEverything();
   });
 }
+
+describe("a project's picture", () => {
+  it("is the picture of whoever owns the repository on GitHub, until it has a look of its own", async () => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "github_identity") return { login: "trade100x", source: "ssh", email: null, repo: "acme-inc/web" };
+      return base(command, args);
+    });
+    await boot([session("here", "/repos/web", new Date(Date.UTC(2026, 9, 1)).toISOString())]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    const avatar = await within(web).findByTestId("project-avatar");
+    expect(avatar.getAttribute("src")).toBe("https://github.com/acme-inc.png?size=32");
+    expect(avatar.getAttribute("title")).toBe("On GitHub as acme-inc/web");
+    // Asked for the project's folder, not a chat's.
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "github_identity").map(([, args]) => args)).toEqual([{ projectPath: "/repos/web", refresh: false }]);
+  });
+});
+
+describe("a project's fold", () => {
+  it("folds its branches away from the project row and remembers it, the picture giving way to a chevron", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    await boot([session("here", "/repos/web", at(1)), session("there", "/repos/web", at(2), { branch: "dev" })]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getAllByRole("listitem").length).toBeGreaterThan(0);
+    const fold = within(web).getByRole("button", { name: "Collapse web" });
+    expect(fold.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => { fireEvent.click(fold); });
+    // The rows stay in the tree so they can slide away; folded, they are hidden from readers and keyboards alike.
+    const branches = within(web).getByTestId("project-branches");
+    expect(branches.getAttribute("aria-hidden")).toBe("true");
+    expect(branches.hasAttribute("inert")).toBe(true);
+    expect(branches.getAttribute("class")).toContain("grid-rows-[0fr]");
+    expect(within(web).getByRole("button", { name: "Expand web" }).getAttribute("aria-expanded")).toBe("false");
+    // Folded, the chevron points at the name; the fold is kept with the other sidebar sections.
+    expect(within(web).getByTestId("project-fold").getAttribute("class")).toContain("-rotate-90");
+    expect(prefs.getPrefs().sidebarSections["project:/repos/web"]).toBe("collapsed");
+    await act(async () => { fireEvent.click(within(web).getByRole("button", { name: "Expand web" })); });
+    expect(within(web).getByTestId("project-branches").getAttribute("class")).toContain("grid-rows-[1fr]");
+  });
+});
 
 describe("the conversation list", () => {
   it("puts each conversation under the project it is linked to, a chat by the repo its agent works in, and the rest under Chats", async () => {
@@ -87,7 +129,11 @@ describe("the conversation list", () => {
 
   it("starts another session on a branch from its row, in the folder where that branch is checked out", async () => {
     const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
-    await boot([session("here", "/repos/web", at(1)), session("gone-branch", "/repos/web", at(2), { branch: "old" })]);
+    await boot([
+      session("here", "/repos/web", at(1)),
+      session("gone-branch", "/repos/web", at(2), { branch: "old" }),
+      session("tree", "/repos/web", at(3), { worktreeName: "fix-login", branch: "raccoon/fix-login", cwd: "/repos/web/.worktrees/fix-login" }),
+    ]);
     const base = mocks.invoke.getMockImplementation()!;
     mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
       if (command === "list_harnesses") return [{ id: "claude", name: "Claude", available: true }];
@@ -97,11 +143,16 @@ describe("the conversation list", () => {
     await act(async () => { await store.refreshHarnesses(); });
     mount();
     const web = screen.getByRole("group", { name: "web" });
-    // A branch checked out nowhere has nowhere to start one.
-    expect(within(web).queryByRole("button", { name: "New session on old" })).toBeNull();
     await act(async () => { fireEvent.click(within(web).getByRole("button", { name: "New session on main" })); });
     const created = mocks.invoke.mock.calls.find(([command]) => command === "create_session");
     expect(created?.[1]).toMatchObject({ req: { projectPath: "/repos/web", cwd: "/repos/web", useWorktree: false } });
+    // A branch checked out nowhere gets a new workspace branched from it, named after it.
+    expect(within(web).queryByRole("button", { name: "New session on old" })).toBeNull();
+    await act(async () => { fireEvent.click(within(web).getByRole("button", { name: "New workspace from old" })); });
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "create_session").at(-1)?.[1]).toMatchObject({ req: { projectPath: "/repos/web", cwd: null, useWorktree: true, baseRef: "old", worktreeName: "old" } });
+    // A worktree's branch has its folder, listed or not.
+    await act(async () => { fireEvent.click(within(web).getByRole("button", { name: "New session on raccoon/fix-login" })); });
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "create_session").at(-1)?.[1]).toMatchObject({ req: { projectPath: "/repos/web", cwd: "/repos/web/.worktrees/fix-login", useWorktree: false } });
   });
 
   it("removes a project from its menu after asking, archiving its conversations rather than deleting them", async () => {
@@ -163,7 +214,7 @@ describe("the conversation list", () => {
     await boot([]);
     mount();
     const destinations = screen.getByRole("toolbar", { name: "Destinations" });
-    expect(within(destinations).getAllByRole("button").map((button) => button.textContent)).toEqual(["Dashboard", "Issues", "Automations", "Skills", "Usage"]);
+    expect(within(destinations).getAllByRole("button").map((button) => button.textContent)).toEqual(["Dashboard", "Issues", "Automations"]);
     expect(destinations.compareDocumentPosition(screen.getByTestId("conversation-list")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });

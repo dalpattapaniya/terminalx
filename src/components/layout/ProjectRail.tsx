@@ -1,55 +1,27 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Archive, BarChart3, CalendarClock, Check, ChevronDown, CircleDot, Ellipsis, FolderOpen, FolderPlus, ImagePlus, LayoutGrid, MessageCircle, MessagesSquare, Pin, PinOff, Plus, RefreshCw, Search, Settings, Sparkles, Trash2 } from "lucide-react";
+import { useMemo, useState, type ReactNode } from "react";
+import { CalendarClock, CircleDot, Folder, FolderOpen, ImagePlus, LayoutGrid } from "@/icons";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
-import { WithTooltip } from "@/components/ui/tooltip";
-import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/menu";
 import { cn } from "@/lib/cn";
-import { useShortcutKeys } from "@/lib/hotkeys";
-import { setPrefs, usePrefs } from "@/lib/prefs";
+import { usePrefs } from "@/lib/prefs";
+import { githubAvatarUrl, useGithubIdentity } from "@/lib/githubIdentity";
 import type { ShortcutId } from "@/lib/shortcuts";
-import { errorMessage } from "@/lib/api";
-import {
-  addProject,
-  refreshEverything,
-  refreshWorkspaces,
-  removeProject,
-  selectProjectInSidebar,
-  setShowArchived as setSessionsArchived,
-  setProjectLogo,
-  startChat,
-  startSessionIn,
-  updateProject,
-  useSessionStore,
-} from "@/lib/sessions";
+import { setProjectLogo, updateProject, useSessionStore } from "@/lib/sessions";
 import { bucketSessions, COLUMNS, type ColumnId } from "@/lib/dashboard";
-import { SIDEBAR_FILTERS, setSidebarFilter, useSidebarFilter } from "@/lib/sidebarFilter";
 import { useCloudDashboard } from "@/lib/cloudDashboard";
-import { START_ACTIONS } from "@/lib/projectStart";
 import type { Project } from "@/types/session";
 import { MASCOTS, PROJECT_COLORS, PixelMascot, colorCss } from "./PixelMascot";
-import { TITLEBAR_INSET } from "./AppShell";
 import { useAutomationStore } from "@/lib/automations";
-import { AccountSidebarEntry } from "@/components/account/AccountSidebarEntry";
-import { ChatsNode, ProjectNavigation } from "./SidebarTree";
-import { QuickChatsSection } from "./QuickChatsSection";
-import { showFloatingWindow, useFloating } from "@/lib/floating";
-import { bindingText } from "@/lib/shortcuts";
-import { isQuickChat } from "@/lib/quickChats";
-import { navigateTree } from "./treeKeyboard";
-import { refreshAccountRoles } from "@/lib/accountRoles";
-import { refreshCloudCatalog } from "@/lib/cloudCatalog";
-import { TreeToggle } from "./SidebarRows";
-import { CloudSections, useCloudSections, useSectionCollapsed } from "./cloud/CloudSections";
-import { DevelopmentSection } from "@/components/cloud/DevRuntime";
+import { useCloudSections } from "./cloud/CloudSections";
 import { visibleDashboardSessions } from "@/lib/organizationSessions";
 import type { SettingsTab } from "@/components/settings/SettingsPage";
 import { SessionSidebar } from "./SessionSidebar";
+import { ChatListSidebar } from "./ChatListSidebar";
 
 export interface RailProps {
+  /** Hide the sidebar; its button leads the titlebar, so the window's own controls, then it, then the sidebar's. */
+  onHide: () => void;
   onOpenSettings: (tab?: SettingsTab) => void;
   onOpenAccount: () => void;
   onOpenIssues: () => void;
@@ -60,333 +32,10 @@ export interface RailProps {
   onSearch: () => void;
 }
 
-/** The sidebar in the shape the reader chose: a list of conversations, or the project tree. */
+/** The sidebar in the shape the reader chose: the projects with their conversations, or one flat list of chats. */
 export function ProjectRail(props: RailProps) {
   const { sidebarLayout } = usePrefs();
-  return sidebarLayout === "detailed" ? <DetailedRail {...props} /> : <SessionSidebar {...props} />;
-}
-
-/**
- * The detailed sidebar: global destinations followed by an expandable project
- * tree. The project menu remains the home for naming, appearance and refresh.
- */
-function DetailedRail({
-  onOpenSettings,
-  onOpenAccount,
-  onOpenIssues,
-  onOpenAgents,
-  onOpenStats,
-  onOpenAutomations,
-  onOpenSkills,
-  onSearch,
-}: RailProps) {
-  const store = useSessionStore();
-  // The floating window's system-wide shortcut, when it has one that is registered.
-  const floating = useFloating().status;
-  const quickChatKeys = floating?.shortcut && !floating.shortcutError ? bindingText(floating.shortcut) : null;
-  // Section headers appear only when an organization section exists; otherwise the sidebar is as it was.
-  const cloud = useCloudSections();
-  const sectioned = cloud.all.length > 0;
-  const [localCollapsedPref, toggleLocal] = useSectionCollapsed("local");
-  const localCollapsed = sectioned && localCollapsedPref;
-  const [error, setError] = useState<string | null>(null);
-  const [showArchived, setShowArchived] = useState(false);
-  const [spinning, setSpinning] = useState(false);
-  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
-
-  const filter = useSidebarFilter();
-  const projects = [...store.projects]
-    // The Chats folder is New chat's, not a project, even where an earlier build registered it.
-    .filter((p) => p.path !== store.chatsPath)
-    .filter((p) => !!p.archived === showArchived || store.sessions.some((s) => s.id === store.selectedSessionId && s.projectPath === p.path))
-    // Unread or Needs you: only the projects with such a session.
-    .filter((p) => !filter.active || filter.showsProject(p.path))
-    .sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || a.name.localeCompare(b.name));
-  const archivedCount = store.projects.filter((p) => p.archived).length;
-  // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
-  const selectedSession = store.sessions.find((session) => session.id === store.selectedSessionId) ?? null;
-  // A quick chat has no project: opening one leaves the project in focus where it was, and never focuses its scratch folder.
-  const sessionProject = selectedSession && !isQuickChat(selectedSession) ? selectedSession.projectPath : null;
-  const focus = store.selectedProject ?? sessionProject ?? store.lastProject ?? store.projects[0]?.path ?? null;
-
-  useEffect(() => {
-    if (!store.selectedProject && focus) selectProjectInSidebar(focus);
-  }, [focus, store.selectedProject]);
-
-  useEffect(() => {
-    const path = focus;
-    if (!path) return;
-    setExpandedProjects((current) => {
-      if (current.has(path)) return current;
-      const next = new Set(current);
-      next.add(path);
-      return next;
-    });
-  }, [focus, store.navigationVersion]);
-
-  const pickProject = async () => {
-    try {
-      const dir = await openDialog({ directory: true, multiple: false, title: "Add a project" });
-      if (typeof dir === "string") {
-        const p = await addProject(dir);
-        selectProjectInSidebar(p.path);
-      }
-      setError(null);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
-  };
-
-  const newChat = async () => {
-    try {
-      await startChat();
-      setError(null);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
-  };
-
-  const refreshAll = async () => {
-    setSpinning(true);
-    try {
-      // The account too: its organizations, roles and capabilities are read again from the server (a role may have changed, or a token refresh brought new ones).
-      await Promise.all([refreshEverything(), refreshAccountRoles(true).then(() => refreshCloudCatalog())]);
-    } finally {
-      setSpinning(false);
-    }
-  };
-
-  const filterLabel = SIDEBAR_FILTERS.find((entry) => entry.id === filter.filter)!.label;
-  // Two quiet buttons: + makes something, ⋯ holds the view (filter, archived) and refresh.
-  const headerActions = (
-    <div className="flex items-center">
-      {filter.active && (
-        <button
-          type="button"
-          onClick={() => setSidebarFilter("all")}
-          className="mr-1 rounded-sm bg-veil-strong px-1.5 text-[10px] text-foreground hover:bg-veil-raised"
-          title="Show all sessions"
-          data-testid="sidebar-filter-chip"
-        >
-          {filterLabel} ×
-        </button>
-      )}
-      <DropdownMenu>
-        <WithTooltip label="New">
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon-xs" aria-label="New">
-              <Plus />
-            </Button>
-          </DropdownMenuTrigger>
-        </WithTooltip>
-        <DropdownMenuContent align="end">
-          <DropdownMenuItem onSelect={() => void newChat()}>
-            <MessagesSquare /> New chat
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => void pickProject()}>
-            <FolderPlus /> Add project…
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-      <DropdownMenu>
-        <WithTooltip label="View options">
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="View options"
-              className={filter.active || store.showArchived ? "bg-veil-strong text-foreground" : undefined}
-              data-testid="sidebar-filter"
-              data-filter={filter.filter}
-            >
-              <Ellipsis />
-            </Button>
-          </DropdownMenuTrigger>
-        </WithTooltip>
-        <DropdownMenuContent align="end">
-          <DropdownMenuLabel>Show</DropdownMenuLabel>
-          {SIDEBAR_FILTERS.map((entry) => (
-            <DropdownMenuItem key={entry.id} onSelect={() => setSidebarFilter(entry.id)} aria-checked={filter.filter === entry.id} role="menuitemradio">
-              {filter.filter === entry.id ? <Check /> : <span aria-hidden className="size-4" />}
-              {entry.label}
-            </DropdownMenuItem>
-          ))}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => setSessionsArchived(!store.showArchived)} aria-checked={store.showArchived} role="menuitemcheckbox">
-            {store.showArchived ? <Check /> : <Archive />} Archived sessions
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setShowArchived((v) => !v)} aria-checked={showArchived} role="menuitemcheckbox">
-            {showArchived ? <Check /> : <Archive />} Archived projects{archivedCount ? ` (${archivedCount})` : ""}
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => void refreshAll()}>
-            <RefreshCw className={cn(spinning && "animate-spin")} /> Refresh everything
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => setPrefs({ sidebarLayout: "simple" })}>
-            <MessagesSquare /> Simple sidebar
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
-  );
-
-  const localRows = (
-    <>
-      {!localCollapsed && <ChatsNode onNewChat={() => void newChat()} />}
-      {!localCollapsed && projects.length === 0 && (
-        <div className="px-2 py-6 text-center text-xs text-muted-foreground" data-testid={filter.active ? "sidebar-filter-empty" : undefined}>
-          {filter.active ? (
-            <>
-              {filter.empty}{" "}
-              <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => setSidebarFilter("all")}>
-                Show all sessions
-              </button>
-            </>
-          ) : showArchived ? (
-            "Nothing archived."
-          ) : (
-            <StartLinks onError={setError} />
-          )}
-        </div>
-      )}
-      {!localCollapsed && projects.map((project) => {
-        // A filter shows what it found: its projects are open while it is on.
-        const expanded = filter.active || expandedProjects.has(project.path);
-        return (
-          <ProjectRow
-            key={project.path}
-            project={project}
-            selected={store.selectedProject === project.path}
-            active={selectedSession?.projectPath === project.path}
-            expanded={expanded}
-            onToggle={() =>
-              setExpandedProjects((current) => {
-                const next = new Set(current);
-                if (next.has(project.path)) next.delete(project.path);
-                else next.add(project.path);
-                return next;
-              })
-            }
-          >
-            <ProjectNavigation project={project} expanded={expanded} />
-          </ProjectRow>
-        );
-      })}
-    </>
-  );
-
-  return (
-    <div className="flex h-full min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-hairline" data-testid="sidebar-rail">
-      <div data-tauri-drag-region="deep" className="h-(--titlebar-h) shrink-0" style={{ paddingLeft: TITLEBAR_INSET }} />
-      <div className="flex shrink-0 flex-col gap-0.5 px-2">
-        <Button variant="ghost" className="justify-start gap-2 px-2" onClick={onSearch}>
-          <Search />
-          Search
-          <Keys shortcut="app.commandPalette" />
-        </Button>
-        <AppDestinations onOpenIssues={onOpenIssues} onOpenAgents={onOpenAgents} onOpenStats={onOpenStats} onOpenAutomations={onOpenAutomations} onOpenSkills={onOpenSkills} />
-        <WithTooltip label={quickChatKeys ? `Open the floating chat window (${quickChatKeys} from any app)` : "Open the floating chat window: a chat or terminal with no project"}>
-          <Button variant="ghost" className="justify-start gap-2 px-2" onClick={() => void showFloatingWindow()} data-testid="open-floating-window">
-            <MessageCircle />
-            <span className="truncate">Quick Chat</span>
-            {quickChatKeys && <span className="ml-auto shrink-0 text-[10px] text-faint">{quickChatKeys}</span>}
-          </Button>
-        </WithTooltip>
-      </div>
-
-      {!sectioned && (
-        <div className="mt-3 flex shrink-0 items-center justify-between pl-4 pr-2">
-          <button
-            type="button"
-            onClick={() => setShowArchived((v) => !v)}
-            className="text-[11px] font-medium uppercase tracking-wide text-faint hover:text-muted-foreground"
-            title={archivedCount ? `${archivedCount} archived` : undefined}
-          >
-            {showArchived ? "Archived" : "Workspace"}
-          </button>
-          {headerActions}
-        </div>
-      )}
-      {error && <div className="mx-2 mt-1 shrink-0 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</div>}
-
-      {/*
-        The one scroll container between the fixed top and the fixed footer: Local and every
-        organization section. `basis-0` (not a 0% basis) so WebKit sizes it from the rail, not
-        from its content, in a short window.
-      */}
-      <div className="mt-1 min-h-0 flex-1 basis-0 overflow-y-auto overscroll-contain scrollbar-thin px-2" role="tree" data-testid="sidebar-tree" aria-label="Projects, workspaces, sessions, and tabs" onKeyDown={navigateTree}>
-        {sectioned ? (
-          // With organization sections, Local is a section of the tree like them (PRO-23 CS-19):
-          // its header is a node the arrow keys reach, and its projects sit under it.
-          <div role="treeitem" aria-label="Local section" aria-expanded={!localCollapsed} className="min-w-0" data-testid="local-section">
-            <div data-tree-row className="mt-2 flex h-7 min-w-0 items-center justify-between">
-              <span className="flex min-w-0 items-center gap-1" data-testid="local-section-header">
-                <TreeToggle expanded={!localCollapsed} label="Local" onToggle={toggleLocal} />
-                <button
-                  type="button"
-                  onClick={() => setShowArchived((v) => !v)}
-                  className="truncate rounded-sm text-[11px] font-medium uppercase tracking-wide text-faint outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
-                  title={archivedCount ? `Projects on this computer · ${archivedCount} archived` : "Projects on this computer"}
-                >
-                  {showArchived ? "Local · Archived" : "Local"}
-                </button>
-              </span>
-              {headerActions}
-            </div>
-            {!localCollapsed && <div role="group">{localRows}</div>}
-          </div>
-        ) : (
-          localRows
-        )}
-        <QuickChatsSection />
-        {sectioned && <CloudSections onOpenAccount={onOpenAccount} onOpenOrganizations={() => onOpenSettings("organizations")} />}
-        <DevelopmentSection />
-      </div>
-
-      {/* One row: the account (which opens Account) truncates, the switch to the chat view sits beside it, and the gear is its own target at the right end. */}
-      <div className="flex shrink-0 items-center gap-1 border-t border-hairline p-2" data-testid="sidebar-account-row">
-        <div className="min-w-0 max-w-[70%]">
-          <AccountSidebarEntry onOpenAccount={onOpenAccount} />
-        </div>
-        <WithTooltip label="Chat view: one list of conversations" side="top">
-          <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Chat view" onClick={() => setPrefs({ sidebarLayout: "simple" })}>
-            <MessagesSquare />
-          </Button>
-        </WithTooltip>
-        <div className="flex-1" />
-        <WithTooltip label="Settings" shortcut="app.settings" side="top">
-          <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Settings" onClick={() => onOpenSettings()}>
-            <Settings />
-          </Button>
-        </WithTooltip>
-      </div>
-    </div>
-  );
-}
-
-/** The empty sidebar points at the same three ways to a project as the start screen. */
-function StartLinks({ onError }: { onError: (message: string | null) => void }) {
-  return (
-    <div data-testid="sidebar-start">
-      Add a project to get started.
-      <div className="mt-2 flex flex-col items-center gap-1">
-        {START_ACTIONS.map((action) => (
-          <button
-            key={action.id}
-            type="button"
-            className="rounded-sm underline underline-offset-2 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
-            onClick={() => {
-              onError(null);
-              void Promise.resolve(action.run()).catch((cause) => onError(errorMessage(cause)));
-            }}
-          >
-            {action.label}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
+  return sidebarLayout === "list" ? <ChatListSidebar {...props} /> : <SessionSidebar {...props} />;
 }
 
 /**
@@ -396,11 +45,8 @@ function StartLinks({ onError }: { onError: (message: string | null) => void }) 
 export function AppDestinations({
   onOpenIssues,
   onOpenAgents,
-  onOpenStats,
   onOpenAutomations,
-  onOpenSkills,
-  variant = "strip",
-}: Pick<RailProps, "onOpenIssues" | "onOpenAgents" | "onOpenStats" | "onOpenAutomations" | "onOpenSkills"> & { variant?: "strip" | "list" }) {
+}: Pick<RailProps, "onOpenIssues" | "onOpenAgents" | "onOpenAutomations">) {
   const store = useSessionStore();
   const automationStore = useAutomationStore();
   // The dashboard's totals count cloud sessions too (PRO-23 CS-19), like the dashboard itself.
@@ -414,7 +60,6 @@ export function AppDestinations({
   const active = onNavView ? store.view : null;
   const dashboard = { id: "agents", label: "Agent dashboard", shortcut: "app.agentDashboard", icon: <LayoutGrid />, onOpen: onOpenAgents, ...dashboardStatus(dashboardBuckets) } satisfies Destination;
   const issues = { id: "issues", label: "Issues", shortcut: "app.issues", icon: <CircleDot />, onOpen: onOpenIssues } satisfies Destination;
-  const stats = { id: "stats", label: "Stats & Usage", shortcut: "app.stats", icon: <BarChart3 />, onOpen: onOpenStats } satisfies Destination;
   const automations: Destination = {
     id: "automations",
     label: "Automations",
@@ -424,13 +69,10 @@ export function AppDestinations({
     dot: automationFailures > 0 ? { tone: "warning", label: `${automationFailures} failed` } : automationRunning ? { tone: "info", label: "Running" } : null,
     count: automationFailures || undefined,
   };
-  const skills = { id: "skills", label: "Skills", shortcut: "app.skills", icon: <Sparkles />, onOpen: onOpenSkills } satisfies Destination;
-  if (variant === "list") {
-    // Named, the dashboard leads and says what is waiting on you, or what is still running.
-    const waiting = dashboardBuckets.needs.length || dashboardBuckets.working.length;
-    return <DestinationList active={active} destinations={[{ ...dashboard, label: "Dashboard", count: waiting || undefined }, issues, automations, skills, { ...stats, label: "Usage" }]} />;
-  }
-  return <DestinationStrip active={active} destinations={[issues, dashboard, stats, automations, skills]} />;
+  // Skills and Usage are reached from Settings (and their shortcuts), not from here.
+  // Named rows, the same in both sidebar layouts: the dashboard leads and says what is waiting on you, or what is still running.
+  const waiting = dashboardBuckets.needs.length || dashboardBuckets.working.length;
+  return <DestinationList active={active} destinations={[{ ...dashboard, label: "Dashboard", count: waiting || undefined }, issues, automations]} />;
 }
 
 /** `status` is read out with the label; `dot` marks it when something there wants a look; `count` is shown beside it in a list. */
@@ -484,92 +126,43 @@ function dashboardStatus(buckets: Record<ColumnId, readonly unknown[]>): { statu
   return { status, dot };
 }
 
-/**
- * The app's destinations as one row of icons: each names itself and its keys
- * in a tooltip, marks itself while it is what the main slot shows, and carries
- * a dot when something there wants a look.
- */
-function DestinationStrip({
-  active,
-  destinations,
-}: {
-  active: string | null;
-  destinations: Destination[];
-}) {
-  return (
-    <div className="flex items-center justify-between px-1 py-0.5" role="toolbar" aria-label="Destinations" data-testid="destination-strip">
-      {destinations.map((destination) => {
-        const status = destination.status ?? destination.dot?.label;
-        return (
-        <WithTooltip key={destination.id} label={status ? `${destination.label} · ${status}` : destination.label} shortcut={destination.shortcut}>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label={status ? `${destination.label}, ${status}` : destination.label}
-            aria-pressed={active === destination.id}
-            className={cn("relative", active === destination.id && "bg-selected text-foreground")}
-            onClick={destination.onOpen}
-          >
-            {destination.icon}
-            {destination.dot && (
-              <span
-                aria-hidden
-                className={cn(
-                  "absolute right-1 top-1 size-1.5 rounded-full",
-                  destination.dot.tone === "warning" && "bg-warning",
-                  destination.dot.tone === "info" && "bg-info animate-pulse-soft",
-                  destination.dot.tone === "add" && "bg-add",
-                )}
-              />
-            )}
-          </Button>
-        </WithTooltip>
-        );
-      })}
-    </div>
-  );
-}
-
-function Keys({ shortcut }: { shortcut: ShortcutId }) {
-  const keys = useShortcutKeys(shortcut);
-  return (
-    <span className="ml-auto flex gap-0.5 text-[10px] text-faint">
-      {keys.map((k) => (
-        <kbd key={k} className="rounded-sm bg-veil-raised px-1 font-sans">
-          {k}
-        </kbd>
-      ))}
-    </span>
-  );
-}
 
 export function ProjectGlyph({ project, size = 16 }: { project: Project; size?: number }) {
+  // A repository with no look of its own wears its GitHub picture: the one of
+  // the organisation or user that owns it, as GitHub shows it. A plain folder has none.
+  const identity = useGithubIdentity(project.logo || project.mascot || project.kind === "folder" ? null : project.path);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   if (project.logo) {
     return <img src={convertFileSrc(project.logo)} alt="" width={size} height={size} className="shrink-0 rounded-sm object-cover" style={{ width: size, height: size }} />;
   }
   if (project.mascot) return <PixelMascot id={project.mascot} color={project.color} size={size} />;
-  return <FolderOpen className="shrink-0" style={{ width: size, height: size, color: colorCss(project.color) }} />;
+  const owner = identity?.repo?.split("/")[0];
+  if (owner && unavailable !== owner) {
+    return (
+      <img
+        src={githubAvatarUrl(owner, size * 2)}
+        alt=""
+        title={`On GitHub as ${identity?.repo}`}
+        width={size}
+        height={size}
+        loading="lazy"
+        className="shrink-0 rounded-full object-cover"
+        style={{ width: size, height: size }}
+        onError={() => setUnavailable(owner)}
+        data-testid="project-avatar"
+      />
+    );
+  }
+  return <Folder className="shrink-0" style={{ width: size, height: size, color: colorCss(project.color) }} />;
 }
 
-function ProjectRow({
-  project,
-  selected,
-  active,
-  expanded,
-  onToggle,
-  children,
-}: {
-  project: Project;
-  selected: boolean;
-  active: boolean;
-  expanded: boolean;
-  onToggle: () => void;
-  children: ReactNode;
-}) {
-  const store = useSessionStore();
-  const main = store.workspaces[project.path]?.find((w) => w.isMain);
+/**
+ * How a project looks and is called: its name, an optional logo, its colour
+ * and its mascot. Drawn inside a project's menu; the name is kept on Enter or
+ * when the field is left.
+ */
+export function ProjectAppearance({ project }: { project: Project }) {
   const [name, setName] = useState(project.name);
-  const [busy, setBusy] = useState(false);
 
   const commitName = () => {
     const n = name.trim();
@@ -579,165 +172,88 @@ function ProjectRow({
     const file = await openDialog({ multiple: false, title: "Project logo", filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "svg", "webp"] }] });
     if (typeof file === "string") await setProjectLogo(project.path, file);
   };
-  const refresh = async () => {
-    setBusy(true);
-    try {
-      await refreshWorkspaces(project.path);
-    } finally {
-      setBusy(false);
-    }
-  };
 
   return (
-    <DropdownMenu onOpenChange={(o) => o && setName(project.name)}>
-      <div role="treeitem" aria-label={project.name} aria-expanded={expanded} className="min-w-0">
-        <div
-          data-tree-row
-          className={cn(
-            actionRow,
-            "relative flex h-8 cursor-default items-center gap-1 rounded-md px-1 outline-none",
-            selected ? "bg-selected" : active ? "bg-selected/50" : "hover:bg-selected/50",
-          )}
-          title={project.path}
-        >
-          <button
-            type="button"
-            data-tree-toggle
-            aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
-            onClick={onToggle}
-            className="shrink-0 rounded-sm p-0.5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+    <div className="w-[17rem] p-1" data-testid="project-appearance">
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onBlur={commitName}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commitName();
+          }
+          e.stopPropagation();
+        }}
+        className="mb-2 h-8 w-full rounded-md bg-well px-2 text-[13px] outline-none focus:ring-2 focus:ring-ring/40"
+        aria-label="Project name"
+      />
+      <button
+        type="button"
+        onClick={() => void pickLogo()}
+        className="mb-2 flex w-full items-center gap-3 rounded-md px-1 py-1 text-left hover:bg-veil-raised"
+      >
+        <span className="flex size-9 items-center justify-center rounded-md bg-well">
+          {project.logo ? <ProjectGlyph project={project} size={20} /> : <ImagePlus className="size-4 text-muted-foreground" />}
+        </span>
+        <span className="min-w-0">
+          <span className="block text-[13px]">Project logo</span>
+          <span className="block text-[11px] text-faint">{project.logo ? "Click to replace" : "Optional, replaces the mascot"}</span>
+        </span>
+        {project.logo && (
+          <span
+            role="button"
+            className="ml-auto text-[11px] text-faint hover:text-foreground"
+            onClick={(e) => {
+              e.stopPropagation();
+              void setProjectLogo(project.path, null);
+            }}
           >
-            <ChevronDown className={cn("size-3 text-faint transition-transform", !expanded && "-rotate-90")} />
-          </button>
-          <button
-            type="button"
-            onClick={() => selectProjectInSidebar(project.path)}
-            className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-          >
-            <ProjectGlyph project={project} />
-            <span className="min-w-0 flex-1 truncate text-[13px]">{project.name}</span>
-            {project.pinned && <Pin className="size-3 shrink-0 text-faint" />}
-            {project.archived && <Archive className="size-3 shrink-0 text-faint" aria-label="Archived project" />}
-            {main && (main.additions > 0 || main.deletions > 0) && (
-              <span className={cn("shrink-0 text-[11px] tabular-nums", yieldsToRowActions)}>
-                {main.additions > 0 && <span className="text-add">+{main.additions}</span>}
-                {main.deletions > 0 && <span className="ml-1 text-destructive">−{main.deletions}</span>}
-              </span>
-            )}
-          </button>
-          <RowActions>
-            <WithTooltip label={`New session in ${project.name}`}>
-              <Button variant="ghost" size="icon-xs" aria-label={`New session in ${project.name}`} onClick={() => startSessionIn(project.path, null)}>
-                <FolderPlus />
-              </Button>
-            </WithTooltip>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label={`Project menu for ${project.name}`}>
-                <Ellipsis />
-              </Button>
-            </DropdownMenuTrigger>
-          </RowActions>
-        </div>
-        {children}
-      </div>
-      <DropdownMenuContent align="start" className="w-[19rem] p-2">
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onBlur={commitName}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commitName();
-            }
-            e.stopPropagation();
-          }}
-          className="mb-2 h-8 w-full rounded-md bg-well px-2 text-[13px] outline-none focus:ring-2 focus:ring-ring/40"
-          aria-label="Project name"
-        />
-        <button
-          type="button"
-          onClick={() => void pickLogo()}
-          className="mb-2 flex w-full items-center gap-3 rounded-md px-1 py-1 text-left hover:bg-veil-raised"
-        >
-          <span className="flex size-9 items-center justify-center rounded-md bg-well">
-            {project.logo ? <ProjectGlyph project={project} size={20} /> : <ImagePlus className="size-4 text-muted-foreground" />}
+            Remove
           </span>
-          <span className="min-w-0">
-            <span className="block text-[13px]">Project logo</span>
-            <span className="block text-[11px] text-faint">{project.logo ? "Click to replace" : "Optional, replaces the mascot"}</span>
-          </span>
-          {project.logo && (
-            <span
-              role="button"
-              className="ml-auto text-[11px] text-faint hover:text-foreground"
-              onClick={(e) => {
-                e.stopPropagation();
-                void setProjectLogo(project.path, null);
-              }}
-            >
-              Remove
-            </span>
-          )}
-        </button>
-        <div className="mb-2 flex items-center gap-1.5 px-1" role="radiogroup" aria-label="Colour">
-          {PROJECT_COLORS.map((c) => (
-            <button
-              key={c.id}
-              type="button"
-              role="radio"
-              aria-checked={(project.color ?? "slate") === c.id}
-              onClick={() => void updateProject(project.path, { color: c.id })}
-              className={cn("size-5 rounded-full ring-offset-2 ring-offset-popover", (project.color ?? "slate") === c.id && "ring-2 ring-foreground/60")}
-              style={{ background: c.css }}
-              title={c.id}
-            />
-          ))}
-        </div>
-        <div className="px-1 text-[11px] text-faint">Mascot</div>
-        <div className="mb-1 flex flex-wrap gap-1 px-1" role="radiogroup" aria-label="Mascot">
+        )}
+      </button>
+      <div className="mb-2 flex items-center gap-1.5 px-1" role="radiogroup" aria-label="Colour">
+        {PROJECT_COLORS.map((c) => (
           <button
+            key={c.id}
             type="button"
             role="radio"
-            aria-checked={!project.mascot}
-            onClick={() => void updateProject(project.path, { mascot: null })}
-            className={cn("flex size-7 items-center justify-center rounded-md hover:bg-veil-raised", !project.mascot && "bg-veil-strong")}
-            title="Folder"
+            aria-checked={(project.color ?? "slate") === c.id}
+            onClick={() => void updateProject(project.path, { color: c.id })}
+            className={cn("size-5 rounded-full ring-offset-2 ring-offset-popover", (project.color ?? "slate") === c.id && "ring-2 ring-foreground/60")}
+            style={{ background: c.css }}
+            title={c.id}
+          />
+        ))}
+      </div>
+      <div className="px-1 text-[11px] text-faint">Mascot</div>
+      <div className="mb-1 flex flex-wrap gap-1 px-1" role="radiogroup" aria-label="Mascot">
+        <button
+          type="button"
+          role="radio"
+          aria-checked={!project.mascot}
+          onClick={() => void updateProject(project.path, { mascot: null })}
+          className={cn("flex size-7 items-center justify-center rounded-md hover:bg-veil-raised", !project.mascot && "bg-veil-strong")}
+          title="Folder"
+        >
+          <FolderOpen className="size-4" style={{ color: colorCss(project.color) }} />
+        </button>
+        {MASCOTS.map((m) => (
+          <button
+            key={m}
+            type="button"
+            role="radio"
+            aria-checked={project.mascot === m}
+            onClick={() => void updateProject(project.path, { mascot: m })}
+            className={cn("flex size-7 items-center justify-center rounded-md hover:bg-veil-raised", project.mascot === m && "bg-veil-strong")}
+            title={m}
           >
-            <FolderOpen className="size-4" style={{ color: colorCss(project.color) }} />
+            <PixelMascot id={m} color={project.color} size={16} />
           </button>
-          {MASCOTS.map((m) => (
-            <button
-              key={m}
-              type="button"
-              role="radio"
-              aria-checked={project.mascot === m}
-              onClick={() => void updateProject(project.path, { mascot: m })}
-              className={cn("flex size-7 items-center justify-center rounded-md hover:bg-veil-raised", project.mascot === m && "bg-veil-strong")}
-              title={m}
-            >
-              <PixelMascot id={m} color={project.color} size={16} />
-            </button>
-          ))}
-        </div>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void updateProject(project.path, { pinned: !project.pinned })}>
-          {project.pinned ? <PinOff /> : <Pin />} {project.pinned ? "Unpin project" : "Pin project"}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void revealItemInDir(project.path)}>
-          <FolderOpen /> Reveal in Finder
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void refresh()} disabled={busy}>
-          <RefreshCw className={cn(busy && "animate-spin")} /> Refresh workspaces
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void updateProject(project.path, { archived: !project.archived })}>
-          <Archive /> {project.archived ? "Unarchive" : "Archive"}
-        </DropdownMenuItem>
-        <DropdownMenuItem destructive onSelect={() => void removeProject(project.path)}>
-          <Trash2 /> Remove from TerminalX
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+        ))}
+      </div>
+    </div>
   );
 }

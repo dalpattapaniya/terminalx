@@ -469,18 +469,22 @@ export async function addProject(path: string) {
  * the session runs in place with no worktree, and it is never added as a
  * project: the sidebar lists its sessions on their own.
  */
-export async function startChat(place?: { projectPath: string; cwd: string }): Promise<SessionEntry> {
+export async function startChat(place?: { projectPath: string; cwd?: string; fromBranch?: string }): Promise<SessionEntry> {
   const harness = state.harnesses.find((item) => item.id === "claude" && item.available) ?? state.harnesses.find((item) => item.available);
   if (!harness) throw new Error("Install and sign in to an agent to start a chat.");
-  // Without a place, a chat of its own; with one, another session in that checkout, on its branch.
+  // Without a place, a chat of its own; with one, another session in that
+  // checkout, on its branch, or in a new workspace branched from `fromBranch`.
   const chatsPath = place ? null : (state.chatsPath ?? (await api.chatsDir()));
   if (chatsPath && chatsPath !== state.chatsPath) set({ chatsPath });
   const prefs = getPrefs();
   const session = await api.createSession({
     projectPath: place?.projectPath ?? chatsPath!,
-    cwd: place?.cwd ?? chatsPath!,
+    cwd: place?.fromBranch ? null : (place?.cwd ?? chatsPath!),
     title: "Chat",
-    useWorktree: false,
+    useWorktree: !!place?.fromBranch,
+    baseRef: place?.fromBranch ?? null,
+    // The workspace is named after the branch it comes from (made unique), not after the chat.
+    worktreeName: place?.fromBranch ? (place.fromBranch.split("/").pop() ?? null) : null,
     tab: {
       harness: harness.id,
       model: prefs.lastModel[harness.id] ?? "",

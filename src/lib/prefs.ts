@@ -41,10 +41,11 @@ export interface Prefs {
   organizationDisplay: "all" | "one";
   selectedOrganization: string | null;
   /**
-   * The sidebar's shape: "simple" lists every conversation newest first, as a
-   * chat app does; "detailed" is the project, workspace and tab tree.
+   * The sidebar's shape: "simple" groups the conversations under their
+   * projects; "list" is one flat list of chats, newest first, as a messaging
+   * app draws it.
    */
-  sidebarLayout: "simple" | "detailed";
+  sidebarLayout: "simple" | "list";
   /**
    * Cloud projects the reader added with "+ Add project", per organization:
    * repository identities (`host/owner/name`). Projects with workspaces show
@@ -126,6 +127,8 @@ function load(): Prefs {
     prefs.hiddenOrganizations = Array.isArray(prefs.hiddenOrganizations) ? [...new Set(prefs.hiddenOrganizations.filter((id: unknown) => typeof id === "string"))] : [];
     prefs.organizationDisplay = prefs.organizationDisplay === "one" ? "one" : "all";
     prefs.selectedOrganization = typeof prefs.selectedOrganization === "string" ? prefs.selectedOrganization : null;
+    // The project tree ("detailed") is gone; anyone who had it gets the default.
+    prefs.sidebarLayout = prefs.sidebarLayout === "list" ? "list" : "simple";
     // Older versions saved the whole object, including the TerminalX default,
     // without recording whether it was chosen. Migrate unmarked values once;
     // choices made in Settings or remembered in the chooser survive this migration.

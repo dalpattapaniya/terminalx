@@ -1,12 +1,13 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
-import { Archive, Ellipsis, FolderInput, FolderOpen, FolderPlus, GitBranch, ListTree, ChevronDown, Pin, Plus, Search, Settings, SquarePen, Trash2 } from "lucide-react";
+import { Archive, ChevronDown, Ellipsis, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, Palette, Pin, Plus, Settings, SquarePen, Trash2 } from "@/icons";
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from "@/components/ui/menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from "@/components/ui/menu";
 import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
 import { AccountSidebarEntry } from "@/components/account/AccountSidebarEntry";
+import { SidebarTitlebar } from "./SidebarTitlebar";
 import { cn } from "@/lib/cn";
 import { errorMessage } from "@/lib/api";
 import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
@@ -16,8 +17,8 @@ import { confirmDeleteSession } from "@/lib/deleteSessionFlow";
 import type { Project, Workspace } from "@/types/session";
 import { sessionStatus, type SessionEntry } from "@/types/session";
 import { RowTime } from "./SidebarRows";
-import { AppDestinations, ProjectGlyph, type RailProps } from "./ProjectRail";
-import { TITLEBAR_INSET } from "./AppShell";
+import { StatusMark } from "@/components/ui/StatusMark";
+import { AppDestinations, ProjectAppearance, ProjectGlyph, type RailProps } from "./ProjectRail";
 import { AgentMark } from "@/components/AgentMark";
 
 const canon = (path: string) => path.replace(/\/+$/, "");
@@ -158,7 +159,7 @@ function useFold(key: string, byDefault: boolean): [boolean, () => void] {
  * that belong to none. Workspaces and tabs are not levels here; a row names
  * its branch, and the full tree is one click away as the detailed sidebar.
  */
-export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...destinations }: RailProps) {
+export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch, onOpenIssues, onOpenAgents, onOpenAutomations }: RailProps) {
   const store = useSessionStore();
   const [error, setError] = useState<string | null>(null);
   const chatsPath = store.chatsPath ? canon(store.chatsPath) : null;
@@ -184,47 +185,10 @@ export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...des
 
   return (
     <div className="flex h-full min-h-0 w-full shrink-0 flex-col overflow-hidden border-r border-hairline" data-testid="sidebar-rail">
-      <div data-tauri-drag-region="deep" className="flex h-(--titlebar-h) shrink-0 items-center justify-end gap-1 pr-2" style={{ paddingLeft: TITLEBAR_INSET }}>
-        <WithTooltip label="Search" shortcut="app.commandPalette">
-          <Button variant="ghost" size="icon-sm" aria-label="Search" onClick={onSearch}>
-            <Search />
-          </Button>
-        </WithTooltip>
-      </div>
+      <SidebarTitlebar onHide={onHide} onSearch={onSearch} onNewChat={newChat} onAddProject={addAndStart} projects={projects} />
 
       <div className="shrink-0 px-2">
-        <div className="flex items-center rounded-md bg-veil-raised">
-          <Button variant="ghost" className="min-w-0 flex-1 justify-start gap-2 px-2 font-medium text-foreground" onClick={newChat}>
-            <SquarePen />
-            New chat
-          </Button>
-          <DropdownMenu>
-            <WithTooltip label="New chat in a project">
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon-sm" aria-label="New chat in a project">
-                  <ChevronDown />
-                </Button>
-              </DropdownMenuTrigger>
-            </WithTooltip>
-            <DropdownMenuContent align="end" className="w-60">
-              {projects.length > 0 && (
-                <>
-                  <DropdownMenuLabel>New chat in a project</DropdownMenuLabel>
-                  {projects.map((project) => (
-                    <DropdownMenuItem key={project.path} onSelect={() => startSessionIn(project.path, null)}>
-                      <ProjectGlyph project={project} /> <span className="truncate">{project.name}</span>
-                    </DropdownMenuItem>
-                  ))}
-                  <DropdownMenuSeparator />
-                </>
-              )}
-              <DropdownMenuItem onSelect={addAndStart}>
-                <FolderPlus /> Add a project…
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-        <div className="mt-1"><AppDestinations {...destinations} variant="list" /></div>
+        <div><AppDestinations onOpenIssues={onOpenIssues} onOpenAgents={onOpenAgents} onOpenAutomations={onOpenAutomations} /></div>
       </div>
 
       {error && <div className="mx-2 mt-1 shrink-0 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">{error}</div>}
@@ -250,7 +214,7 @@ export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...des
                     group={group}
                     selectedId={store.selectedSessionId}
                     workspaces={store.workspaces[group.path] ?? []}
-                    onNewSession={(cwd) => run(() => startChat({ projectPath: group.path, cwd }))()}
+                    onNewSession={(place) => run(() => startChat({ projectPath: group.path, ...place }))()}
                   />
                 ))}
               </ListSection>
@@ -285,15 +249,10 @@ export function SessionSidebar({ onOpenSettings, onOpenAccount, onSearch, ...des
       </ShowAgents.Provider>
 
       <div className="flex shrink-0 items-center gap-1 border-t border-hairline px-2 pb-2 pt-1" data-testid="sidebar-account-row">
-        {/* The account and, beside it, the switch to the detailed sidebar; Settings keeps the far end. */}
+        {/* The account; Settings keeps the far end. */}
         <div className="min-w-0 max-w-[70%]">
           <AccountSidebarEntry onOpenAccount={onOpenAccount} />
         </div>
-        <WithTooltip label="Detailed sidebar: projects, workspaces and tabs" side="top">
-          <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Detailed sidebar" onClick={() => setPrefs({ sidebarLayout: "detailed" })}>
-            <ListTree />
-          </Button>
-        </WithTooltip>
         <div className="flex-1" />
         <WithTooltip label="Settings" shortcut="app.settings" side="top">
           <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Settings" onClick={() => onOpenSettings()}>
@@ -335,14 +294,24 @@ function ProjectGroup({
   selectedId: string | null;
   /** The project's checkouts, to find the folder a branch is checked out in. */
   workspaces: Workspace[];
-  onNewSession: (cwd: string) => void;
+  /** Start a session in a checkout (`cwd`), or in a new workspace branched from `fromBranch`. */
+  onNewSession: (place: { cwd: string } | { fromBranch: string }) => void;
 }) {
-  // Another session on a branch runs where that branch is checked out; one checked out nowhere has nowhere to run.
-  const newSessionOn = (branch: string) => {
-    const checkout = workspaces.find((workspace) => workspace.branch === branch);
-    return checkout ? () => onNewSession(checkout.path) : null;
+  // Another session on a branch runs where that branch is checked out: the
+  // project's checkout on it, else the worktree a conversation on it has
+  // (the checkout list is not always loaded; a shared checkout may have
+  // moved on since). One checked out nowhere (its worktree gone, the
+  // checkout moved on) gets a new workspace branched from it instead.
+  const newSessionOn = (branch: string, sessions: SessionEntry[]): NewSessionAction | null => {
+    const checkout = workspaces.find((workspace) => workspace.branch === branch)?.path ?? sessions.find((session) => session.worktreeName && !session.worktreeRemoved)?.cwd;
+    if (checkout) return { label: `New session on ${branch || "this branch"}`, run: () => onNewSession({ cwd: checkout }) };
+    if (!branch) return null;
+    return { label: `New workspace from ${branch}`, run: () => onNewSession({ fromBranch: branch }) };
   };
   const [all, toggleAll] = useFold(`project-all:${canon(group.path)}`, false);
+  // The project folds its branches away: its picture turns into a chevron on hover, and stays one while folded.
+  const [open, toggle] = useFold(`project:${canon(group.path)}`, true);
+  const { animations } = usePrefs();
   // One row per branch, newest work first; the conversations come in that order already.
   const branches = useMemo(() => {
     const byBranch = new Map<string, SessionEntry[]>();
@@ -358,8 +327,27 @@ function ProjectGroup({
     <div role="group" aria-label={group.name} className="mb-1">
       <DropdownMenu>
         <div className={cn(actionRow, "relative flex h-8 items-center gap-2 rounded-md px-2 hover:bg-selected/50")} title={group.path}>
-          {group.project ? <ProjectGlyph project={group.project} /> : <FolderOpen className="size-4 shrink-0 text-faint" />}
-          <span className="min-w-0 flex-1 truncate text-[13px]">{group.name}</span>
+          <button
+            type="button"
+            onClick={toggle}
+            aria-expanded={open}
+            aria-label={open ? `Collapse ${group.name}` : `Expand ${group.name}`}
+            className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          >
+            <span className="relative size-4 shrink-0">
+              <span className={cn("absolute inset-0 transition-opacity duration-150", open ? "group-hover/row:opacity-0 group-focus-within/row:opacity-0" : "opacity-0")} aria-hidden>
+                {group.project ? <ProjectGlyph project={group.project} /> : <Folder className="size-4 text-faint" />}
+              </span>
+              <ChevronDown
+                className={cn(
+                  "absolute inset-0 size-4 text-muted-foreground transition-[opacity,transform] duration-200",
+                  open ? "opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100" : "-rotate-90 opacity-100",
+                )}
+                data-testid="project-fold"
+              />
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[13px]">{group.name}</span>
+          </button>
           <RowActions>
             <WithTooltip label={`New chat in ${group.name}`}>
               <Button variant="ghost" size="icon-xs" aria-label={`New chat in ${group.name}`} onClick={() => startSessionIn(group.path, null)}>
@@ -381,9 +369,19 @@ function ProjectGroup({
             <FolderOpen /> Reveal in Finder
           </DropdownMenuItem>
           {group.project && (
-            <DropdownMenuItem onSelect={() => void updateProject(group.path, { pinned: !group.project?.pinned })}>
-              <Pin /> {group.project.pinned ? "Unpin project" : "Pin project"}
-            </DropdownMenuItem>
+            <>
+              <DropdownMenuItem onSelect={() => void updateProject(group.path, { pinned: !group.project?.pinned })}>
+                <Pin /> {group.project.pinned ? "Unpin project" : "Pin project"}
+              </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Palette /> Name and appearance
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <ProjectAppearance project={group.project} />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            </>
           )}
           <DropdownMenuSeparator />
           <DropdownMenuItem destructive onSelect={() => void confirmRemoveProject(group)}>
@@ -391,6 +389,14 @@ function ProjectGroup({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      {/* The branches slide open and closed: a grid row that grows from nothing to its content's height, which a height alone cannot animate. */}
+      <div
+        className={cn("grid", animations && "transition-[grid-template-rows,opacity] duration-200 ease-out", open ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0")}
+        aria-hidden={!open}
+        inert={!open}
+        data-testid="project-branches"
+      >
+        <div className="min-h-0 overflow-hidden">
       <ul className="ml-[15px] flex flex-col gap-px border-l border-hairline pl-1.5">
         {shown.map(({ branch, sessions }) =>
           sessions.length === 1 ? (
@@ -400,11 +406,11 @@ function ProjectGroup({
               selected={selectedId === sessions[0].id}
               branch={branch || null}
               named="branch"
-              onNewSession={newSessionOn(branch)}
+              onNewSession={newSessionOn(branch, sessions)}
               linkTo={null}
             />
           ) : (
-            <BranchRow key={branch} path={group.path} branch={branch} sessions={sessions} selectedId={selectedId} onNewSession={newSessionOn(branch)} />
+            <BranchRow key={branch} path={group.path} branch={branch} sessions={sessions} selectedId={selectedId} onNewSession={newSessionOn(branch, sessions)} />
           ),
         )}
         {more && (
@@ -419,6 +425,8 @@ function ProjectGroup({
           </li>
         )}
       </ul>
+        </div>
+      </div>
     </div>
   );
 }
@@ -435,7 +443,7 @@ function BranchRow({
   branch: string;
   sessions: SessionEntry[];
   selectedId: string | null;
-  onNewSession: (() => void) | null;
+  onNewSession: NewSessionAction | null;
 }) {
   const holdsSelected = sessions.some((session) => session.id === selectedId);
   const [open, toggle] = useFold(`branch:${canon(path)}:${branch}`, false);
@@ -458,7 +466,7 @@ function BranchRow({
         </button>
         {onNewSession && (
           <RowActions>
-            <NewSessionButton branch={label} onClick={onNewSession} />
+            <NewSessionButton action={onNewSession} />
           </RowActions>
         )}
       </div>
@@ -473,10 +481,16 @@ function BranchRow({
   );
 }
 
-function NewSessionButton({ branch, onClick }: { branch: string; onClick: () => void }) {
+/** What a branch row's + does, and what it is called. */
+interface NewSessionAction {
+  label: string;
+  run: () => void;
+}
+
+function NewSessionButton({ action }: { action: NewSessionAction }) {
   return (
-    <WithTooltip label={`New session on ${branch}`}>
-      <Button variant="ghost" size="icon-xs" aria-label={`New session on ${branch}`} onClick={onClick}>
+    <WithTooltip label={action.label}>
+      <Button variant="ghost" size="icon-xs" aria-label={action.label} onClick={action.run}>
         <Plus />
       </Button>
     </WithTooltip>
@@ -495,8 +509,8 @@ function ConversationRow({
   selected: boolean;
   /** What the row is called: the conversation's title, or (alone on its branch in a project) the branch. */
   named?: "title" | "branch";
-  /** Start another session on the row's branch, where it is checked out. */
-  onNewSession?: (() => void) | null;
+  /** Start another session on the row's branch, where it is checked out (or a workspace from it). */
+  onNewSession?: NewSessionAction | null;
   /** The branch it works on, named at the row's end; without one the row shows when it was last active. */
   branch: string | null;
   /** For a chat linked to nothing: the projects it may be linked to. */
@@ -520,28 +534,24 @@ function ConversationRow({
             aria-label={named === "branch" ? `${branch ?? "No branch"}, ${title}` : undefined}
             className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           >
-            {(status === "waiting" || status === "in_progress") && (
-              <span
-                role="img"
-                aria-label={status === "waiting" ? "Needs you" : "Working"}
-                className={cn("size-1.5 shrink-0 rounded-full", status === "waiting" ? "bg-warning" : "bg-info animate-pulse-soft")}
-              />
-            )}
             {session.pinned && <Pin className="size-3 shrink-0 text-faint" />}
             {named === "branch" ? (
               <>
                 <GitBranch className="size-3.5 shrink-0 text-faint" />
                 <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{branch ?? "No branch"}</span>
                 {mark}
-                <RowTime at={session.modified} />
+                {/* The row's state sits where the time does, at the end, so the row's own icon keeps its place; while working, the sign stands in for the time. */}
+                <StatusMark status={status} />
+                {status !== "in_progress" && <RowTime at={session.modified} />}
               </>
             ) : (
               <>
                 <span className="min-w-0 flex-1 truncate text-[13px]">{title}</span>
                 {mark}
+                <StatusMark status={status} />
               </>
             )}
-            {named === "branch" ? null : branch ? (
+            {named === "branch" || status === "in_progress" ? null : branch ? (
               <span className={cn("flex max-w-[45%] shrink-0 items-center gap-1 font-mono text-[10px] text-faint", yieldsToRowActions)}>
                 <GitBranch className="size-3 shrink-0" />
                 <span className="truncate">{branch}</span>
@@ -551,7 +561,7 @@ function ConversationRow({
             )}
           </button>
           <RowActions>
-            {onNewSession && <NewSessionButton branch={branch ?? "this branch"} onClick={onNewSession} />}
+            {onNewSession && <NewSessionButton action={onNewSession} />}
             <DropdownMenuTrigger asChild>
               <Button variant="ghost" size="icon-xs" aria-label={`Menu for ${title}`}>
                 <Ellipsis />
