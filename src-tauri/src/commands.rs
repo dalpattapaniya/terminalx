@@ -2743,6 +2743,14 @@ pub fn github_repo(project_path: String) -> Option<String> {
     crate::issues::github_repo(Path::new(&project_path))
 }
 
+/// The GitHub account a project is connected to: the one its pushes land as.
+#[tauri::command]
+pub async fn github_identity(project_path: String, refresh: Option<bool>) -> CmdResult<crate::github_identity::GithubIdentity> {
+    tauri::async_runtime::spawn_blocking(move || crate::github_identity::identity(Path::new(&project_path), refresh.unwrap_or(false)))
+        .await
+        .map_err(err)
+}
+
 #[cfg(test)]
 mod command_tests {
     #[test]

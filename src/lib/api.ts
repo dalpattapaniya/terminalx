@@ -1709,7 +1709,17 @@ export const issues = {
   linearSetApiKey: (key: string) => invoke<LinearStatus>("linear_set_api_key", { key }),
   linearTeams: () => invoke<IssueTeam[]>("linear_teams"),
   githubRepo: (projectPath: string) => invoke<string | null>("github_repo", { projectPath }),
+  /** The GitHub account a project is connected to: the one its pushes land as, else the CLI's. */
+  githubIdentity: (projectPath: string, refresh = false) => invoke<GithubIdentity>("github_identity", { projectPath, refresh }),
 };
+
+export interface GithubIdentity {
+  login: string | null;
+  /** `ssh`: the folder's key, so pushes land as this account; `gh`: the CLI's active account. */
+  source: "ssh" | "gh" | null;
+  email: string | null;
+  repo: string | null;
+}
 
 // ---- transcription models and dictation input
 export interface TranscriptionModel {

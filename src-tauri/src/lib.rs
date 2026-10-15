@@ -76,6 +76,7 @@ mod media;
 mod media_types;
 mod git;
 mod github;
+mod github_identity;
 mod harness;
 pub mod hooks;
 mod issues;
@@ -593,6 +594,7 @@ pub fn run() {
             commands::linear_set_api_key,
             commands::linear_teams,
             commands::github_repo,
+            commands::github_identity,
             commands::transcription_models,
             commands::transcription_download,
             commands::transcription_cancel_download,
