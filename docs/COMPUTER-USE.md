@@ -281,7 +281,8 @@ identifier and code directory hash. It then requires of every helper process:
   the exact build, so an older signed helper is refused too;
 - for the released app (`com.terminalx.next`): the identifier
   `com.terminalx.next.computer-use.v2` and a Developer ID of the team that
-  signed the app;
+  signed the app. A released app that cannot read its own team accepts no
+  helper;
 - no pre-PRO-90 identity.
 
 Every helper process (the agent session, the status probe, the setup window)
@@ -297,6 +298,10 @@ expected code. The helper's location is resolved again before every start,
 so a restart after the helper died is checked the same way. "Reset
 permissions" clears the rows of the identifier read from the bundled helper's
 signature, never one read from the copy, and only a `….computer-use.v2` id.
+`tccutil` refuses an id LaunchServices cannot resolve, and the helper is no
+longer opened through LaunchServices, so when a reset fails the app
+registers the bundled helper inside TerminalX.app (`lsregister -f`, never the
+copy) and tries once more.
 
 **The drag tile.** The setup window's drag tile is what the person drags into
 System Settings, and macOS grants whatever was dropped. The app therefore
@@ -432,6 +437,10 @@ the owner's Mac, without granting anything to TerminalX itself:
       between that comparison and the start is refused by the code check
       before it runs; the unit tests cover that race, which cannot be timed by
       hand.
+12. Reset. In Settings → Computer Use, press "Reset permissions". It
+    succeeds without "No such bundle identifier", both helper rows are gone,
+    and the TerminalX row (if any) is untouched. Grant both again afterwards
+    for the steps above.
 
 ## Testing
 

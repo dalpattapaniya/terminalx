@@ -955,6 +955,7 @@ mod tests {
     /// Needs a built helper (`pnpm build:computer-macos --dev`) and macOS 14+.
     #[test]
     #[ignore]
+    #[cfg(target_os = "macos")]
     fn real_helper_round_trip() {
         let app = super::super::helper_app_path(None).expect("build the helper first");
         let executable = super::super::helper_executable_in(&app).unwrap();

@@ -1,10 +1,12 @@
 //! macOS permission status and setup for the computer-use helper.
 //!
-//! TCC keys consent to the helper bundle, so every probe has to run *as* the
-//! helper: status is read by launching the bundle through LaunchServices with
-//! `--permission-status-file`, and the grant prompts are opened the same way
-//! with `--permission <id>`. Executing the binary directly would make macOS
-//! evaluate the calling app instead.
+//! TCC keys consent to the helper's own identity, so every probe has to run
+//! *as* the helper: the status probe (`--permission-status`) and the setup
+//! window (`--permission <id>`) are spawned directly with the responsibility
+//! disclaim, started suspended and checked against the bundled helper's code
+//! before they run (`macos_native::spawn_checked`, #480). A helper nested in
+//! TerminalX.app runs from its copy outside the app, since Screen Recording
+//! is charged to the outermost app around the executable.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -704,29 +706,50 @@ pub fn reset(helper: Option<&super::ResolvedHelper>) -> Result<PermissionResetRe
     // permissions are cleared.
     let bundle_id = resettable_helper_id(&helper.bundle_id)?.to_owned();
     close_setup_helpers(&helper.run);
-    for id in [PermissionId::Accessibility, PermissionId::Screenshots] {
-        let output = std::process::Command::new("/usr/bin/tccutil")
-            .args(["reset", id.tcc_service(), &bundle_id])
-            .output()
-            .map_err(|e| ComputerError::accessibility(format!("Could not reset {}: {e}", id.tcc_service())))?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let detail = if detail.is_empty() {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
-            } else {
-                detail
-            };
-            return Err(ComputerError::accessibility(format!(
-                "Could not reset {}: {}",
-                id.tcc_service(),
-                if detail.is_empty() { format!("exit {}", output.status.code().unwrap_or(-1)) } else { detail }
-            )));
-        }
-    }
+    reset_current_helper(&bundle_id, &helper.bundled, &mut run_capturing)?;
     Ok(PermissionResetResult {
         status: status(Some(helper))?,
         bundle_id: Some(bundle_id),
     })
+}
+
+/// Runs a system tool for a reset; `Err` carries what the tool said.
+pub type ToolRunner<'a> = dyn FnMut(&str, &[String]) -> Result<(), String> + 'a;
+
+/// Run a system tool and return its error output on failure.
+fn run_capturing(program: &str, args: &[String]) -> Result<(), String> {
+    let output = std::process::Command::new(program).args(args).output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if detail.is_empty() { String::from_utf8_lossy(&output.stdout).trim().to_string() } else { detail };
+    Err(if detail.is_empty() { format!("exit {}", output.status.code().unwrap_or(-1)) } else { detail })
+}
+
+/// `tccutil reset` both services for the current helper. `tccutil` refuses
+/// an id LaunchServices cannot resolve, and the helper is no longer opened
+/// through LaunchServices (#480), so when a reset fails the bundled helper
+/// inside the app is registered and the reset tried once more. The copy is
+/// never registered: its files are not trusted.
+pub fn reset_current_helper(
+    bundle_id: &str,
+    bundled: &Path,
+    run: &mut ToolRunner,
+) -> Result<(), ComputerError> {
+    let reset = |run: &mut ToolRunner| {
+        for service in [PermissionId::Accessibility, PermissionId::Screenshots] {
+            run(TCCUTIL, &["reset".into(), service.tcc_service().into(), bundle_id.into()])
+                .map_err(|detail| ComputerError::accessibility(format!("Could not reset {}: {detail}", service.tcc_service())))?;
+        }
+        Ok(())
+    };
+    if reset(run).is_ok() {
+        return Ok(());
+    }
+    run(LSREGISTER, &["-f".into(), bundled.to_string_lossy().into_owned()])
+        .map_err(|detail| ComputerError::accessibility(format!("Could not register {} with LaunchServices: {detail}", bundled.display())))?;
+    reset(run)
 }
 
 /// Reset clears the current helper's rows only: an id that is not a
@@ -848,6 +871,49 @@ mod tests {
         for refused in ["com.terminalx.next", "com.apple.Terminal", "com.terminalx.next.computer-use", ""] {
             assert!(resettable_helper_id(refused).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn a_reset_that_cannot_find_the_helper_registers_the_bundled_one_and_tries_again() {
+        let bundled = Path::new("/Applications/TerminalX.app/Contents/Resources/TerminalX Computer Use Helper.app");
+        let id = "com.terminalx.next.computer-use.v2";
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut registered = false;
+        let mut run = |program: &str, args: &[String]| {
+            calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
+            if program == LSREGISTER {
+                registered = true;
+                return Ok(());
+            }
+            if registered { Ok(()) } else { Err("No such bundle identifier".to_string()) }
+        };
+        reset_current_helper(id, bundled, &mut run).unwrap();
+        let calls = calls.into_inner();
+        assert_eq!(
+            calls,
+            vec![
+                format!("{TCCUTIL} reset Accessibility {id}"),
+                format!("{LSREGISTER} -f {}", bundled.display()),
+                format!("{TCCUTIL} reset Accessibility {id}"),
+                format!("{TCCUTIL} reset ScreenCapture {id}"),
+            ]
+        );
+
+        // Found at once: nothing is registered.
+        let mut calls = Vec::new();
+        reset_current_helper(id, bundled, &mut |program: &str, _: &[String]| {
+            calls.push(program.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, vec![TCCUTIL, TCCUTIL]);
+
+        // Still not found after registering: the error says which service.
+        let error = reset_current_helper(id, bundled, &mut |program: &str, _: &[String]| {
+            if program == LSREGISTER { Ok(()) } else { Err("No such bundle identifier".to_string()) }
+        })
+        .unwrap_err();
+        assert!(error.message.contains("Could not reset Accessibility: No such bundle identifier"), "{}", error.message);
     }
 
     #[test]

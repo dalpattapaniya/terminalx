@@ -13,6 +13,7 @@
 //! runs a single instruction; an agent helper is checked again on its socket
 //! (the peer's audit token) once the app has connected.
 
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 /// The identifier of the released helper. The released app accepts no other.
@@ -56,8 +57,8 @@ fn is_team(value: &str) -> bool {
 
 /// Decide what to require of a helper, from the bundled helper's signature
 /// and the app's own. The released app (`com.terminalx.next`) requires the
-/// released helper's identifier and, when the app itself is signed by a
-/// team, the same team's Developer ID. Every build requires the bundled
+/// released helper's identifier and its own team's Developer ID; a released
+/// app whose team cannot be read refuses every helper. Every build requires the bundled
 /// helper's exact cdhash and refuses the pre-PRO-90 identities.
 pub fn expect(bundled: SigningInfo, release_app: bool, app_team: Option<&str>) -> Result<ExpectedHelper, String> {
     if !is_identifier(&bundled.identifier) {
@@ -82,7 +83,8 @@ pub fn expect(bundled: SigningInfo, release_app: bool, app_team: Option<&str>) -
             }
             Some(team.to_owned())
         }
-        _ => None,
+        (true, None) => return Err("this app's signing team could not be read, so no helper is accepted".into()),
+        (false, _) => None,
     };
     Ok(ExpectedHelper { identifier: bundled.identifier, cdhash: bundled.cdhash, team })
 }
@@ -358,12 +360,16 @@ mod tests {
         assert!(expect(info(RELEASE_HELPER_IDENTIFIER, None), true, Some("AQ6323SP66")).is_err());
         assert!(expect(info("com.terminalx.next.dev.computer-use.v2", Some("AQ6323SP66")), true, Some("AQ6323SP66")).is_err());
         assert!(expect(info(RELEASE_HELPER_IDENTIFIER, Some("AQ6323SP66")), true, Some("not a team\"")).is_err());
+        // A released app that cannot read its own team fails closed.
+        let error = expect(info(RELEASE_HELPER_IDENTIFIER, Some("AQ6323SP66")), true, None).unwrap_err();
+        assert!(error.contains("signing team could not be read"), "{error}");
     }
 
     #[test]
     fn old_helpers_and_unusable_identities_are_refused() {
-        assert!(expect(info("com.terminalx.next.computer-use", None), false, None).is_err());
-        assert!(expect(info("com.terminalx.next.dev.computer-use", None), false, None).is_err());
+        for legacy in super::super::permissions::LEGACY_HELPER_BUNDLE_IDS {
+            assert!(expect(info(legacy, None), false, None).is_err(), "{legacy}");
+        }
         assert!(expect(info("x\" or anchor apple", None), false, None).is_err());
         let mut no_hash = info("com.terminalx.next.dev.computer-use.v2", None);
         no_hash.cdhash.clear();
