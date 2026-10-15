@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Globe, TerminalSquare, X } from "lucide-react";
+import { Globe, TerminalSquare, X } from "@/icons";
 import { AgentMark } from "@/components/AgentMark";
 import { pagesFor, useBrowser } from "@/lib/browser";
 import { cn } from "@/lib/cn";
