@@ -1155,7 +1155,9 @@ PY
         MacosNativeProvider::new(move || Ok(HelperLaunch { executable: executable.clone(), check: accept_all() }))
     }
 
+    // A suspended start and a socket audit token exist only on macOS.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_helper_whose_code_is_refused_never_runs_and_leaves_nothing_behind() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let script = fake_helper(dir.path());
@@ -1181,7 +1183,9 @@ PY
         assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
     }
 
+    // A suspended start and a socket audit token exist only on macOS.
     #[test]
+    #[cfg(target_os = "macos")]
     fn an_accepted_helper_is_checked_by_pid_and_again_on_its_socket() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let script = fake_helper(dir.path());
@@ -1202,7 +1206,9 @@ PY
         started.close();
     }
 
+    // A suspended start and a socket audit token exist only on macOS.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_socket_held_by_another_process_than_the_helper_is_refused() {
         // The "helper" hands the socket to a process of its own and waits.
         let dir = tempfile::tempdir_in("/tmp").unwrap();
