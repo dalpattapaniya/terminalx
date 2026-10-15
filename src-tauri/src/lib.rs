@@ -45,6 +45,8 @@ mod cloud_remote;
 #[cfg(feature = "desktop")]
 mod agent_local_login;
 #[cfg(feature = "desktop")]
+mod codex_device_login;
+#[cfg(feature = "desktop")]
 mod cloud_workspaces;
 #[cfg(feature = "desktop")]
 mod organization_github_app;
@@ -398,6 +400,10 @@ pub fn run() {
             commands::cloud_agent_claude_login_open,
             commands::cloud_agent_claude_login_complete,
             commands::cloud_agent_claude_login_cancel,
+            commands::cloud_agent_codex_login_start,
+            commands::cloud_agent_codex_login_open,
+            commands::cloud_agent_codex_login_status,
+            commands::cloud_agent_codex_login_cancel,
             commands::cloud_workspace_setup,
             commands::cloud_workspace_quote,
             commands::cloud_workspace_create,

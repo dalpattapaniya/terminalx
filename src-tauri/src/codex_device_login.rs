@@ -1,0 +1,696 @@
+//! "Log in with ChatGPT" for Codex (PRO-79): Codex's own device-code login,
+//! run on this Mac in a throwaway home, so an owner or admin can connect a
+//! ChatGPT subscription to their organization's cloud workspaces.
+//!
+//! The flow is the CLI's, unchanged (`codex login --device-auth`, codex-cli
+//! 0.153.4, `codex-rs/login/src/device_code_auth.rs`):
+//!
+//! 1. The CLI asks OpenAI for a one-time code and prints, on stdout,
+//!    "1. Open this link in your browser and sign in to your account", the
+//!    page (`https://auth.openai.com/codex/device`) on the next line, then
+//!    "2. Enter this one-time code (expires in 15 minutes)" and the code on
+//!    the next line, each value wrapped in ANSI colours.
+//! 2. The person opens the page, signs in and enters the code; the CLI
+//!    polls until then (at most 15 minutes: "device auth timed out after 15
+//!    minutes"), exchanges what it gets for tokens and writes them to
+//!    `$CODEX_HOME/auth.json` (`-c cli_auth_credentials_store="file"` keeps
+//!    them out of the Keychain), prints "Successfully logged in" on stderr
+//!    and exits 0. Any failure is "Error logging in with device code: …" and
+//!    exit 1.
+//!
+//! Rules this module keeps:
+//!
+//! - **The person's own Codex login is never touched.** `HOME` and
+//!   `CODEX_HOME` point into a new private (0700) directory, and the CLI
+//!   gets no other environment than `PATH`, proxy and certificate settings,
+//!   so neither `~/.codex` nor an `OPENAI_API_KEY` reaches it. The directory
+//!   is wiped (the auth file overwritten first) as soon as the CLI ends,
+//!   and when the attempt is canceled or dropped.
+//! - **The code stays on this Mac.** It goes from the CLI's output to the
+//!   one dialog that shows it, and nowhere else: not to the account
+//!   service, not to a log. The CLI's output and errors are never logged.
+//! - What the CLI wrote is held in memory (`Zeroizing`) only until it is
+//!   uploaded, and is never handed to the webview.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Map, Value};
+use zeroize::Zeroizing;
+
+/// How long the CLI has to print its code.
+const CODE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The code's own life, as the CLI says, and a little more for its last poll.
+pub const CODE_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const GRACE: Duration = Duration::from_secs(30);
+/// Throwaway homes start with this, so one left by a crash can be found.
+const HOME_PREFIX: &str = "terminalx-codex-login-";
+const MAX_AUTH_BYTES: u64 = 64 * 1024;
+/// OpenAI's device page, as codex-cli documents it; used only when the CLI printed no page.
+const DOCUMENTED_PAGE: &str = "https://auth.openai.com/codex/device";
+/// What the CLI is given besides its throwaway home: where programs are, and how to reach the network.
+const PASSED_ENV: &[&str] = &["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "USER", "LOGNAME"];
+const CONFIG: &str = "check_for_update_on_startup = false\ncli_auth_credentials_store = \"file\"\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLoginError {
+    /// No `codex` on this Mac.
+    CliMissing,
+    /// The CLI could not begin a login (offline, the service refused, an unexpected answer).
+    Unavailable,
+}
+
+impl DeviceLoginError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CliMissing => "cloud_agent_codex_cli_missing",
+            Self::Unavailable => "cloud_agent_codex_login_unavailable",
+        }
+    }
+}
+
+/// Where an attempt is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// The code is shown; the person has not finished at OpenAI yet.
+    Waiting,
+    /// The CLI finished and its login is held, ready to upload.
+    SignedIn,
+    /// The code ran out before the person finished.
+    Expired,
+    Cancelled,
+    /// The CLI ended without a login it could use.
+    Failed,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::SignedIn => "signed-in",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What the person enters at OpenAI, and where.
+pub struct DeviceCode {
+    pub verification_url: String,
+    pub user_code: Zeroizing<String>,
+}
+
+/// The login the CLI wrote, reduced to what Codex reads, and whose it is.
+pub struct SignIn {
+    pub secret: Zeroizing<String>,
+    pub account: Option<String>,
+}
+
+struct Inner {
+    phase: Phase,
+    sign_in: Option<SignIn>,
+    cancel: bool,
+}
+
+/// One running login. Dropping it cancels it and wipes its home.
+pub struct DeviceLogin {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl DeviceLogin {
+    pub fn phase(&self) -> Phase {
+        self.inner.lock().map(|inner| inner.phase).unwrap_or(Phase::Failed)
+    }
+
+    /// A copy of the login to upload, while one is held.
+    pub fn sign_in(&self) -> Option<SignIn> {
+        let inner = self.inner.lock().ok()?;
+        inner.sign_in.as_ref().map(|held| SignIn { secret: held.secret.clone(), account: held.account.clone() })
+    }
+
+    /// Stop the CLI if it still runs. A login it already wrote is dropped.
+    pub fn cancel(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.cancel = true;
+            inner.sign_in = None;
+            if matches!(inner.phase, Phase::Waiting | Phase::SignedIn) {
+                inner.phase = Phase::Cancelled;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl DeviceLogin {
+    /// A login whose CLI has already finished, as the waiter leaves it.
+    pub(crate) fn finished_for_test(phase: Phase, sign_in: Option<SignIn>) -> Self {
+        Self { inner: Arc::new(Mutex::new(Inner { phase, sign_in, cancel: false })) }
+    }
+}
+
+impl Drop for DeviceLogin {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Whether `value` is a page that may be opened for the code: OpenAI's own
+/// over `https`, with no credentials in the address. A debug build also
+/// accepts a loopback address, for a local stand-in issuer.
+pub fn verification_page(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else { return false };
+    if value.len() > 2048 || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let host = url.host_str().unwrap_or("");
+    if cfg!(debug_assertions) && url.scheme() == "http" && matches!(host, "127.0.0.1" | "localhost") {
+        return true;
+    }
+    url.scheme() == "https" && ["openai.com", "chatgpt.com"].iter().any(|domain| host == *domain || host.strip_suffix(domain).is_some_and(|rest| rest.ends_with('.')))
+}
+
+/// A one-time code as the CLI prints them ("ABCD-12345"): letters, digits and dashes.
+fn plausible_code(value: &str) -> bool {
+    (4..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') && value.bytes().any(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// A line of the CLI's output without its colours.
+fn plain(line: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(line.len()));
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: ESC [ parameters final-byte.
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Reads the page and the code out of the CLI's prompt, a line at a time.
+#[derive(Default)]
+struct PromptReader {
+    want: Option<&'static str>,
+    url: Option<String>,
+    code: Option<Zeroizing<String>>,
+}
+
+impl PromptReader {
+    /// Feed one line; the page and the code once both have been read.
+    fn feed(&mut self, raw: &str) -> Option<DeviceCode> {
+        let line = plain(raw);
+        let text = line.trim();
+        match self.want {
+            _ if text.contains("Open this link") => self.want = Some("url"),
+            _ if text.contains("one-time code") => self.want = Some("code"),
+            Some(_) if text.is_empty() => {}
+            Some("url") => {
+                self.want = None;
+                if verification_page(text) {
+                    self.url = Some(text.to_owned());
+                }
+            }
+            Some(_) => {
+                self.want = None;
+                if plausible_code(text) {
+                    self.code = Some(Zeroizing::new(text.to_owned()));
+                }
+            }
+            None => {}
+        }
+        if self.code.is_some() {
+            // The CLI prints its page before the code. Only if it printed none is the documented page used.
+            let verification_url = self.url.take().unwrap_or_else(|| DOCUMENTED_PAGE.to_owned());
+            return Some(DeviceCode { verification_url, user_code: self.code.take()? });
+        }
+        None
+    }
+}
+
+fn record(value: &Value) -> Option<&Map<String, Value>> {
+    value.as_object()
+}
+
+fn token<'a>(tokens: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    tokens.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// The login the CLI wrote, as the account service stores a Codex
+/// subscription login: the four tokens and when they were last renewed.
+/// The refresh token is kept: the throwaway home is wiped, so the service is
+/// the only holder and the one that renews it.
+pub fn sign_in_from_raw(raw: &str) -> Option<SignIn> {
+    if raw.len() as u64 > MAX_AUTH_BYTES {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let parsed = record(&parsed)?;
+    let tokens = parsed.get("tokens").and_then(record)?;
+    let id_token = token(tokens, "id_token")?;
+    let mut kept = Map::new();
+    kept.insert("id_token".into(), Value::String(id_token.into()));
+    kept.insert("access_token".into(), Value::String(token(tokens, "access_token")?.into()));
+    kept.insert("refresh_token".into(), Value::String(token(tokens, "refresh_token")?.into()));
+    if let Some(account_id) = token(tokens, "account_id") {
+        kept.insert("account_id".into(), Value::String(account_id.into()));
+    }
+    let mut secret = json!({ "auth_mode": "chatgpt", "tokens": kept });
+    if let Some(last_refresh) = parsed.get("last_refresh").and_then(Value::as_str) {
+        secret["last_refresh"] = Value::String(last_refresh.into());
+    }
+    Some(SignIn { secret: Zeroizing::new(secret.to_string()), account: crate::agent_local_login::codex_account(id_token) })
+}
+
+/// Overwrite the auth file, then remove the whole home.
+fn wipe(home: tempfile::TempDir) {
+    let auth = home.path().join(".codex/auth.json");
+    if let Ok(meta) = std::fs::symlink_metadata(&auth) {
+        if meta.is_file() {
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&auth) {
+                let _ = file.write_all(&vec![0u8; meta.len() as usize]);
+                let _ = file.sync_all();
+            }
+        }
+    }
+    let _ = home.close();
+}
+
+/// Homes left by an earlier run that ended without cleaning up (a crash, a
+/// force quit). Only this module's own, and only ones older than a code lives.
+pub fn sweep_stale(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let old = entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age > CODE_LIFETIME + GRACE);
+        if old && entry.file_name().to_string_lossy().starts_with(HOME_PREFIX) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_group(child: &mut Child) {
+    // The npm `codex` is a node script that starts the real binary: the whole group goes.
+    if let Ok(pid) = i32::try_from(child.id()) {
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_group(child: &mut Child) {
+    let _ = child.kill();
+}
+
+/// Start `program login --device-auth` in a new throwaway home under
+/// `parent`, and wait for its code. `extra_args` go after Codex's own
+/// (a debug build passes a stand-in issuer this way).
+pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Path) -> Result<(DeviceLogin, DeviceCode), DeviceLoginError> {
+    let unavailable = |_| DeviceLoginError::Unavailable;
+    sweep_stale(parent);
+    let home = tempfile::Builder::new().prefix(HOME_PREFIX).tempdir_in(parent).map_err(unavailable)?;
+    let codex_home = home.path().join(".codex");
+    let mut dir = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+    dir.create(&codex_home).map_err(unavailable)?;
+    std::fs::write(codex_home.join("config.toml"), CONFIG).map_err(unavailable)?;
+
+    let mut command = Command::new(program);
+    command
+        .args(["login", "--device-auth", "-c", "cli_auth_credentials_store=\"file\""])
+        .args(extra_args)
+        .env_clear()
+        .env("PATH", path_env)
+        .env("HOME", home.path())
+        .env("CODEX_HOME", &codex_home)
+        .env("TMPDIR", home.path())
+        .current_dir(home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in PASSED_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().map_err(|error| if error.kind() == std::io::ErrorKind::NotFound { DeviceLoginError::CliMissing } else { DeviceLoginError::Unavailable })?;
+
+    let stdout = child.stdout.take().ok_or(DeviceLoginError::Unavailable)?;
+    let stderr = child.stderr.take().ok_or(DeviceLoginError::Unavailable)?;
+    let (code_tx, code_rx) = mpsc::sync_channel::<DeviceCode>(1);
+    let out_reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut prompt = PromptReader::default();
+        let mut sent = false;
+        loop {
+            let mut line = Zeroizing::new(String::new());
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if !sent => {
+                    if let Some(code) = prompt.feed(&line) {
+                        let _ = code_tx.send(code);
+                        sent = true;
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+    // Read only to tell an expired code from other failures; never shown or logged.
+    let err_reader = std::thread::spawn(move || {
+        let mut text = Zeroizing::new(Vec::new());
+        let _ = stderr.take(16 * 1024).read_to_end(&mut text);
+        String::from_utf8_lossy(&text).contains("timed out")
+    });
+
+    let inner = Arc::new(Mutex::new(Inner { phase: Phase::Waiting, sign_in: None, cancel: false }));
+    let watched = inner.clone();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let status = loop {
+            let stop = watched.lock().map(|inner| inner.cancel).unwrap_or(true);
+            let late = started.elapsed() > CODE_LIFETIME + GRACE;
+            if stop || late {
+                kill_group(&mut child);
+                let _ = child.wait();
+                if late {
+                    if let Ok(mut inner) = watched.lock() {
+                        if inner.phase == Phase::Waiting {
+                            inner.phase = Phase::Expired;
+                        }
+                    }
+                }
+                break None;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Err(_) => break None,
+            }
+        };
+        let _ = out_reader.join();
+        let timed_out = err_reader.join().unwrap_or(false);
+        let written = status.filter(|status| status.success()).and_then(|_| {
+            let file = std::fs::File::open(codex_home.join("auth.json")).ok()?;
+            let mut raw = Zeroizing::new(String::new());
+            file.take(MAX_AUTH_BYTES + 1).read_to_string(&mut raw).ok()?;
+            Some(sign_in_from_raw(&raw))
+        });
+        wipe(home);
+        if let Ok(mut inner) = watched.lock() {
+            if inner.phase == Phase::Waiting && !inner.cancel {
+                (inner.phase, inner.sign_in) = match (status, written) {
+                    (_, Some(Some(sign_in))) => (Phase::SignedIn, Some(sign_in)),
+                    (Some(_), _) if timed_out => (Phase::Expired, None),
+                    _ => (Phase::Failed, None),
+                };
+            }
+        }
+    });
+
+    let login = DeviceLogin { inner };
+    match code_rx.recv_timeout(CODE_TIMEOUT) {
+        Ok(code) => Ok((login, code)),
+        // The CLI ended, or said nothing usable in time: dropping the login stops it and wipes its home.
+        Err(_) => Err(DeviceLoginError::Unavailable),
+    }
+}
+
+/// Where throwaway homes go: this user's own temporary directory.
+pub fn homes_parent() -> PathBuf {
+    std::env::temp_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROMPT: &str = "\nWelcome to Codex [v\u{1b}[90m0.153.4\u{1b}[0m]\n\u{1b}[90mOpenAI's command-line coding agent\u{1b}[0m\n\nFollow these steps to sign in with ChatGPT using device code authorization:\n\n1. Open this link in your browser and sign in to your account\n   \u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\n2. Enter this one-time code \u{1b}[90m(expires in 15 minutes)\u{1b}[0m\n   \u{1b}[94mWXYZ-12345\u{1b}[0m\n\n\u{1b}[90mContinue only if you started this login in Codex. If a website or another person gave you this code, cancel.\u{1b}[0m\n\n";
+
+    fn read(prompt: &str) -> Option<DeviceCode> {
+        let mut reader = PromptReader::default();
+        prompt.split_inclusive('\n').find_map(|line| reader.feed(line))
+    }
+
+    #[test]
+    fn the_page_and_code_are_read_from_the_clis_own_prompt() {
+        let code = read(PROMPT).unwrap();
+        assert_eq!(code.verification_url, "https://auth.openai.com/codex/device");
+        assert_eq!(code.user_code.as_str(), "WXYZ-12345");
+    }
+
+    #[test]
+    fn the_page_is_the_one_the_cli_printed_and_the_documented_one_only_when_it_printed_none() {
+        let printed = read(&PROMPT.replace("https://auth.openai.com/codex/device", "https://auth.openai.com/codex/device?region=eu")).unwrap();
+        assert_eq!(printed.verification_url, "https://auth.openai.com/codex/device?region=eu");
+        let none = read(&PROMPT.replace("   \u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n", "")).unwrap();
+        assert_eq!(none.verification_url, DOCUMENTED_PAGE);
+        assert_eq!(none.user_code.as_str(), "WXYZ-12345");
+    }
+
+    #[test]
+    fn a_prompt_pointing_elsewhere_or_with_no_code_gives_nothing() {
+        // A page that is not OpenAI's is not opened; the documented one is used instead of it.
+        assert_eq!(read(&PROMPT.replace("https://auth.openai.com/codex/device", "https://auth.openai.com.evil.test/codex/device")).unwrap().verification_url, DOCUMENTED_PAGE);
+        assert_eq!(read(&PROMPT.replace("https://auth.openai.com/codex/device", "https://user:pw@auth.openai.com/codex/device")).unwrap().verification_url, DOCUMENTED_PAGE);
+        assert!(read(&PROMPT.replace("WXYZ-12345", "run rm -rf now")).is_none());
+        assert!(read("Error logging in with device code: device code login is not enabled for this Codex server.\n").is_none());
+        assert!(verification_page("https://chatgpt.com/codex/device"));
+        assert!(!verification_page("http://auth.openai.com/codex/device"));
+        assert!(!verification_page("https://openai.com.example/"));
+    }
+
+    fn jwt(claims: Value) -> String {
+        crate::agent_local_login::tests::jwt(claims)
+    }
+
+    #[test]
+    fn the_written_login_is_kept_whole_and_named_by_its_account() {
+        let id = jwt(json!({ "email": "ada@example.com" }));
+        let raw = json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": { "id_token": id, "access_token": "at", "refresh_token": "rt", "account_id": "acct_1" },
+            "last_refresh": "2026-10-15T10:00:00Z",
+            "agent_identity": null,
+        })
+        .to_string();
+        let sign_in = sign_in_from_raw(&raw).unwrap();
+        let stored: Value = serde_json::from_str(&sign_in.secret).unwrap();
+        assert_eq!(
+            stored,
+            json!({ "auth_mode": "chatgpt", "tokens": { "id_token": id, "access_token": "at", "refresh_token": "rt", "account_id": "acct_1" }, "last_refresh": "2026-10-15T10:00:00Z" })
+        );
+        assert_eq!(sign_in.account.as_deref(), Some("ada@example.com"));
+        for raw in ["{}", r#"{"OPENAI_API_KEY":"sk-1"}"#, r#"{"tokens":{"id_token":"x","access_token":"at"}}"#, "nope"] {
+            assert!(sign_in_from_raw(raw).is_none(), "{raw}");
+        }
+    }
+
+    /// A stand-in for `codex` that prints the real prompt and, unless told
+    /// otherwise, writes a login where the real one does. It also records
+    /// what it was given, to check the throwaway home.
+    fn fake_cli(dir: &Path, behaviour: &str) -> PathBuf {
+        let script = dir.join("codex");
+        let prompt = PROMPT.replace('\u{1b}', "\\033").replace('\n', "\\n").replace('\'', "'\\''");
+        let id = jwt(json!({ "email": "ada@example.com" }));
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s|%s|%s|%s|%s\n' "$*" "$HOME" "$CODEX_HOME" "${{OPENAI_API_KEY:-none}}" "$(cat "$CODEX_HOME/config.toml" | tr '\n' ';')" > '{record}'
+printf '{prompt}'
+case '{behaviour}' in
+  expire) echo 'Error logging in with device code: device auth timed out after 15 minutes' >&2; exit 1 ;;
+  fail) echo 'Error logging in with device code: device auth failed with status 500' >&2; exit 1 ;;
+  wait) sleep 30; exit 1 ;;
+esac
+sleep 1
+printf '%s' '{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"{id}","access_token":"at-1","refresh_token":"rt-1","account_id":"acct_1"}},"last_refresh":"2026-10-15T10:00:00Z"}}' > "$CODEX_HOME/auth.json"
+echo 'Successfully logged in' >&2
+"#,
+            record = dir.join("record").display(),
+        );
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn settle(login: &DeviceLogin) -> Phase {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while login.phase() == Phase::Waiting && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        login.phase()
+    }
+
+    fn homes(parent: &Path) -> usize {
+        std::fs::read_dir(parent).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(HOME_PREFIX)).count()
+    }
+
+    #[test]
+    fn a_finished_login_is_held_and_its_throwaway_home_wiped() {
+        let bin = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let cli = fake_cli(bin.path(), "succeed");
+        let (login, code) = start(&cli, &[], "/usr/bin:/bin", parent.path()).unwrap();
+        assert_eq!(code.user_code.as_str(), "WXYZ-12345");
+        assert_eq!(login.phase(), Phase::Waiting);
+        assert_eq!(settle(&login), Phase::SignedIn);
+        let sign_in = login.sign_in().unwrap();
+        assert!(sign_in.secret.contains("rt-1") && sign_in.secret.contains("at-1"));
+        assert_eq!(sign_in.account.as_deref(), Some("ada@example.com"));
+        assert_eq!(homes(parent.path()), 0, "the throwaway home is gone once the CLI ends");
+        let record = std::fs::read_to_string(bin.path().join("record")).unwrap();
+        let fields: Vec<&str> = record.trim_end().split('|').collect();
+        assert_eq!(fields[0], "login --device-auth -c cli_auth_credentials_store=\"file\"");
+        let home = Path::new(fields[1]);
+        assert!(home.starts_with(parent.path()) && home.file_name().unwrap().to_string_lossy().starts_with(HOME_PREFIX));
+        assert_eq!(Path::new(fields[2]), home.join(".codex"));
+        assert_eq!(fields[3], "none", "the app's own environment does not reach the CLI");
+        assert!(fields[4].contains("cli_auth_credentials_store = \"file\""));
+        // Canceling after the fact drops what was held.
+        login.cancel();
+        assert!(login.sign_in().is_none());
+        assert_eq!(login.phase(), Phase::Cancelled);
+    }
+
+    #[test]
+    fn an_expired_code_a_failure_and_a_cancel_each_say_so_and_leave_nothing() {
+        let bin = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        for (behaviour, phase) in [("expire", Phase::Expired), ("fail", Phase::Failed)] {
+            let (login, _) = start(&fake_cli(bin.path(), behaviour), &[], "/usr/bin:/bin", parent.path()).unwrap();
+            assert_eq!(settle(&login), phase, "{behaviour}");
+            assert!(login.sign_in().is_none());
+        }
+        let (login, _) = start(&fake_cli(bin.path(), "wait"), &[], "/usr/bin:/bin", parent.path()).unwrap();
+        login.cancel();
+        assert_eq!(login.phase(), Phase::Cancelled);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while homes(parent.path()) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(homes(parent.path()), 0);
+    }
+
+    #[test]
+    fn a_cli_that_never_prints_a_code_or_is_missing_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        assert_eq!(start(Path::new("/nonexistent/codex"), &[], "/usr/bin:/bin", parent.path()).err(), Some(DeviceLoginError::CliMissing));
+        let bin = tempfile::tempdir().unwrap();
+        let script = bin.path().join("codex");
+        std::fs::write(&script, "#!/bin/sh\necho 'Error logging in with device code: device code login is not enabled for this Codex server.' >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(start(&script, &[], "/usr/bin:/bin", parent.path()).err(), Some(DeviceLoginError::Unavailable));
+    }
+
+    #[test]
+    fn stale_homes_from_an_earlier_run_are_swept_and_nothing_else() {
+        let parent = tempfile::tempdir().unwrap();
+        let stale = parent.path().join(format!("{HOME_PREFIX}old"));
+        let other = parent.path().join("someone-else");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let old = std::time::SystemTime::now() - CODE_LIFETIME - GRACE - Duration::from_secs(60);
+        for dir in [&stale, &other] {
+            std::fs::File::open(dir).unwrap().set_modified(old).unwrap();
+        }
+        let fresh = parent.path().join(format!("{HOME_PREFIX}new"));
+        std::fs::create_dir(&fresh).unwrap();
+        sweep_stale(parent.path());
+        assert!(!stale.exists() && other.exists() && fresh.exists());
+    }
+
+    /// The real `codex` on this Mac, against a stand-in OpenAI issuer on
+    /// loopback (`--experimental_issuer`, a hidden flag of the CLI): the
+    /// prompt is read, the code is approved after two polls, and the login
+    /// the CLI writes is picked up. Touches no account and no `~/.codex`.
+    /// Run with `cargo test -- --ignored the_real_codex_cli`.
+    #[test]
+    #[ignore]
+    fn the_real_codex_cli_signs_in_against_a_stand_in_issuer() {
+        use std::net::TcpListener;
+        let program = crate::binpath::resolve("codex").expect("codex on PATH");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let id_token = jwt(json!({ "email": "ada@example.com", "https://api.openai.com/auth": { "chatgpt_plan_type": "plus", "chatgpt_account_id": "acct_test" }, "exp": 4_000_000_000u64 }));
+        let access_token = jwt(json!({ "exp": 4_000_000_000u64 }));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let (id_reply, access_reply) = (id_token.clone(), access_token.clone());
+        std::thread::spawn(move || {
+            let mut polls = 0;
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(format!("{path} {}", String::from_utf8_lossy(&body)));
+                let (status, reply) = match path.as_str() {
+                    "/api/accounts/deviceauth/usercode" => (200, json!({ "device_auth_id": "dev-1", "user_code": "TEST-12345", "interval": "1" }).to_string()),
+                    "/api/accounts/deviceauth/token" if polls < 2 => {
+                        polls += 1;
+                        (403, "{}".to_string())
+                    }
+                    "/api/accounts/deviceauth/token" => (200, json!({ "authorization_code": "code-1", "code_challenge": "ch", "code_verifier": "ver" }).to_string()),
+                    "/oauth/token" => (200, json!({ "id_token": id_reply, "access_token": access_reply, "refresh_token": "rt-test" }).to_string()),
+                    _ => (404, "{}".to_string()),
+                };
+                let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+            }
+        });
+        let parent = tempfile::tempdir().unwrap();
+        let (login, code) = start(&program, &["--experimental_issuer".into(), issuer.clone()], &crate::binpath::login_path(), parent.path()).unwrap();
+        assert_eq!(code.verification_url, format!("{issuer}/codex/device"));
+        assert_eq!(code.user_code.as_str(), "TEST-12345");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while login.phase() == Phase::Waiting && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(login.phase(), Phase::SignedIn, "requests: {:?}", seen.lock().unwrap());
+        let sign_in = login.sign_in().unwrap();
+        let stored: Value = serde_json::from_str(&sign_in.secret).unwrap();
+        assert_eq!(stored["auth_mode"], "chatgpt");
+        assert_eq!(stored["tokens"]["refresh_token"], "rt-test");
+        assert_eq!(stored["tokens"]["access_token"], json!(access_token));
+        assert_eq!(stored["tokens"]["id_token"], json!(id_token));
+        assert_eq!(stored["tokens"]["account_id"], "acct_test");
+        assert!(stored["last_refresh"].is_string());
+        assert_eq!(sign_in.account.as_deref(), Some("ada@example.com"));
+        assert_eq!(homes(parent.path()), 0);
+        let requests = seen.lock().unwrap().join("\n");
+        // The code goes only to the issuer, never anywhere else.
+        assert!(requests.contains("/api/accounts/deviceauth/token {\"device_auth_id\":\"dev-1\",\"user_code\":\"TEST-12345\"}"), "{requests}");
+    }
+}

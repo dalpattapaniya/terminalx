@@ -328,6 +328,13 @@ export const api = {
   cloudAgentClaudeLoginComplete: (attemptId: string, consent: AgentLoginConsent) =>
     invoke<ClaudeLoginOutcome>("cloud_agent_claude_login_complete", { attemptId, consent }),
   cloudAgentClaudeLoginCancel: (attemptId: string, contextRevision: string) => invoke<void>("cloud_agent_claude_login_cancel", { attemptId, contextRevision }),
+  // "Log in with ChatGPT" for Codex: Codex's own device-code login runs on this Mac in a throwaway home. The code
+  // comes back to be shown in the sign-in dialog only; the login the CLI writes is stored by Rust and never comes here.
+  cloudAgentCodexLoginStart: (consent: AgentLoginConsent) => invoke<CodexLoginStarted>("cloud_agent_codex_login_start", { consent }),
+  cloudAgentCodexLoginOpen: (attemptId: string) => invoke<void>("cloud_agent_codex_login_open", { attemptId }),
+  cloudAgentCodexLoginStatus: (attemptId: string, consent: AgentLoginConsent) =>
+    invoke<CodexLoginStatus>("cloud_agent_codex_login_status", { attemptId, consent }),
+  cloudAgentCodexLoginCancel: (attemptId: string) => invoke<void>("cloud_agent_codex_login_cancel", { attemptId }),
   cloudProviderConnect: (provider: CloudWorkspaceProviderId, input: CloudProviderConnectInput) =>
     invoke<CloudProviderConnection>("cloud_provider_connect", { provider, input }),
   // Cloud workspace routes take the Organization they act in (CS-18). None
@@ -767,6 +774,19 @@ export interface ClaudeLoginOutcome {
   status: "complete" | "code-invalid" | "unavailable" | "pending" | "expired" | "canceled" | "failed" | (string & {});
   credential?: AgentLogin;
   attemptsLeft?: number;
+}
+
+export interface CodexLoginStarted {
+  attemptId: string;
+  /** The one-time code to enter at OpenAI. Shown in the sign-in dialog and nowhere else. */
+  userCode: string;
+  verificationUrl: string;
+  expiresInSeconds: number;
+}
+
+export interface CodexLoginStatus {
+  status: "waiting" | "complete" | "expired" | "cancelled" | "failed" | (string & {});
+  credential?: AgentLogin;
 }
 
 export interface AgentLoginConsent {
