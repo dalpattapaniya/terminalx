@@ -464,7 +464,7 @@ pub fn upgrade_note(legacy: Option<&LegacyHelperCleanup>) -> String {
     format!("If you allowed computer use in an earlier TerminalX: its helper was replaced for security and macOS treats the new one as a new app, so grant it here once more.{outcome}")
 }
 
-pub fn status(helper_app: Option<&Path>) -> Result<PermissionStatusResult, ComputerError> {
+pub fn status(helper: Option<&super::ResolvedHelper>) -> Result<PermissionStatusResult, ComputerError> {
     if !cfg!(target_os = "macos") {
         return Ok(PermissionStatusResult {
             platform: platform(),
@@ -474,13 +474,14 @@ pub fn status(helper_app: Option<&Path>) -> Result<PermissionStatusResult, Compu
             permissions: unsupported_states(),
         });
     }
-    let Some(app) = helper_app else {
+    let Some(helper) = helper else {
         return Ok(unavailable(
             format!("{} was not found", super::HELPER_APP_NAME),
             None,
         ));
     };
-    if super::helper_executable_in(app).is_none() {
+    let app = helper.run.as_path();
+    if helper.executable().is_none() {
         return Ok(unavailable(
             format!(
                 "{}/Contents/MacOS/{} was not found",
@@ -490,7 +491,7 @@ pub fn status(helper_app: Option<&Path>) -> Result<PermissionStatusResult, Compu
             Some(app),
         ));
     }
-    let raw = read_status_via_helper(app)?;
+    let raw = read_status_via_helper(helper)?;
     let state = |id: PermissionId| PermissionState {
         id,
         status: raw
@@ -517,84 +518,59 @@ fn unavailable(reason: String, app: Option<&Path>) -> PermissionStatusResult {
     }
 }
 
-fn read_status_via_helper(app: &Path) -> Result<std::collections::HashMap<String, String>, ComputerError> {
-    let dir = std::env::temp_dir().join(format!(
-        "terminalx-computer-use-permissions-{}",
-        uuid::Uuid::now_v7().simple()
-    ));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| ComputerError::accessibility(format!("Could not check permissions: {e}")))?;
-    let status_path = dir.join("status.json");
-    let outcome = (|| {
-        launch_status_probe(app, &status_path)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&status_path) {
-                return serde_json::from_str(&text).map_err(|e| {
-                    ComputerError::accessibility(format!("Could not read permission status: {e}"))
-                });
-            }
-            if Instant::now() >= deadline {
-                return Err(ComputerError::accessibility("Timed out checking permissions"));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
+/// Run the helper's status probe and read its answer from its stdout. The
+/// probe is spawned directly (not through `open`) with its own TCC
+/// identity, suspended until its code is confirmed to be the bundled
+/// helper's, so a swapped copy cannot answer "granted".
+#[cfg(unix)]
+fn read_status_via_helper(helper: &super::ResolvedHelper) -> Result<std::collections::HashMap<String, String>, ComputerError> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let executable = helper
+        .executable()
+        .ok_or_else(|| ComputerError::accessibility("Could not check permissions: the helper has no executable"))?;
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(ComputerError::accessibility(format!("Could not check permissions: {}", std::io::Error::last_os_error())));
+    }
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&read, &write] {
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let mut child = super::macos_native::spawn_checked(
+        &executable,
+        &["--permission-status".into()],
+        Some(write.as_raw_fd()),
+        None,
+        &helper.check,
+    )
+    .map_err(|e| ComputerError::accessibility(format!("Could not check permissions: {e}")))?;
+    drop(write);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::fs::File::from(read).take(64 * 1024).read_to_string(&mut text);
+        let _ = sender.send(text);
+    });
+    let outcome = match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(text) => serde_json::from_str(text.trim())
+            .map_err(|e| ComputerError::accessibility(format!("Could not read permission status: {e}"))),
+        Err(_) => Err(ComputerError::accessibility("Timed out checking permissions")),
+    };
+    child.kill();
+    child.wait();
     outcome
 }
 
-/// `open -g -j -n` launches a fresh helper instance in the background without
-/// activating it, so a status probe never steals focus from the agent's app.
-fn launch_status_probe(app: &Path, status_path: &Path) -> Result<(), ComputerError> {
-    let mut child = std::process::Command::new("/usr/bin/open")
-        .args(["-g", "-j", "-n"])
-        .arg(app)
-        .arg("--args")
-        .arg("--permission-status-file")
-        .arg(status_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| ComputerError::accessibility("Could not check permissions: failed to launch helper"))?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    return Ok(());
-                }
-                let output = child.wait_with_output().ok();
-                let detail = output
-                    .as_ref()
-                    .map(|o| {
-                        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                        if err.is_empty() {
-                            String::from_utf8_lossy(&o.stdout).trim().to_string()
-                        } else {
-                            err
-                        }
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| format!("exit {}", status.code().unwrap_or(-1)));
-                return Err(ComputerError::accessibility(format!(
-                    "Could not check permissions: {detail}"
-                )));
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ComputerError::accessibility("Timed out launching permission helper"));
-            }
-        }
-    }
+#[cfg(not(unix))]
+fn read_status_via_helper(_helper: &super::ResolvedHelper) -> Result<std::collections::HashMap<String, String>, ComputerError> {
+    Err(ComputerError::accessibility("Could not check permissions on this platform"))
 }
 
 /// Open the system prompt (or the helper's setup window when no id is given).
 pub fn open_setup(
-    helper_app: Option<&Path>,
+    helper: Option<&super::ResolvedHelper>,
     permission: Option<PermissionId>,
 ) -> Result<PermissionSetupResult, ComputerError> {
     if !cfg!(target_os = "macos") {
@@ -609,13 +585,13 @@ pub fn open_setup(
             warning: None,
         });
     }
-    let Some(app) = helper_app else {
+    let Some(helper) = helper else {
         return Err(ComputerError::accessibility(format!(
             "{} was not found",
             super::HELPER_APP_NAME
         )));
     };
-    let current = status(Some(app))?;
+    let current = status(Some(helper))?;
     if let Some(reason) = current.helper_unavailable_reason {
         return Err(ComputerError::accessibility(reason));
     }
@@ -633,23 +609,8 @@ pub fn open_setup(
             next_step: None,
         });
     }
-    close_setup_helpers(app);
-    let mut command = std::process::Command::new("/usr/bin/open");
-    command.arg("-n").arg(app).arg("--args");
-    match permission {
-        Some(id) => {
-            command.arg("--permission").arg(id.wire());
-        }
-        None => {
-            command.arg("--permissions");
-        }
-    }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| ComputerError::accessibility(format!("Could not open permission setup: {e}")))?;
+    close_setup_helpers(&helper.run);
+    launch_setup(helper, permission)?;
     let warning = legacy_warning(&current);
     Ok(PermissionSetupResult {
         platform: platform(),
@@ -661,6 +622,35 @@ pub fn open_setup(
         permissions: current.permissions,
         next_step: next,
     })
+}
+
+/// Start the helper's setup window, spawned directly with its own TCC
+/// identity and checked before it runs, like every other helper process: the
+/// Screen Recording request it makes is then the helper's, and a swapped copy
+/// never gets to show a window. The drag tile offers the helper inside the
+/// app (`--drag-source`), not the copy, so what the person drags into
+/// System Settings is never a file an agent can replace.
+#[cfg(unix)]
+fn launch_setup(helper: &super::ResolvedHelper, permission: Option<PermissionId>) -> Result<(), ComputerError> {
+    let executable = helper
+        .executable()
+        .ok_or_else(|| ComputerError::accessibility("Could not open permission setup: the helper has no executable"))?;
+    let mut args: Vec<std::ffi::OsString> = match permission {
+        Some(id) => vec!["--permission".into(), id.wire().into()],
+        None => vec!["--permissions".into()],
+    };
+    args.push("--drag-source".into());
+    args.push(helper.bundled.clone().into_os_string());
+    let mut child = super::macos_native::spawn_checked(&executable, &args, None, None, &helper.check)
+        .map_err(|e| ComputerError::accessibility(format!("Could not open permission setup: {e}")))?;
+    // Reap it when the person closes it.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn launch_setup(_helper: &super::ResolvedHelper, _permission: Option<PermissionId>) -> Result<(), ComputerError> {
+    Err(ComputerError::accessibility("Could not open permission setup on this platform"))
 }
 
 /// Setup helpers are windowed; only one should be open. The pattern is
@@ -686,7 +676,7 @@ fn close_setup_helpers(app: &Path) {
 }
 
 /// Clear the helper's TCC rows so a stale denial can be re-prompted.
-pub fn reset(helper_app: Option<&Path>) -> Result<PermissionResetResult, ComputerError> {
+pub fn reset(helper: Option<&super::ResolvedHelper>) -> Result<PermissionResetResult, ComputerError> {
     if !cfg!(target_os = "macos") {
         return Ok(PermissionResetResult {
             status: PermissionStatusResult {
@@ -699,18 +689,21 @@ pub fn reset(helper_app: Option<&Path>) -> Result<PermissionResetResult, Compute
             bundle_id: None,
         });
     }
-    let Some(app) = helper_app else {
+    let Some(helper) = helper else {
         return Err(ComputerError::accessibility(format!(
             "{} was not found",
             super::HELPER_APP_NAME
         )));
     };
-    let current = status(Some(app))?;
+    let current = status(Some(helper))?;
     if let Some(reason) = current.helper_unavailable_reason {
         return Err(ComputerError::accessibility(reason));
     }
-    let bundle_id = read_bundle_id(app)?;
-    close_setup_helpers(app);
+    // The id from the bundled helper's verified signature, never from the
+    // copy's Info.plist: whoever edits the copy must not choose whose
+    // permissions are cleared.
+    let bundle_id = resettable_helper_id(&helper.bundle_id)?.to_owned();
+    close_setup_helpers(&helper.run);
     for id in [PermissionId::Accessibility, PermissionId::Screenshots] {
         let output = std::process::Command::new("/usr/bin/tccutil")
             .args(["reset", id.tcc_service(), &bundle_id])
@@ -731,9 +724,19 @@ pub fn reset(helper_app: Option<&Path>) -> Result<PermissionResetResult, Compute
         }
     }
     Ok(PermissionResetResult {
-        status: status(Some(app))?,
+        status: status(Some(helper))?,
         bundle_id: Some(bundle_id),
     })
+}
+
+/// Reset clears the current helper's rows only: an id that is not a
+/// computer-use helper's (TerminalX's own, or any other app's) is refused.
+pub fn resettable_helper_id(id: &str) -> Result<&str, ComputerError> {
+    if id.ends_with(".computer-use.v2") && !is_legacy_helper(id) {
+        Ok(id)
+    } else {
+        Err(ComputerError::accessibility(format!("{id} is not a computer-use helper's id; nothing was reset")))
+    }
 }
 
 /// The bundle id is whatever the built helper declares; dev and release
@@ -807,6 +810,43 @@ mod tests {
             assert_eq!(open_setup(None, None).unwrap_err().code, "accessibility_error");
         } else {
             assert!(result.permissions.iter().all(|p| p.status == "unsupported"));
+        }
+    }
+
+    /// A helper bundle whose "probe" answers that both permissions are
+    /// granted, as a swapped copy would.
+    #[cfg(target_os = "macos")]
+    fn lying_helper(dir: &Path, check: super::super::macos_native::CodeCheck) -> super::super::ResolvedHelper {
+        use std::os::unix::fs::PermissionsExt;
+        let app = dir.join("H.app");
+        let executable = app.join("Contents/MacOS").join(super::super::HELPER_EXECUTABLE_NAME);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\necho '{\"accessibility\":\"granted\",\"screenshots\":\"granted\"}'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::super::ResolvedHelper { bundled: app.clone(), run: app, bundle_id: "com.terminalx.test.computer-use.v2".into(), check }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_status_probe_that_is_not_the_bundled_helper_is_never_believed() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = lying_helper(&dir.path().join("refused"), std::sync::Arc::new(|_| Err("swapped".into())));
+        let error = status(Some(&refused)).unwrap_err();
+        assert!(error.message.contains("swapped"), "{}", error.message);
+        assert!(open_setup(Some(&refused), Some(PermissionId::Screenshots)).is_err());
+
+        // The same probe, accepted, is read from its own stdout.
+        let accepted = lying_helper(&dir.path().join("accepted"), std::sync::Arc::new(|_| Ok(())));
+        let result = status(Some(&accepted)).unwrap();
+        assert!(result.permissions.iter().all(|p| p.status == "granted"));
+    }
+
+    #[test]
+    fn reset_clears_only_a_current_helpers_rows() {
+        assert!(resettable_helper_id("com.terminalx.next.computer-use.v2").is_ok());
+        assert!(resettable_helper_id("com.terminalx.next.dev.computer-use.v2").is_ok());
+        for refused in ["com.terminalx.next", "com.apple.Terminal", "com.terminalx.next.computer-use", ""] {
+            assert!(resettable_helper_id(refused).is_err(), "{refused}");
         }
     }
 

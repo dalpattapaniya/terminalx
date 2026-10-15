@@ -14,11 +14,15 @@
 //! The app therefore runs a copy of the bundled helper from outside its own
 //! bundle, under Application Support. The copy is the same signed code, so
 //! its TCC rows are the helper's, and the peer rules are the helper's own:
-//! they do not depend on where it lives. The copy is compared with the
-//! bundled helper, file by file, every time it is about to be used, and
-//! replaced whenever they differ. Anything the person's user can write to,
-//! an agent can too; what keeps a replaced copy harmless is that TCC grants
-//! only code signed as the helper, and the helper serves only its launcher.
+//! they do not depend on where it lives.
+//!
+//! This module only keeps the copy current: it is compared with the bundled
+//! helper, file by file, before every helper start and at most every ten
+//! seconds otherwise, and replaced whenever they differ. It is not what makes
+//! the copy safe. Anything the person's user can write to, an agent can too,
+//! so the app never trusts the copy's files: every process started from it is
+//! checked against the bundled helper's signature and exact cdhash before it
+//! runs (see `code_identity`).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -66,8 +70,66 @@ pub fn helper_to_run(bundled: &Path, base: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// One install at a time in this process: the settings window, the CLI and
-/// a helper start can all ask at once.
+/// a helper start can all ask at once. Other processes (a second TerminalX)
+/// are kept out by a lock file in the base folder.
 static INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The file in each copy's folder that names the bundled helper it copies,
+/// so copies whose app is gone can be removed.
+const SOURCE_FILE: &str = "source";
+
+/// Hold an exclusive `flock` on `base/.lock` until dropped.
+struct InstallLock(std::fs::File);
+
+impl InstallLock {
+    fn take(base: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(base.join(".lock"))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// A copy whose bundled helper no longer exists (the app was moved, deleted
+/// or ran from an App Translocation mount that is gone), or whose folder does
+/// not say what it copies. Folders are left alone for a minute, in case
+/// another process is creating one.
+fn sweep_orphaned_copies(base: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || entry.file_name().to_string_lossy().starts_with('.') || !is_stale(&path) {
+            continue;
+        }
+        let source = std::fs::read_to_string(path.join(SOURCE_FILE)).ok();
+        let orphaned = match source {
+            Some(source) => {
+                let source = Path::new(source.trim());
+                source.as_os_str().to_string_lossy().contains("/AppTranslocation/") || std::fs::symlink_metadata(source).is_err()
+            }
+            None => true,
+        };
+        if orphaned {
+            let _ = remove_any(&path);
+        }
+    }
+}
 
 /// Make `copy` the same tree as `bundled`. A copy that already matches is
 /// left alone; otherwise a new one is written beside it and renamed into
@@ -75,8 +137,12 @@ static INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn install(bundled: &Path, copy: &Path) -> std::io::Result<()> {
     let _guard = INSTALL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let holder = copy.parent().ok_or_else(|| std::io::Error::other("the helper copy has no folder"))?;
+    let base = holder.parent().ok_or_else(|| std::io::Error::other("the helper copy has no base folder"))?;
     ensure_plain_dirs(holder)?;
+    let _lock = InstallLock::take(base)?;
     sweep_leftovers(holder);
+    sweep_orphaned_copies(base, holder);
+    record_source(holder, bundled)?;
     if same_tree(bundled, copy)? {
         return Ok(());
     }
@@ -108,6 +174,22 @@ fn install(bundled: &Path, copy: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Say which bundled helper this folder's copy is of.
+fn record_source(holder: &Path, bundled: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let file = holder.join(SOURCE_FILE);
+    let wanted = bundled.as_os_str().as_bytes();
+    if std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_file())
+        && std::fs::read(&file).is_ok_and(|current| current == wanted)
+    {
+        return Ok(());
+    }
+    let _ = remove_any(&file);
+    let staging = holder.join(format!(".source-{}", uuid::Uuid::now_v7().simple()));
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)?.write_all(wanted)?;
+    std::fs::rename(&staging, &file)
+}
+
 /// Create `dir` and its parents, and refuse if any of the folders this
 /// module owns (the copy's folder and the one above it) is a symlink.
 fn ensure_plain_dirs(dir: &Path) -> std::io::Result<()> {
@@ -127,7 +209,7 @@ fn sweep_leftovers(holder: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(".old-") || (name.starts_with(".staging-") && is_stale(&entry.path())) {
+        if name.starts_with(".old-") || ((name.starts_with(".staging-") || name.starts_with(".source-")) && is_stale(&entry.path())) {
             let _ = remove_any(&entry.path());
         }
     }
@@ -329,8 +411,9 @@ mod tests {
 
         // Nothing is left beside the copy.
         let holder = run.parent().unwrap();
-        let names: Vec<_> = std::fs::read_dir(holder).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names, vec![run.file_name().unwrap().to_owned()]);
+        let mut names: Vec<_> = std::fs::read_dir(holder).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, vec![run.file_name().unwrap().to_str().unwrap().to_owned(), SOURCE_FILE.to_owned()]);
     }
 
     #[test]
@@ -353,6 +436,40 @@ mod tests {
         let helper = shipped(dir.path());
         let base = dir.path().join("Other.app/Contents/Resources");
         assert!(helper_to_run(&helper, &base).is_err());
+    }
+
+    #[test]
+    fn copies_whose_app_is_gone_or_was_translocated_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = shipped(dir.path());
+        let base = dir.path().join("support");
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        let orphan = |name: &str, source: Option<&str>| {
+            let folder = base.join(name);
+            write(&folder.join("H.app/Contents/Info.plist"), "<plist/>", 0o644);
+            if let Some(source) = source {
+                write(&folder.join(SOURCE_FILE), source, 0o644);
+            }
+            std::fs::File::open(&folder).unwrap().set_modified(old_time).unwrap();
+            folder
+        };
+        let gone = orphan("gone", Some("/nowhere/TerminalX.app/Contents/Resources/H.app"));
+        // A translocated helper that still exists this minute is gone at the
+        // next launch (a new random mount), so its copy goes too.
+        let mount = dir.path().join("AppTranslocation/ABC/d/H.app");
+        std::fs::create_dir_all(&mount).unwrap();
+        let translocated = orphan("moved", Some(&mount.to_string_lossy()));
+        let unlabelled = orphan("unlabelled", None);
+        let alive = orphan("alive", Some(&helper.to_string_lossy()));
+        let fresh = base.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+
+        helper_to_run(&helper, &base).unwrap();
+        assert!(!gone.exists() && !translocated.exists() && !unlabelled.exists());
+        assert!(alive.exists(), "another build whose helper still exists keeps its copy");
+        assert!(fresh.exists(), "a folder another process may be creating is left alone");
+        let copy = copy_location(&base, &helper);
+        assert_eq!(std::fs::read_to_string(copy.parent().unwrap().join(SOURCE_FILE)).unwrap(), helper.to_string_lossy());
     }
 
     #[test]

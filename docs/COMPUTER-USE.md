@@ -257,19 +257,60 @@ as well. A helper outside any app bundle is charged to itself for both.
 
 So the app copies the bundled helper to Application Support and runs the
 copy, for the agent session, the status probe and the Grant and Reset
-buttons alike. Before every use the copy is compared with the bundled helper
-(names, kinds, modes, contents and symlink targets) and replaced when they
-differ, by writing a new copy beside it and renaming it into place. The
-folders it lives in must be plain folders (a symlink is refused), and a copy
-location inside an app bundle is refused. A helper that is not inside an app
-(`pnpm tauri:dev`, `.build/release-dev`) runs where it is.
+buttons alike. A helper that is not inside an app (`pnpm tauri:dev`,
+`.build/release-dev`) runs where it is.
 
-The copy is the same signed code, so it has the helper's TCC rows; an
-existing grant to "TerminalX Computer Use Helper" applies to it unchanged.
-It is in a folder the person's user, and so an agent, can write to. That
-gives an agent nothing: TCC grants only code that satisfies the helper's
-signing requirement, a helper the agent starts itself refuses it (see
-Security), and the next use replaces whatever was put there.
+**Keeping the copy current** (`helper_install.rs`). The copy is compared with
+the bundled helper (names, kinds, modes, contents and symlink targets) before
+every helper start, and before a status or permission request at most every
+ten seconds. When they differ, a new copy is written beside it and renamed
+into place. The folders it lives in must be plain folders (a symlink is
+refused), a copy location inside an app bundle is refused, installs are
+serialised in the process and across processes (`flock` on a lock file in the
+base folder), and copies whose bundled helper no longer exists (a moved or
+deleted app, an App Translocation mount) are removed. Each copy's folder
+records which bundled helper it copies. None of this is a security
+boundary: the folder is writable by the person's user, and so by an agent.
+
+**Which code the app runs** (`code_identity.rs`). The app never trusts the
+copy's files. Before each start it validates the *bundled* helper's signature
+(strictly, every architecture, nested code included) and reads its signing
+identifier and code directory hash. It then requires of every helper process:
+
+- `identifier "<the bundled helper's>" and cdhash H"<the bundled helper's>"`:
+  the exact build, so an older signed helper is refused too;
+- for the released app (`com.terminalx.next`): the identifier
+  `com.terminalx.next.computer-use.v2` and a Developer ID of the team that
+  signed the app;
+- no pre-PRO-90 identity.
+
+Every helper process (the agent session, the status probe, the setup window)
+is spawned directly with the responsibility disclaim and
+`POSIX_SPAWN_START_SUSPENDED`. The app checks the code running in that
+suspended child by pid (an unreaped child, so the pid cannot be reused) and
+only then resumes it. Otherwise it kills it before it ran a single
+instruction, so a swapped copy never sees the token or the app's environment,
+cannot answer a status probe, and cannot show a setup window. An agent session
+is checked a second time once connected: the socket's peer (its audit token,
+`LOCAL_PEERTOKEN`) must be the child just started and must still run the
+expected code. The helper's location is resolved again before every start,
+so a restart after the helper died is checked the same way. "Reset
+permissions" clears the rows of the identifier read from the bundled helper's
+signature, never one read from the copy, and only a `….computer-use.v2` id.
+
+**The drag tile.** The setup window's drag tile is what the person drags into
+System Settings, and macOS grants whatever was dropped. The app therefore
+passes the helper *inside the app* with `--drag-source`. The setup window
+offers it only if its signature is intact and its cdhash equals the running
+helper's own. Otherwise there is no tile, and the window says to add the
+helper from `TerminalX.app › Contents › Resources` with +.
+
+**What remains.** All of this rests on the bundled helper inside
+`TerminalX.app`. If an agent can modify `/Applications/TerminalX.app` itself
+(macOS's App Management protection decides that), it could replace the
+bundled helper with an older signed one and the copy would follow. That was
+true of the in-app helper before #480 as well; the signed-build checklist
+records whether it is possible.
 
 ## Permissions
 
@@ -344,7 +385,7 @@ the owner's Mac, without granting anything to TerminalX itself:
    `terminalx computer capabilities --json`.
 3. Check the copy exists and is the bundled code:
    `ls ~/Library/Application\ Support/TerminalX/computer-use-helper/*/` shows
-   one "TerminalX Computer Use Helper.app", and `codesign -dr - <that app>`
+   one "TerminalX Computer Use Helper.app" (and a `source` file), and `codesign -dr - <that app>`
    prints the same designated requirement as
    `codesign -dr - "/Applications/TerminalX.app/Contents/Resources/TerminalX Computer Use Helper.app"`.
 4. `ps -o pid,command -ax | grep terminalx-computer-use-macos` shows the
@@ -364,18 +405,49 @@ the owner's Mac, without granting anything to TerminalX itself:
    `/usr/bin/log stream --level debug --predicate 'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ_SUBJECT"'`
    while doing step 2. The screen-capture request's subject is
    `com.terminalx.next.computer-use.v2`, not `com.terminalx.next`.
+9. The copy is valid code: `codesign --verify --deep --strict --verbose=2 <copy>`
+   says "valid on disk" and "satisfies its Designated Requirement", and
+   `spctl --assess --type execute --verbose <copy>` says "accepted" with
+   source "Notarized Developer ID". Note any App Management prompt
+   ("TerminalX would like to modify apps" / "was prevented from modifying
+   apps") when TerminalX first creates the copy, and after updating
+   TerminalX, when it replaces it.
+10. The drag tile. Press Grant… for Screen Recording with the helper row
+    removed. The floating panel shows a tile. Drag it into the list (it is the
+    helper inside `TerminalX.app`, not the copy). Then repeat step 5: the row
+    created from the in-app helper must be the one the copy satisfies
+    (screenshots `granted`). If it is not, say so in #480: the tile must then
+    be removed.
+11. A swapped copy is refused. In a TerminalX terminal (an agent's
+    position):
+    - check whether the shell can write to `/Applications/TerminalX.app`:
+      `touch /Applications/TerminalX.app/Contents/Resources/x480 && rm /Applications/TerminalX.app/Contents/Resources/x480`.
+      Record whether macOS allowed it;
+    - check whether it can write to the copy (it can; that is expected);
+    - replace the copy's executable (`cp /usr/bin/true "<copy>/Contents/MacOS/terminalx-computer-use-macos"`),
+      kill the running helper (`pkill -f terminalx-computer-use-macos`), and run
+      `terminalx computer list-apps`. It works, and
+      `cmp "<copy>/Contents/MacOS/terminalx-computer-use-macos" "/Applications/TerminalX.app/Contents/Resources/TerminalX Computer Use Helper.app/Contents/MacOS/terminalx-computer-use-macos"`
+      shows the copy was put back before the restart. A swap that lands
+      between that comparison and the start is refused by the code check
+      before it runs; the unit tests cover that race, which cannot be timed by
+      hand.
 
 ## Testing
 
 - `cargo test computer` in `src-tauri`: framing, handshake, timeout and
   hang-up handling against a fake helper, argument validation, screenshot
-  export, CLI parsing and output, and the helper copy outside the app
-  (`helper_install`).
+  export, CLI parsing and output, the helper copy outside the app
+  (`helper_install`), and which code may run as the helper: suspended start,
+  the pid and socket-peer checks, re-resolution at a restart, and real
+  ad-hoc signatures whose cdhash differs (`code_identity`, `macos_native`,
+  `permissions`).
 - `cargo test real_helper -- --ignored --nocapture`: drives the built helper
   for real (capabilities, app listing, error codes, clean shutdown).
 - `pnpm test:computer-macos`: the Swift package's unit tests, including who
-  the helper serves (`PeerTrustTests`) and which targets it refuses
-  (`OwnAppProtectionTests`).
+  the helper serves (`PeerTrustTests`), which targets it refuses
+  (`OwnAppProtectionTests`), and what the drag tile may offer
+  (`DragSourceTests`).
 - `pnpm smoke:computer [-- --screenshot --actions --apps Finder,TextEdit]`:
   end-to-end through the CLI against a running TerminalX.
 
