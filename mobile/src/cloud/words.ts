@@ -39,6 +39,8 @@ const CODES: Record<string, string> = {
   cloud_workspace_rate_limited: "Too many requests just now. Try again in a moment.",
   cloud_workspace_agent_command_limit: "Too many messages are waiting for this workspace. Wait for the agent, or cancel one.",
   cloud_workspace_share_redundant: "This person already has access as owner, admin or creator.",
+  // The server refuses a driver while a managers-only agent login could reach the workspace.
+  cloud_workspace_share_credential_restricted: "Can send is not available here while the organization has an agent login that only owners and admins may use. Share as view only, or an admin can share that login with the whole organization first.",
   cloud_workspace_share_requires_organization_access: "Make the workspace visible to the organization first.",
   cloud_workspace_share_limit: "This workspace is already shared with the maximum number of people (64). Remove someone first.",
   cloud_workspace_share_forbidden: "Only organization admins and the workspace's creator can change who it is shared with.",
@@ -70,9 +72,18 @@ export function codeText(code: string | null | undefined): string | null {
   return CODES[code] ?? "That did not work. Try again in a moment.";
 }
 
-/** One line for the banner above a workspace's conversation. */
-export function connectionLine(connection: WorkspaceConnectionState, listedState: string | null, problem: CloudLinkProblem, starting = false): { tone: "live" | "idle" | "warn"; text: string } {
-  if (connection.state === "connected") return { tone: "live", text: "Live · end-to-end encrypted" };
+/**
+ * One line for the banner above a workspace's conversation. A connection is
+ * live only for someone with a role there: with none (access taken away, or
+ * never given) or before the runtime knows (#475), nothing of it is shown, and
+ * the banner says so instead of "Live".
+ */
+export function connectionLine(connection: WorkspaceConnectionState, listedState: string | null, problem: CloudLinkProblem, starting = false, access: { role: CloudRole | null; checking: boolean } = { role: null, checking: false }): { tone: "live" | "idle" | "warn"; text: string } {
+  if (connection.state === "connected") {
+    if (access.checking) return { tone: "idle", text: "Checking your access…" };
+    if (access.role === "none") return { tone: "warn", text: "No access: this workspace is not shared with you." };
+    return { tone: "live", text: "Live · end-to-end encrypted" };
+  }
   if (connection.state === "updateRequired") return { tone: "warn", text: "Update the app to connect to this workspace." };
   if (listedState === "archived") return { tone: "idle", text: "Archived. Showing the saved conversation." };
   // Asked to start by a message, or already starting: said as long as it lasts, so a workspace that bills is never shown as stopped.

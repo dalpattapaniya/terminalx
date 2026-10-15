@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { SHORTCUTS_VERSION, migrateShortcuts, shortcutsVersionOf } from "@/lib/shortcutMigration";
 
 /**
  * UI preferences that the frontend can read for itself live in localStorage.
@@ -13,6 +14,8 @@ export interface Prefs {
   sidebarOpen: boolean;
   sidebarWidth: number;
   panelOpen: boolean;
+  /** A session's tabs as a row in the title bar. Off leaves them to the sidebar alone. */
+  tabStrip: boolean;
   panelWidth: number;
   editorPaneWidth: number;
   updateChannel: "stable" | "beta";
@@ -64,11 +67,18 @@ export interface Prefs {
   /** Cloud projects the reader collapsed, by project key (`cloud:<orgId>:<identity>`); expanded by default. */
   cloudCollapsed: Record<string, true>;
   /**
+   * Personal named sections of cloud projects (see `@/lib/cloudSidebarSections`),
+   * by account email, then organization id, in the reader's order.
+   */
+  cloudSections: Record<string, Record<string, CloudSidebarSection[]>>;
+  /**
    * Keyboard shortcuts the reader changed, by action id (see `@/lib/shortcuts`):
    * the bindings that replace the action's defaults, an empty list for none.
    * Kept per machine. An action not listed uses its defaults.
    */
   shortcuts: Record<string, string[]>;
+  /** Which version's action ids `shortcuts` is written in (see `@/lib/shortcutMigration`). */
+  shortcutsVersion: number;
   /**
    * The sidebar's session filter per person, by account email (`local` while
    * signed out). Only a filter that is on is kept; someone not listed sees
@@ -86,6 +96,7 @@ const DEFAULTS: Prefs = {
   sidebarOpen: true,
   sidebarWidth: 268,
   panelOpen: false,
+  tabStrip: true,
   panelWidth: 400,
   editorPaneWidth: 520,
   updateChannel: "stable",
@@ -111,12 +122,38 @@ const DEFAULTS: Prefs = {
   cloudBlankProjects: {},
   cloudPinned: {},
   cloudCollapsed: {},
+  cloudSections: {},
   shortcuts: {},
+  shortcutsVersion: SHORTCUTS_VERSION,
   sidebarFilters: {},
   projectsDir: null,
 };
 
 const KEY = "raccoon.prefs";
+
+/** One personal section of an organization's cloud projects. */
+export interface CloudSidebarSection {
+  id: string;
+  name: string;
+  /** Project identities (`host/owner/name` or `blank/<name>`), each in one section at most. */
+  projects: string[];
+}
+
+/** Saved sections as written, minus anything malformed (a hand-edited or older file never breaks the sidebar). */
+function cleanCloudSections(value: unknown): Prefs["cloudSections"] {
+  const isObject = (item: unknown): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item);
+  if (!isObject(value)) return {};
+  const out: Prefs["cloudSections"] = {};
+  for (const [who, orgs] of Object.entries(value)) {
+    if (!isObject(orgs)) continue;
+    for (const [orgId, sections] of Object.entries(orgs)) {
+      if (!Array.isArray(sections)) continue;
+      const kept = sections.filter((section): section is CloudSidebarSection => isObject(section) && typeof section.id === "string" && typeof section.name === "string" && Array.isArray(section.projects)).map((section) => ({ id: section.id, name: section.name, projects: section.projects.filter((id): id is string => typeof id === "string") }));
+      if (kept.length) (out[who] ??= {})[orgId] = kept;
+    }
+  }
+  return out;
+}
 
 function load(): Prefs {
   try {
@@ -129,11 +166,24 @@ function load(): Prefs {
     prefs.selectedOrganization = typeof prefs.selectedOrganization === "string" ? prefs.selectedOrganization : null;
     // The project tree ("detailed") is gone; anyone who had it gets the default.
     prefs.sidebarLayout = prefs.sidebarLayout === "list" ? "list" : "simple";
+    prefs.cloudSections = cleanCloudSections(prefs.cloudSections);
+    let migrated = false;
     // Older versions saved the whole object, including the TerminalX default,
     // without recording whether it was chosen. Migrate unmarked values once;
     // choices made in Settings or remembered in the chooser survive this migration.
     if (prefs.linkBrowser === "terminalx" && prefs.linkBrowserChosen !== true) {
       prefs.linkBrowser = "system";
+      migrated = true;
+    }
+    // Shortcuts saved under an older version's action ids, once. A newer version's are left as they are.
+    const version = shortcutsVersionOf(parsed.shortcutsVersion);
+    if (version < SHORTCUTS_VERSION) {
+      const shortcuts = migrateShortcuts(prefs.shortcuts, version);
+      migrated ||= shortcuts !== prefs.shortcuts;
+      prefs.shortcuts = shortcuts;
+      prefs.shortcutsVersion = SHORTCUTS_VERSION;
+    }
+    if (migrated) {
       try {
         localStorage.setItem(KEY, JSON.stringify(prefs));
       } catch {

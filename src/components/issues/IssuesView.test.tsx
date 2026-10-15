@@ -1,17 +1,21 @@
 import "@testing-library/dom";
 import { StrictMode, type ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getPrefs, setPrefs } from "@/lib/prefs";
 import type { ModelInfo } from "@/lib/api";
 import { issuePrompt, issueWorktreeName } from "@/lib/issueSession";
+import type { IssuePipeline, IssuePipelineSettings } from "@/types/issuePipeline";
+import type { Project } from "@/types/session";
 
-const { invoke, openAutomation, catalog, sessionStore } = vi.hoisted(() => ({
+const { invoke, openAutomation, catalog, sessionStore, pipelineStore, startPipeline } = vi.hoisted(() => ({
   invoke: vi.fn(),
   openAutomation: vi.fn(),
   catalog: { models: [] as ModelInfo[] },
+  pipelineStore: { pipelines: [] as IssuePipeline[] },
+  startPipeline: vi.fn(),
   sessionStore: {
-    projects: [{ path: "/repo", name: "Raccoon" }],
+    projects: [{ path: "/repo", name: "Raccoon" }] as Project[],
     harnesses: [
       {
         id: "claude",
@@ -60,6 +64,13 @@ vi.mock("@/lib/models", async (original) => ({
   useModels: (harness: string) => catalog.models.filter((m) => m.harness === harness),
 }));
 vi.mock("@/lib/dialogs", () => ({ chooseMode: vi.fn() }));
+vi.mock("@/lib/notify", () => ({ notePipelineState: vi.fn() }));
+vi.mock("@/lib/issuePipeline", async (original) => ({
+  // What a pipeline means stays real; which ones exist, and starting one, are the test's.
+  ...(await original<typeof import("@/lib/issuePipeline")>()),
+  useIssuePipelines: () => pipelineStore.pipelines,
+  startPipeline,
+}));
 vi.mock("@/lib/sessions", () => ({
   addProject: vi.fn(),
   clearNewSessionPreset: vi.fn(),
@@ -179,9 +190,29 @@ function issueSwitch() {
   return screen.getByRole("switch", { name: "Start issue in a new worktree" });
 }
 
+const MERGE_SWITCH = "Merge automatically when the review is addressed";
+const BRIEF = "End every reply with a status block.";
+
+function pipelineOf(issue: Pick<(typeof issues)[number], "provider" | "id" | "identifier" | "title" | "url">, patch: Partial<IssuePipeline> = {}): IssuePipeline {
+  return {
+    id: "pipeline-1", projectPath: "/repo",
+    issue: { provider: issue.provider, id: issue.id, identifier: issue.identifier, title: issue.title, url: issue.url },
+    branch: "raccoon/11-fix-login-timeout",
+    author: { sessionId: "session-1", tabId: "tab-1" }, reviewer: null,
+    autoMerge: false, stopped: false, stage: "work", state: "working", reason: null, note: "The author session is working on the issue.",
+    pr: null, round: 0, maxRounds: 3, reviewCommit: null, verdict: null, securityAreas: [], merged: null, events: [],
+    created: "2026-09-02T00:00:00.000Z", modified: "2026-09-02T00:00:00.000Z",
+    ...patch,
+  };
+}
+
 beforeEach(() => {
   invoke.mockReset();
   openAutomation.mockReset();
+  pipelineStore.pipelines = [];
+  sessionStore.projects = [{ path: "/repo", name: "Raccoon" }];
+  startPipeline.mockReset();
+  startPipeline.mockImplementation(async (_sessionId: string, _tabId: string, autoMerge: boolean | null) => ({ pipeline: pipelineOf(issues[0], { autoMerge: !!autoMerge }), authorBrief: BRIEF }));
   vi.mocked(upsertSession).mockClear();
   vi.mocked(selectSession).mockClear();
   vi.mocked(refreshModels).mockReset();
@@ -370,6 +401,231 @@ async function startIssue() {
   return launchRequest();
 }
 
+describe("the pipeline an issue session starts", () => {
+  const settings = (patch: Partial<IssuePipelineSettings>): IssuePipelineSettings => ({
+    enabled: true, autoMerge: false, requirePerson: false, maxRounds: 3, mergeMethod: "merge",
+    protected: { migrations: true, deploy: true, security: true, paths: [] }, ignoredChecks: [],
+    ...patch,
+  });
+  const mergeSwitch = () => screen.getByRole("switch", { name: MERGE_SWITCH });
+  async function open(title = "Fix login timeout", onCreated = vi.fn()) {
+    render(<IssuesView onCreated={onCreated} />);
+    fireEvent.click(await screen.findByText(title));
+    await screen.findByText(title === "Fix login timeout" ? "First issue body." : "Second issue body.");
+    return onCreated;
+  }
+  async function start() {
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    await waitFor(() => expect(selectSession).toHaveBeenCalledWith("session-1"));
+  }
+
+  it("is off for the merge by default, and carries the issue's own switch when it is turned on", async () => {
+    const onCreated = await open();
+    expect(mergeSwitch().getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByText("A pull request is opened and reviewed when the work is done. Off, it stops at Ready to merge.")).toBeTruthy();
+    fireEvent.click(mergeSwitch());
+    await start();
+    expect(startPipeline).toHaveBeenCalledWith("session-1", "tab-1", true);
+    expect(onCreated).toHaveBeenCalledWith("session-1", "tab-1", `${issuePrompt(issues[0])}\n\n${BRIEF}`);
+    // The pipeline is started for the session that exists, before the reader is taken to it.
+    expect(vi.mocked(upsertSession).mock.invocationCallOrder[0]).toBeLessThan(startPipeline.mock.invocationCallOrder[0]);
+    expect(startPipeline.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(selectSession).mock.invocationCallOrder[0]);
+  });
+
+  it("starts each issue at the project's default, and does not carry one issue's choice to the next", async () => {
+    sessionStore.projects = [{ path: "/repo", name: "Raccoon", issuePipeline: settings({ autoMerge: true }) }];
+    await open();
+    expect(mergeSwitch().getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(mergeSwitch());
+    expect(mergeSwitch().getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(screen.getByText("Repair session target"));
+    await screen.findByText("Second issue body.");
+    expect(mergeSwitch().getAttribute("aria-checked")).toBe("true");
+    await start();
+    expect(startPipeline).toHaveBeenCalledWith("session-1", "tab-1", true);
+  });
+
+  it("cannot be set to merge in a project that has a person do the merge", async () => {
+    sessionStore.projects = [{ path: "/repo", name: "Raccoon", issuePipeline: settings({ autoMerge: true, requirePerson: true }) }];
+    await open();
+    expect(mergeSwitch().getAttribute("aria-checked")).toBe("false");
+    expect(mergeSwitch().hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText("A pull request is opened and reviewed when the work is done. This project has a person do the merge.")).toBeTruthy();
+    await start();
+    expect(startPipeline).toHaveBeenCalledWith("session-1", "tab-1", false);
+  });
+
+  it("is not started for a session on the project's own checkout, which has no branch to open a pull request from", async () => {
+    const onCreated = await open();
+    fireEvent.click(issueSwitch());
+    expect(screen.queryByRole("switch", { name: MERGE_SWITCH })).toBeNull();
+    expect(screen.getByText("No pull request is opened for a session on the project’s own checkout.")).toBeTruthy();
+    await start();
+    expect(startPipeline).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledWith("session-1", "tab-1", issuePrompt(issues[0]));
+  });
+
+  it("is not started in a project that turned it off", async () => {
+    sessionStore.projects = [{ path: "/repo", name: "Raccoon", issuePipeline: settings({ enabled: false }) }];
+    const onCreated = await open();
+    expect(screen.queryByRole("switch", { name: MERGE_SWITCH })).toBeNull();
+    expect(screen.queryByText(/No pull request is opened/)).toBeNull();
+    await start();
+    expect(startPipeline).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledWith("session-1", "tab-1", issuePrompt(issues[0]));
+  });
+
+  it("still starts the session when the pipeline cannot start", async () => {
+    startPipeline.mockRejectedValue("The issue pipeline needs a Git project.");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onCreated = await open();
+    await start();
+    expect(onCreated).toHaveBeenCalledWith("session-1", "tab-1", issuePrompt(issues[0]));
+    expect(logged).toHaveBeenCalledWith("issue pipeline did not start", "The issue pipeline needs a Git project.");
+    logged.mockRestore();
+  });
+
+  it("shows an issue's pipeline on its page and in the list, with the switch where the pipeline is", async () => {
+    pipelineStore.pipelines = [
+      pipelineOf(issues[0], {
+        stage: "merge", state: "readyToMerge", autoMerge: false, round: 1,
+        reason: { kind: "autoMergeOff" }, note: "Reviewed, checks passed. Automatic merge is off for this issue.",
+        pr: { number: 7, url: "https://example.test/pull/7", base: "main" },
+      }),
+    ];
+    await open();
+    // In the list row and at the head of the panel.
+    expect(screen.getAllByText("Ready to merge")).toHaveLength(2);
+    expect(screen.getByText("Reviewed, checks passed. Automatic merge is off for this issue.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Pull request #7/ })).toBeTruthy();
+    // One switch for the issue: the pipeline's own.
+    expect(screen.getAllByRole("switch", { name: MERGE_SWITCH })).toHaveLength(1);
+    expect(screen.getByTestId("issue-pipeline").contains(mergeSwitch())).toBe(true);
+    // The other issue has none, and offers the switch for its start.
+    fireEvent.click(screen.getByText("Repair session target"));
+    await screen.findByText("Second issue body.");
+    expect(screen.queryByTestId("issue-pipeline")).toBeNull();
+    expect(mergeSwitch().getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("starts an issue again with the choice its pipeline already holds", async () => {
+    pipelineStore.pipelines = [pipelineOf(issues[0], { autoMerge: true, state: "needsYou", note: "The author session stopped before it finished." })];
+    await open();
+    await start();
+    expect(startPipeline).toHaveBeenCalledWith("session-1", "tab-1", true);
+  });
+});
+
+describe("an issue its merge closed", () => {
+  // The tracker lists open issues, so this one is no longer among them.
+  const closed = { ...issues[0], id: "9", identifier: "#9", number: 9, title: "Ship the exporter", url: "https://example.test/issues/9", state: "CLOSED", stateType: "completed" as const, body: "Closed issue body." };
+  const merged = (issue: Parameters<typeof pipelineOf>[0], patch: Partial<IssuePipeline> = {}) =>
+    pipelineOf(issue, {
+      id: `pipeline-${issue.id}`, stage: "merge", state: "merged", round: 1, note: "TerminalX merged pull request #7 at abc1234 into main.",
+      pr: { number: 7, url: "https://example.test/pull/7", base: "main" },
+      ...patch,
+    });
+  /** The tracker as it answers once `gone` are closed. */
+  type Row = { id: string } & Record<string, unknown>;
+  function tracker(gone: Row[], open: Row[] = issues) {
+    const backend = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "issues_list") return open;
+      if (command === "issue_details") return [...gone, ...open].find((issue) => issue.id === args?.id);
+      return backend(command, args);
+    });
+  }
+  const calls = (command: string) => invoke.mock.calls.filter(([name]) => name === command).length;
+  const unlisted = () => screen.getByTestId("issues-unlisted");
+
+  it("stays reachable below the list, with its record and what the tracker says of it now", async () => {
+    tracker([closed]);
+    pipelineStore.pipelines = [merged(closed)];
+    render(<IssuesView />);
+    await screen.findByText("Fix login timeout");
+    const row = within(unlisted()).getByRole("button", { name: /Ship the exporter/ });
+    // The row says where the pipeline stands and claims nothing of the issue's own state.
+    expect(row.textContent).toContain("Merged");
+    expect(row.textContent).not.toMatch(/OPEN|CLOSED|·/);
+    // An issue the tracker still lists is not repeated there.
+    expect(within(unlisted()).queryByText("Fix login timeout")).toBeNull();
+
+    fireEvent.click(row);
+    await screen.findByText("Closed issue body.");
+    expect(invoke).toHaveBeenCalledWith("issue_details", { projectPath: "/repo", provider: "github", id: "9" });
+    expect(screen.getByText("CLOSED")).toBeTruthy();
+    expect(within(screen.getByTestId("issue-pipeline")).getByText("TerminalX merged pull request #7 at abc1234 into main.")).toBeTruthy();
+  });
+
+  it("is listed once, by its newest pipeline, and only for the tracker and project in view", async () => {
+    tracker([closed]);
+    pipelineStore.pipelines = [
+      merged(closed, { id: "older", state: "needsYou", note: "The review limit was reached.", created: "2026-09-01T00:00:00.000Z" }),
+      merged(closed, { id: "newer", created: "2026-09-03T00:00:00.000Z" }),
+      merged({ ...closed, id: "8", identifier: "#8", title: "Another project's issue", url: "https://example.test/issues/8" }, { projectPath: "/elsewhere" }),
+      merged({ ...linearIssues[0], id: "lin-7", identifier: "DEMO-7", title: "A Linear issue", url: "https://example.test/linear/DEMO-7" } as never),
+    ];
+    render(<IssuesView />);
+    await screen.findByText("Fix login timeout");
+    const rows = within(unlisted()).getAllByRole("button");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain("Ship the exporter");
+    expect(rows[0].textContent).toContain("Merged");
+  });
+
+  it("follows the search like the list above it, and shows when no open issue matches", async () => {
+    tracker([closed], []);
+    pipelineStore.pipelines = [merged(closed)];
+    render(<IssuesView />);
+    expect(within(await screen.findByTestId("issues-unlisted")).getByText("Ship the exporter")).toBeTruthy();
+    expect(screen.getByText("No open issues match.")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("Search"), { target: { value: "exporter" } });
+    expect(within(unlisted()).getByText("Ship the exporter")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("Search"), { target: { value: "timeout" } });
+    expect(screen.queryByTestId("issues-unlisted")).toBeNull();
+  });
+
+  it("is read again, with the list, a moment after its pipeline merges", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      pipelineStore.pipelines = [pipelineOf(issues[0], { stage: "merge", state: "readyToMerge", round: 1 })];
+      const view = render(<IssuesView />);
+      fireEvent.click(await screen.findByText("Fix login timeout"));
+      await screen.findByText("First issue body.");
+      expect([calls("issues_list"), calls("issue_details")]).toEqual([1, 1]);
+
+      // The merge closes the issue on the tracker.
+      tracker([{ ...issues[0], state: "CLOSED", stateType: "completed" as const }], [issues[1]]);
+      pipelineStore.pipelines = [merged(issues[0], { id: "pipeline-1" })];
+      view.rerender(<IssuesView />);
+      await act(async () => void (await vi.advanceTimersByTimeAsync(2900)));
+      expect(calls("issues_list")).toBe(1);
+      await act(async () => void (await vi.advanceTimersByTimeAsync(500)));
+      await waitFor(() => expect([calls("issues_list"), calls("issue_details")]).toEqual([2, 2]));
+
+      // Its page stays open and now says what the tracker says; its row has moved below the list.
+      await screen.findByText("CLOSED");
+      expect(screen.getByText("First issue body.")).toBeTruthy();
+      expect(within(unlisted()).getByText("Fix login timeout")).toBeTruthy();
+      expect(screen.getByTestId("issue-pipeline")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the page as it is while a refresh reads the issue again", async () => {
+    render(<IssuesView />);
+    fireEvent.click(await screen.findByText("Fix login timeout"));
+    await screen.findByText("First issue body.");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    // No blank page and no "Loading…" between the two answers.
+    expect(screen.getByText("First issue body.")).toBeTruthy();
+    expect(screen.queryByText("Loading…")).toBeNull();
+    await waitFor(() => expect(calls("issue_details")).toBe(2));
+    expect(screen.getByText("First issue body.")).toBeTruthy();
+  });
+});
+
 describe.each(["github", "linear"] as const)("%s issue agent choices", (provider) => {
   it.each(["claude", "codex"])("matches New Session defaults and launch choices for %s", async (agent) => {
     setPrefs({ lastAgent: agent });
@@ -413,7 +669,9 @@ describe.each(["github", "linear"] as const)("%s issue agent choices", (provider
     });
     expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({ tabs: [{ id: "tab-1", ...tab }] }));
     expect(selectSession).toHaveBeenCalledWith("session-1");
-    expect(onCreated).toHaveBeenCalledWith("session-1", "tab-1", issuePrompt(issue));
+    // The issue itself, then how the pipeline wants the work handed over.
+    expect(onCreated).toHaveBeenCalledWith("session-1", "tab-1", `${issuePrompt(issue)}\n\n${BRIEF}`);
+    expect(startPipeline).toHaveBeenCalledWith("session-1", "tab-1", false);
     view.unmount();
     render(<NewSessionView />);
     expect(screen.getByTitle("Agent").textContent).toBe("Codex");

@@ -26,7 +26,20 @@ fn fixture() -> Fixture {
     let root = std::fs::canonicalize(dir.path()).unwrap().join("workspace");
     std::fs::create_dir(&root).unwrap();
     let rpc = WorkspaceRpc::new(&root, 1, Arc::new(BroadcastSink::new(64)), Arc::new(Terminals::new()), None).unwrap();
+    listed(&rpc);
     Fixture { _dir: dir, root, rpc }
+}
+
+/// Who the API lists, as it does before any client connects: the manager and
+/// one viewer, the people `peer` connects as.
+fn listed(rpc: &WorkspaceRpc) {
+    rpc.set_collaboration(Some(
+        serde_json::from_value(json!({ "v": 1, "members": [{ "userId": "admin", "role": "manager" }, { "userId": "viewer", "role": "viewer" }] })).unwrap(),
+    ));
+}
+
+fn person_for(authority: Authority) -> Option<String> {
+    Some(if authority == Authority::Manage { "admin" } else { "viewer" }.into())
 }
 
 async fn call(rpc: &Arc<WorkspaceRpc>, peer: &Arc<Peer>, method: &str, params: Value) -> Result<Value, String> {
@@ -39,7 +52,7 @@ async fn call(rpc: &Arc<WorkspaceRpc>, peer: &Arc<Peer>, method: &str, params: V
 }
 
 async fn peer(rpc: &Arc<WorkspaceRpc>, device: &str, authority: Authority) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new(device.into(), authority);
+    let (peer, events) = Peer::for_user(device.into(), authority, person_for(authority));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["fs/1"] })).await.unwrap();
     (peer, events)
 }

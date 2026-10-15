@@ -2,6 +2,263 @@
 
 ## Unreleased
 
+## 0.2.12
+
+A browser-style tab strip in the title bar, workspaces that remove themselves
+once their pull request is merged, issue pages that stay reachable after the
+merge, Stop from a guest or the phone that interrupts instead of ending the
+agent, and cloud mirror and agent login fixes.
+
+### Tabs
+
+- A session's tabs are a row in the title bar, as in a browser: one tab per
+  agent, terminal and browser page, each with its icon, a shortened title
+  and its state (working, waiting, an unread reply, exited). Click to
+  switch, middle-click or the close button to close, and the "+" at the end
+  of the row opens a new tab. Hover a tab, or move the keyboard focus to it,
+  for its full title, its agent and its state. Settings → General has "Tabs
+  in the title bar" to turn the row off and keep tabs in the sidebar only.
+  (#438)
+- The row is the workspace's: when several sessions share a worktree, all
+  their tabs are in it, in one flat row, and opening a tab opens its session
+  too. A tab of another workspace is never in it. (#438)
+- A tab in the row is what runs in its terminal, as its sidebar row is: an
+  agent's mark, name and state while one runs there, a terminal when none
+  does, with the menu items that apply to what it is now. A terminal an
+  agent is started in stays where you put it, with its pin, its mute and the
+  name you gave it, and a name you give a tab is kept whatever comes to run
+  in it. (#438)
+- Tabs share the width and shrink evenly; when they no longer fit, the row
+  scrolls and a menu at its end lists every tab by its full title. The
+  session's name and its chips give way to the tabs in a narrow window, and
+  the header's own buttons are never covered. Empty title bar still drags
+  the window; a tab does not. (#438)
+- Drag a tab to move it. The order is one order for the workspace, saved
+  with the sessions: the sidebar, next and previous tab and the numbered
+  shortcuts follow it, it survives a restart, and the CLI and a paired
+  phone list a session's tabs in it. "Move tab left" and "Move tab right"
+  do the same from the keyboard. (#438)
+- New shortcuts, all remappable in Settings → Shortcuts: the main modifier
+  and 1 to 8 switch to that tab, 9 to the last one, from the composer and
+  from a terminal as well; move tab left and right; and reopen closed tab.
+  (#438)
+- Right-click a tab, in the row or in the sidebar, for everything that can
+  be done to it: rename it, switch it between chat and terminal view,
+  duplicate it, fork its conversation, open it in the floating window,
+  reload or restart it, copy its title, folder, conversation id or address,
+  pin it (pinned tabs stay at the left as an icon), mute its notifications,
+  move it, act on its session, and open a new tab right after it. (#438)
+- Close other tabs, tabs to the right, tabs to the left, idle tabs or all
+  tabs from the same menu. Each says how many tabs it will close first, and
+  names any with an agent working or waiting, a terminal in the middle of a
+  command or a draft not sent, with the choice to close only the idle ones.
+  Pinned tabs are left open unless you include them. (#438)
+- A closed agent tab keeps its conversation, and "Reopen closed tab" brings
+  the last closed tab back where it was: an agent with its conversation, a
+  browser page at its address. (#438)
+- Closing the last agent tab of a session no longer takes you off the
+  terminal or page you were on, or opens a shell you did not ask for.
+  (#438)
+
+### Workspaces that go once their pull request is merged
+
+- A new setting, off unless you turn it on: **Delete the workspace when its
+  pull request is merged** (Settings → Storage). It has a default for every
+  project, and each Git project and cloud workspace can answer for itself.
+  When it is on and a workspace's pull request shows as merged, the worktree
+  is removed with its local branch, and with its branch on the remote while
+  that still points at the commit that was merged. Its conversations are
+  kept, filed under the project as from a removed workspace; deleting them
+  too is a separate switch, also off. (#432)
+- Nothing is forced, and no work is lost. The workspace goes through the same
+  checks and the same removal as the Delete workspace dialog and the worktree
+  clean-up: one with uncommitted work, commits that are not merged, ignored
+  local files other than build output, a Git operation in progress, a turn
+  running or a terminal open stays, and its row in the sidebar says why
+  ("kept: 2 uncommitted files"). Squash and rebase merges are recognised. A
+  remote branch that has moved since the merge is kept, and that is said; a
+  remote that cannot be reached leaves its branch and does not hold up the
+  rest. An agent that sits idle at its prompt does not keep a workspace: it
+  is stopped, as the dialog stops it. One you started by hand in a terminal
+  does keep it, and so does a tab that is a terminal now. (#432)
+- It waits first: 10 minutes by default (5 minutes to 1 hour), counted from
+  when the merge is first seen and from the last thing done in the
+  workspace's sessions. A notice says the workspace will go and offers
+  **Keep workspace**; the row offers Keep too. After a removal a notice
+  offers **Undo**, which puts back the worktree, its branch, the branch on
+  the remote and the sessions that have not been used since. The grace
+  period runs only while the app is running, so nothing goes the moment the
+  app is opened again. A pull request merged in TerminalX, from the pull
+  request panel or by an issue's pipeline, is seen at once. (#432)
+- Every removal is recorded with its workspace, branch, commit and pull
+  request, and listed in Settings → Storage with **Restore** for as long as
+  its commit is still in the repository. (#432)
+- It never applies to a project's main directory, a worktree TerminalX did
+  not create, or a pull request that was closed without merging. For a cloud
+  workspace it runs on the workspace's own runtime, only for a manager and
+  only while the workspace is connected; a runtime from before this needs a
+  restart to offer it (`workspace/2`). (#432)
+- For a project the setting is on for, Settings also offers to turn on
+  GitHub's own "Automatically delete head branches" when you administer the
+  repository, which covers pull requests merged while TerminalX is closed.
+  (#432)
+
+### Issues
+
+- An issue stays in the Issues view after its pull request is merged. The
+  merge closes the issue and the list holds open ones only, so its page, with
+  the record of every stage, verdict and merge, could no longer be reached in
+  the app. Issues with a pipeline that the list does not hold are now shown
+  below it, under **Pipelines on issues not listed above**, and the open
+  issue's page says *Closed* once the merge has closed it. (#433)
+- **Refresh** in the Issues view reads the open issue again too, and keeps
+  its page as it is until the answer comes. (#433)
+
+### Stop from a guest or the phone interrupts too
+
+- A guest's Stop in a shared session no longer ends the host's agent and puts
+  "Session closed" over the host's tab. It interrupts the running turn, as the
+  host's own Stop does; if the agent does not answer, the same button becomes
+  "Stop session" and ends the process. What guests queued behind the turn is
+  kept and goes out when the interrupted turn has ended. (#427)
+- A guest's Steer no longer stops the host's agent and starts it again. The
+  turn is interrupted and the steering prompt is the next message, to the
+  same process, ahead of anything already waiting.
+- A guest's queued follow-up is no longer dropped when its turn ends within a
+  quarter of a second of that guest's last action.
+- On the phone, Stop in a cloud workspace interrupts the running turn instead
+  of ending the agent's process; pressed again while that turn is still
+  running, it stops the session. A workspace on a runtime from before the
+  interrupt keeps the old Stop.
+
+### Cloud
+
+- Local mirror: "Discard my changes" (and "Keep a copy, then discard") now
+  puts the workspace's files back right away, and reads "Files synced" only
+  once they are back. With an unchanged workspace it used to say "Files
+  synced" at once and leave the discarded edits on disk until the workspace
+  next changed. (#451)
+- Settings → Account → Agent logins now flags a login whose configurer is no
+  longer an owner or admin of the organization, and says that logging in
+  again takes it over. A member sees, per agent, whether a login their
+  workspaces can use is connected. The text about Disconnect matches what
+  the service does: it reaches running workspaces too. A first prompt
+  refused for lack of a login says which cases it can be and opens the
+  desktop's Agent logins instead of pointing at the web console. (#450)
+
+### Mobile companion
+
+These source changes require a separately updated mobile app.
+
+- The phone's Stop in a cloud workspace interrupts the running turn instead
+  of ending the agent's process; pressed again on the same turn, it stops the
+  session. (#427, #456)
+
+## 0.2.11
+
+Issue sessions that carry through a pull request, review and optional merge;
+tabs that follow what runs in their terminal; Escape that interrupts instead
+of killing the agent; dictation that respects edits; live clean-up progress;
+scheduled tasks and an environment section for cloud workspaces; and cloud
+terminal, login and mobile fixes.
+
+### Issues
+
+- A session started from a GitHub or Linear issue no longer stops at the
+  code. When the agent reports the work done and its checks passing,
+  TerminalX opens a pull request that closes the issue, has a second session
+  that did not write the code review it, takes the findings back to the first
+  session, and has the new commit reviewed again, up to three times. The
+  issue's page shows the stage it is at, the open findings, and a record of
+  every stage, verdict and merge with links to the sessions and the pull
+  request. A Linear issue is moved to In Review when its pull request opens.
+  (#433)
+- It ends at *Ready to merge* unless **Merge automatically when the review is
+  addressed** is on for the issue. With it on, TerminalX merges only at the
+  exact commit the reviewer approved, with no finding of medium severity or
+  higher open, its checks passed, no conflicts, and nothing in a category the
+  project keeps for a person (database migrations, deploy configuration,
+  anything the security pass flagged). Otherwise the page says *Ready to
+  merge* or *Needs you*, and why. The merge uses your own `gh` credentials
+  and never bypasses branch protection. (#433)
+- Each project has its own settings under **Issue pipeline…** in its menu:
+  whether the pipeline runs at all, what the switch starts at, whether a
+  person always does the merge, the number of review rounds, the merge
+  method, and what is always left for a person. (#433)
+- `terminalx sessions create --issue <issue>` starts a session from an issue,
+  and `terminalx pipelines` lists and steers the pipelines. (#433)
+- With a session already on an issue, **Open session** and **Start session**
+  no longer cover the worktree choice in a narrow window. (#433)
+
+This covers workspaces on this computer. See
+[docs/ISSUE-PIPELINE.md](docs/ISSUE-PIPELINE.md).
+
+### Tabs follow their terminal
+
+- A tab is now what runs in its terminal. Type `claude` or `codex` into a
+  plain terminal and its sidebar row becomes that agent's tab, with its
+  status and a chat that shows the conversation from its first turn. Exit
+  the agent and the row is a terminal again. Start another agent there and
+  the same tab is that agent's. The tab keeps its place, its selection and
+  any name you gave it throughout. (#437)
+- The same goes for a tab created as an agent tab: exiting its CLI from the
+  terminal view leaves a shell in the same terminal, and the tab is a
+  terminal until an agent is started in it. (#437)
+- Exiting an agent is not an error. There is no "needs attention", no
+  recovery banner and no "Resume safely"; a turn that was cut short is
+  marked as interrupted, with one line saying so. (#437)
+- A tab keeps every conversation it has held. The chat shows the current
+  one; earlier ones are under **Conversations**, and a terminal's last
+  conversation can be resumed in place with **Resume here**. Starting an
+  agent by hand on a conversation the tab already holds (`claude --resume`,
+  `claude -c`, `codex resume`) picks it up instead of opening a second copy.
+  (#437)
+- Sending from the chat types into an agent you started by hand, as it does
+  for one the app started. What would need that agent restarted (its
+  permission mode, and for Codex its model and effort) is disabled there and
+  says why. (#437)
+- Cursor and OpenCode started in a terminal are shown on the terminal's row
+  by their mark; they have no chat. Cloud workspaces do not follow their
+  terminals yet. See [docs/TABS-FOLLOW-TERMINAL.md](docs/TABS-FOLLOW-TERMINAL.md).
+  (#437)
+
+### Escape interrupts the agent instead of ending it
+
+- Pressing Escape while an agent works no longer kills the agent and puts
+  "Session closed … Resume safely" over the tab. Escape is the agent's own
+  key. In the terminal view (local and cloud) it is typed into the agent's
+  screen like every other key, so it also closes the agent's menus and leaves
+  its modes; an Escape typed in any terminal is never taken by a shortcut. In
+  the chat it interrupts the running turn: the turn shows as "Stopped", the
+  agent's process stays, and the next message goes to it without a restart.
+  With nothing running, Escape does nothing. Dialogs, menus, pickers and the
+  editor still get the key first. (#427)
+- Queued follow-ups survive Escape. Claude Code and Codex keep their own
+  queue and, interrupted with a message queued, send it at once as the next
+  turn; the chat now shows that as the queued message becoming the next
+  prompt rather than drawing it twice. For agents with no queue of their own
+  the app's is kept, and the next message starts when the interrupted turn
+  has ended. A request the turn was waiting on (a permission or a question)
+  is withdrawn with it, so nothing you were still deciding about runs.
+- Stopping the session is now a separate, explicit action: "Stop session" in
+  the terminal view and on the recovery banner, and "Stop the session" in
+  Settings → Shortcuts, which has no keys until you give it some (never a bare
+  Escape). The composer's Stop interrupts first; if the agent does not answer,
+  the same button becomes "Stop session" and ends the process. Only that
+  shows the "Session closed" banner.
+- If you had moved "Stop the running turn" to other keys, they now interrupt
+  (that is what stopping a turn does now), and Escape stays free if you had
+  taken the action off it.
+- Cloud tabs: Escape in the chat is sent to the runtime as a live interrupt
+  (`session/3`), for whoever may stop the tab. A workspace whose runtime is
+  older than this leaves the key alone until it is updated; its Stop works as
+  before.
+- The same holds for the agents that are driven without a terminal, checked
+  against the real ones. On an OpenCode tab the first message no longer fails
+  with "The connection was lost" (it was sent before OpenCode had started),
+  the reply no longer begins with your own prompt, and a message queued
+  behind a turn is no longer cut short the moment it starts.
+
 ### Dictation
 
 - Text deleted from the composer while dictating stays deleted. Selecting
@@ -22,6 +279,96 @@
 - A composer stops following the recogniser once its own dictation has
   ended, so a later dictation in the other window (main or floating) cannot
   add its words to it as well. (#428)
+
+### Cleaning up worktrees and leftovers
+
+- Removing worktrees ("Clean up worktrees…") now shows how far it is. After
+  the removal is confirmed the dialog has a progress bar and "N of M
+  worktrees done", the space freed so far against what the review measured
+  ("3.2 GB of about 11 GB", or "at least" when some sizes were never
+  measured), the worktree being handled with its host and the step it is on
+  (measuring, checking it again, removing, updating sessions), and each
+  worktree's outcome as soon as it is known. On this computer the counter
+  used to stay at "0 of N" until every worktree was done. When it finishes,
+  the same view is the result. (#426)
+- The dialog can be hidden while it runs, with Hide, Escape or the close
+  button. The clean-up carries on and the app stays usable. A small indicator
+  in the bottom-right corner then shows "Cleaning up 4 of 12" and the space
+  freed, sits below any notices and above the composer so a message can still
+  be written and sent, and opens the dialog again when it is clicked or
+  reached with the keyboard. If the run finishes while hidden the indicator
+  becomes its summary: one where everything was removed goes away by itself;
+  one with anything skipped, failed or not known stays until it is dismissed
+  or read. (#426)
+- Only one clean-up runs at a time: "Clean up worktrees…" during a run opens
+  that run instead of starting a new scan. Stop lets the worktree being
+  removed finish and leaves the rest, reported as "Not attempted"; it never
+  interrupts a removal half way. Hiding and stopping change nothing about
+  what is removed: each worktree is still checked again on its own machine
+  first, and git is never forced. (#426)
+- A worktree whose size the review already measured is no longer measured a
+  second time before it is removed. Its figure is then shown as "about";
+  one that was never measured is still measured, and shown exactly. (#426)
+- Deleting leftovers in Settings → Storage has the same treatment. It used
+  to show only a spinner on "Scan again" for the whole deletion; it now says
+  that everything is being checked again, then which leftover is being
+  deleted, how many are done and what was freed. It carries on when Settings
+  is left, with the same corner indicator leading back to Storage. (#426)
+- Quitting while a clean-up or a deletion of leftovers is running now asks
+  first: from the Quit menu item and ⌘Q, the tray's Quit and the main
+  window's close button. Quitting from the Dock, logging out and shutting
+  down cannot be asked about and end the app as before. (#426)
+
+### Cloud workspaces
+
+- Scheduled tasks. On a server that has them turned on, an organization's
+  owners and admins find "Scheduled tasks…" in a cloud workspace's menu: a
+  task wakes the workspace at set times and sends one prompt to an agent.
+  The dialog shows what a task costs before it is saved (each run, a month,
+  and the limit of 24 runs in 24 hours), how its last run went, and lets
+  them pause, resume or delete it, or pause every task of the organization.
+  A scheduled agent never starts in bypass permissions. (PRO-37)
+- Settings → Account gains a **Cloud environment** section for the
+  organization's provider template: the machine install script and each
+  repository's setup, with revisions, a confirmed Build, the versions with
+  their state, log, cancel, retry and roll back, and recipe results labelled
+  as observed by TerminalX or reported by the agent. Members see the active
+  version only. A save names the revision it started from, so a draft cannot
+  overwrite someone else's save. (PRO-20, #442)
+- **Configure with an agent…** in that section, for owners and admins on a
+  server that offers recipes, asks first with the price and limits, starts a
+  private preparation workspace with a fixed first prompt, verifies the
+  agent's recipe itself in fresh clones (machine script, setup, lint, test,
+  build and start), stops the machine, and shows the proposal to save as a
+  recipe. It needs a server with preparation workspaces; without one the
+  create is refused and nothing starts. (PRO-20, #446)
+- A line typed into a cloud tab's terminal view just after a wake is no longer
+  lost without a word. The runtime answers a tab's slash-command list from its
+  own task so it no longer holds up the terminal, a cloud tab that is not on
+  screen does not ask for the list, the view says "Connecting to the agent's
+  terminal" while the attach is unanswered and tells you when a key was
+  dropped, and a replaced attach no longer prints the history again. The
+  runtime part needs a runtime release. (#449, #455)
+- The provider connection in Settings loads once when it opens, not twice,
+  so the controls no longer flash and a click in the gap is not lost. (#444)
+- Agent logins: every native dialog says when it replaces the login stored
+  for the agent, an open sign-in can choose Replace if someone else stores a
+  login meanwhile, and logging in again no longer widens a login an admin had
+  narrowed to managers; the dialogs say who the stored login reaches. (PRO-79,
+  #429, #435)
+- A command refused because the workspace is stopped is resent under the same
+  command id once you agree to wake it, from the CLI and the phone. (PRO-89,
+  #430)
+
+### Mobile companion
+
+These source changes require a separately updated mobile app.
+
+- A cloud session comes back to Live after the app was in the background or
+  the workspace was stopped and started, instead of staying on "waiting for
+  the runtime". (#448, #454)
+- The phone asks before waking a workspace for a command the server already
+  holds, and resends a refused command under its original id. (PRO-89, #430)
 
 ## 0.2.10
 
@@ -55,6 +402,20 @@ through a silent turn and follow role changes.
   promoted to driver starts holding it without reconnecting. Phones are still
   not counted, and revoking access or the first member list revalidates the
   connections already open. (#423)
+- A line typed into a cloud agent tab's terminal view in the first seconds
+  after a wake is no longer lost without a word. With another tab of the
+  session left in chat, that tab asked the runtime for its slash commands on
+  every connect; the runtime answered nothing else until the tab's CLI had
+  answered (15 seconds when it never did), so the terminal was not attached
+  yet while the view already read "Idle", and keys typed then were dropped.
+  The runtime now answers the command list apart from everything else, a
+  tab that is not on screen no longer asks for it, and while the terminal is
+  still connecting the view says so, and says when something typed was not
+  sent. Needs the next runtime release for the first part; the rest is in
+  the desktop. (#449)
+- Opening a cloud agent tab's terminal view no longer prints its history
+  more than once when the view was left and shown again before the runtime
+  had answered. (#449)
 
 ## 0.2.9
 

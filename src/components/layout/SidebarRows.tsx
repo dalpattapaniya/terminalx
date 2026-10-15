@@ -271,6 +271,8 @@ export interface TabRowProps extends TabRowPassThrough {
   onOpen: () => void;
   /** Absent when this reader may not close the tab (a cloud tab for anyone but a workspace manager): no close button is drawn. */
   onClose?: () => void;
+  /** Pinned in its workspace's row of tabs: listed first, and marked. */
+  pinned?: boolean;
   children: ReactNode;
 }
 
@@ -279,7 +281,7 @@ export interface TabRowProps extends TabRowPassThrough {
  * middle click or its hover close button. Remaining props (a context menu
  * trigger's handlers and ref, `aria-description`) land on the row element.
  */
-export function TabRow({ tone, nodeId, panelId, label, title, selected, closeLabel, onOpen, onClose, children, ...rest }: TabRowProps) {
+export function TabRow({ tone, nodeId, panelId, label, title, selected, closeLabel, onOpen, onClose, pinned, children, ...rest }: TabRowProps) {
   const style = TAB_ROW[tone];
   return (
     <div
@@ -303,6 +305,7 @@ export function TabRow({ tone, nodeId, panelId, label, title, selected, closeLab
       className={cn(style.row, selected ? "bg-(--surface-thumb) text-foreground shadow-button" : style.idle)}
     >
       {children}
+      {pinned ? <Pin className="size-3 shrink-0 text-faint" aria-label="Pinned tab" /> : null}
       {onClose && (
         <button
           type="button"
@@ -349,11 +352,24 @@ export function AgentTabRow({ harness, label, status, mobileDriven, terminalView
   );
 }
 
-/** A shell terminal tab; an exited shell stays listed, struck through. */
-export function ShellTabRow({ title, exited, ...row }: TabRowBase & { title: string; exited: boolean }) {
+/**
+ * A terminal tab; an exited shell stays listed, struck through.
+ *
+ * `agent` is the agent in front of the terminal when that is one the app
+ * draws by its mark and has no chat for (#437): the row is then that agent's,
+ * and still a terminal's to open.
+ */
+export function ShellTabRow({ title, exited, agent, ...row }: TabRowBase & { title: string; exited: boolean; agent?: string | null }) {
   return (
-    <TabRow {...row} tone="peer" label={`${title}${exited ? ", exited" : ""}`} title={title} closeLabel={`Close ${title} terminal tab`}>
-      <Terminal className="size-3.5 shrink-0" />
+    <TabRow
+      {...row}
+      tone="peer"
+      label={`${title}${exited ? ", exited" : ""}`}
+      aria-description={agent ? `${agentName(agent)}, running in a terminal` : undefined}
+      title={agent ? `${title} · running in this terminal` : title}
+      closeLabel={`Close ${title} terminal tab`}
+    >
+      {agent ? <AgentMark id={agent} className="size-3.5 shrink-0" decorative /> : <Terminal className="size-3.5 shrink-0" />}
       <span className={cn("min-w-0 flex-1 truncate", exited && "text-faint line-through")}>{title}</span>
     </TabRow>
   );

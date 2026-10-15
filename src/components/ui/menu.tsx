@@ -1,13 +1,12 @@
 import * as React from "react";
 import { ContextMenu as Ctx, DropdownMenu as Prim } from "radix-ui";
-import { Check } from "@/icons";
+import { Check, ChevronRight } from "@/icons";
 import { cn } from "@/lib/cn";
 
 export const DropdownMenu = Prim.Root;
 export const DropdownMenuTrigger = Prim.Trigger;
 export const DropdownMenuGroup = Prim.Group;
 export const DropdownMenuSub = Prim.Sub;
-export const DropdownMenuSubTrigger = Prim.SubTrigger;
 export const DropdownMenuRadioGroup = Prim.RadioGroup;
 
 const contentClass =
@@ -35,6 +34,18 @@ DropdownMenuSubContent.displayName = "DropdownMenuSubContent";
 
 const itemClass =
   "relative flex cursor-default select-none items-center gap-2 whitespace-nowrap rounded-md px-2 py-1.5 text-[13px] outline-none data-[highlighted]:bg-veil-strong data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground";
+
+/** A row that opens a submenu, styled as an item; the arrow at its end says so. */
+export const DropdownMenuSubTrigger = React.forwardRef<
+  React.ComponentRef<typeof Prim.SubTrigger>,
+  React.ComponentPropsWithoutRef<typeof Prim.SubTrigger>
+>(({ className, children, ...props }, ref) => (
+  <Prim.SubTrigger ref={ref} className={cn(itemClass, "data-[state=open]:bg-veil-strong", className)} {...props}>
+    {children}
+    <ChevronRight className="ml-auto size-3.5! text-faint!" />
+  </Prim.SubTrigger>
+));
+DropdownMenuSubTrigger.displayName = "DropdownMenuSubTrigger";
 
 export const DropdownMenuItem = React.forwardRef<
   React.ComponentRef<typeof Prim.Item>,
@@ -118,3 +129,30 @@ ContextMenuItem.displayName = "ContextMenuItem";
 export function ContextMenuSeparator({ className }: { className?: string }) {
   return <Ctx.Separator className={cn("my-1 h-px bg-hairline", className)} />;
 }
+
+export const ContextMenuSub = Ctx.Sub;
+
+/** A row that opens a submenu; the arrow at its end says so. */
+export const ContextMenuSubTrigger = React.forwardRef<
+  React.ComponentRef<typeof Ctx.SubTrigger>,
+  React.ComponentPropsWithoutRef<typeof Ctx.SubTrigger>
+>(({ className, children, ...props }, ref) => (
+  <Ctx.SubTrigger ref={ref} className={cn(itemClass, "data-[state=open]:bg-veil-strong", className)} {...props}>
+    {children}
+    <ChevronRight className="ml-auto size-3.5! text-faint!" />
+  </Ctx.SubTrigger>
+));
+ContextMenuSubTrigger.displayName = "ContextMenuSubTrigger";
+
+export const ContextMenuSubContent = React.forwardRef<
+  React.ComponentRef<typeof Ctx.SubContent>,
+  React.ComponentPropsWithoutRef<typeof Ctx.SubContent>
+>(({ className, ...props }, ref) => (
+  <Ctx.Portal>
+    <Ctx.SubContent ref={ref} className={cn(contentClass, className)} {...props} />
+  </Ctx.Portal>
+));
+ContextMenuSubContent.displayName = "ContextMenuSubContent";
+
+/** A heading over a group of items, as in a dropdown. */
+export const ContextMenuLabel = DropdownMenuLabel;

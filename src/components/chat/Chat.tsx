@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown } from "@/icons";
+import { ArrowDown, Loader2 } from "@/icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import type { Transcript } from "@/lib/transcript";
@@ -42,6 +42,7 @@ export function Chat({
   answering,
   answerBlockedReason,
   askDetail = false,
+  loading = false,
   footer,
   onSendQueuedNow,
 }: {
@@ -58,6 +59,8 @@ export function Chat({
   answerBlockedReason?: string | null;
   /** Quote the command, file or tool a permission request is about (a shared cloud workspace). */
   askDetail?: boolean;
+  /** The conversation is on its way (a cloud tab opened here for the first time): empty is not "nothing yet". */
+  loading?: boolean;
   footer: React.ReactNode;
   /** Send a message queued behind the running turn now, where the backend can (local). */
   onSendQueuedNow?: (seq: number) => void;
@@ -206,7 +209,14 @@ export function Chat({
           {!turns.length && !live && (
             <div className="flex h-[40vh] min-h-[160px] flex-col justify-end">
               <RaccoonScene />
-              <p className="mt-3 text-center text-xs text-faint">Nothing here yet. Ask for something below.</p>
+              {loading ? (
+                <p role="status" className="mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-faint">
+                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                  Loading the conversation…
+                </p>
+              ) : (
+                <p className="mt-3 text-center text-xs text-faint">Nothing here yet. Ask for something below.</p>
+              )}
             </div>
           )}
           {turns.slice(oldestMounted).map((t, i, arr) => {

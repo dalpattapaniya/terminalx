@@ -59,9 +59,13 @@ export interface CloudWorkspaceSnapshot {
   problem: CloudLinkProblem;
   /** This person's role: the runtime's word while connected, else the list's. */
   role: CloudRole | null;
+  /** Connected, but the runtime has no member list yet (just restarted): it serves this phone nothing until it has (#475). */
+  checkingAccess: boolean;
   canApprove: boolean;
   /** Whether this phone can seal a command and open a transcript. */
   hasKey: boolean;
+  /** Whether Stop can interrupt (#427): a live connection to a runtime that granted `session/3`. Otherwise Stop is the mailbox `stop`. */
+  interrupts: boolean;
   tabs: CloudTab[];
   outbox: OutboxEntry[];
   /** The last thing that went wrong while reading, as a code. */
@@ -182,9 +186,10 @@ export class CloudWorkspaceSession {
         else if (event.type === "note") this.addNotes(event.note.tabId, [event.note]);
         else if (event.type === "you") {
           const before = this.you?.role ?? null;
+          const wasChecking = this.checking();
           this.you = event.you;
-          // Access given, changed or taken away while connected: bring everything in line with the new role.
-          if (before !== event.you.role) {
+          // Access given, changed or taken away while connected, or known at last: bring everything in line with the new role.
+          if (before !== event.you.role || (wasChecking && !this.checking())) {
             void this.reconcile();
             // Access taken away: the list says so too, and what this phone kept goes with it.
             if (this.unshared()) void this.options.refreshList?.().catch(() => false);
@@ -310,8 +315,23 @@ export class CloudWorkspaceSession {
     return this.command(tabId, "steer", { text }, {});
   }
 
+  /** The hard stop: the agent's process is ended and the tab's queued follow-ups are dropped. */
   stop(tabId: string): Promise<OutboxEntry> {
     return this.command(tabId, "stop", {}, {});
+  }
+
+  /**
+   * Stop as Escape (#427): the running turn is interrupted and the agent's
+   * process stays, with what is queued behind the turn. A live call, never
+   * the mailbox (a queued Escape would land in some later turn), so only
+   * while `snapshot.interrupts`. False when the tab had nothing running.
+   */
+  async interrupt(tabId: string): Promise<boolean> {
+    const { role } = this.snapshot;
+    if (role !== "manager" && role !== "driver") throw new CloudSendError(role === "viewer" ? "read-only" : "unavailable");
+    const sessionId = this.tabs.get(tabId)?.sessionId;
+    if (!sessionId || !this.client.hasCapability("session/3")) throw new CloudSendError("unavailable");
+    return (await this.client.interruptAgentTab({ sessionId, tabId })).interrupted;
   }
 
   /**
@@ -522,6 +542,13 @@ export class CloudWorkspaceSession {
           // Refused for someone with no role; `you` from the hello stands.
         }
       }
+      // The runtime does not know yet who may see what, and refuses everything until it does:
+      // nothing is asked, and `collab.you` says when it knows (#475).
+      if (this.checking()) {
+        this.error = null;
+        this.publish();
+        return;
+      }
       // Not shared with this person: the runtime refuses everything, so nothing is asked.
       if (this.unshared()) {
         // And nothing of it is held in memory either: no conversation, no tab titles, no notes, no one's presence.
@@ -563,6 +590,11 @@ export class CloudWorkspaceSession {
    */
   private unshared(): boolean {
     return this.you?.role === "none" && this.you.listed !== false;
+  }
+
+  /** Connected to a runtime that has said who it is, but not yet whether this person has access. */
+  private checking(): boolean {
+    return this.client?.connection.state === "connected" && collabGranted(this.client.connection) && this.you?.listed === false;
   }
 
   private present(tabId: string, activity: "viewing" | "typing"): void {
@@ -739,8 +771,11 @@ export class CloudWorkspaceSession {
       },
       problem: this.link?.problem ?? null,
       role: (you?.role as CloudRole | undefined) ?? null,
+      checkingAccess: connection.state === "connected" && available && said?.listed === false,
       canApprove: you?.canApprove === true,
       hasKey: !!this.keys?.current(),
+      // As shown: in the moment after a trip to the home screen an interrupt is refused, never turned into the stop that ends the process.
+      interrupts: connection.state === "connected" && connection.capabilities.includes("session/3"),
       tabs: [...(this.tabs?.values() ?? [])].map((tab) => ({ ...tab })),
       outbox: this.outbox?.entries() ?? [],
       error: this.error,

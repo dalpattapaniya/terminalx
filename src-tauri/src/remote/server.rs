@@ -71,9 +71,6 @@ pub const MAX_QUEUED_OUTPUT: usize = 4 * 1024 * 1024;
 const REPLAY_CHUNK: usize = 256 * 1024;
 /// Distinct writers remembered per terminal for resend detection.
 const MAX_WRITERS: usize = 64;
-/// Methods a `participate` attachment could not call before PRO-30. With no
-/// member list from the API (an older API) they stay closed to it.
-const SHARED_ONLY: &[&str] = &["keys.get", "pty.write", "pty.resize", "pty.control", "ports.list", "ports.open", "ports.write"];
 /// Longest session title `session.update` accepts, in characters.
 const MAX_TITLE_CHARS: usize = 200;
 /// Launch modes a tab may be given (`src/lib/models.ts` `PERMISSION_MODES`).
@@ -151,6 +148,13 @@ impl Peer {
     #[cfg(test)]
     pub(crate) fn counts_as_attached(&self) -> bool {
         self.attached.lock().unwrap().is_some()
+    }
+
+    /// Whether this connection is counted as one that may answer a
+    /// permission request.
+    #[cfg(test)]
+    pub(crate) fn counts_as_approver(&self) -> bool {
+        self.attached.lock().unwrap().as_ref().is_some_and(crate::cloud_activity::Attached::approves)
     }
 
     pub fn for_user(device_id: String, authority: Authority, user_id: Option<String>) -> (Arc<Self>, Notifications) {
@@ -596,11 +600,17 @@ impl WorkspaceRpc {
         // Read access under the attachment lock: a concurrent hello must
         // not overwrite a role refresh with a decision from the old list.
         let mut attached = peer.attached.lock().unwrap();
-        let types = !self.collab.known() || self.access(peer).can_drive();
+        let access = self.access(peer);
+        let types = !self.collab.known() || access.can_drive();
+        // Whether it may answer the agent's permission requests; before
+        // there are roles to go by, as for typing.
+        let approves = !self.collab.known() || access.can_approve;
         if peer.phone.load(Ordering::SeqCst) || !types || peer.gone.load(Ordering::SeqCst) {
             *attached = None;
-        } else if attached.is_none() {
-            *attached = Some(crate::cloud_activity::attached());
+        } else if attached.as_ref().is_none_or(|current| current.approves() != approves) {
+            // The old count goes before the new one is taken.
+            *attached = None;
+            *attached = Some(crate::cloud_activity::attached(approves));
         }
     }
 
@@ -621,8 +631,8 @@ impl WorkspaceRpc {
     }
 
     /// `listed` is false until the API has said who has access: the runtime
-    /// then serves participants what it did before sharing existed, and
-    /// clients must not read the role as "not shared".
+    /// then refuses participants everything until it knows, and clients must
+    /// not read the role as "not shared".
     fn you(&self, peer: &Peer) -> Value {
         let access = self.access(peer);
         json!({ "userId": peer.user_id, "role": access.role, "canApprove": access.can_approve, "listed": self.collab.known() })
@@ -894,16 +904,22 @@ impl WorkspaceRpc {
         result
     }
 
-    /// What a participant's role allows (contract §21.1). Before the API
-    /// has listed members, participants keep exactly what they had before
-    /// sharing existed.
+    /// What a participant's role allows (contract §21.1). Until the API has
+    /// listed members (after a restart, before the first list), nobody's
+    /// role is known, so a participant is refused everything: a member whose
+    /// share was revoked must not read the workspace in that window (#475).
+    /// The list comes with the runtime's session, before any client can
+    /// connect, and `collab.you` tells every connection when it arrives.
     fn authorize_participant(&self, peer: &Peer, spec: &protocol::Method) -> Result<(), RpcError> {
         let method = spec.name;
-        if !self.collab.known() && spec.capability != "collab/1" && !SHARED_ONLY.contains(&method) {
-            return Ok(());
+        if !self.collab.known() {
+            return Err(RpcError::forbidden(format!("{method} needs the workspace's member list, which has not arrived yet"))
+                .with_data(json!({ "role": Role::None, "reason": "access-unknown" })));
         }
         let needed = match method {
             "pty.write" | "pty.resize" | "pty.control" | "lease.acquire" | "lease.release" => Role::Driver,
+            // Escape for a running turn is driving it, as a mailbox stop is.
+            "session.interrupt" => Role::Driver,
             // Bytes sent to a port are input to whatever listens there.
             "ports.list" | "ports.open" | "ports.write" => Role::Driver,
             "lease.takeOver" => Role::Manager,
@@ -996,9 +1012,13 @@ impl WorkspaceRpc {
             "cleanup.scan" => self.cleanup_scan(),
             "cleanup.size" => self.cleanup_size(peer, params),
             "cleanup.cancel" => self.cleanup_cancel(peer),
-            "cleanup.remove" => self.cleanup_remove(params),
+            "cleanup.remove" => self.cleanup_remove(peer, params),
             "workspace.disposition" => self.workspace_disposition(peer, params),
             "workspace.remove" => self.workspace_remove(peer, params),
+            "workspace.sweepMerged" => self.workspace_sweep_merged(params),
+            "workspace.holdMerged" => self.workspace_hold_merged(params),
+            "workspace.removedRecords" => self.workspace_removed_records(),
+            "workspace.restoreRemoved" => self.workspace_restore_removed(params),
             git if git.starts_with("git.") => self
                 .git
                 .handle(git, &params)
@@ -1008,6 +1028,7 @@ impl WorkspaceRpc {
             "session.create" => self.session_create(params),
             "session.close" => self.session_close(params),
             "session.send" => self.session_send(peer, params),
+            "session.interrupt" => self.session_interrupt(peer, params),
             "session.subscribe" => self.session_subscribe(peer, params),
             "session.tabs" => self.session_tabs(peer),
             "session.commands" => self.session_commands(peer, params),
@@ -2140,17 +2161,17 @@ impl WorkspaceRpc {
             })
             .collect::<Result<_, _>>()?;
         let protected = [self.root.clone()];
-        let busy: HashSet<(String, String)> = self
-            .agents
-            .get()
-            .map(|agents| agents.tabs())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|tab| tab.process == "running" || !tab.pending_permissions.is_empty() || matches!(tab.status, index::TabStatus::InProgress | index::TabStatus::Waiting))
-            .map(|tab| (tab.session_id, tab.tab_id))
+        let tabs = self.agents.get().map(|agents| agents.tabs()).unwrap_or_default();
+        // In a turn, or waiting on an answer: what keeps a worktree even from
+        // a removal that stops the agents sitting idle in it.
+        let turns: HashSet<(String, String)> = tabs
+            .iter()
+            .filter(|tab| !tab.pending_permissions.is_empty() || matches!(tab.status, index::TabStatus::InProgress | index::TabStatus::Waiting))
+            .map(|tab| (tab.session_id.clone(), tab.tab_id.clone()))
             .collect();
+        let busy: HashSet<(String, String)> = tabs.iter().filter(|tab| tab.process == "running").map(|tab| (tab.session_id.clone(), tab.tab_id.clone())).chain(turns.iter().cloned()).collect();
         let running = |session: &str, tab: &str| busy.contains(&(session.to_string(), tab.to_string())) || self.sessions.as_ref().is_some_and(|manager| manager.is_running(session, tab));
-        let live = |sessions: &[SessionEntry]| crate::worktree_cleanup::Live::observe(&self.terminals, sessions, &running);
+        let live = |sessions: &[SessionEntry]| crate::worktree_cleanup::Live { turns: turns.clone(), ..crate::worktree_cleanup::Live::observe(&self.terminals, sessions, &running) };
         Ok(f(&crate::worktree_cleanup::Host { projects: &projects, protected: &protected, confine: Some(&self.root), live: &live, fetch: crate::landed::Fetch::Fresh }))
     }
 
@@ -2167,27 +2188,37 @@ impl WorkspaceRpc {
         let job = format!("peer:{}:{}", peer.id, required_str(&params, "job")?);
         let (project, path) = (required_str(&params, "projectPath")?, required_str(&params, "path")?);
         let size = self
-            .with_cleanup_host(|host| crate::worktree_cleanup::estimate_size(host, crate::worktree_cleanup::SizeJobs::global(), &job, project, path))?
+            .with_cleanup_host(|host| crate::worktree_cleanup::estimate_size(host, crate::worktree_cleanup::Jobs::sizes(), &job, project, path))?
             .map_err(|error| RpcError::invalid(format!("{error:#}")))?;
         Ok(json!({ "bytes": size }))
     }
 
     fn cleanup_cancel(&self, peer: &Peer) -> Result<Value, RpcError> {
-        crate::worktree_cleanup::SizeJobs::global().cancel(&format!("peer:{}:", peer.id));
+        crate::worktree_cleanup::Jobs::sizes().cancel(&format!("peer:{}:", peer.id));
         Ok(json!({}))
     }
 
     /// `cleanup/1`: remove the named worktrees. Each is inspected again here,
     /// on the machine that holds it, and left alone unless it is still what
     /// its token stands for. Nothing running is stopped.
-    fn cleanup_remove(&self, params: Value) -> Result<Value, RpcError> {
+    ///
+    /// While it runs the caller, and nobody else, is sent `cleanup.progress`
+    /// notifications: each worktree as it starts, the step it is on, and what
+    /// it came to. `run` in them is the request's `clientRequestId`. The
+    /// answer is what happened; a resent request gets it without them.
+    fn cleanup_remove(&self, peer: &Peer, params: Value) -> Result<Value, RpcError> {
+        use crate::worktree_cleanup::{OfRun, Progress, Watch};
         #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Params {
             items: Vec<crate::worktree_cleanup::RemoveItem>,
+            #[serde(default)]
+            client_request_id: String,
         }
         let p: Params = parse(params)?;
         let before = index::load().map_err(RpcError::internal)?;
-        let results = self.with_cleanup_host(|host| crate::worktree_cleanup::remove(host, &*self.sink, &p.items))?;
+        let report = |progress: &Progress| peer.notify("cleanup.progress", json!(OfRun { run: &p.client_request_id, progress }));
+        let results = self.with_cleanup_host(|host| crate::worktree_cleanup::remove(host, &*self.sink, &p.items, Watch { report: Some(&report), stop: None }))?;
         // What the runtime still holds for sessions that were deleted with
         // their worktree, as after `session.delete`.
         let deleted: HashSet<String> = results.iter().flat_map(|done| done.sessions_deleted.iter().cloned()).collect();
@@ -2482,6 +2513,7 @@ impl WorkspaceRpc {
                     expected_sessions: Some(&expected),
                     direct: crate::git::DirectDelete::Never,
                     fetch: crate::landed::Fetch::Fresh,
+                    guard: None,
                 };
                 let removed = crate::session_ops::remove_workspace(&*self.sink, &request, &stop).map_err(RpcError::internal)?;
                 kept_branch = removed.removal.kept_branch;
@@ -2574,11 +2606,80 @@ impl WorkspaceRpc {
             expected_sessions: Some(&p.expected_sessions),
             direct: crate::git::DirectDelete::Never,
             fetch: crate::landed::Fetch::Fresh,
+            guard: None,
         };
         let stop = |doomed: &SessionEntry| self.stop_before_removal(doomed);
         let removed = crate::session_ops::remove_workspace(&*self.sink, &request, &stop).map_err(RpcError::internal)?;
         let deleted = self.forget_deleted_sessions(&removed.sessions);
         Ok(json!({ "deleted": deleted, "keptBranch": removed.removal.kept_branch, "rescuedBranch": removed.removal.rescued_branch }))
+    }
+
+    // ---- the removal that follows a merged pull request -------------------------
+
+    /// `workspace/2`: one pass over this workspace's repositories: which
+    /// worktrees' pull requests merged, which stay and why, and the removal
+    /// of those that are safe and due, with their branches. The caller says
+    /// only that it is on, whether conversations go too, and how long the
+    /// grace period is; when a merge was first seen is kept here. With
+    /// `enabled: false` nothing is looked at and what was seen is forgotten:
+    /// the caller's way of saying it has been turned off.
+    fn workspace_sweep_merged(&self, params: Value) -> Result<Value, RpcError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Params {
+            enabled: Option<bool>,
+            #[serde(default)]
+            delete_sessions: bool,
+            grace_seconds: u64,
+        }
+        let p: Params = parse(params)?;
+        let before = index::load().map_err(RpcError::internal)?;
+        let swept = self
+            .with_cleanup_host(|host| {
+                let scope = crate::merged_cleanup::Scope {
+                    projects: host.projects.iter().filter(|_| p.enabled != Some(false)).map(|project| project.path.clone()).collect(),
+                    delete_sessions: p.delete_sessions,
+                    grace_seconds: p.grace_seconds,
+                };
+                let stop = |doomed: &SessionEntry| self.stop_before_removal(doomed);
+                let pull_requests = |cwd: &Path, branches: &[String]| crate::github::branch_prs(cwd, branches);
+                let run = crate::merged_cleanup::Sweep { host, sink: &*self.sink, stop: &stop, pull_requests: &pull_requests, now: chrono::Utc::now() };
+                crate::merged_cleanup::sweep(&run, &scope)
+            })?
+            .map_err(RpcError::internal)?;
+        // What the runtime still holds for sessions deleted with their
+        // worktree, as after `session.delete`.
+        let deleted: HashSet<&String> = swept.statuses.iter().filter_map(|status| status.record.as_ref()).flat_map(|record| &record.sessions_deleted).collect();
+        if !deleted.is_empty() {
+            let removed: Vec<SessionEntry> = before.into_iter().filter(|session| deleted.contains(&session.id)).collect();
+            self.forget_deleted_sessions(&removed);
+        }
+        Ok(json!({ "statuses": swept.statuses, "unreadable": swept.unreadable }))
+    }
+
+    /// `workspace/2`: keep a worktree that is waiting to be removed, or let
+    /// it go again. The path only names an entry of what this runtime has
+    /// itself seen merged.
+    fn workspace_hold_merged(&self, params: Value) -> Result<Value, RpcError> {
+        let held = params.get("held").and_then(Value::as_bool).ok_or_else(|| RpcError::invalid("held is required"))?;
+        crate::merged_cleanup::hold(required_str(&params, "path")?, held, chrono::Utc::now()).map_err(|error| RpcError::not_found(format!("{error:#}")))?;
+        Ok(json!({}))
+    }
+
+    /// `workspace/2`: what was removed here, newest first, with whether each
+    /// can still be brought back.
+    fn workspace_removed_records(&self) -> Result<Value, RpcError> {
+        let records = self.with_cleanup_host(crate::merged_cleanup::records)?.map_err(RpcError::internal)?;
+        Ok(json!({ "records": records }))
+    }
+
+    /// `workspace/2`: undo one recorded removal, where it was.
+    fn workspace_restore_removed(&self, params: Value) -> Result<Value, RpcError> {
+        let id = required_str(&params, "id")?;
+        let restored = self
+            .with_cleanup_host(|host| crate::merged_cleanup::restore(host, &*self.sink, id, chrono::Utc::now()))?
+            .map_err(|error| RpcError::invalid(format!("{error:#}")))?;
+        Ok(json!({ "record": restored.record, "notes": restored.notes }))
     }
 
     /// Close the terminals opened for sessions that are gone.
@@ -2733,6 +2834,35 @@ impl WorkspaceRpc {
             let _ = self.collab.claim(&tab.id, user, now, busy, false);
         }
         Ok(json!({ "sessionId": session.id, "tabId": tab.id, "outcome": outcome }))
+    }
+
+    /// `session/3` (#427): Escape for a tab's running turn. The turn is
+    /// interrupted and the agent's process stays up. The follow-up queue is
+    /// not touched, so the next queued message goes out once the turn has
+    /// settled (a mailbox `stop` is what drops it). Live only, and never a
+    /// mailbox command: queued, it would land in some later turn.
+    ///
+    /// Whoever may stop the tab may interrupt it: a driver while nobody else
+    /// holds its lease, a manager always. It claims no lease and is not use
+    /// of the workspace that keeps it awake.
+    fn session_interrupt(&self, peer: &Peer, params: Value) -> Result<Value, RpcError> {
+        let tab = self.visible_tab(peer, &params)?;
+        let access = self.access(peer);
+        if self.authority(peer) == Authority::Participate && !access.can_drive() {
+            return Err(RpcError::forbidden("interrupting needs driver access to the workspace"));
+        }
+        match peer.user_id.as_deref() {
+            Some(user) if access.role != Role::Manager => {
+                let busy = agents_busy(&self.agents, &tab.session_id, &tab.tab_id);
+                if let Some(held) = self.collab.held_by_other(&tab.tab_id, user, crate::cloud_agents::now_ms(), busy) {
+                    return Err(lease_refusal(LeaseRefusal::Held(held)));
+                }
+            }
+            None if self.authority(peer) == Authority::Participate => return Err(RpcError::forbidden("interrupting needs a signed-in person")),
+            _ => {}
+        }
+        let interrupted = self.agents()?.ops.interrupt(&tab.session_id, &tab.tab_id).map_err(RpcError::internal)?;
+        Ok(json!({ "interrupted": interrupted }))
     }
 
     /// Replay a tab's events after `sinceCursor`, then stream live ones.

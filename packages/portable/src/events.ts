@@ -177,6 +177,12 @@ export type Payload =
   | { type: "api_retry"; attempt: number; maxRetries: number; reason?: string }
   | { type: "rate_limited"; status?: string; resetsAt?: number; window?: string; message?: string }
   | { type: "status"; text: string }
+  /**
+   * The tab's terminal changed hands (#437): the events from here to the next
+   * marker belong to another of the tab's conversations. `id` is absent for
+   * the conversation the tab began with.
+   */
+  | { type: "conversation"; id?: string; harness: string; resumed?: boolean }
   | { type: "error"; message: string; fatal: boolean }
   | { type: "unknown"; kind: string };
 
@@ -187,4 +193,15 @@ export function mergeAgentEvents(existing: readonly AgentEvent[], incoming: read
   const bySequence = new Map(existing.map((event) => [event.seq, event]));
   for (const event of incoming) bySequence.set(event.seq, event);
   return [...bySequence.values()].sort((left, right) => left.seq - right.seq);
+}
+
+/**
+ * Whether an interrupt is still unanswered (#427). `interruptedAt` is the
+ * sequence number of the newest event when the interrupt was sent; until a
+ * turn has ended after it, the turn the interrupt was meant for is the one
+ * still running, and the same control may offer the stop that ends the
+ * agent's process.
+ */
+export function interruptUnanswered(events: readonly AgentEvent[], interruptedAt: number | null): boolean {
+  return interruptedAt !== null && !events.some((event) => event.seq > interruptedAt && event.payload.type === "turn_completed");
 }

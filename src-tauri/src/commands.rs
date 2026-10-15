@@ -52,15 +52,21 @@ fn stop_agents_and_wait(state: &tauri::State<'_, crate::AppState>, session: &Ses
         .iter()
         .map(|tab| {
             state.host.kill(&format!("{}/{}", session.id, tab.id));
-            crate::session::SessionManager::pane_id(&tab.id)
+            tab.pane_id()
         })
         .collect();
     state.terminals.kill_all_and_wait(&panes, STOP_BEFORE_REMOVE_WAIT);
 }
 
-fn kill_tab(state: &tauri::State<'_, crate::AppState>, session_id: &str, tab_id: &str) {
+fn kill_tab(app: &AppHandle, state: &tauri::State<'_, crate::AppState>, session_id: &str, tab_id: &str) {
     state.host.kill(&format!("{session_id}/{tab_id}"));
-    state.terminals.kill(&crate::session::SessionManager::pane_id(tab_id));
+    // The tab's own pane, or the shell's it took over (#437).
+    let pane = index::get(session_id).ok().and_then(|session| session.tab(tab_id).map(TabEntry::pane_id)).unwrap_or_else(|| crate::session::SessionManager::pane_id(tab_id));
+    state.terminals.kill(&pane);
+    // A shell's pane is listed by every window, which is told it has gone.
+    if crate::pty::is_shell_id(&pane) {
+        let _ = app.emit(PTY_CLOSED_EVENT, &pane);
+    }
 }
 
 // ------------------------------------------------------------------ account
@@ -333,6 +339,100 @@ pub fn organization_github_app_open(url: String, app: tauri::AppHandle) -> Githu
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|_| crate::organization_github_app::GithubAppError::local("github_app_browser_failed"))
+}
+
+// ------------------------------------------------ organization environment
+
+async fn environment_call(
+    state: tauri::State<'_, crate::AppState>,
+    operation: impl FnOnce(&crate::organization_environment::OrganizationEnvironmentService) -> ComputeResult + Send + 'static,
+) -> ComputeResult {
+    let service = state.organization_environment.clone();
+    tauri::async_runtime::spawn_blocking(move || operation(&service))
+        .await
+        .map_err(|_| crate::organization_compute::OrganizationComputeError::local("cloud_environment_unavailable"))?
+}
+
+#[tauri::command]
+pub async fn organization_environment_status(provider: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.status(&provider)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_update(
+    provider: String,
+    expected_revision: u64,
+    definition: serde_json::Value,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.update(&provider, expected_revision, &definition, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_build(
+    provider: String,
+    idempotency_key: String,
+    confirm_provider_spend: bool,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.build(&provider, &idempotency_key, confirm_provider_spend, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version(version_id: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.version(&version_id)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version_retry(
+    version_id: String,
+    confirm_provider_spend: bool,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.retry(&version_id, confirm_provider_spend, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version_cancel(version_id: String, context_revision: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.cancel(&version_id, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_version_rollback(version_id: String, context_revision: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.rollback(&version_id, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipes(provider: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.recipes(&provider)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipe_propose(
+    provider: String,
+    recipe: serde_json::Value,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.propose_recipe(&provider, &recipe, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipe_apply(
+    recipe_id: String,
+    confirm_apply: bool,
+    context_revision: String,
+    state: tauri::State<'_, crate::AppState>,
+) -> ComputeResult {
+    environment_call(state, move |service| service.apply_recipe(&recipe_id, confirm_apply, &context_revision)).await
+}
+
+#[tauri::command]
+pub async fn organization_environment_recipe_dismiss(recipe_id: String, context_revision: String, state: tauri::State<'_, crate::AppState>) -> ComputeResult {
+    environment_call(state, move |service| service.dismiss_recipe(&recipe_id, &context_revision)).await
 }
 
 // ------------------------------------------- cloud workspace configuration
@@ -727,7 +827,7 @@ fn local_login_confirmation(
          The refresh token stays on this Mac, so this Mac's sign-in keeps working and the uploaded token cannot be renewed: it stops working on {expires}.\n\n\
          Until then agents run on your Claude subscription. {reach} \
          Anyone who can drive one of those workspaces can read the token off its machine.\n\n\
-         To end it sooner, disconnect it in Settings (the service refuses while a workspace still uses the login)."
+         To end it sooner, disconnect it in Settings: that reaches every workspace of the organization, running ones included."
     )
 }
 
@@ -1097,6 +1197,73 @@ pub async fn cloud_workspace_share_revoke(
         .share_revoke(org_id.as_deref(), &workspace_id, &user_id))
 }
 
+/// The organization's scheduled cloud tasks, or one workspace's (PRO-37).
+#[tauri::command]
+pub async fn cloud_schedules(
+    workspace_id: Option<String>,
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<crate::cloud_workspaces::CloudSchedules, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Read, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedules(org_id.as_deref(), workspace_id.as_deref()))
+}
+
+#[tauri::command]
+pub async fn cloud_schedule(
+    schedule_id: String,
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<crate::cloud_workspaces::CloudScheduleDetail, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Read, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedule(org_id.as_deref(), &schedule_id))
+}
+
+/// What a schedule would cost, before it is saved. Writes nothing.
+#[tauri::command]
+pub async fn cloud_schedule_estimate(
+    input: crate::cloud_workspaces::CloudScheduleEstimateInput,
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<crate::cloud_workspaces::CloudScheduleQuote, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Read, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedule_estimate(org_id.as_deref(), &input))
+}
+
+#[tauri::command]
+pub async fn cloud_schedule_create(
+    input: crate::cloud_workspaces::CloudScheduleCreateInput,
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<crate::cloud_workspaces::CloudSchedule, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedule_create(org_id.as_deref(), &input))
+}
+
+/// Pause a scheduled task (`active: false`) or resume a paused one.
+#[tauri::command]
+pub async fn cloud_schedule_set_active(
+    schedule_id: String,
+    active: bool,
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<crate::cloud_workspaces::CloudSchedule, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedule_set_active(org_id.as_deref(), &schedule_id, active))
+}
+
+#[tauri::command]
+pub async fn cloud_schedule_delete(
+    schedule_id: String,
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<(), crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedule_delete(org_id.as_deref(), &schedule_id))
+}
+
+/// Pause every active scheduled task of the organization.
+#[tauri::command]
+pub async fn cloud_schedules_pause_all(
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<crate::cloud_workspaces::CloudSchedulesPaused, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.schedules_pause_all(org_id.as_deref()))
+}
+
 /// Switch who may see a cloud workspace: `organization` so it can be shared,
 /// `private` to hide it again (the server revokes every share with it).
 #[tauri::command]
@@ -1411,22 +1578,56 @@ pub fn add_tab(app: AppHandle, state: State<'_, AppState>, session_id: String, t
     Ok(tab)
 }
 
+/// Tell every window how the workspaces' tabs are arranged now, and which closed tabs can be reopened.
+fn announce_tabs(app: &AppHandle) {
+    if let Ok(tabs) = index::tab_state() {
+        let _ = app.emit("tab_state_changed", &tabs);
+    }
+}
+
+/// Close an agent tab: its CLI is stopped and it leaves the session. A tab
+/// that holds a conversation stays reopenable ([`reopen_tab`]), log and all.
 #[tauri::command]
 pub fn remove_tab(app: AppHandle, session_id: String, tab_id: String) -> CmdResult<()> {
     let state = app.state::<crate::AppState>();
-    kill_tab(&state, &session_id, &tab_id);
-    index::update_session(&session_id, |s| {
-        s.tabs.retain(|t| t.id != tab_id);
-        if s.active_tab.as_deref() == Some(&tab_id) {
-            s.active_tab = s.tabs.last().map(|t| t.id.clone());
-        }
-        Ok(())
-    })
-    .map_err(err)?;
-    if let Ok(p) = store::log_path(&session_id, &tab_id) {
-        let _ = std::fs::remove_file(p);
-    }
+    kill_tab(&app, &state, &session_id, &tab_id);
+    crate::session_ops::close_tab_entry(&session_id, &tab_id)?;
     announce_session(&app, &session_id);
+    announce_tabs(&app);
+    Ok(())
+}
+
+/// Bring a closed tab back into its session, with its conversation.
+#[tauri::command]
+pub fn reopen_tab(app: AppHandle, session_id: String, tab_id: String) -> CmdResult<TabEntry> {
+    let tab = crate::session_ops::reopen_tab_entry(&session_id, &tab_id)?;
+    announce_session(&app, &session_id);
+    announce_tabs(&app);
+    Ok(tab)
+}
+
+/// Give an agent tab the reader's own title; `None` (or blank) takes it away,
+/// and the tab goes by its first request again.
+#[tauri::command]
+pub fn rename_tab(app: AppHandle, session_id: String, tab_id: String, title: Option<String>) -> CmdResult<()> {
+    crate::session_ops::rename_tab_entry(&session_id, &tab_id, title)?;
+    announce_session(&app, &session_id);
+    Ok(())
+}
+
+/// How every workspace's tabs are arranged, and the closed tabs that can be reopened.
+#[tauri::command]
+pub fn tab_state() -> CmdResult<index::TabState> {
+    index::tab_state().map_err(err)
+}
+
+/// Save one workspace's tab order, pins, mutes and titles, for every window and every device.
+#[tauri::command]
+pub fn set_tab_layout(app: AppHandle, workspace: String, layout: index::TabLayout) -> CmdResult<()> {
+    for session in index::set_tab_layout(&workspace, layout).map_err(err)? {
+        let _ = app.emit("session_updated", &session);
+    }
+    announce_tabs(&app);
     Ok(())
 }
 
@@ -1525,7 +1726,8 @@ fn sweep_quick_chats(app: &AppHandle) {
     let state = app.state::<crate::AppState>();
     // A shell the reader left running in it is a use of it, whatever its date.
     let shells = state.terminals.shells();
-    let busy = |session: &SessionEntry| shells.iter().any(|shell| shell.session_id == session.id && !shell.exited);
+    let live: Vec<&str> = shells.iter().filter(|shell| !shell.exited).map(|shell| shell.session_id.as_str()).collect();
+    let busy = |session: &SessionEntry| crate::session_ops::has_shell_in_use(session, &live, |pane| state.terminals.is_running(pane));
     let stop = |session: &SessionEntry| stop_sessions_and_wait(&state, std::slice::from_ref(session));
     match crate::session_ops::sweep_idle_quick_chats(app, days, &busy, &stop) {
         Ok(removed) if !removed.is_empty() => log::info!("removed {} quick chat(s) idle for more than {days} day(s)", removed.len()),
@@ -1649,7 +1851,7 @@ pub async fn relocate_session(app: AppHandle, session_id: String) -> CmdResult<S
             return Err("session has no worktree".to_string());
         }
         for tab in &s.tabs {
-            kill_tab(&state, &s.id, &tab.id);
+            kill_tab(&app, &state, &s.id, &tab.id);
         }
         let branch = git::current_branch(Path::new(&s.project_path));
         let out = index::update_session(&session_id, |s| {
@@ -1912,7 +2114,7 @@ pub async fn send_message(
 }
 
 #[tauri::command]
-pub fn interrupt_turn(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<()> {
+pub fn interrupt_turn(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<bool> {
     state.manager().ok_or("not ready")?.interrupt(&session_id, &tab_id).map_err(err)
 }
 
@@ -2309,16 +2511,40 @@ pub(crate) const PTY_OPENED_EVENT: &str = "pty_opened";
 pub(crate) const PTY_CLOSED_EVENT: &str = "pty_closed";
 pub(crate) const PTY_RENAMED_EVENT: &str = "pty_renamed";
 
+/// Which of these shell tabs are running a command now, for a close that would end it.
+#[tauri::command]
+pub fn pty_busy(state: State<'_, AppState>, ids: Vec<String>) -> Vec<String> {
+    ids.into_iter().filter(|id| state.terminals.is_busy(id)).collect()
+}
+
 /// The shell tabs that are open, in every session: a window loaded after
 /// they were opened (the floating one, a reload) lists them from this.
 #[tauri::command]
 pub fn pty_shells(state: State<'_, AppState>) -> Vec<crate::pty::ShellPane> {
-    state.terminals.shells()
+    // A shell an agent was started in is that agent's tab from then on
+    // (#437): the session lists it, and it is not also a shell tab.
+    let taken: std::collections::HashSet<String> = index::load().unwrap_or_default().iter().flat_map(|session| &session.tabs).filter_map(|tab| tab.follow.pane.clone()).collect();
+    state.terminals.shells().into_iter().filter(|shell| !taken.contains(&shell.id)).collect()
+}
+
+/// The agents in front of terminals right now (#437), for a window that
+/// loads after they were started.
+#[tauri::command]
+pub fn pane_agents(state: State<'_, AppState>) -> Vec<crate::session::follow::PaneAgent> {
+    state.manager().map(|manager| manager.pane_agents()).unwrap_or_default()
+}
+
+/// Start a tab's agent again on one of the tab's conversations (#437): the
+/// one it holds, or one it held before another agent was run in its terminal.
+#[tauri::command]
+pub async fn tab_resume_conversation(app: AppHandle, session_id: String, tab_id: String, harness: String, provider_session_id: String) -> CmdResult<()> {
+    let manager = app.state::<AppState>().manager().ok_or("not ready")?;
+    tauri::async_runtime::spawn_blocking(move || manager.resume_conversation(&session_id, &tab_id, &harness, &provider_session_id).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub fn pty_rename(app: AppHandle, state: State<'_, AppState>, id: String, title: String) {
-    state.terminals.set_title(&id, &title);
+    state.terminals.rename(&id, &title);
     if let Some(shell) = state.terminals.shell(&id) {
         let _ = app.emit(PTY_RENAMED_EVENT, &shell);
     }
@@ -2751,6 +2977,56 @@ pub async fn github_identity(project_path: String, refresh: Option<bool>) -> Cmd
         .map_err(err)
 }
 
+// ------------------------------------------------------------------ issue pipelines
+
+/// A pipeline as it starts, with what the author's first prompt must carry
+/// for the pipeline to hear when the work is done.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartedIssuePipeline {
+    pub pipeline: crate::issue_pipeline::Pipeline,
+    pub author_brief: String,
+}
+
+#[tauri::command]
+pub fn issue_pipelines_list() -> CmdResult<Vec<crate::issue_pipeline::Pipeline>> {
+    crate::issue_pipeline::store::list().map_err(err)
+}
+
+/// Carry a session that was started from an issue on to a pull request, a
+/// review and a merge. Refused, with the reason, for a session the pipeline
+/// cannot serve: one on the default branch, or in a project that turned it off.
+#[tauri::command]
+pub async fn issue_pipeline_start(app: AppHandle, session_id: String, tab_id: String, auto_merge: Option<bool>) -> CmdResult<StartedIssuePipeline> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = crate::issue_pipeline::desktop::LocalHost::of(&app).map_err(err)?;
+        let pipeline = crate::issue_pipeline::engine::start(&host, &session_id, &tab_id, auto_merge).map_err(err)?;
+        Ok(StartedIssuePipeline { pipeline, author_brief: crate::issue_pipeline::prompts::author_brief() })
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn issue_pipeline_set_auto_merge(app: AppHandle, id: String, value: bool) -> CmdResult<crate::issue_pipeline::Pipeline> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = crate::issue_pipeline::desktop::LocalHost::of(&app).map_err(err)?;
+        crate::issue_pipeline::engine::set_auto_merge(&host, &id, value).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn issue_pipeline_act(app: AppHandle, id: String, action: crate::issue_pipeline::engine::Action) -> CmdResult<crate::issue_pipeline::Pipeline> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = crate::issue_pipeline::desktop::LocalHost::of(&app).map_err(err)?;
+        crate::issue_pipeline::engine::act(&host, &id, action).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
 #[cfg(test)]
 mod command_tests {
     #[test]
@@ -2868,7 +3144,9 @@ mod command_tests {
         let first = super::claude_code_prompt("Acme", None, &new);
         assert!(first.starts_with("Paste the code") && first.contains("By default, agents in every member's cloud workspaces"));
         assert!(text.contains("Anyone who can drive one of those workspaces can read the token"));
-        assert!(text.contains("the service refuses while a workspace still uses the login"));
+        // #450: a running workspace does not stop a disconnect.
+        assert!(text.contains("To end it sooner, disconnect it in Settings: that reaches every workspace of the organization, running ones included."));
+        assert!(!text.contains("refuses while a workspace still uses the login"));
     }
     use crate::session_ops::{
         create_session_entry, new_tab_entry, notify_workspace_deleted,
@@ -3158,6 +3436,7 @@ mod command_tests {
             expected_sessions: None,
             direct: crate::git::DirectDelete::Allowed,
             fetch: crate::landed::Fetch::Skip,
+            guard: None,
         };
         crate::session_ops::remove_workspace(&sink, &request, &|_| {}).unwrap().sessions
     }
@@ -3303,11 +3582,16 @@ pub async fn scan_leftovers() -> CmdResult<Vec<crate::cleanup::Leftover>> {
 }
 
 /// Delete the leftovers the person confirmed. Each is checked again first;
-/// anything in use, or not clean and merged, is left alone.
+/// anything in use, or not clean and merged, is left alone. How far it is
+/// goes out as `leftover_cleanup_progress` events carrying `run`.
 #[tauri::command]
-pub async fn remove_leftovers(app: AppHandle, ids: Vec<String>) -> CmdResult<crate::cleanup::Removal> {
+pub async fn remove_leftovers(app: AppHandle, ids: Vec<String>, run: Option<String>) -> CmdResult<crate::cleanup::Removal> {
     tauri::async_runtime::spawn_blocking(move || {
-        let removal = crate::cleanup::remove(&ids).map_err(err)?;
+        let run = run.unwrap_or_default();
+        let report = |progress: &crate::cleanup::Progress| {
+            let _ = app.emit(crate::cleanup::PROGRESS_EVENT, crate::worktree_cleanup::OfRun { run: &run, progress });
+        };
+        let removal = crate::cleanup::remove(&ids, &report).map_err(err)?;
         let projects: std::collections::BTreeSet<&str> =
             removal.removed.iter().filter_map(|id| id.strip_prefix("worktree:")).filter_map(|rest| rest.rsplit_once(':')).map(|(project, _)| project).collect();
         for project in projects {
@@ -3349,7 +3633,7 @@ pub async fn worktree_cleanup_scan(app: AppHandle, project_paths: Option<Vec<Str
 pub async fn worktree_cleanup_size(app: AppHandle, job: String, project_path: String, path: String) -> CmdResult<Option<u64>> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::AppState>();
-        with_cleanup_host(&state, |host| crate::worktree_cleanup::estimate_size(host, crate::worktree_cleanup::SizeJobs::global(), &format!("local:{job}"), &project_path, &path).map_err(err))?
+        with_cleanup_host(&state, |host| crate::worktree_cleanup::estimate_size(host, crate::worktree_cleanup::Jobs::sizes(), &format!("local:{job}"), &project_path, &path).map_err(err))?
     })
     .await
     .map_err(err)?
@@ -3358,16 +3642,26 @@ pub async fn worktree_cleanup_size(app: AppHandle, job: String, project_path: St
 /// Stop the size estimates whose job id starts with `prefix`.
 #[tauri::command]
 pub fn worktree_cleanup_cancel_sizes(prefix: String) {
-    crate::worktree_cleanup::SizeJobs::global().cancel(&format!("local:{prefix}"));
+    crate::worktree_cleanup::Jobs::sizes().cancel(&format!("local:{prefix}"));
 }
 
 /// Remove the worktrees the person confirmed. Each is checked again on the
 /// spot; one that changed, is in use or is protected is left and reported.
+/// How far it is goes out as `worktree_cleanup_progress` events carrying
+/// `run`; the list returned is what happened.
 #[tauri::command]
-pub async fn worktree_cleanup_remove(app: AppHandle, items: Vec<crate::worktree_cleanup::RemoveItem>) -> CmdResult<Vec<crate::worktree_cleanup::ItemResult>> {
+pub async fn worktree_cleanup_remove(app: AppHandle, items: Vec<crate::worktree_cleanup::RemoveItem>, run: Option<String>) -> CmdResult<Vec<crate::worktree_cleanup::ItemResult>> {
+    use crate::worktree_cleanup::{Jobs, OfRun, Progress, Watch, PROGRESS_EVENT};
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::AppState>();
-        let results = with_cleanup_host(&state, |host| crate::worktree_cleanup::remove(host, &app, &items))?;
+        let run = run.unwrap_or_default();
+        let report = |progress: &Progress| {
+            let _ = app.emit(PROGRESS_EVENT, OfRun { run: &run, progress });
+        };
+        let stop = Jobs::removals().start(&run);
+        let results = with_cleanup_host(&state, |host| crate::worktree_cleanup::remove(host, &app, &items, Watch { report: Some(&report), stop: Some(&stop) }));
+        Jobs::removals().finish(&stop);
+        let results = results?;
         for done in results.iter().filter(|done| matches!(done.outcome, crate::worktree_cleanup::Outcome::Removed | crate::worktree_cleanup::Outcome::AlreadyRemoved)) {
             state.browser.forget_workspace(&crate::browser::control::canonical(&done.path));
         }
@@ -3375,6 +3669,146 @@ pub async fn worktree_cleanup_remove(app: AppHandle, items: Vec<crate::worktree_
     })
     .await
     .map_err(err)?
+}
+
+/// Stop the removal `run` once the worktree it is on is finished. The ones
+/// it has not started are left as they are and reported as not attempted.
+#[tauri::command]
+pub fn worktree_cleanup_stop(run: String) {
+    // An id is matched from its start; none at all would match every removal.
+    if !run.is_empty() {
+        crate::worktree_cleanup::Jobs::removals().cancel(&run);
+    }
+}
+
+// ---- removing a workspace once its pull request has merged ------------------
+
+pub(crate) const MERGED_CLEANUP_SETTINGS_EVENT: &str = "merged_cleanup_settings";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedCleanupProjectPatch {
+    /// A local project's path, or a cloud workspace's key.
+    key: String,
+    /// `None` follows the default again.
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedCleanupPatch {
+    enabled: Option<bool>,
+    delete_conversations: Option<bool>,
+    grace_minutes: Option<u32>,
+    project: Option<MergedCleanupProjectPatch>,
+}
+
+#[tauri::command]
+pub fn merged_cleanup_settings() -> crate::store::settings::MergedCleanupSettings {
+    store::settings::load().merged_cleanup
+}
+
+#[tauri::command]
+pub fn set_merged_cleanup_settings(app: AppHandle, patch: MergedCleanupPatch) -> CmdResult<crate::store::settings::MergedCleanupSettings> {
+    let mut settings = store::settings::load();
+    let cleanup = &mut settings.merged_cleanup;
+    if let Some(value) = patch.enabled {
+        cleanup.enabled = value;
+    }
+    if let Some(value) = patch.delete_conversations {
+        cleanup.delete_conversations = value;
+    }
+    if let Some(value) = patch.grace_minutes {
+        if !crate::store::settings::GRACE_MINUTES.contains(&value) {
+            return Err(format!("The grace period cannot be {value} minutes."));
+        }
+        cleanup.grace_minutes = value;
+    }
+    if let Some(project) = patch.project {
+        match project.enabled {
+            Some(enabled) => cleanup.projects.insert(project.key, enabled),
+            None => cleanup.projects.remove(&project.key),
+        };
+    }
+    store::settings::save(&settings).map_err(err)?;
+    let _ = app.emit(MERGED_CLEANUP_SETTINGS_EVENT, &settings.merged_cleanup);
+    Ok(settings.merged_cleanup)
+}
+
+/// One pass over the projects the setting is on for: what merged, what
+/// stays and why, and the removal of what is safe and due. Which projects
+/// those are is read here, from the settings file, so no caller can widen it:
+/// with the setting off this removes nothing.
+#[tauri::command]
+pub async fn merged_cleanup_sweep(app: AppHandle) -> CmdResult<crate::merged_cleanup::Swept> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        let settings = store::settings::load().merged_cleanup;
+        let swept = with_cleanup_host(&state, |host| {
+            let scope = crate::merged_cleanup::Scope {
+                projects: host.projects.iter().filter(|project| settings.enabled_for(&project.path)).map(|project| project.path.clone()).collect(),
+                delete_sessions: settings.delete_conversations,
+                grace_seconds: u64::from(settings.grace_minutes) * 60,
+            };
+            let stop = |session: &SessionEntry| stop_sessions_and_wait(&state, std::slice::from_ref(session));
+            let pull_requests = |cwd: &Path, branches: &[String]| crate::github::branch_prs(cwd, branches);
+            let run = crate::merged_cleanup::Sweep { host, sink: &app, stop: &stop, pull_requests: &pull_requests, now: chrono::Utc::now() };
+            crate::merged_cleanup::sweep(&run, &scope).map_err(err)
+        })??;
+        for removed in swept.statuses.iter().filter(|status| status.phase == crate::merged_cleanup::Phase::Removed) {
+            state.browser.forget_workspace(&crate::browser::control::canonical(&removed.path));
+        }
+        Ok(swept)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Keep a workspace that is waiting to be removed, or let it go again.
+#[tauri::command]
+pub async fn merged_cleanup_hold(path: String, held: bool) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(move || crate::merged_cleanup::hold(&path, held, chrono::Utc::now()).map_err(err)).await.map_err(err)?
+}
+
+/// What was removed by itself, newest first, with whether each can still be
+/// brought back.
+#[tauri::command]
+pub async fn merged_cleanup_records(app: AppHandle) -> CmdResult<Vec<crate::merged_cleanup::RecordView>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        with_cleanup_host(&state, |host| crate::merged_cleanup::records(host).map_err(err))?
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Undo one removal: the worktree, its branch and what else can be put back.
+#[tauri::command]
+pub async fn merged_cleanup_restore(app: AppHandle, id: String) -> CmdResult<crate::merged_cleanup::Restored> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<crate::AppState>();
+        with_cleanup_host(&state, |host| crate::merged_cleanup::restore(host, &app, &id, chrono::Utc::now()).map_err(err))?
+    })
+    .await
+    .map_err(err)?
+}
+
+/// An attached project's directory, for a call that asks GitHub about it.
+fn attached_project(project_path: &str) -> CmdResult<std::path::PathBuf> {
+    let (all, _) = projects::list().map_err(err)?;
+    all.iter().find(|project| project.path == project_path).map(|project| std::path::PathBuf::from(&project.path)).ok_or_else(|| "That project is not attached.".to_string())
+}
+
+/// GitHub's own "Automatically delete head branches" for a project's
+/// repository, and whether the reader may change it.
+#[tauri::command]
+pub async fn github_head_branch_setting(project_path: String) -> CmdResult<crate::github::HeadBranchSetting> {
+    tauri::async_runtime::spawn_blocking(move || crate::github::head_branch_setting(&attached_project(&project_path)?).map_err(err)).await.map_err(err)?
+}
+
+#[tauri::command]
+pub async fn github_enable_head_branch_deletion(project_path: String) -> CmdResult<crate::github::HeadBranchSetting> {
+    tauri::async_runtime::spawn_blocking(move || crate::github::enable_head_branch_deletion(&attached_project(&project_path)?).map_err(err)).await.map_err(err)?
 }
 
 /// What a workspace takes on disk. Asked for one workspace at a time, after
@@ -3458,6 +3892,7 @@ pub async fn remove_workspace(
             expected_sessions: Some(&expected_sessions),
             direct,
             fetch: crate::landed::Fetch::Fresh,
+            guard: None,
         };
         let stop = |session: &SessionEntry| stop_sessions_and_wait(&state, std::slice::from_ref(session));
         let removed = crate::session_ops::remove_workspace(&app, &request, &stop)?;
@@ -3484,6 +3919,8 @@ fn cloud_mirror(organization_id: &str, workspace_id: &str) -> CmdResult<crate::c
 pub struct CloudMirrorCheck {
     diverged: Vec<crate::cloud_mirror::Divergence>,
     diverged_total: usize,
+    /// Discarded paths no sync has replaced yet: not in sync until a plan is carried out.
+    discarded: usize,
 }
 
 #[tauri::command]
@@ -3504,8 +3941,9 @@ pub async fn cloud_mirror_disable(organization_id: String, workspace_id: String,
 #[tauri::command]
 pub async fn cloud_mirror_check(organization_id: String, workspace_id: String) -> CmdResult<CloudMirrorCheck> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (diverged, diverged_total) = cloud_mirror(&organization_id, &workspace_id)?.check().map_err(err)?;
-        Ok(CloudMirrorCheck { diverged, diverged_total })
+        let mirror = cloud_mirror(&organization_id, &workspace_id)?;
+        let (diverged, diverged_total) = mirror.check().map_err(err)?;
+        Ok(CloudMirrorCheck { diverged, diverged_total, discarded: mirror.pending_discards().map_err(err)? })
     })
     .await
     .map_err(err)?

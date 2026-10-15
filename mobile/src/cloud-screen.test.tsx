@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   params: { workspaceId: "ws-1", orgId: "org-1" } as Record<string, string>,
   app: {} as any,
   catalog: null as any,
+  listProps: {} as any,
   push: vi.fn(),
   alert: vi.fn(),
   focus: [] as (() => void)[],
@@ -35,7 +36,7 @@ vi.mock("react-native", () => {
     StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
     Pressable: ({ children, onPress, disabled, accessibilityLabel, accessibilityState }: any) => <button disabled={disabled} aria-label={accessibilityLabel} aria-pressed={accessibilityState?.selected} onClick={onPress}>{typeof children === "function" ? children({ pressed: false }) : children}</button>,
     TextInput: ({ value, onChangeText, placeholder, editable, accessibilityLabel }: any) => <input type="text" aria-label={accessibilityLabel} value={value} disabled={editable === false} onInput={(event) => onChangeText(event.currentTarget.value)} placeholder={placeholder} />,
-    FlatList: ({ data, renderItem, ListHeaderComponent, ListEmptyComponent, ListFooterComponent }: any) => <div>{ListHeaderComponent}{data.length ? data.map((item: unknown, index: number) => <div key={index}>{renderItem({ item })}</div>) : ListEmptyComponent}{ListFooterComponent}</div>,
+    FlatList: ({ data, renderItem, ListHeaderComponent, ListEmptyComponent, ListFooterComponent, ...rest }: any) => (mocks.listProps = { data, ...rest }) && <div>{ListHeaderComponent}{data.length ? data.map((item: unknown, index: number) => <div key={index}>{renderItem({ item })}</div>) : ListEmptyComponent}{ListFooterComponent}</div>,
     SectionList: ({ sections, renderItem, renderSectionHeader, renderSectionFooter, ListHeaderComponent, ListEmptyComponent }: any) => <div>{ListHeaderComponent}{sections.length ? sections.map((section: any) => <div key={section.key}>{renderSectionHeader({ section })}{section.data.map((item: any) => <div key={item.workspace.id}>{renderItem({ item })}</div>)}{renderSectionFooter({ section })}</div>) : ListEmptyComponent}</div>,
   };
 });
@@ -55,7 +56,7 @@ const item = (id: string, fields: Record<string, unknown> = {}) => ({ workspace:
 
 const NAMES: Record<string, string> = { "u-alice": "Alice", "u-bob": "Bob" };
 
-function world(options: { state?: string | null; role?: string | null; canApprove?: boolean; hasKey?: boolean; events?: unknown[]; outbox?: unknown[]; connection?: string; noKey?: boolean; tabs?: number; access?: string; problem?: unknown; collab?: Record<string, unknown> } = {}) {
+function world(options: { state?: string | null; role?: string | null; canApprove?: boolean; hasKey?: boolean; events?: unknown[]; outbox?: unknown[]; connection?: string; noKey?: boolean; tabs?: number; access?: string; problem?: unknown; collab?: Record<string, unknown>; interrupts?: boolean } = {}) {
   const state = options.state === undefined ? "ready" : options.state;
   const snapshot = {
     connection: { state: options.connection ?? (state === "ready" ? "connected" : "suspended") },
@@ -64,6 +65,7 @@ function world(options: { state?: string | null; role?: string | null; canApprov
     role: options.role === undefined ? "driver" : options.role,
     canApprove: options.canApprove ?? false,
     hasKey: options.hasKey ?? true,
+    interrupts: options.interrupts ?? false,
     tabs: Array.from({ length: options.tabs ?? 1 }, (_, index) => ({ tabId: index ? `t${index + 1}` : "t1", sessionId: "s1", title: index ? `Second ${index}` : "Fix login", status: "in_progress", source: "live", pendingPermissions: [], events: index ? [] : (options.events ?? [event(1, { type: "user_message", text: "run the tests", queued: false })]), truncated: false, noKey: options.noKey ?? false })),
     outbox: options.outbox ?? [],
     error: null,
@@ -74,6 +76,7 @@ function world(options: { state?: string | null; role?: string | null; canApprov
     view: vi.fn(() => () => undefined),
     send: vi.fn(async () => ({})),
     stop: vi.fn(async () => ({})),
+    interrupt: vi.fn(async () => true),
     decide: vi.fn(async () => ({})),
     cancel: vi.fn(async () => undefined),
     typingIn: vi.fn(),
@@ -98,7 +101,7 @@ function world(options: { state?: string | null; role?: string | null; canApprov
     people: { subscribe: () => () => undefined, getVersion: () => 1, name: (userId: string | null | undefined) => NAMES[userId ?? ""] ?? "Someone", roster: vi.fn(async () => [{ userId: "u-me", email: "me@example.com", role: "admin" }, { userId: "u-alice", email: "alice@example.com", displayName: "Alice", role: "member" }, { userId: "u-bob", email: "bob@example.com", displayName: "Bob", role: "member" }]), remember: vi.fn() },
     api: { shares: vi.fn(), putShare: vi.fn(async () => ({})), revokeShare: vi.fn(async () => undefined) },
   };
-  return { session, release };
+  return { session, release, snapshot };
 }
 
 const text = () => container.textContent ?? "";
@@ -160,6 +163,35 @@ describe("the Cloud tab", () => {
 });
 
 describe("a cloud workspace screen", () => {
+  it("interrupts with Stop, and ends the agent's process only when that went unanswered", async () => {
+    const { session, snapshot } = world({ interrupts: true });
+    await show(<CloudWorkspaceScreen />);
+    await click("Stop the agent");
+    expect(session.interrupt).toHaveBeenCalledWith("t1");
+    expect(session.stop).not.toHaveBeenCalled();
+    // The turn it was sent to is still running: the same button now ends the process, and says so.
+    expect(() => button("Stop the agent")).toThrow();
+    await click("Stop the session");
+    expect(session.stop).toHaveBeenCalledWith("t1");
+    expect(session.interrupt).toHaveBeenCalledTimes(1);
+
+    // The agent answered and a later turn runs: Stop is an interrupt again.
+    snapshot.tabs[0].events = [...snapshot.tabs[0].events, event(2, { type: "turn_completed", status: "aborted" }), event(3, { type: "user_message", text: "again", queued: false })];
+    await show(<CloudWorkspaceScreen />);
+    expect(() => button("Stop the session")).toThrow();
+    await click("Stop the agent");
+    expect(session.interrupt).toHaveBeenCalledTimes(2);
+    expect(session.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Stop as the stop that ends the process on a runtime that cannot take an interrupt", async () => {
+    const { session } = world({ interrupts: false });
+    await show(<CloudWorkspaceScreen />);
+    await click("Stop the agent");
+    expect(session.stop).toHaveBeenCalledWith("t1");
+    expect(session.interrupt).not.toHaveBeenCalled();
+  });
+
   it("shows a running workspace live and sends without asking", async () => {
     const { session, release } = world();
     await show(<CloudWorkspaceScreen />);
@@ -506,6 +538,22 @@ describe("a shared cloud workspace on the phone", () => {
   });
 });
 
+describe("the workspace conversation", () => {
+  it("opens at the newest turn, not the oldest", async () => {
+    world({ events: [event(1, { type: "user_message", text: "first ask", queued: false }), event(2, { type: "turn_completed", status: "completed" }), event(3, { type: "user_message", text: "newest ask", queued: false })] });
+    await show(<CloudWorkspaceScreen />);
+    // The native list is inverted: offset zero, where it opens, is its first item.
+    expect(mocks.listProps.inverted).toBe(true);
+    expect(JSON.stringify(mocks.listProps.data[0])).toContain("newest ask");
+    expect(JSON.stringify(mocks.listProps.data.at(-1))).toContain("first ask");
+  });
+
+  it("goes back to the Cloud tab by name, not the route group", async () => {
+    const layout = (await import("../app/_layout.tsx?raw")).default;
+    expect(layout).toMatch(/name="cloud\/\[workspaceId\]" options=\{\{[^}]*headerBackTitle: "Cloud"/);
+  });
+});
+
 describe("the sharing screen", () => {
   const share = (userId: string, fields: Record<string, unknown> = {}) => ({ userId, email: `${userId.slice(2)}@example.com`, name: NAMES[userId], role: "driver", canApprove: false, createdBy: "u-me", createdAt: 1, updatedAt: 1, ...fields });
 
@@ -587,6 +635,32 @@ describe("the sharing screen", () => {
     refuse("something_new_entirely");
     await click("Bob: Can send");
     expect(alert()).toBe("That did not work. Try again in a moment.");
+  });
+
+  it("does not offer owners, admins or the creator, who already have access", async () => {
+    world();
+    mocks.catalog.workspace = () => item("ws-1", { createdBy: "u-carol" }).workspace;
+    mocks.catalog.people.roster.mockResolvedValue([
+      { userId: "u-bob", email: "bob@example.com", displayName: "Bob", role: "member" },
+      { userId: "u-erin", email: "erin@example.com", displayName: "Erin", role: "admin" },
+      { userId: "u-olga", email: "olga@example.com", displayName: "Olga", role: "owner" },
+      { userId: "u-carol", email: "carol@example.com", displayName: "Carol", role: "member" },
+    ]);
+    mocks.catalog.api.shares.mockResolvedValue({ shares: [], you: { role: "manager", canApprove: true, canManageShares: true } });
+    await show(<CloudSharesScreen />);
+    expect(text()).toContain("bob@example.com");
+    for (const email of ["erin@example.com", "olga@example.com", "carol@example.com"]) expect(text()).not.toContain(email);
+  });
+
+  it("says why a driver share is refused while a managers-only agent login exists", async () => {
+    world();
+    mocks.catalog.api.shares.mockResolvedValue({ shares: [share("u-bob", { role: "viewer" })], you: { role: "manager", canApprove: true, canManageShares: true } });
+    await show(<CloudSharesScreen />);
+    mocks.catalog.api.putShare.mockRejectedValueOnce(Object.assign(new Error("x"), { code: "cloud_workspace_share_credential_restricted" }));
+    await click("Bob: Can send");
+    const alert = container.querySelector('[role="alert"]')!.textContent;
+    expect(alert).toMatch(/agent login that only owners and admins may use/);
+    expect(alert).not.toMatch(/Try again in a moment/);
   });
 
   it("says when the list cannot be read and offers to try again", async () => {

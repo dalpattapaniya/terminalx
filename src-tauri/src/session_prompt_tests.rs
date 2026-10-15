@@ -759,21 +759,92 @@ fn a_queued_composer_prompt_the_cli_takes_after_the_turn_starts_the_next_one() {
     }
 }
 
-/// The reader queues a prompt from the composer, stops the turn, and then
-/// types the same words into the terminal. The CLI never sent what was
-/// queued, so its echo must not be left to swallow what was typed.
+/// The reader queues a prompt from the composer and presses Escape. Both
+/// CLIs stop the turn and send what was queued at once, as their next prompt
+/// (#427; Claude Code 2.1.296 writes the interruption and then the prompt,
+/// Codex 0.153.4 says "Model interrupted to submit steer instructions"). It
+/// is the message the reader already sees as queued, so it becomes the
+/// prompt of the next turn rather than being drawn a second time.
 #[test]
-fn a_queued_prompt_the_cli_never_sent_does_not_swallow_the_same_words_typed_later() {
+fn a_queued_prompt_the_cli_sends_once_its_turn_was_stopped_starts_the_next_turn() {
     for kind in BOTH {
         let rig = Rig::of(kind, "");
         rig.compose("start", 0);
         rig.cli_takes("start");
         assert!(rig.compose("continue", 0));
+        rig.enter_written();
         rig.interrupt();
         assert!(!rig.turn_open(), "{kind:?}");
 
         rig.cli_takes("continue");
+        assert!(rig.turn_open(), "{kind:?}");
+        assert_eq!(rig.status(), TabStatus::InProgress, "{kind:?}");
         rig.cli_replies("continuing");
+        assert_eq!(rig.told(), ["user: start", "queued: continue", "end", "reply: continuing", "end"], "{kind:?}: one message, not two");
+        assert_eq!(rig.taken_as_prompts(), ["continue"], "{kind:?}");
+        rig.advance(QUEUED_ECHO_GRACE + Duration::from_secs(60));
+        rig.tick();
+        assert_eq!(rig.banner(), None, "{kind:?}");
+    }
+}
+
+/// Found in the app, with Codex: the message had been queued for a minute
+/// behind a reply that was still streaming when Escape was pressed. Nothing
+/// is written to the transcript while a reply streams, and the turn was
+/// closed by the `Interrupt` hook with nothing new to read, so the wait for
+/// the queued message, counted from when it was sent, had already run out.
+/// The tab said delivery could not be confirmed and then drew the message a
+/// second time when the CLI sent it. The wait starts when the turn ends.
+#[test]
+fn a_prompt_queued_long_before_its_turn_was_stopped_is_still_expected() {
+    for kind in BOTH {
+        let rig = Rig::of(kind, "");
+        rig.compose("start", 0);
+        rig.cli_takes("start");
+        assert!(rig.compose("continue", 0));
+        rig.enter_written();
+        // Queued five minutes ago, and the transcript has been quiet since.
+        if let Engine::Cli(p) = &mut rig.rt.lock().unwrap().engine {
+            p.echoed.back_mut().unwrap().sent_at = Instant::now() - Duration::from_secs(300);
+        }
+        rig.interrupt();
+        rig.tick();
+        assert_eq!(rig.banner(), None, "{kind:?}: the CLI has a moment to send it, counted from now");
+        assert!(!rig.kinds().iter().any(|k| k == "recovery"), "{kind:?}");
+
+        rig.cli_takes("continue");
+        rig.cli_replies("continuing");
+        assert_eq!(rig.told(), ["user: start", "queued: continue", "end", "reply: continuing", "end"], "{kind:?}: one message, not two");
+        assert_eq!(rig.taken_as_prompts(), ["continue"], "{kind:?}");
+    }
+}
+
+/// A CLI that keeps what was queued in its own input when its turn is
+/// stopped (as Claude Code did before it sent it): the reader is told the
+/// message was not sent, and the same words typed into the terminal later
+/// are a message of their own, not that one's echo.
+#[test]
+fn a_queued_prompt_the_cli_kept_back_when_its_turn_was_stopped_is_flagged_and_swallows_nothing() {
+    for kind in BOTH {
+        let rig = Rig::of(kind, "");
+        rig.compose("start", 0);
+        rig.cli_takes("start");
+        assert!(rig.compose("continue", 0));
+        rig.enter_written();
+        rig.interrupt();
+        rig.tick();
+        assert_eq!(rig.banner(), None, "{kind:?}: the CLI has a moment to send it");
+
+        rig.advance(QUEUED_ECHO_GRACE + Duration::from_secs(60));
+        rig.tick();
+        rig.tick();
+        assert_eq!(rig.banner(), Some(RecoveryKind::DeliveryUnconfirmed), "{kind:?}: not silently dropped");
+        assert_eq!(rig.kinds().iter().filter(|k| *k == "recovery").count(), 1, "{kind:?}: said once");
+        assert_eq!(rig.told(), ["user: start", "queued: continue", "end"], "{kind:?}: nothing sent again");
+
+        rig.cli_takes("continue");
+        rig.cli_replies("continuing");
+        assert_eq!(rig.banner(), None, "{kind:?}");
         assert_eq!(rig.told(), ["user: start", "queued: continue", "end", "user: continue", "reply: continuing", "end"], "{kind:?}");
     }
 }
@@ -976,3 +1047,90 @@ fn a_slash_command_is_shown_as_typed_and_the_app_s_own_is_not_shown() {
     }
     assert_eq!(rig.told().len(), 3, "{:?}", rig.told());
 }
+
+impl Rig {
+    /// Put the open turn's start `by` further back, as if that long had passed.
+    fn turn_began_earlier(&self, by: Duration) {
+        let mut rt = self.rt.lock().unwrap();
+        rt.turn_started_at = Some(rt.turn_started_at.expect("a turn is open") - by);
+    }
+
+    /// How long the last turn to end was said to have taken.
+    fn last_turn_took(&self) -> Duration {
+        let ms = self.events().iter().rev().find_map(|e| match &e.payload {
+            Payload::TurnCompleted { duration_ms, .. } => Some(duration_ms.expect("a turn with a start has a duration")),
+            _ => None,
+        });
+        Duration::from_millis(ms.expect("a turn ended"))
+    }
+}
+
+/// Found in a cloud acceptance pass: a driver sent `/help` from the composer,
+/// which the CLI answers on its own screen with no prompt record and no
+/// `Stop`, so the turn it opened stayed open. A one-second prompt typed into
+/// the terminal minutes later then said "Worked for 5m 27s": its hook and its
+/// record found a turn open and kept that turn's start.
+#[test]
+fn a_prompt_after_a_command_that_never_ends_counts_its_own_time() {
+    const LONG_AGO: Duration = Duration::from_secs(5 * 60);
+    for kind in BOTH {
+        for record_first in [false, true] {
+            let case = format!("{kind:?}, {}", if record_first { "the record and then the hook" } else { "the hook and then the record" });
+            let rig = Rig::of(kind, "");
+            assert!(!rig.compose("/help", 0), "{case}");
+            assert!(rig.turn_open(), "{case}");
+            rig.turn_began_earlier(LONG_AGO);
+
+            if record_first {
+                rig.append(&rig.cli().prompt("typed in the terminal"));
+                rig.hook("UserPromptSubmit", json!({ "prompt": "typed in the terminal" }));
+            } else {
+                rig.cli_takes("typed in the terminal");
+            }
+            rig.cli_replies("done");
+            assert!(rig.last_turn_took() < LONG_AGO, "{case}: {:?}", rig.last_turn_took());
+
+            // From the composer, it is a prompt of its own, not one queued
+            // behind a turn that is not running.
+            rig.compose("/help", 0);
+            rig.turn_began_earlier(LONG_AGO);
+            assert!(!rig.compose("from the composer", 0), "{case}");
+            rig.cli_takes("from the composer");
+            rig.cli_replies("done again");
+            assert!(rig.last_turn_took() < LONG_AGO, "{case}: {:?}", rig.last_turn_took());
+        }
+    }
+}
+
+/// What the fix must leave alone: a turn that is working keeps its start
+/// through its own hooks and through a prompt typed into it mid-turn.
+#[test]
+fn a_running_turn_keeps_its_start_through_its_hooks_and_a_mid_turn_prompt() {
+    const LONG_AGO: Duration = Duration::from_secs(5 * 60);
+    for kind in BOTH {
+        let rig = Rig::of(kind, "");
+        rig.cli_takes("start");
+        rig.turn_began_earlier(LONG_AGO);
+        // Codex asks the reader about every tool at `PreToolUse`.
+        let tool_hook = if kind == CliKind::Claude { "PreToolUse" } else { "PostToolUse" };
+        rig.hook(tool_hook, json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t1" }));
+        rig.hook("PostToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "t1" }));
+        rig.append(&rig.cli().steer("and one more thing"));
+        rig.cli_replies("both");
+        assert!(rig.last_turn_took() >= LONG_AGO, "{kind:?}: {:?}", rig.last_turn_took());
+
+        // A command that does work of its own is a turn like any other.
+        assert!(!rig.compose("/review the last commit", 0));
+        rig.turn_began_earlier(LONG_AGO);
+        rig.hook("UserPromptSubmit", json!({ "prompt": "/review the last commit" }));
+        rig.hook(tool_hook, json!({ "tool_name": "Bash", "tool_input": { "command": "git show" }, "tool_use_id": "t2" }));
+        rig.append(&rig.cli().steer("look at the tests too"));
+        rig.cli_replies("reviewed");
+        assert!(rig.last_turn_took() >= LONG_AGO, "{kind:?}: {:?}", rig.last_turn_took());
+    }
+}
+
+/// Escape, from the chat and from the agent's own terminal (#427): the same
+/// rig and the same two CLIs, and a headless tab beside them.
+#[path = "session_interrupt_tests.rs"]
+mod interrupts;

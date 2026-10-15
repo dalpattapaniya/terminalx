@@ -54,6 +54,8 @@ mod organization_members;
 #[cfg(feature = "desktop")]
 mod organization_compute;
 #[cfg(feature = "desktop")]
+mod organization_environment;
+#[cfg(feature = "desktop")]
 mod organization_workspace_config;
 #[cfg(feature = "desktop")]
 pub mod computer;
@@ -69,6 +71,7 @@ mod drag_text;
 mod transcription;
 mod events;
 mod files;
+mod foreground;
 #[cfg(feature = "desktop")]
 mod floating;
 #[cfg(feature = "desktop")]
@@ -79,6 +82,8 @@ mod github;
 mod github_identity;
 mod harness;
 pub mod hooks;
+#[cfg(feature = "desktop")]
+mod issue_pipeline;
 mod issues;
 #[cfg(feature = "desktop")]
 mod installation;
@@ -87,12 +92,15 @@ mod keychain;
 mod landed;
 mod local_sharing;
 mod memory_baseline;
+mod merged_cleanup;
 mod models;
 mod names;
 #[cfg(feature = "desktop")]
 mod pairing;
 mod project_start;
 mod pty;
+#[cfg(feature = "desktop")]
+mod quit;
 mod relay_e2ee;
 pub mod remote;
 mod session;
@@ -125,6 +133,7 @@ pub struct AppState {
     pub organization_compute: Arc<organization_compute::OrganizationComputeService>,
     pub organization_github_app: Arc<organization_github_app::OrganizationGithubAppService>,
     pub workspace_config: Arc<organization_workspace_config::WorkspaceConfigService>,
+    pub organization_environment: Arc<organization_environment::OrganizationEnvironmentService>,
     pub pairing: Arc<pairing::PairingManager>,
     pub host: Arc<harness::host::Host>,
     pub terminals: Arc<pty::Terminals>,
@@ -168,6 +177,7 @@ pub fn run() {
     let organization_compute = Arc::new(organization_compute::OrganizationComputeService::new(account.clone()));
     let organization_github_app = Arc::new(organization_github_app::OrganizationGithubAppService::new(account.clone()));
     let workspace_config = Arc::new(organization_workspace_config::WorkspaceConfigService::new(account.clone()));
+    let organization_environment = Arc::new(organization_environment::OrganizationEnvironmentService::new(account.clone()));
     let cloud_remote = cloud_remote::CloudRemote::new(account.clone(), cloud_workspaces.clone(), cloud_agents.clone());
     // The resource directory is only known once Tauri is up; the service
     // resolves the helper lazily, so it can be built before `setup`.
@@ -180,6 +190,7 @@ pub fn run() {
         organization_compute,
         organization_github_app,
         workspace_config,
+        organization_environment,
         pairing: pairing.clone(),
         host: host.clone(),
         terminals: terminals.clone(),
@@ -229,6 +240,10 @@ pub fn run() {
                     }
                 }
                 Err(error) => log::warn!("allow attachments in the asset scope: {error:#}"),
+            }
+            // Shells ended with the last run of the app; a tab layout that still names one names nothing.
+            if let Err(error) = store::index::forget_shell_tabs() {
+                log::warn!("forget the shell tabs of the last run: {error:#}");
             }
             agent_keys.configure(&app.config().identifier);
             cloud_remote.watch_identity(app.handle().clone());
@@ -319,7 +334,11 @@ pub fn run() {
             });
             manager.follow_pane_exits();
             session::idle_orphaned_tabs();
+            // Tabs follow what runs in their terminal (#437). Only here: a
+            // cloud workspace's runtime does not.
+            manager.follow_terminals();
             automations::start_scheduler(app.handle().clone());
+            issue_pipeline::desktop::start(app.handle().clone());
             // The built-in browser: sweep daemons a crashed run left behind,
             // then keep this run's own daemons warm and its page list honest.
             browser.attach(app.handle().clone());
@@ -355,6 +374,17 @@ pub fn run() {
             commands::organization_github_app_repositories_save,
             commands::organization_github_app_disconnect,
             commands::organization_github_app_open,
+            commands::organization_environment_status,
+            commands::organization_environment_update,
+            commands::organization_environment_build,
+            commands::organization_environment_version,
+            commands::organization_environment_version_retry,
+            commands::organization_environment_version_cancel,
+            commands::organization_environment_version_rollback,
+            commands::organization_environment_recipes,
+            commands::organization_environment_recipe_propose,
+            commands::organization_environment_recipe_apply,
+            commands::organization_environment_recipe_dismiss,
             commands::workspace_config_organization,
             commands::workspace_config_organization_update,
             commands::workspace_config_repository_update,
@@ -398,6 +428,13 @@ pub fn run() {
             commands::cloud_workspace_shares,
             commands::cloud_workspace_share_put,
             commands::cloud_workspace_share_revoke,
+            commands::cloud_schedules,
+            commands::cloud_schedule,
+            commands::cloud_schedule_estimate,
+            commands::cloud_schedule_create,
+            commands::cloud_schedule_set_active,
+            commands::cloud_schedule_delete,
+            commands::cloud_schedules_pause_all,
             commands::cloud_workspace_set_access,
             commands::cloud_workspace_operation,
             commands::cloud_workspace_operation_cancel,
@@ -471,6 +508,12 @@ pub fn run() {
             floating::floating_open_in_main,
             commands::add_tab,
             commands::remove_tab,
+            commands::reopen_tab,
+            commands::rename_tab,
+            commands::tab_state,
+            commands::set_tab_layout,
+            commands::tab_resume_conversation,
+            commands::pane_agents,
             commands::rename_session,
             commands::set_session_archived,
             commands::set_session_pinned,
@@ -547,6 +590,7 @@ pub fn run() {
             commands::pty_spawn,
             commands::pty_shells,
             commands::pty_rename,
+            commands::pty_busy,
             commands::pty_write,
             commands::pty_attach,
             commands::pty_detach,
@@ -588,7 +632,21 @@ pub fn run() {
             commands::worktree_cleanup_size,
             commands::worktree_cleanup_cancel_sizes,
             commands::worktree_cleanup_remove,
+            commands::worktree_cleanup_stop,
+            commands::merged_cleanup_settings,
+            commands::set_merged_cleanup_settings,
+            commands::merged_cleanup_sweep,
+            commands::merged_cleanup_hold,
+            commands::merged_cleanup_records,
+            commands::merged_cleanup_restore,
+            commands::github_head_branch_setting,
+            commands::github_enable_head_branch_deletion,
+            quit::set_quit_warning,
             commands::issues_list,
+            commands::issue_pipelines_list,
+            commands::issue_pipeline_start,
+            commands::issue_pipeline_set_auto_merge,
+            commands::issue_pipeline_act,
             commands::issue_details,
             commands::linear_status,
             commands::linear_set_api_key,
@@ -633,6 +691,10 @@ pub fn run() {
             if event.id().as_ref() == status::MENU_ID {
                 status::toggle_from_menu(app);
             }
+            // The same request as the tray's Quit: it can be held back, see below.
+            if event.id().as_ref() == quit::MENU_ID {
+                app.exit(0);
+            }
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(drag) = event {
@@ -646,6 +708,12 @@ pub fn run() {
                     floating::hide(window.app_handle());
                 }
                 return;
+            }
+            // The app goes with its main window, so closing it is a quit.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && quit::held(window.app_handle()) {
+                    api.prevent_close();
+                }
             }
             if let tauri::WindowEvent::Destroyed = event {
                 if let Some(state) = window.try_state::<AppState>() {
@@ -661,6 +729,11 @@ pub fn run() {
                             let _ = floating.destroy();
                         }
                     }
+                    // The panes that exit from here on were closed by the
+                    // app, and no tab is turned into a terminal for that.
+                    if let Some(manager) = state.manager() {
+                        manager.closing();
+                    }
                     state.host.kill_all();
                     state.terminals.kill_all();
                     state.computer.shutdown();
@@ -671,6 +744,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // A restart never returns to be told no, so it is not held back.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                if *code != Some(tauri::RESTART_EXIT_CODE) && quit::held(app) {
+                    api.prevent_exit();
+                }
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 let state = app.state::<AppState>();
                 state.stats_usage.shutdown();

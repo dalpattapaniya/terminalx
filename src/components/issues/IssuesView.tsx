@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ExternalLink, FolderGit2, GitBranch, Loader2, RefreshCw, Search, Settings2, UserRound } from "@/icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "@/components/ui/menu";
 import { AutomationEditor, type AutomationEditorPrefill } from "@/components/automations/AutomationEditor";
 import { IssueListItem } from "@/components/issues/IssueListItem";
+import { IssuePipelinePanel } from "@/components/issues/IssuePipelinePanel";
 import { SessionAgentControls } from "@/components/session/SessionAgentControls";
 import { useSessionAgent } from "@/lib/useSessionAgent";
 import { Markdown } from "@/components/chat/Markdown";
@@ -19,9 +20,27 @@ import { PERMISSION_MODES } from "@/lib/models";
 import { chooseMode } from "@/lib/dialogs";
 import { cn } from "@/lib/cn";
 import { issuePrompt, issueWorktreeName } from "@/lib/issueSession";
+import { pipelineForIssue, pipelineSettings, startPipeline, unlistedPipelines, useIssuePipelines } from "@/lib/issuePipeline";
+import type { IssuePipeline } from "@/types/issuePipeline";
 import type { WorkStatus } from "@/types/session";
 
 type Provider = "github" | "linear";
+
+/**
+ * GitHub closes an issue a moment after the pull request that closes it is
+ * merged. The list is read again once that has had time to happen.
+ */
+const AFTER_MERGE_MS = 3000;
+
+/**
+ * A row for an issue the tracker's list no longer holds, from what its
+ * pipeline remembers of it. What the tracker says of it now is read when the
+ * issue is opened, so the row claims no state.
+ */
+function issueOfPipeline(pipeline: IssuePipeline): Issue {
+  const { provider, id, identifier, title, url } = pipeline.issue;
+  return { provider: provider === "linear" ? "linear" : "github", id, identifier, number: Number(id) || 0, title, url, state: "", stateType: "completed", labels: [], updatedAt: pipeline.modified };
+}
 
 /**
  * Issues from the project's tracker, and a way to start a session on one.
@@ -49,6 +68,8 @@ export function IssuesView({
   const [teams, setTeams] = useState<IssueTeam[]>([]);
   const [search, setSearch] = useState("");
   const [list, setList] = useState<Issue[]>([]);
+  // Which project and tracker `list` was read for. Until it is this one, nothing can be said to be missing from it.
+  const [listOf, setListOf] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Issue | null>(null);
@@ -67,12 +88,44 @@ export function IssuesView({
   const project = store.projects.find((p) => p.path === prefs.lastProject) ?? store.projects[0] ?? null;
   const isGit = project?.kind !== "folder";
   const useWorktree = isGit && (controlledUseWorktree ?? localUseWorktree);
+  const pipelines = useIssuePipelines();
+  const pipelineDefaults = pipelineSettings(project);
+  // The issue's own switch, before its session exists. It starts at the project's default.
+  const [autoMerge, setAutoMerge] = useState(pipelineDefaults.autoMerge);
+  // A pull request needs a branch of its own, so a session on the project's checkout ends at the code.
+  const pipelineOffered = isGit && useWorktree && pipelineDefaults.enabled;
+  const pipeline = selected && project ? pipelineForIssue(pipelines, project.path, selected.url) : null;
+  // Once an issue has a pipeline its switch is the pipeline's, on the panel
+  // below; a session started on it again keeps what was chosen there.
+  const mergeChoice = pipeline ? pipeline.autoMerge : autoMerge;
   const agentSelection = useSessionAgent(store.harnesses);
   const { harness, modelId, effort } = agentSelection;
   const linkedIssueUrls = useMemo(
     () => new Set(store.sessions.flatMap((session) => session.issue?.url ? [session.issue.url] : [])),
     [store.sessions],
   );
+  // Issues with a pipeline here that the list does not hold: closed by their
+  // merge, or outside the search. They stay below it, so the record of what
+  // happened to them can still be read on their page.
+  const unlisted = useMemo(() => {
+    if (!project || listOf !== `${project.path}\n${provider}`) return [];
+    const words = search.trim().toLowerCase();
+    return unlistedPipelines(pipelines, project.path, provider, list.map((issue) => issue.url))
+      .filter((value) => !words || `${value.issue.identifier} ${value.issue.title}`.toLowerCase().includes(words))
+      .map((value) => ({ issue: issueOfPipeline(value), pipeline: value }));
+  }, [pipelines, project, provider, list, listOf, search]);
+  // A merge closes the issue on the tracker. The list and the open issue are
+  // read again when a pipeline of this project gets there.
+  const mergedHere = pipelines.filter((value) => value.projectPath === project?.path && value.state === "merged").length;
+  const mergedSeen = useRef({ project: project?.path, count: mergedHere });
+  useEffect(() => {
+    const before = mergedSeen.current;
+    mergedSeen.current = { project: project?.path, count: mergedHere };
+    // Another project's count is not a merge that happened in this one.
+    if (before.project !== project?.path || mergedHere <= before.count) return;
+    const timer = window.setTimeout(() => setTick((t) => t + 1), AFTER_MERGE_MS);
+    return () => window.clearTimeout(timer);
+  }, [mergedHere, project?.path]);
 
   useEffect(() => {
     onTargetProjectChange?.(selected && project ? project.path : null);
@@ -131,10 +184,14 @@ export function IssuesView({
       setError(null);
       try {
         const r = await issuesApi.list(project.path, provider, { assignedToMe, teamId, search });
-        if (live) setList(r);
+        if (live) {
+          setList(r);
+          setListOf(`${project.path}\n${provider}`);
+        }
       } catch (e) {
         if (live) {
           setList([]);
+          setListOf(`${project.path}\n${provider}`);
           setError(errorMessage(e));
         }
       } finally {
@@ -147,16 +204,27 @@ export function IssuesView({
     };
   }, [project, provider, assignedToMe, teamId, search, linear?.connected, tick]);
 
-  // Body on demand: GitHub lists come without it.
+  // Body on demand: GitHub lists come without it. A refresh reads the open
+  // issue again as well, since its state may have moved; what is on the page
+  // stays there until the answer comes.
+  const shown = useRef<string | null>(null);
+  const selectedAtTick = useRef(tick);
   useEffect(() => {
-    setDetail(null);
+    const key = selected && project ? `${project.path}:${selected.provider}:${selected.id}` : null;
+    const again = key != null && shown.current === key;
+    shown.current = key;
+    if (!again) {
+      setDetail(null);
+      selectedAtTick.current = tick;
+    }
     if (!selected || !project) return;
-    if (selected.body != null && selected.provider === "linear") {
+    // A Linear row carries its body, and is as fresh as the list it came with.
+    if (selected.body != null && selected.provider === "linear" && selectedAtTick.current === tick) {
       setDetail(selected);
       return;
     }
     let live = true;
-    setDetailLoading(true);
+    if (!again) setDetailLoading(true);
     issuesApi
       .details(project.path, selected.provider, selected.id)
       .then((d) => live && setDetail(d))
@@ -165,7 +233,7 @@ export function IssuesView({
     return () => {
       live = false;
     };
-  }, [selected, project]);
+  }, [selected, project, tick]);
 
   const start = useCallback(async () => {
     const issue = detail ?? selected;
@@ -188,14 +256,25 @@ export function IssuesView({
         },
       });
       upsertSession(s);
+      // The pipeline starts with the session, and tells the author how to hand
+      // its work over. A session it cannot serve still starts, as it always did.
+      let prompt = issuePrompt(issue);
+      if (pipelineOffered) {
+        try {
+          const started = await startPipeline(s.id, s.tabs[0].id, mergeChoice && !pipelineDefaults.requirePerson);
+          prompt = `${prompt}\n\n${started.authorBrief}`;
+        } catch (e) {
+          console.error("issue pipeline did not start", e);
+        }
+      }
       selectSession(s.id);
-      onCreated?.(s.id, s.tabs[0].id, issuePrompt(issue));
+      onCreated?.(s.id, s.tabs[0].id, prompt);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
       setStarting(false);
     }
-  }, [detail, selected, project, harness, modelId, effort, prefs.lastMode, useWorktree, isGit, onCreated]);
+  }, [detail, selected, project, harness, modelId, effort, prefs.lastMode, useWorktree, isGit, onCreated, pipelineOffered, mergeChoice, pipelineDefaults.requirePerson]);
 
   const emptyReason = useMemo(() => {
     if (!project) return "Add a project to see its issues.";
@@ -209,8 +288,17 @@ export function IssuesView({
   }, [project, provider, ghOk, repo, linear]);
 
   const mode = PERMISSION_MODES.find((m) => m.id === prefs.lastMode);
+  const open = (issue: Issue) => {
+    setSelected(issue);
+    setUseWorktree(prefs.useWorktree);
+    setAutoMerge(pipelineDefaults.autoMerge);
+  };
+  const isOpen = (issue: Issue) => selected?.id === issue.id && selected.provider === issue.provider;
+  // What the tracker says of the open issue now, once that has been read; the row it was opened from until then.
+  const current = detail && isOpen(detail) ? detail : selected;
+  // The session working on the issue: the pipeline's author, never its reviewer.
   const linkedSession = selected
-    ? store.sessions.find((session) => session.issue?.url === selected.url)
+    ? store.sessions.find((session) => session.id === pipeline?.author.sessionId) ?? store.sessions.find((session) => session.issue?.url === selected.url)
     : null;
 
   if (automationPrefill) {
@@ -338,12 +426,10 @@ export function IssuesView({
                     <ContextMenuTrigger className="block">
                       <IssueListItem
                         issue={i}
-                        selected={selected?.id === i.id && selected.provider === i.provider}
+                        selected={isOpen(i)}
                         linked={linkedIssueUrls.has(i.url)}
-                        onSelect={() => {
-                          setSelected(i);
-                          setUseWorktree(prefs.useWorktree);
-                        }}
+                        pipeline={project ? pipelineForIssue(pipelines, project.path, i.url) : null}
+                        onSelect={() => open(i)}
                       />
                     </ContextMenuTrigger>
                     <ContextMenuContent>
@@ -366,6 +452,18 @@ export function IssuesView({
               ))}
             </ul>
           )}
+          {!emptyReason && unlisted.length > 0 && (
+            <section aria-label="Pipelines on issues not listed above" data-testid="issues-unlisted">
+              <h3 className="px-4 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-faint">Pipelines on issues not listed above</h3>
+              <ul className="px-2 pb-4">
+                {unlisted.map(({ issue, pipeline: its }) => (
+                  <li key={`${issue.provider}:${issue.id}`}>
+                    <IssueListItem issue={issue} selected={isOpen(issue)} pipeline={its} onSelect={() => open(issue)} />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
         </div>
       </div>
 
@@ -380,9 +478,9 @@ export function IssuesView({
                 <h2 className="min-w-0 flex-1 text-[15px] font-semibold leading-snug">{selected.title}</h2>
               </div>
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                <span>{selected.state}</span>
-                {selected.team && <span>{selected.team.name}</span>}
-                {selected.assignee && <span>Assigned to {selected.assignee.name}</span>}
+                {current?.state && <span>{current.state}</span>}
+                {current?.team && <span>{current.team.name}</span>}
+                {current?.assignee && <span>Assigned to {current.assignee.name}</span>}
                 <button type="button" onClick={() => void openUrl(selected.url)} className="flex items-center gap-1 hover:text-foreground">
                   Open in browser <ExternalLink className="size-3" />
                 </button>
@@ -405,10 +503,12 @@ export function IssuesView({
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
-              <div className="flex items-center gap-2">
-                {!isGit ? <span className="text-xs text-faint">In folder · no Git</span> : <label className="flex min-w-0 items-center gap-2 text-[11px] text-faint">
+              {/* Where it runs, and the buttons. The buttons take a line of their own
+                  when the pane is too narrow for both, rather than sit on the words. */}
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5" data-testid="issue-start-row">
+                {!isGit ? <span className="text-xs text-faint">In folder · no Git</span> : <label className="flex min-w-0 flex-1 basis-56 items-center gap-2 text-[11px] text-faint">
                   <Switch aria-label="Start issue in a new worktree" size="sm" checked={useWorktree} onCheckedChange={setUseWorktree} />
-                  <span className={cn("flex min-w-0 items-center gap-1", !useWorktree && "text-warning")}>
+                  <span className={cn("flex min-w-0 items-center gap-1 whitespace-nowrap", !useWorktree && "text-warning")}>
                     <GitBranch className="size-3.5 shrink-0" />
                     {useWorktree ? (
                       <>
@@ -422,20 +522,48 @@ export function IssuesView({
                     )}
                   </span>
                 </label>}
-                {linkedSession && (
-                  <Button variant="secondary" size="sm" onClick={() => selectSession(linkedSession.id)}>
-                    Open session
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  {linkedSession && (
+                    <Button variant="secondary" size="sm" onClick={() => selectSession(linkedSession.id)}>
+                      Open session
+                    </Button>
+                  )}
+                  <Button size="sm" variant="accent" disabled={starting || !harness?.available || detailLoading} onClick={() => void start()}>
+                    {starting ? <Loader2 className="animate-spin" /> : null}
+                    Start session
                   </Button>
-                )}
-                <Button size="sm" variant="accent" className="ml-auto shrink-0" disabled={starting || !harness?.available || detailLoading} onClick={() => void start()}>
-                  {starting ? <Loader2 className="animate-spin" /> : null}
-                  Start session
-                </Button>
+                </div>
               </div>
+              {pipeline ? null : pipelineOffered ? (
+                <label className="flex min-w-0 items-start gap-2 text-[11px] text-faint">
+                  <Switch
+                    aria-label="Merge automatically when the review is addressed"
+                    size="sm"
+                    className="mt-px shrink-0"
+                    checked={autoMerge && !pipelineDefaults.requirePerson}
+                    disabled={pipelineDefaults.requirePerson}
+                    onCheckedChange={setAutoMerge}
+                  />
+                  <span className="min-w-0 text-muted-foreground">
+                    Merge automatically when the review is addressed
+                    <span className="block text-faint">
+                      {pipelineDefaults.requirePerson
+                        ? "A pull request is opened and reviewed when the work is done. This project has a person do the merge."
+                        : "A pull request is opened and reviewed when the work is done. Off, it stops at Ready to merge."}
+                    </span>
+                  </span>
+                </label>
+              ) : (
+                isGit && pipelineDefaults.enabled && <span className="text-[11px] text-faint">No pull request is opened for a session on the project’s own checkout.</span>
+              )}
             </div>
-            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 scrollbar-thin">
-              {detailLoading && <div className="text-xs text-faint">Loading…</div>}
-              {detail && (detail.body?.trim() ? <Markdown text={detail.body} /> : <div className="text-sm text-faint">No description.</div>)}
+            {/* The pipeline scrolls with the issue: its findings and record can be long. */}
+            <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+              {pipeline && <IssuePipelinePanel key={pipeline.id} pipeline={pipeline} />}
+              <div className="px-5 py-4">
+                {detailLoading && <div className="text-xs text-faint">Loading…</div>}
+                {detail && (detail.body?.trim() ? <Markdown text={detail.body} /> : <div className="text-sm text-faint">No description.</div>)}
+              </div>
             </div>
           </>
         )}

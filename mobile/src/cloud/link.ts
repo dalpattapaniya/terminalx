@@ -27,8 +27,8 @@ import { b64 } from "./crypto";
  */
 
 export const WORKSPACE_PROTOCOL = "terminalx-workspace-rpc/1";
-/** What a phone asks for: agent sessions, the content key, sharing. No terminals, files or Git. */
-export const PHONE_CAPABILITIES = ["session/1", "session/2", "keys/1", "collab/1", "agents/1"] as const;
+/** What a phone asks for: agent sessions (`session/3` is Stop as an interrupt, #427), the content key, sharing. No terminals, files or Git. */
+export const PHONE_CAPABILITIES = ["session/1", "session/2", "session/3", "keys/1", "collab/1", "agents/1"] as const;
 
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const BACKOFF_FIRST_MS = 250;
@@ -214,6 +214,11 @@ export class CloudWorkspaceLink implements WorkspaceTransport {
       return;
     }
     if (generation !== this.generation || !this.running) return;
+    // A new pairing is asked for once. The server answers the ask by issuing
+    // the attachment again, which then waits for the runtime, and it issues a
+    // ready one again every time it is asked: asking on each poll would never
+    // see it ready (`still_refreshing` in the desktop's client).
+    this.refreshPairing = false;
     if (attachment.state !== "ready" || !attachment.pairingCode) {
       // Each ask counts as activity on the server, so they grow apart and end.
       this.waits += 1;
@@ -246,7 +251,6 @@ export class CloudWorkspaceLink implements WorkspaceTransport {
       this.retry("ticket");
       return;
     }
-    this.refreshPairing = false;
     // The same runtime key means the resume credential installed earlier is still its own.
     const resume = this.resumeToken && this.offer && this.offer.publicKeyB64 === offer.publicKeyB64 ? this.resumeToken : null;
     if (!resume) this.resumeToken = null;

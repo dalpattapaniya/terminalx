@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { codeText, leaseLine, outboxLine, presenceLine } from "./words";
+import type { WorkspaceConnectionState } from "@terminalx/portable/workspace";
+import { codeText, connectionLine, leaseLine, outboxLine, presenceLine } from "./words";
 
 const nameOf = (userId: string | null | undefined) => ({ "u-alice": "Alice", "u-bob": "Bob" })[userId ?? ""] ?? "Someone";
 const lease = (holderId: string, expiresAt = 2_000) => ({ tabId: "t1", holderId, acquiredAt: 0, expiresAt });
@@ -46,5 +47,24 @@ describe("sharing, in words", () => {
   it("says a message the server holds for a stopped workspace has not started it", () => {
     expect(outboxLine(entry({ state: "queued", wake: "not-requested", asleep: true }), true, nameOf)).toEqual({ tone: "warn", text: "Not started. This workspace is stopped, and sending starts it." });
     expect(outboxLine(entry({ state: "queued", wake: "not-needed" }), false, nameOf)?.text).toBe("Sent. Waiting for the agent.");
+  });
+});
+
+describe("connectionLine reflects the role, not only the socket (#475)", () => {
+  const connected: WorkspaceConnectionState = { state: "connected", runtimeGeneration: 1, runtimeVersion: "", capabilities: [], authority: "participate" };
+  it("says Live only for someone with a role", () => {
+    expect(connectionLine(connected, "ready", null, false, { role: "driver", checking: false })).toEqual({ tone: "live", text: "Live · end-to-end encrypted" });
+    expect(connectionLine(connected, "ready", null, false, { role: "viewer", checking: false }).tone).toBe("live");
+  });
+  it("says there is no access when the runtime gives none, whatever the socket", () => {
+    expect(connectionLine(connected, "ready", null, false, { role: "none", checking: false })).toEqual({ tone: "warn", text: "No access: this workspace is not shared with you." });
+  });
+  it("says access is being checked while the runtime has no member list", () => {
+    expect(connectionLine(connected, "ready", null, false, { role: "driver", checking: true })).toEqual({ tone: "idle", text: "Checking your access…" });
+  });
+  it("says a refused open in words, not Live", () => {
+    const line = connectionLine({ state: "stopped" }, "ready", { kind: "api", code: "cloud_workspace_not_found", unreachable: false }, false, { role: "none", checking: false });
+    expect(line.tone).toBe("warn");
+    expect(line.text).not.toMatch(/Live/);
   });
 });

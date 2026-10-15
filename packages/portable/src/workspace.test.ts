@@ -149,6 +149,8 @@ class FakeRuntime implements WorkspaceTransport {
         this.cache.set(key!, result);
         return ok(result);
       }
+      case "session.interrupt":
+        return ok({ interrupted: true });
       case "session.nudge":
         return ok({});
       case "session.list":
@@ -184,14 +186,36 @@ class FakeRuntime implements WorkspaceTransport {
       case "cleanup.cancel":
         return ok({});
       case "cleanup.remove": {
-        const result = { results: (params.items as { projectPath: string; path: string }[]).map((item) => ({ ...item, outcome: "removed" })) };
+        const items = params.items as { projectPath: string; path: string }[];
+        const result = { results: items.map((item) => ({ ...item, outcome: "removed" })) };
         this.cache.set(key!, result);
+        // As the runtime does: the caller hears of each worktree before the answer.
+        const run = params.clientRequestId;
+        items.forEach((item, index) => {
+          this.deliver({ event: "cleanup.progress", params: { run, kind: "started", index, total: items.length, projectPath: item.projectPath, path: item.path } });
+          this.deliver({ event: "cleanup.progress", params: { run, kind: "step", index, total: items.length, path: item.path, step: "removing" } });
+          this.deliver({ event: "cleanup.progress", params: { run, kind: "finished", index, total: items.length, result: result.results[index] } });
+        });
         return ok(result);
       }
       case "workspace.disposition":
         return ok({ disposition: { exists: true, isMain: false, landed: params.fetch ? { safe: true } : null } });
       case "workspace.remove": {
         const result = { deleted: params.expectedSessions, keptBranch: null, rescuedBranch: null };
+        this.cache.set(key!, result);
+        return ok(result);
+      }
+      case "workspace.sweepMerged": {
+        const result = { statuses: [{ path: "/w/.raccoon/worktrees/a", phase: params.graceSeconds === 0 ? "removed" : "scheduled", sessions: ["s1"] }], unreadable: [{ projectPath: "/w/other", reason: "gh is not signed in" }] };
+        this.cache.set(key!, result);
+        return ok(result);
+      }
+      case "workspace.holdMerged":
+        return ok({});
+      case "workspace.removedRecords":
+        return ok({ records: [{ id: "r1", path: "/w/.raccoon/worktrees/a", blocked: null }] });
+      case "workspace.restoreRemoved": {
+        const result = { record: { id: params.id, restoredAt: "2026-10-12T00:00:00Z" }, notes: [] };
         this.cache.set(key!, result);
         return ok(result);
       }
@@ -605,6 +629,40 @@ describe("workspace RPC client", () => {
       before.close();
     });
 
+    it("workspace/2: the removal that follows a merge is the runtime's to run, every change is one idempotent request, and a workspace/1 runtime is never asked", async () => {
+      const runtime = new FakeRuntime();
+      const client = new WorkspaceRpcClient(runtime, ids);
+      runtime.connect([...WORKSPACE_CAPABILITIES]);
+      expect(await client.sweepMergedWorkspaces({ deleteSessions: false, graceSeconds: 600 })).toEqual({
+        statuses: [expect.objectContaining({ phase: "scheduled", sessions: ["s1"] })],
+        unreadable: [{ projectPath: "/w/other", reason: "gh is not signed in" }],
+      });
+      await client.holdMergedWorkspace("/w/.raccoon/worktrees/a", true);
+      expect(await client.removedWorkspaceRecords()).toEqual([expect.objectContaining({ id: "r1", blocked: null })]);
+      expect(await client.restoreRemovedWorkspace("r1")).toMatchObject({ record: { id: "r1" }, notes: [] });
+      const sent = (method: string) => runtime.sent.find((frame) => frame.method === method)!.params as Record<string, unknown>;
+      expect(sent("workspace.sweepMerged")).toMatchObject({ deleteSessions: false, graceSeconds: 600 });
+      expect(sent("workspace.holdMerged")).toMatchObject({ path: "/w/.raccoon/worktrees/a", held: true });
+      for (const method of ["workspace.sweepMerged", "workspace.holdMerged", "workspace.restoreRemoved"]) {
+        expect(typeof sent(method).clientRequestId, method).toBe("string");
+        expect(MUTATING_METHODS.has(method), method).toBe(true);
+      }
+      client.close();
+
+      // A runtime from before it still serves the removal dialog, and is asked nothing more.
+      const old = new FakeRuntime();
+      const before = new WorkspaceRpcClient(old, ids);
+      old.connect(WORKSPACE_CAPABILITIES.filter((capability) => capability !== "workspace/2"));
+      expect(before.hasCapability("workspace/1")).toBe(true);
+      expect(before.hasCapability("workspace/2")).toBe(false);
+      await expect(before.sweepMergedWorkspaces({ deleteSessions: false, graceSeconds: 600 })).rejects.toMatchObject({ code: "capability_not_granted" });
+      await expect(before.holdMergedWorkspace("/w/a", true)).rejects.toMatchObject({ code: "capability_not_granted" });
+      await expect(before.removedWorkspaceRecords()).rejects.toMatchObject({ code: "capability_not_granted" });
+      await expect(before.restoreRemovedWorkspace("r1")).rejects.toMatchObject({ code: "capability_not_granted" });
+      expect(old.sent.some((frame) => ["workspace.sweepMerged", "workspace.holdMerged", "workspace.removedRecords", "workspace.restoreRemoved"].includes(frame.method))).toBe(false);
+      before.close();
+    });
+
     it("cleanup/1: the runtime is asked about its own worktrees, a removal is one idempotent request, and an older runtime is never asked", async () => {
       const runtime = new FakeRuntime();
       const client = new WorkspaceRpcClient(runtime, ids);
@@ -619,6 +677,23 @@ describe("workspace RPC client", () => {
       expect(sent).toMatchObject({ items: [{ projectPath: "/w", path: "/w/a", token: "t" }] });
       expect(typeof sent.clientRequestId).toBe("string");
       expect(MUTATING_METHODS.has("cleanup.remove")).toBe(true);
+
+      // A removal's caller hears how far it is, in order, and only of its own request.
+      const told: string[] = [];
+      const pending = client.removeCleanup(
+        [
+          { projectPath: "/w", path: "/w/b", token: "t", estimatedBytes: 2048 },
+          { projectPath: "/w", path: "/w/c", token: "t" },
+        ],
+        (progress) => told.push(`${progress.kind} ${progress.index}/${progress.total} ${progress.kind === "finished" ? progress.result.path : progress.path}`),
+      );
+      runtime.deliver({ event: "cleanup.progress", params: { run: "someone-else", kind: "started", index: 0, total: 1, projectPath: "/w", path: "/w/other" } });
+      expect(await pending).toHaveLength(2);
+      expect(told).toEqual(["started 0/2 /w/b", "step 0/2 /w/b", "finished 0/2 /w/b", "started 1/2 /w/c", "step 1/2 /w/c", "finished 1/2 /w/c"]);
+      expect((runtime.sent.at(-1)!.params as { items: unknown[] }).items[0]).toMatchObject({ estimatedBytes: 2048 });
+      // Once it has answered, nothing more is heard for that request.
+      runtime.deliver({ event: "cleanup.progress", params: { run: (runtime.sent.at(-1)!.params as { clientRequestId: string }).clientRequestId, kind: "step", index: 0, total: 2, path: "/w/b", step: "sessions" } });
+      expect(told).toHaveLength(6);
       client.close();
 
       const old = new FakeRuntime();
@@ -628,6 +703,35 @@ describe("workspace RPC client", () => {
       await expect(before.scanCleanup()).rejects.toMatchObject({ code: "capability_not_granted" });
       await expect(before.removeCleanup([{ projectPath: "/w", path: "/w/a", token: "t" }])).rejects.toMatchObject({ code: "capability_not_granted" });
       expect(old.sent.some((frame) => frame.method.startsWith("cleanup."))).toBe(false);
+      before.close();
+    });
+
+    it("session/3: an interrupt is one live call, never resent after a drop, and an older runtime is never asked", async () => {
+      const runtime = new FakeRuntime();
+      const client = new WorkspaceRpcClient(runtime, ids);
+      runtime.connect([...WORKSPACE_CAPABILITIES]);
+      const interrupts = () => runtime.sent.filter((frame) => frame.method === "session.interrupt");
+      expect(await client.interruptAgentTab({ sessionId: "s1", tabId: "t1" })).toEqual({ interrupted: true });
+      // Not a mutation: it carries no request id for the runtime to answer a second time from.
+      expect(interrupts().map((frame) => frame.params)).toEqual([{ sessionId: "s1", tabId: "t1" }]);
+      expect(MUTATING_METHODS.has("session.interrupt")).toBe(false);
+
+      // An Escape whose answer was lost with the connection is not typed again into whatever runs afterwards.
+      runtime.loseAnswers = true;
+      void client.interruptAgentTab({ sessionId: "s1", tabId: "t1" }).catch(() => undefined);
+      await settle();
+      runtime.drop();
+      runtime.connect([...WORKSPACE_CAPABILITIES]);
+      await settle();
+      expect(interrupts()).toHaveLength(2);
+      client.close();
+
+      const old = new FakeRuntime();
+      const before = new WorkspaceRpcClient(old, ids);
+      old.connect([...SESSION_1, "session/2"]);
+      expect(before.hasCapability("session/3")).toBe(false);
+      await expect(before.interruptAgentTab({ sessionId: "s1", tabId: "t1" })).rejects.toMatchObject({ code: "capability_not_granted" });
+      expect(old.sent.some((frame) => frame.method === "session.interrupt")).toBe(false);
       before.close();
     });
 

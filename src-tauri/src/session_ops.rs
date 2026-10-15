@@ -159,6 +159,7 @@ pub(crate) fn new_tab_entry(t: &NewTab) -> TabEntry {
         context_used: None,
         context_max: None,
         fork_from: None,
+        follow: Default::default(),
         unknown: BTreeMap::new(),
     }
 }
@@ -475,6 +476,14 @@ pub(crate) fn move_quick_chat_to_project(sink: &dyn EventSink, session_id: &str,
     Ok(updated)
 }
 
+/// Whether the reader has a shell open in `session`: one of its terminals
+/// (`live` names the session of each that is running), or the shell of a tab
+/// that became a terminal when its agent exited (#437). That one runs in the
+/// tab's own pane, which is not listed among the session's shells.
+pub(crate) fn has_shell_in_use(session: &SessionEntry, live: &[&str], running: impl Fn(&str) -> bool) -> bool {
+    live.contains(&session.id.as_str()) || session.tabs.iter().any(|tab| tab.is_terminal() && running(&tab.pane_id()))
+}
+
 /// Delete quick chats nobody has touched for `days` days, with their scratch
 /// directories. A pinned or archived one is kept (the reader set it aside on
 /// purpose), and so is one `busy` says is running. `stop` ends what an idle
@@ -668,6 +677,12 @@ pub(crate) struct WorkspaceRemoval<'a> {
     pub expected_sessions: Option<&'a [String]>,
     pub direct: git::DirectDelete,
     pub fetch: crate::landed::Fetch,
+    /// A last look the caller wants taken once the sessions are stopped and
+    /// the workspace has been checked again, immediately before the
+    /// directory goes. An `Err` says why it stays, and nothing is removed.
+    /// For a caller with rules of its own on top of clean-and-merged (the
+    /// removal that follows a merged pull request).
+    pub guard: Option<&'a dyn Fn() -> Result<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -715,6 +730,7 @@ fn needs_confirmation(landed: &crate::landed::Landed, confirmation: &Confirmatio
 /// 3. `stop` ends what each session runs, and waits.
 /// 4. The workspace is read again. Something an agent wrote between the
 ///    check and its stopping must not be deleted under the earlier verdict.
+///    A caller's own `guard` is asked last.
 /// 5. The directory is removed. On the safe path git is not forced, so it
 ///    refuses by itself if the tree is not clean after all.
 ///
@@ -758,6 +774,9 @@ pub(crate) fn remove_workspace(sink: &dyn EventSink, request: &WorkspaceRemoval<
     if ids(&now) != ids(&affected) {
         let titles: Vec<String> = now.iter().map(|session| format!("• {}", session.title)).collect();
         return Err(format!("{SESSIONS_CHANGED}, while it was being checked. Nothing was removed; the sessions that were in it are stopped. It now holds:\n{}", titles.join("\n")));
+    }
+    if let Some(guard) = request.guard {
+        guard()?;
     }
     let on_disk = std::fs::symlink_metadata(&target).is_ok();
     let removal = if on_disk {
@@ -896,6 +915,47 @@ pub(crate) fn add_tab_entry(session_id: &str, tab: &NewTab) -> Result<TabEntry> 
     Ok(out)
 }
 
+/// Close an agent tab: it leaves its session, and nothing of a conversation
+/// is deleted. A tab that holds one (a log, or a conversation of the agent's
+/// own) stays reopenable with [`reopen_tab_entry`]; only a tab with nothing
+/// in it, or one pushed out by newer closed tabs, loses its log. The caller
+/// stops what the tab was running first.
+pub(crate) fn close_tab_entry(session_id: &str, tab_id: &str) -> Result<()> {
+    let session = index::get(session_id).map_err(err)?;
+    let has_log = store::log_path(session_id, tab_id).ok().and_then(|path| std::fs::metadata(path).ok()).is_some_and(|meta| meta.len() > 0);
+    let keep = has_log || session.tab(tab_id).is_some_and(|tab| tab.provider_session_id.is_some());
+    for (session_id, tab_id) in index::close_tab(session_id, tab_id, keep).map_err(err)? {
+        if let Ok(path) = store::log_path(&session_id, &tab_id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// Bring a closed tab back into its session, with its conversation.
+pub(crate) fn reopen_tab_entry(session_id: &str, tab_id: &str) -> Result<TabEntry> {
+    index::reopen_tab(session_id, tab_id).map_err(err)
+}
+
+/// Give an agent tab the reader's own title: its name from then on, whatever
+/// runs in the tab and whichever conversation it moves on to (#437). `None`
+/// or a blank one takes it away, and the tab goes by the first request of
+/// the conversation it holds again.
+pub(crate) fn rename_tab_entry(session_id: &str, tab_id: &str, title: Option<String>) -> Result<()> {
+    let title = title.map(|title| title.trim().to_string()).filter(|title| !title.is_empty());
+    let reset = title.is_none();
+    index::update_tab(session_id, tab_id, |tab| {
+        tab.follow.title_pinned = title.is_some();
+        tab.title = title;
+        Ok(())
+    })
+    .map_err(err)?;
+    if reset {
+        let _ = store::conversation_titles::name_tab(session_id, tab_id);
+    }
+    Ok(())
+}
+
 /// Delete one session: its index entry, logs, attachments and the agents'
 /// own data for it. Nothing else goes: not its workspace, and never another
 /// session, whatever they share. A workspace is removed only through
@@ -927,6 +987,27 @@ pub(crate) fn sole_workspace_of(session_id: &str) -> Result<Option<String>> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A quick chat is kept while the reader has a shell open in it. The
+    /// shell that takes an exited agent's place is in the tab's own pane,
+    /// and counts as much as a terminal opened beside the tab (#437).
+    #[test]
+    fn a_shell_in_a_tab_that_became_a_terminal_is_a_shell_in_use() {
+        let session: SessionEntry = serde_json::from_value(serde_json::json!({
+            "id": "quick", "projectPath": "/p", "cwd": "/p", "title": "t", "created": "x", "modified": "y",
+            "tabs": [
+                { "id": "agent", "harness": "claude", "created": "x" },
+                { "id": "was-agent", "harness": "claude", "created": "x", "front": "terminal" },
+            ],
+        }))
+        .unwrap();
+        assert!(!has_shell_in_use(&session, &[], |_| false));
+        assert!(has_shell_in_use(&session, &["quick"], |_| false));
+        assert!(!has_shell_in_use(&session, &["another"], |_| false));
+        // Only the pane of a tab that is a terminal is a shell: an agent's own pane is the agent.
+        assert!(!has_shell_in_use(&session, &[], |pane| pane == "tab:agent"));
+        assert!(has_shell_in_use(&session, &[], |pane| pane == "tab:was-agent"));
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn repo() -> tempfile::TempDir {
@@ -955,6 +1036,99 @@ mod tests {
             tab: Some(NewTab { harness: "claude".into(), model: String::new(), effort: None, permission_mode: None }),
         })
         .unwrap()
+    }
+
+    fn said(session_id: &str, tab_id: &str, text: &str) -> PathBuf {
+        let path = store::log_path(session_id, tab_id).unwrap();
+        store::append_line(&path, &serde_json::json!({"payload": {"type": "user_message", "text": text}}).to_string()).unwrap();
+        path
+    }
+
+    fn two_tab_session() -> SessionEntry {
+        let session: SessionEntry = serde_json::from_value(serde_json::json!({
+            "id": "s", "projectPath": "/p", "cwd": "/p", "title": "t", "created": "x", "modified": "x", "activeTab": "talked",
+            "tabs": [{"id": "talked", "harness": "claude", "created": "x"}, {"id": "empty", "harness": "codex", "created": "x"}]
+        }))
+        .unwrap();
+        index::update(|sessions| {
+            sessions.push(session.clone());
+            Ok(())
+        })
+        .unwrap();
+        session
+    }
+
+    #[test]
+    fn closing_a_tab_deletes_nothing_of_its_conversation_and_it_reopens_with_it() {
+        let _home = crate::store::temp_home();
+        two_tab_session();
+        let log = said("s", "talked", "Please fix the login loop");
+
+        close_tab_entry("s", "talked").unwrap();
+        assert_eq!(index::get("s").unwrap().tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>(), ["empty"]);
+        assert!(log.exists(), "a close deletes nothing from disk");
+        assert_eq!(index::tab_state().unwrap().closed.len(), 1);
+
+        let back = reopen_tab_entry("s", "talked").unwrap();
+        assert_eq!(back.id, "talked");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1, "the same log, as it was");
+        assert_eq!(index::get("s").unwrap().active_tab.as_deref(), Some("talked"));
+
+        // A tab nobody ever said anything in has nothing to bring back: it is simply gone.
+        close_tab_entry("s", "empty").unwrap();
+        assert!(index::tab_state().unwrap().closed.is_empty());
+        assert!(reopen_tab_entry("s", "empty").is_err());
+    }
+
+    #[test]
+    fn only_a_closed_tab_pushed_out_by_newer_ones_loses_its_log() {
+        let _home = crate::store::temp_home();
+        two_tab_session();
+        let kept = index::CLOSED_TABS_KEPT;
+        let mut logs = Vec::new();
+        for n in 0..=kept {
+            let id = format!("t{n}");
+            index::update_session("s", |session| {
+                let mut tab = session.tabs[0].clone();
+                tab.id = id.clone();
+                session.tabs.push(tab);
+                Ok(())
+            })
+            .unwrap();
+            logs.push(said("s", &id, "hello"));
+            close_tab_entry("s", &id).unwrap();
+        }
+        assert!(!logs[0].exists(), "the oldest closed tab made room");
+        assert!(logs[1..].iter().all(|log| log.exists()));
+        assert_eq!(index::tab_state().unwrap().closed.len(), kept);
+    }
+
+    #[test]
+    fn a_renamed_tab_keeps_the_readers_title_until_it_is_reset() {
+        let _home = crate::store::temp_home();
+        two_tab_session();
+        said("s", "talked", "Please fix the login loop");
+        let title = || index::get("s").unwrap().tab("talked").unwrap().title.clone();
+
+        let pinned = || index::get("s").unwrap().tab("talked").unwrap().follow.title_pinned;
+        rename_tab_entry("s", "talked", Some("  My review  ".into())).unwrap();
+        assert_eq!(title().as_deref(), Some("My review"));
+        // It is the reader's: the tab's name whatever comes to run in it (#437).
+        assert!(pinned());
+        // A later request never renames a tab the reader named.
+        said("s", "talked", "Now rewrite everything");
+        assert!(store::conversation_titles::name_tab("s", "talked").unwrap().is_none());
+        assert_eq!(title().as_deref(), Some("My review"));
+
+        // Reset: it goes by its first request again, and the naming is the app's once more.
+        rename_tab_entry("s", "talked", None).unwrap();
+        assert_eq!(title().as_deref(), Some("Fix the login loop"));
+        assert!(!pinned());
+        // A blank title is a reset too; a tab with nothing said has no title to fall back to.
+        rename_tab_entry("s", "empty", Some("Scratch".into())).unwrap();
+        rename_tab_entry("s", "empty", Some("   ".into())).unwrap();
+        assert_eq!(index::get("s").unwrap().tab("empty").unwrap().title, None);
+        assert!(rename_tab_entry("s", "no-such-tab", Some("x".into())).is_err());
     }
 
     #[test]
@@ -1192,6 +1366,7 @@ mod tests {
             expected_sessions: None,
             direct,
             fetch: crate::landed::Fetch::Skip,
+            guard: None,
         }
     }
 

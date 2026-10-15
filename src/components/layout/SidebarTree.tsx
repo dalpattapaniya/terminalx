@@ -8,11 +8,9 @@ import {
   FolderOpen,
   GitBranch,
   GitFork,
-  MessagesSquare,
   PictureInPicture2,
   Pin,
   Plus,
-  Sparkles,
   Terminal,
   Trash2,
   X,
@@ -20,7 +18,8 @@ import {
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { AgentMark } from "@/components/AgentMark";
 import { WorkspaceNameEditor } from "@/components/session/WorkspaceNameEditor";
-import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
+import { MergedNote } from "@/components/layout/MergedNote";
+import { RowActions } from "@/components/layout/RowActions";
 import {
   AgentTabRow,
   BrowserTabRow,
@@ -38,12 +37,9 @@ import {
   TreeToggle,
 } from "@/components/layout/SidebarRows";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/cn";
 import {
   ContextMenu,
   ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuSeparator,
   ContextMenuTrigger,
   DropdownMenu,
   DropdownMenuContent,
@@ -60,7 +56,7 @@ import { confirmDeleteSession } from "@/lib/deleteSessionFlow";
 import { workspaceName as sessionWorkspaceName } from "@/lib/dashboard";
 import { openSettle, openWorkspaceDelete } from "@/lib/dialogs";
 import { useMobileDrivenTabs } from "@/lib/mobileDriver";
-import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
+import { getPrefs } from "@/lib/prefs";
 import { useSidebarFilter } from "@/lib/sidebarFilter";
 import { useWorkspaceSizes } from "@/lib/workspaceSizes";
 import {
@@ -68,7 +64,6 @@ import {
   archiveSession,
   forkSession,
   openAutomations,
-  openSkills,
   pinSession,
   refreshWorkspaces,
   renameWorkspace,
@@ -78,11 +73,14 @@ import {
   startSessionIn,
   useSessionStore,
 } from "@/lib/sessions";
+import { LOCAL_HOST, useMergedStatus } from "@/lib/mergedCleanup";
 import { useTabViews } from "@/lib/tabViews";
-import { activatePeer, browserPageLabel, closePeer, peerOrder, selectedPeer, tabNodeId, tabPanelId, type PeerTab } from "@/lib/sessionTabs";
-import { openBrowserTab, pagesFor, useBrowser } from "@/lib/browser";
+import { tabViewIn } from "@/lib/tabFront";
+import { activatePeer, closePeer, isShellPeer, peerLabel, peerShell, selectedPeer, tabNodeId, tabPanelId, useTabRow, type PeerTab } from "@/lib/sessionTabs";
+import { openBrowserTab } from "@/lib/browser";
 import { openTerminal, useTerminals } from "@/lib/terminal";
-import { sessionStatus, type Project, type SessionEntry, type TabEntry, type Workspace } from "@/types/session";
+import { TabMenuItems } from "@/components/session/TabMenu";
+import { sessionStatus, type Project, type SessionEntry, type Workspace } from "@/types/session";
 
 interface WorkspaceGroup {
   workspace: Workspace | null;
@@ -209,106 +207,6 @@ export function ProjectNavigation({ project, expanded }: { project: Project; exp
   );
 }
 
-/**
- * Chats as the first entry of the sidebar's list, drawn like a project: its
- * `+` starts a chat (as the row itself does while there is none). Folded, the
- * default, it shows the latest chat and the open one; unfolded, every chat.
- * The choice is remembered like a sidebar section's.
- */
-export function ChatsNode({ onNewChat }: { onNewChat: () => void }) {
-  const store = useSessionStore();
-  const filter = useSidebarFilter();
-  const { sidebarSections } = usePrefs();
-  const expanded = sidebarSections.chats === "expanded";
-  const toggle = () => setPrefs({ sidebarSections: { ...sidebarSections, chats: expanded ? "collapsed" : "expanded" } });
-  const chats = useChats();
-  if (filter.active && !chats.length) return null;
-  // A filter shows everything it found, as it opens projects.
-  const open = expanded || filter.active;
-  const latest = chats.length ? chats.reduce((a, b) => (b.modified > a.modified ? b : a)) : null;
-  const shown = open ? chats : chats.filter((session) => session.id === latest?.id || session.id === store.selectedSessionId);
-  const hidden = chats.length - shown.length;
-
-  return (
-    <div role="treeitem" aria-label="Chats" aria-expanded={open} className="min-w-0" data-testid="chats-node">
-      <div data-tree-row className={cn(actionRow, "relative flex h-8 cursor-default items-center gap-1 rounded-md px-1 hover:bg-selected/50")}>
-        <TreeToggle expanded={open} label="Chats" onToggle={toggle} />
-        <button
-          type="button"
-          onClick={chats.length ? toggle : onNewChat}
-          className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-        >
-          <MessagesSquare className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1 truncate text-[13px]">Chats</span>
-          {chats.length > 1 ? <span className={cn("shrink-0 text-[11px] tabular-nums text-faint", yieldsToRowActions)}>{chats.length}</span> : null}
-        </button>
-        <RowActions>
-          <WithTooltip label="New chat">
-            <Button variant="ghost" size="icon-xs" aria-label="New chat" onClick={onNewChat}>
-              <Plus />
-            </Button>
-          </WithTooltip>
-        </RowActions>
-      </div>
-      {shown.length ? (
-        <div role="group" className="pb-1 pl-2">
-          {shown.map((session) => <ChatRow key={session.id} session={session} selected={store.selectedSessionId === session.id} />)}
-          {hidden > 0 ? (
-            <button
-              type="button"
-              onClick={toggle}
-              className="flex h-6 w-full items-center rounded-md pl-3 text-[11px] text-faint outline-none hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
-            >
-              {hidden} more
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-/** Sessions started with New chat, in sidebar order, under the sidebar's archive and filter choices. */
-function useChats() {
-  const store = useSessionStore();
-  const filter = useSidebarFilter();
-  const chatsPath = store.chatsPath;
-  return useMemo(
-    () => (chatsPath
-      ? sortSessions(store.sessions.filter((session) =>
-        canon(session.projectPath) === canon(chatsPath)
-        && (session.archived === store.showArchived || session.id === store.selectedSessionId)
-        && (!filter.active || filter.shows(session.id))))
-      : []),
-    [chatsPath, store.sessions, store.showArchived, store.selectedSessionId, filter],
-  );
-}
-
-function ChatRow({ session, selected }: { session: SessionEntry; selected: boolean }) {
-  // The conversation's own title once the agent has named it.
-  const title = session.tabs[0]?.title?.trim() || session.title;
-  return (
-    <DropdownMenu>
-      <div role="treeitem" aria-label={title} className="min-w-0">
-        <TreeRow level="item" selected={selected}>
-          <StatusStripe status={sessionStatus(session)} size="row" />
-          <span className="w-1 shrink-0" />
-          <ItemTitle title={title} pinned={session.pinned} archived={session.archived} onActivate={() => selectSession(session.id)} />
-          <RowTime at={session.modified} />
-          <RowActions>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label={`Chat menu for ${title}`}>
-                <Ellipsis />
-              </Button>
-            </DropdownMenuTrigger>
-          </RowActions>
-        </TreeRow>
-      </div>
-      <SessionMenu session={session} />
-    </DropdownMenu>
-  );
-}
-
 function WorkspaceNode({
   project,
   group,
@@ -339,6 +237,8 @@ function WorkspaceNode({
 }) {
   const [renameError, setRenameError] = useState<string | null>(null);
   const workspace = group.workspace;
+  // Why it is still here after its pull request merged, or when it goes.
+  const merged = useMergedStatus(LOCAL_HOST, workspace && !workspace.isMain ? workspace.path : null);
   const removedSession = group.sessions.find((session) => session.removedWorkspace) ?? group.sessions[0];
   const name = group.removed && removedSession ? sessionWorkspaceName(removedSession) : (workspace?.name ?? group.path.split("/").pop() ?? group.path);
   const displayName = group.removed ? name : workspace?.managed ? name : (workspace?.branch ?? name);
@@ -409,6 +309,7 @@ function WorkspaceNode({
           {renameError}
         </div>
       ) : null}
+      <MergedNote status={merged} className="mx-6 mb-1" />
       <TreeGroup expanded={expanded} className="pl-2">
         {group.sessions.map((session) => (
           <SessionNode
@@ -447,13 +348,16 @@ export function SessionNode({
   harnessNames: Map<string, string>;
 }) {
   const terminals = useTerminals();
-  const browser = useBrowser();
-  const peers = peerOrder(session, terminals.panes, pagesFor(browser.pages, session.cwd));
+  // The workspace's one row of tabs, in its saved order; this session lists its own part of it, and the
+  // workspace's browser pages. So the sidebar and the title bar strip are two views of one list.
+  const row = useTabRow(session);
+  const peers = row.tabs.filter((peer) => peer.sessionId === session.id || peer.sessionId === null);
   const activePeer = selectedPeer(session, peers, terminals.selected[session.id]);
   const branchBadge = session.issue && !session.worktreeName && !session.worktreeRemoved ? session.branch : null;
   const isActive = (peer: PeerTab) => selected && activePeer?.kind === peer.kind && peer.id === activePeer.id;
   const close = (peer: PeerTab) => () => void closePeer(session.id, peer, peers, activePeer);
   const open = (peer: PeerTab) => () => { selectSession(session.id); activatePeer(session.id, peer); };
+  const labelOf = (peer: PeerTab) => peerLabel(peer, row.layout, (id) => harnessNames.get(id));
 
   return (
     <DropdownMenu>
@@ -483,96 +387,65 @@ export function SessionNode({
           </button>
         ) : null}
         <TreeGroup expanded={expanded} className="pl-5">
-          {peers.map((peer) => peer.kind === "agent" ? (
-            <TabNode
-              key={peer.id}
-              session={session}
-              tab={peer.tab}
-              active={isActive(peer)}
-              label={peer.tab.title?.trim() || harnessNames.get(peer.tab.harness) || peer.tab.harness}
-              terminal={tabViews[peer.id] === "terminal"}
-              mobileDriven={mobileDriven.has(peer.id)}
-              onClose={close(peer)}
-            />
-          ) : peer.kind === "browser" ? (
-            <BrowserTabRow
-              key={peer.id}
-              nodeId={tabNodeId(peer)}
-              panelId={tabPanelId(peer)}
-              label={browserPageLabel(peer.page)}
-              url={peer.page.url}
-              agentTarget={peer.page.active}
-              selected={isActive(peer)}
-              onOpen={open(peer)}
-              onClose={close(peer)}
-            />
-          ) : (
-            <ShellTabRow
-              key={peer.id}
-              nodeId={tabNodeId(peer)}
-              panelId={tabPanelId(peer)}
-              title={peer.pane.title}
-              exited={peer.pane.exited}
-              selected={isActive(peer)}
-              onOpen={open(peer)}
-              onClose={close(peer)}
-            />
+          {peers.map((peer) => (
+            // The same menu as on the title bar strip, on the tab that was clicked.
+            <ContextMenu key={peer.key}>
+              <ContextMenuTrigger asChild>
+                {peer.kind === "agent" && !isShellPeer(peer) ? (
+                  <AgentTabRow
+                    nodeId={tabNodeId(peer)}
+                    panelId={tabPanelId(peer)}
+                    harness={peer.tab.harness}
+                    label={labelOf(peer)}
+                    status={peer.tab.status}
+                    mobileDriven={mobileDriven.has(peer.id)}
+                    terminalView={tabViewIn(tabViews, peer.tab) === "terminal"}
+                    pinned={peer.pinned}
+                    selected={isActive(peer)}
+                    onOpen={() => {
+                      selectSession(session.id);
+                      void setActiveTab(session.id, peer.id);
+                    }}
+                    onClose={close(peer)}
+                  />
+                ) : peer.kind === "browser" ? (
+                  <BrowserTabRow
+                    nodeId={tabNodeId(peer)}
+                    panelId={tabPanelId(peer)}
+                    label={labelOf(peer)}
+                    url={peer.page.url}
+                    agentTarget={peer.page.active}
+                    pinned={peer.pinned}
+                    selected={isActive(peer)}
+                    onOpen={open(peer)}
+                    onClose={close(peer)}
+                  />
+                ) : (
+                  // A tab is drawn as what its terminal holds now (#437): a session's tab with no agent in it is a
+                  // terminal's row, with the mark of an agent the app has no chat for when one runs there.
+                  <ShellTabRow
+                    nodeId={tabNodeId(peer)}
+                    panelId={tabPanelId(peer)}
+                    title={labelOf(peer)}
+                    exited={!!peerShell(peer)?.exited}
+                    agent={peer.paneAgent}
+                    pinned={peer.pinned}
+                    selected={isActive(peer)}
+                    onOpen={open(peer)}
+                    onClose={close(peer)}
+                  />
+                )}
+              </ContextMenuTrigger>
+              <ContextMenuContent className="max-h-(--radix-context-menu-content-available-height) overflow-y-auto">
+                <TabMenuItems row={row} tab={peer} selected={selected && activePeer ? { kind: activePeer.kind, id: activePeer.id } : null} />
+              </ContextMenuContent>
+            </ContextMenu>
           ))}
           {peers.length === 0 ? <div className="px-3 py-1 text-[11px] text-faint">No tabs.</div> : null}
         </TreeGroup>
       </TreeNode>
       <SessionMenu session={session} />
     </DropdownMenu>
-  );
-}
-
-function TabNode({
-  session,
-  tab,
-  active,
-  label,
-  terminal,
-  mobileDriven,
-  onClose,
-}: {
-  session: SessionEntry;
-  tab: TabEntry;
-  active: boolean;
-  label: string;
-  terminal: boolean;
-  mobileDriven: boolean;
-  onClose: () => void;
-}) {
-  const open = () => {
-    selectSession(session.id);
-    void setActiveTab(session.id, tab.id);
-  };
-  return (
-    <ContextMenu>
-      <ContextMenuTrigger asChild>
-        <AgentTabRow
-          nodeId={tabNodeId({ kind: "agent", id: tab.id })}
-          panelId={tabPanelId({ kind: "agent", id: tab.id })}
-          harness={tab.harness}
-          label={label}
-          status={tab.status}
-          mobileDriven={mobileDriven}
-          terminalView={terminal}
-          selected={active}
-          onOpen={open}
-          onClose={onClose}
-        />
-      </ContextMenuTrigger>
-      <ContextMenuContent>
-        <ContextMenuItem onSelect={() => openSkills({ agent: tab.harness, projectPath: session.cwd })}>
-          <Sparkles /> Skills for this tab
-        </ContextMenuItem>
-        <ContextMenuSeparator />
-        <ContextMenuItem destructive onSelect={onClose}>
-          <X /> Close tab
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
   );
 }
 
@@ -606,7 +479,7 @@ function NewTabButton({ session }: { session: SessionEntry }) {
   );
 }
 
-export function SessionMenu({ session }: { session: SessionEntry }) {
+function SessionMenu({ session }: { session: SessionEntry }) {
   return (
     <DropdownMenuContent align="end">
       <RenameSessionItem session={session} />

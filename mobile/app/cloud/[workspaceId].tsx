@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { Send, Square } from "lucide-react-native";
+import { interruptUnanswered } from "@terminalx/portable/events";
 import { buildTranscript, type PendingAsk } from "@terminalx/portable/transcript";
 import { leaseHeldBy, NOTE_MAX_CHARS } from "@terminalx/portable/workspaceCollab";
 import { useCatalogSnapshot, useCloudCatalog } from "@mobile/cloud/CloudProvider";
@@ -10,6 +11,7 @@ import { accessText, codeText, connectionLine, leaseLine, outboxLine, presenceLi
 import type { CloudWorkspaceSession } from "@mobile/cloud/workspace";
 import { useConversationState } from "@mobile/state/conversation-state";
 import { Button, EmptyState, StatusDot } from "@mobile/ui/primitives";
+import { TranscriptList } from "@mobile/ui/TranscriptList";
 import { useTheme } from "@mobile/ui/theme";
 import { PermissionCard, TurnCard } from "@mobile/ui/transcript";
 import { linkedText } from "@mobile/ui/LinkedText";
@@ -84,7 +86,7 @@ function Workspace({ catalog, session, orgId, workspaceId, listedState, initialT
   const tabId = tab?.tabId ?? null;
   const live = snapshot.connection.state === "connected";
   const starting = listedState === "suspended" && snapshot.outbox.some((entry) => (entry.state === "queued" || entry.state === "leased") && (entry.wake === "queued" || entry.wake === "in-progress"));
-  const banner = connectionLine(snapshot.connection, listedState, snapshot.problem, starting);
+  const banner = connectionLine(snapshot.connection, listedState, snapshot.problem, starting, { role: snapshot.role, checking: snapshot.checkingAccess });
   // The link stopped trying by itself, or was refused: it tries again only when asked.
   const canReconnect = snapshot.connection.state === "stopped" && listedState === "ready";
   const role = roleLabel(snapshot.role);
@@ -135,6 +137,12 @@ function Conversation({ catalog, session, scope, tabId, live, listedState }: { c
   // Also what the server holds for a workspace that stopped before it was delivered: nothing starts it until the person says so.
   const held = stopped ? outbox.filter((entry) => entry.state === "unsent" || entry.asleep) : [];
   const working = tab?.status === "in_progress";
+  // Stop is Escape first (#427), as on the desktop: the turn is interrupted and the agent's process stays. While the
+  // turn it was sent to is still the one running, the same button is the stop that ends the process. A runtime that
+  // cannot take an interrupt (older, or not connected) only has that stop.
+  const [interruptedAt, setInterruptedAt] = useState<number | null>(null);
+  if (!working && interruptedAt !== null) setInterruptedAt(null);
+  const unanswered = working && interruptUnanswered(events ?? [], interruptedAt);
 
   const run = async (action: () => Promise<unknown>, done?: () => void) => {
     setSending(true);
@@ -183,6 +191,14 @@ function Conversation({ catalog, session, scope, tabId, live, listedState }: { c
 
   const sendHeld = () => confirmStart(held.length === 1 ? "Sending the message that is waiting" : `Sending the ${held.length} messages that are waiting`, () => session.deliverHeld({ allowWake: true }));
 
+  const stopAgent = () => {
+    if (!snapshot.interrupts || unanswered) return void run(() => session.stop(tabId));
+    // Read now, not at the last render: the turn this is for may have ended since.
+    const seen = session.getSnapshot().tabs.find((entry) => entry.tabId === tabId)?.events ?? [];
+    setInterruptedAt(seen.length ? seen[seen.length - 1].seq : 0);
+    void run(() => session.interrupt(tabId));
+  };
+
   const decide = (ask: PendingAsk, optionId: string) => void run(() => session.decide(tabId, { requestId: ask.requestId, optionId }));
 
   const addNote = () => {
@@ -207,11 +223,12 @@ function Conversation({ catalog, session, scope, tabId, live, listedState }: { c
         <Button label="Add note" kind="secondary" disabled={!note.trim() || sending} onPress={addNote} />
       </View>
     </View> : null}
-    <FlatList data={transcript.turns} keyExtractor={(turn) => turn.key} automaticallyAdjustContentInsets contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.transcript} keyboardDismissMode="interactive"
-      ListHeaderComponent={tab?.truncated ? <Text style={[styles.notice, { color: palette.muted }]}>Earlier messages are not in the saved conversation.</Text> : null}
+    {/* Opens at the newest turn, as the desktop and the session screen do; the asks and messages waiting sit at that edge. */}
+    <TranscriptList key={tabId ?? "none"} data={transcript.turns} keyExtractor={(turn) => turn.key}
+      earlier={tab?.truncated ? <Text style={[styles.notice, { color: palette.muted }]}>Earlier messages are not in the saved conversation.</Text> : null}
       ListEmptyComponent={tab?.noKey ? <EmptyState title="Not readable on this phone yet" detail={codeText("no-key")!} /> : <EmptyState title="No conversation yet" detail={live ? "This tab has not published any turns." : "Nothing has been saved for this tab."} />}
       renderItem={({ item }) => <TurnCard turn={item} />}
-      ListFooterComponent={<>
+      latest={<>
         {transcript.pendingAsks.map((ask) => snapshot.canApprove
           ? <PermissionCard key={ask.requestId} ask={ask} connected={!stopped} answering={sending || session.outbox.isDeciding(ask.requestId)} onRespond={(optionId) => decide(ask, optionId)} />
           : <Text key={ask.requestId} style={[styles.notice, { color: palette.warning }]}>The agent is waiting for a permission ({ask.title ?? ask.toolName ?? "request"}). Waiting for someone who can approve.</Text>)}
@@ -229,7 +246,7 @@ function Conversation({ catalog, session, scope, tabId, live, listedState }: { c
         {wheel.heldByOther ? <Text style={[styles.notice, { color: palette.warning }]}>{`${nameOf(lease?.holderId)} is driving this tab. ${wheel.canTakeOver ? "Take over to send." : "You can send when they release it."}`}</Text> : null}
         <View style={styles.composeLine}>
           <TextInput accessibilityLabel={stopped ? "Message for the agent. Sending starts the workspace." : "Message for the agent"} value={draft} onChangeText={(value) => { setDraft(value); if (value) session.typingIn(tabId); }} multiline editable={snapshot.hasKey && !wheel.heldByOther} placeholder={stopped ? "Message (starts the workspace)" : "Message the agent"} placeholderTextColor={palette.faint} style={[styles.input, { color: palette.ink }]} />
-          {working && !stopped && (!wheel.heldByOther || snapshot.role === "manager") ? <Pressable accessibilityRole="button" accessibilityLabel="Stop the agent" disabled={sending} onPress={() => void run(() => session.stop(tabId))} style={[styles.round, { backgroundColor: palette.raised }]}><Square size={16} color={palette.ink} /></Pressable> : null}
+          {working && !stopped && (!wheel.heldByOther || snapshot.role === "manager") ? <Pressable accessibilityRole="button" accessibilityLabel={unanswered ? "Stop the session" : "Stop the agent"} accessibilityHint={unanswered ? "Ends the agent's process. The conversation resumes with the next message." : undefined} disabled={sending} onPress={stopAgent} style={[styles.round, { backgroundColor: unanswered ? palette.danger : palette.raised }]}><Square size={16} color={unanswered ? palette.accentInk : palette.ink} /></Pressable> : null}
           <Pressable accessibilityRole="button" accessibilityLabel="Send" disabled={!draft.trim() || sending || !snapshot.hasKey || wheel.heldByOther} onPress={() => void send()} style={[styles.round, { backgroundColor: palette.accent }, (!draft.trim() || sending || !snapshot.hasKey || wheel.heldByOther) && styles.disabled]}><Send size={17} color={palette.accentInk} /></Pressable>
         </View>
       </View>
@@ -259,7 +276,6 @@ const styles = StyleSheet.create({
   tabsContent: { paddingHorizontal: 16, paddingVertical: 8, gap: 8 },
   tab: { minHeight: 36, maxWidth: 220, paddingHorizontal: 13, borderRadius: 10, justifyContent: "center" },
   tabText: { fontSize: 14, fontWeight: "600" },
-  transcript: { padding: 16, paddingBottom: 24, gap: 16 },
   pending: { alignItems: "flex-end", gap: 4, marginTop: 12 },
   pendingText: { maxWidth: "88%", borderRadius: 17, borderBottomRightRadius: 5, paddingHorizontal: 14, paddingVertical: 11, fontSize: 15, lineHeight: 22, overflow: "hidden", opacity: 0.7 },
   pendingState: { fontSize: 12, lineHeight: 17 },

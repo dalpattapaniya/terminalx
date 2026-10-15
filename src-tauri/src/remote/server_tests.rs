@@ -39,11 +39,21 @@ async fn call(rpc: &Arc<WorkspaceRpc>, peer: &Arc<Peer>, method: &str, params: V
 }
 
 async fn manager_peer(rpc: &Arc<WorkspaceRpc>) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new("device-manage".into(), Authority::Manage);
+    let (peer, events) = Peer::for_user("device-manage".into(), Authority::Manage, person_for(Authority::Manage));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["pty/1", "fs/1", "git/1", "session/1"] }))
         .await
         .unwrap();
     (peer, events)
+}
+
+/// Who the API lists, as it does before any client connects (#475): the
+/// manager and one viewer, the people `person_for` names.
+fn listed(rpc: &WorkspaceRpc) {
+    rpc.set_collaboration(members(json!([{ "userId": "admin", "role": "manager" }, { "userId": "viewer", "role": "viewer" }])));
+}
+
+fn person_for(authority: Authority) -> Option<String> {
+    Some(if authority == Authority::Manage { "admin" } else { "viewer" }.into())
 }
 
 fn code(result: Result<Value, (String, String)>) -> String {
@@ -247,7 +257,7 @@ async fn hello_and_cursors_follow_a_newer_registered_generation() {
 }
 
 async fn peer_for(rpc: &Arc<WorkspaceRpc>, device: &str, authority: Authority) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new(device.into(), authority);
+    let (peer, events) = Peer::for_user(device.into(), authority, person_for(authority));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["pty/1"] })).await.unwrap();
     (peer, events)
 }
@@ -340,6 +350,7 @@ async fn input_is_applied_once_in_order_and_backpressure_keeps_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn one_controller_owns_input_and_size_and_viewers_follow() {
     let f = fixture();
+    listed(&f.rpc);
     let (desk, mut desk_events) = peer_for(&f.rpc, "device-desk", Authority::Manage).await;
     let (laptop, mut laptop_events) = peer_for(&f.rpc, "device-laptop", Authority::Manage).await;
     let (phone, _phone_events) = peer_for(&f.rpc, "device-phone", Authority::Participate).await;
@@ -381,6 +392,7 @@ async fn one_controller_owns_input_and_size_and_viewers_follow() {
 #[tokio::test(flavor = "multi_thread")]
 async fn exit_and_close_are_reported_and_nothing_targets_a_closed_terminal() {
     let f = fixture();
+    listed(&f.rpc);
     let (peer, mut events) = manager_peer(&f.rpc).await;
     let pty_id = call(&f.rpc, &peer, "pty.create", json!({ "clientRequestId": "request-exit-1" })).await.unwrap()["ptyId"].as_str().unwrap().to_string();
     call(&f.rpc, &peer, "pty.attach", json!({ "ptyId": pty_id })).await.unwrap();
@@ -524,26 +536,28 @@ impl crate::cloud_agents::AgentOps for NoAgents {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_workspace_key_is_handed_out_over_keys_1_and_only_managers_rotate_it() {
     let f = fixture();
+    listed(&f.rpc);
     let agents = crate::cloud_agents::CloudAgents::open(&f._dir.path().join("agents"), Arc::new(NoAgents), None, None, 7).unwrap();
     f.rpc.set_agents(agents.clone());
-    let (manager, _events) = Peer::new("device-manage".into(), Authority::Manage);
+    let (manager, _events) = Peer::for_user("device-manage".into(), Authority::Manage, person_for(Authority::Manage));
     call(&f.rpc, &manager, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["session/1"] })).await.unwrap();
     assert_eq!(code(call(&f.rpc, &manager, "keys.get", json!({})).await), "capability_not_granted");
-    let (participant, _events) = Peer::new("device-phone".into(), Authority::Participate);
+    // Someone the workspace is not shared with.
+    let (participant, _events) = Peer::for_user("device-phone".into(), Authority::Participate, Some("outsider".into()));
     let hello = call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["session/1", "keys/1"] })).await.unwrap();
     assert_eq!(hello["capabilities"], json!(["session/1", "keys/1"]));
     assert_eq!(agents.attached(), 2, "each connection that said hello counts as attached");
     // The key opens every tab's checkpoint; participants see no tabs.
     assert_eq!(code(call(&f.rpc, &participant, "keys.get", json!({})).await), "forbidden");
-    let (keyholder, _events) = Peer::new("device-desk".into(), Authority::Manage);
+    let (keyholder, _events) = Peer::for_user("device-desk".into(), Authority::Manage, person_for(Authority::Manage));
     call(&f.rpc, &keyholder, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["keys/1"] })).await.unwrap();
     let handout = call(&f.rpc, &keyholder, "keys.get", json!({})).await.unwrap();
     let (current, key) = agents.keys.current().unwrap();
     assert_eq!(handout["currentKeyId"], current);
     assert_eq!(handout["keys"][0]["key"], crate::cloud_agents::crypto::b64(&key));
     assert_eq!(code(call(&f.rpc, &participant, "keys.rotate", json!({ "clientRequestId": "request-0001" })).await), "forbidden");
-    // Nothing is shared with a participant, so it sees no agent tabs.
-    assert_eq!(call(&f.rpc, &participant, "session.tabs", json!({})).await.unwrap()["tabs"], json!([]));
+    // Nothing is shared with it, so it is refused the agent tabs.
+    assert_eq!(code(call(&f.rpc, &participant, "session.tabs", json!({})).await), "forbidden");
     assert_eq!(
         code(call(&f.rpc, &participant, "session.configure", json!({ "sessionId": "s", "tabId": "t", "clientRequestId": "request-0002" })).await),
         "forbidden"
@@ -604,9 +618,10 @@ fn session_cursors_expire_with_the_runtime_process() {
 #[tokio::test(flavor = "multi_thread")]
 async fn participants_read_git_and_disposition_facts_but_never_publish() {
     let f = fixture();
+    listed(&f.rpc);
     crate::git::run(&f.root, &["init", "-q", "-b", "main"]).unwrap();
     std::fs::write(f.root.join("a.txt"), "a").unwrap();
-    let (participant, _events) = Peer::new("device-participate".into(), Authority::Participate);
+    let (participant, _events) = Peer::for_user("device-participate".into(), Authority::Participate, person_for(Authority::Participate));
     call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["git/1"] })).await.unwrap();
     assert_eq!(code(call(&f.rpc, &participant, "lifecycle.dispositionFacts", json!({})).await), "capability_not_granted");
     call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["git/1", "lifecycle/1"] })).await.unwrap();
@@ -742,6 +757,42 @@ async fn only_a_client_that_can_type_counts_as_attached_for_idle_suspend() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn only_a_client_that_may_answer_a_permission_request_counts_as_an_approver() {
+    // A scheduled run that stops at a permission request waits only for
+    // someone who could answer it (`cloud_agents::scheduled`).
+    let f = fixture();
+    let list = |alice_approves: bool| {
+        members(json!([
+            { "userId": "admin", "role": "manager" },
+            { "userId": "alice", "role": "driver", "canApprove": alice_approves },
+            { "userId": "dave", "role": "driver", "canApprove": true },
+            { "userId": "bob", "role": "viewer", "canApprove": true },
+        ]))
+    };
+    f.rpc.set_collaboration(list(false));
+    let (admin, _admin_events, _) = person(&f.rpc, "d-admin", Authority::Manage, "admin").await;
+    let (alice, _alice_events, _) = person(&f.rpc, "d-alice", Authority::Participate, "alice").await;
+    let (dave, _dave_events, _) = person(&f.rpc, "d-dave", Authority::Participate, "dave").await;
+    let (bob, _bob_events, _) = person(&f.rpc, "d-bob", Authority::Participate, "bob").await;
+    assert!(admin.counts_as_approver() && dave.counts_as_approver());
+    // A driver who may not approve types, and cannot answer the request.
+    assert!(alice.counts_as_attached() && !alice.counts_as_approver());
+    // A viewer answers nothing, whatever its share says.
+    assert!(!bob.counts_as_approver());
+    // No reconnect: the API's refresh alone gives and takes the right.
+    f.rpc.set_collaboration(list(true));
+    assert!(alice.counts_as_attached() && alice.counts_as_approver());
+    f.rpc.set_collaboration(list(false));
+    assert!(alice.counts_as_attached() && !alice.counts_as_approver());
+    f.rpc.disconnect(&dave);
+    assert!(!dave.counts_as_approver());
+    // A phone answers through the mailbox: it is not attached.
+    let (phone, _events) = Peer::for_user("p-admin".into(), Authority::Manage, Some("admin".into()));
+    call(&f.rpc, &phone, "rpc.hello", json!({ "protocol": PROTOCOL, "client": { "app": "terminalx-mobile", "version": "1.0.0" }, "want": ALL })).await.unwrap();
+    assert!(!phone.counts_as_approver());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_suspend_attachment_follows_connected_role_changes() {
     for (authority, initial_role, next_role) in [
         (Authority::Participate, "driver", "viewer"),
@@ -844,17 +895,13 @@ async fn roles_decide_what_a_participant_reads_types_and_holds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn without_a_member_list_participants_keep_what_they_had() {
+async fn a_member_list_this_runtime_cannot_read_gives_participants_nothing() {
     let f = fixture();
     with_tab(&f);
+    f.rpc.set_collaboration(members(json!([{ "userId": "alice", "role": "viewer" }])));
     let (phone, _events, hello) = person(&f.rpc, "d-phone", Authority::Participate, "alice").await;
-    assert_eq!(hello["you"]["role"], "none");
+    assert_eq!(hello["you"]["role"], "viewer");
     assert!(call(&f.rpc, &phone, "pty.list", json!({})).await.is_ok());
-    assert!(call(&f.rpc, &phone, "fs.list", json!({})).await.is_ok());
-    assert_eq!(call(&f.rpc, &phone, "session.tabs", json!({})).await.unwrap()["tabs"], json!([]));
-    for method in ["keys.get", "collab.state", "notes.list"] {
-        assert_eq!(code(call(&f.rpc, &phone, method, json!({ "tabId": "tab-1" })).await), "forbidden", "{method}");
-    }
     // A list this runtime cannot read fails closed.
     f.rpc.set_collaboration(Some(collab::Members { v: 9, members: Vec::new() }));
     assert_eq!(code(call(&f.rpc, &phone, "pty.list", json!({})).await), "forbidden");
@@ -991,6 +1038,50 @@ async fn a_manage_attachment_that_names_no_person_loses_everything_once_members_
     assert_eq!((hello["authority"].as_str(), hello["you"]["role"].as_str()), (Some("participate"), Some("none")));
 }
 
+/// #475: after a restart, until the API's member list arrives, no
+/// participant's role is known. A member whose share was revoked must not
+/// read the workspace in that window, so every participant is refused
+/// everything until the list says who they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn participants_are_refused_everything_until_the_member_list_arrives() {
+    let f = fixture();
+    let _agents = with_tab(&f);
+    std::fs::write(f.root.join("notes.txt"), "private").unwrap();
+    let (bob, _bob_events, hello) = person(&f.rpc, "d-bob", Authority::Participate, "bob").await;
+    let (revoked, _revoked_events, _) = person(&f.rpc, "p-revoked", Authority::Participate, "revoked").await;
+    assert_eq!((hello["you"]["role"].as_str(), hello["you"]["listed"].as_bool()), (Some("none"), Some(false)));
+    let reads = [
+        ("session.list", json!({})),
+        ("session.get", json!({ "sessionId": "s1" })),
+        ("session.subscribe", json!({ "sessionId": "s1" })),
+        ("session.tabs", json!({})),
+        ("keys.get", json!({})),
+        ("collab.state", json!({})),
+        ("notes.list", json!({ "tabId": "tab-1" })),
+        ("fs.list", json!({})),
+        ("fs.read", json!({ "path": "notes.txt" })),
+        ("git.status", json!({})),
+        ("pty.list", json!({})),
+        ("pty.attach", json!({ "ptyId": "p1" })),
+    ];
+    for peer in [&bob, &revoked] {
+        for (method, params) in &reads {
+            assert_eq!(code(call(&f.rpc, peer, method, params.clone()).await), "forbidden", "{method} before the member list");
+        }
+    }
+    // The manager's desktop is not held up by the missing list.
+    let (manager, _events) = manager_peer(&f.rpc).await;
+    assert!(call(&f.rpc, &manager, "fs.read", json!({ "path": "notes.txt" })).await.is_ok());
+
+    // The list arrives: Bob is a viewer, the revoked member is not listed.
+    f.rpc.set_collaboration(members(json!([{ "userId": "admin", "role": "manager" }, { "userId": "bob", "role": "viewer" }])));
+    assert!(call(&f.rpc, &bob, "session.list", json!({})).await.is_ok());
+    assert!(call(&f.rpc, &bob, "fs.read", json!({ "path": "notes.txt" })).await.is_ok());
+    for (method, params) in &reads {
+        assert_eq!(code(call(&f.rpc, &revoked, method, params.clone()).await), "forbidden", "{method} for a member with no share");
+    }
+}
+
 /// Review N3: the key is handed out only after the holder is recorded, and
 /// only if access still holds when the handout runs.
 #[tokio::test(flavor = "multi_thread")]
@@ -1020,10 +1111,10 @@ async fn the_first_member_list_stops_streams_of_people_without_access() {
     let (admin, _admin_events, _) = person(&f.rpc, "d-admin", Authority::Manage, "admin").await;
     let created = call(&f.rpc, &admin, "pty.create", json!({ "clientRequestId": "request-first-list" })).await.unwrap();
     let pty_id = created["ptyId"].as_str().unwrap().to_string();
-    // Before any list, a participant may still watch, as before PRO-30.
+    // Before any list, a participant may not even watch (#475).
     let (carol, mut carol_events, hello) = person(&f.rpc, "d-carol", Authority::Participate, "carol").await;
     assert_eq!(hello["you"]["listed"], false, "no list yet is not \"not shared\"");
-    call(&f.rpc, &carol, "pty.attach", json!({ "ptyId": pty_id })).await.unwrap();
+    assert_eq!(code(call(&f.rpc, &carol, "pty.attach", json!({ "ptyId": pty_id })).await), "forbidden");
     // The first list does not name her: her stream ends, her connection stays.
     f.rpc.set_collaboration(members(json!([{ "userId": "admin", "role": "manager" }])));
     let you = next_event(&mut carol_events, "collab.you").await;
@@ -1606,7 +1697,7 @@ async fn claude_model_validation_covers_session_creation_new_tabs_and_configurat
 }
 
 async fn hello_with(rpc: &Arc<WorkspaceRpc>, device: &str, authority: Authority, want: &[&str]) -> (Arc<Peer>, Notifications) {
-    let (peer, events) = Peer::new(device.into(), authority);
+    let (peer, events) = Peer::for_user(device.into(), authority, person_for(authority));
     call(rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": want })).await.unwrap();
     (peer, events)
 }
@@ -1655,6 +1746,7 @@ async fn a_session_1_desktop_is_served_as_before_and_never_sees_the_additions() 
 async fn participants_are_refused_every_session_2_write_and_see_only_shared_sessions() {
     let _home = crate::store::temp_home();
     let f = fixture();
+    listed(&f.rpc);
     f.rpc.set_offered_for_tests(installed_agents());
     let session = seed_session(&f.root, "Fix login", None);
     let (participant, _events) = hello_with(&f.rpc, "device-phone", Authority::Participate, &protocol::CAPABILITIES).await;
@@ -1667,10 +1759,13 @@ async fn participants_are_refused_every_session_2_write_and_see_only_shared_sess
         assert_eq!(code(call(&f.rpc, &participant, method, params).await), "forbidden", "{method}");
     }
     assert_eq!(index::get(&session.id).unwrap().title, "Fix login", "nothing changed");
-    // Nothing is shared with a participant yet: it lists no sessions.
-    assert_eq!(call(&f.rpc, &participant, "session.list", json!({})).await.unwrap()["sessions"], json!([]));
-    // Reading what can run is not a write.
+    // A viewer sees the workspace's sessions; reading what can run is not a write.
+    assert_eq!(call(&f.rpc, &participant, "session.list", json!({})).await.unwrap()["sessions"][0]["id"], session.id.as_str());
     assert!(call(&f.rpc, &participant, "runtime.agents", json!({})).await.is_ok());
+    // Someone it is not shared with is refused even the list.
+    let (outsider, _outsider_events) = Peer::for_user("device-outsider".into(), Authority::Participate, Some("outsider".into()));
+    call(&f.rpc, &outsider, "rpc.hello", json!({ "protocol": PROTOCOL, "want": protocol::CAPABILITIES })).await.unwrap();
+    assert_eq!(code(call(&f.rpc, &outsider, "session.list", json!({})).await), "forbidden");
 }
 
 /// PRO-30 on top of CS-12: sharing is workspace-wide, so the session list and
@@ -1872,6 +1967,7 @@ async fn runtime_agents_lists_installed_agents_with_models_efforts_and_modes() {
 async fn a_terminal_names_its_session_only_to_pty_2_peers_that_may_see_it() {
     let _home = crate::store::temp_home();
     let f = fixture();
+    listed(&f.rpc);
     let session = seed_session(&f.root, "Fix login", None);
     let (manager, _events) = hello_with(&f.rpc, "device-desk", Authority::Manage, &protocol::CAPABILITIES).await;
     let created = call(&f.rpc, &manager, "pty.create", json!({ "sessionId": session.id, "clientRequestId": "request-scope-1" })).await.unwrap();
@@ -1887,12 +1983,11 @@ async fn a_terminal_names_its_session_only_to_pty_2_peers_that_may_see_it() {
     let controlled = call(&f.rpc, &old, "pty.control", json!({ "ptyId": pty_id })).await.unwrap();
     assert!(controlled.get("sessionId").is_none());
 
-    // A participant with pty/2 is not shown a session that is not shared with it.
-    let (participant, _part_events) = hello_with(&f.rpc, "device-phone", Authority::Participate, &protocol::CAPABILITIES).await;
-    let listed = call(&f.rpc, &participant, "pty.list", json!({})).await.unwrap();
-    assert!(listed["terminals"][0].get("sessionId").is_none());
-    let attached = call(&f.rpc, &participant, "pty.attach", json!({ "ptyId": pty_id })).await.unwrap();
-    assert!(attached.get("sessionId").is_none());
+    // A participant with pty/2 that the workspace is not shared with sees no terminal at all.
+    let (participant, _part_events) = Peer::for_user("device-phone".into(), Authority::Participate, Some("outsider".into()));
+    call(&f.rpc, &participant, "rpc.hello", json!({ "protocol": PROTOCOL, "want": protocol::CAPABILITIES })).await.unwrap();
+    assert_eq!(code(call(&f.rpc, &participant, "pty.list", json!({})).await), "forbidden");
+    assert_eq!(code(call(&f.rpc, &participant, "pty.attach", json!({ "ptyId": pty_id })).await), "forbidden");
 
     // The pty/2 manager, who may see the session, is told it.
     let listed = call(&f.rpc, &manager, "pty.list", json!({})).await.unwrap();
@@ -2323,14 +2418,15 @@ async fn a_terminal_does_not_come_back_while_someone_else_drives_its_tab() {
 /// back, get nothing by themselves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_does_not_come_back_to_someone_who_may_not_type() {
-    // No member list yet: a manage attachment types, a participant's does not.
+    // No member list yet: a manage attachment types, a participant's link gets nothing.
     let f = fixture();
     let (before, _before_events) = installed(&f.rpc, "device-before-stop", Authority::Manage, "admin", "admin-desk").await;
     let shell = call(&f.rpc, &before, "pty.create", json!({ "clientRequestId": "request-shell-rights" })).await.unwrap()["ptyId"].as_str().unwrap().to_string();
     f.rpc.disconnect(&before);
     let (lesser, _lesser_events) = installed(&f.rpc, "device-after-wake", Authority::Participate, "admin", "admin-desk").await;
-    assert_eq!(call(&f.rpc, &lesser, "pty.list", json!({})).await.unwrap()["terminals"][0]["control"], "other");
-    assert_eq!(call(&f.rpc, &lesser, "pty.attach", json!({ "ptyId": shell })).await.unwrap()["control"], "other");
+    // Before the member list nobody's role is known, so the participate link gets nothing (#475).
+    assert_eq!(code(call(&f.rpc, &lesser, "pty.list", json!({})).await), "forbidden");
+    assert_eq!(code(call(&f.rpc, &lesser, "pty.attach", json!({ "ptyId": shell })).await), "forbidden");
     assert!(call(&f.rpc, &lesser, "pty.write", json!({ "ptyId": shell, "data": "x", "seq": 1, "writerId": "w" })).await.is_err());
     assert_eq!(controller_of(&f, &shell).as_deref(), Some("device-before-stop"));
 
@@ -3050,4 +3146,139 @@ async fn a_restarted_runtime_starts_the_terminal_over_for_the_returning_device()
     assert_eq!(code(call(&f.rpc, &after, "pty.write", json!({ "ptyId": AGENT_TERMINAL, "data": "x", "seq": 2, "writerId": "w" })).await), "conflict");
     call(&f.rpc, &after, "pty.write", json!({ "ptyId": AGENT_TERMINAL, "data": "echo woke-$$\n", "seq": 1, "writerId": "new" })).await.unwrap();
     output_until(&mut events, &format!("woke-{pid}")).await;
+}
+
+// ---- #427: Escape for a running turn (`session/3`) ----------------------------
+
+/// The seeded session's tab with a turn running, and every interrupt and
+/// stop it is sent on record.
+struct Interruptible {
+    session_id: String,
+    tab_id: String,
+    interrupts: Mutex<Vec<(String, String)>>,
+    stops: AtomicUsize,
+}
+
+impl crate::cloud_agents::AgentOps for Interruptible {
+    fn tabs(&self) -> Vec<crate::cloud_agents::AgentTabInfo> {
+        let mut tab = OneTab.tabs().remove(0);
+        tab.session_id = self.session_id.clone();
+        tab.tab_id = self.tab_id.clone();
+        tab.status = crate::store::index::TabStatus::InProgress;
+        vec![tab]
+    }
+    fn busy(&self, _: &str, _: &str) -> bool {
+        true
+    }
+    fn send(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("an interrupt sends nothing to the agent but its Escape")
+    }
+    fn interrupt(&self, session_id: &str, tab_id: &str) -> anyhow::Result<bool> {
+        self.interrupts.lock().unwrap().push((session_id.into(), tab_id.into()));
+        Ok(true)
+    }
+    fn stop(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn respond(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), crate::cloud_agents::DecisionError> {
+        Ok(())
+    }
+    fn answer(&self, _: &str, _: &str, _: &str, _: HashMap<String, String>) -> Result<(), crate::cloud_agents::DecisionError> {
+        Ok(())
+    }
+    fn configure(&self, _: &str, _: &str, _: &crate::cloud_agents::Settings) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn note(&self, _: &str, _: &str, _: &str) {}
+    fn events(&self, _: &str, _: &str) -> anyhow::Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Escape in a cloud tab's chat is a live call that interrupts the turn. It
+/// is for whoever may stop the tab (a driver while nobody else drives it, a
+/// manager always), it stops nothing and drops no queued follow-up, and it
+/// is never answered from a cache: each call is an Escape for the turn
+/// running then.
+#[tokio::test(flavor = "multi_thread")]
+async fn escape_interrupts_a_running_turn_for_whoever_may_stop_it_and_stops_nothing() {
+    let _home = crate::store::temp_home();
+    let f = fixture();
+    let session = seed_session(&f.root, "Fix login", None);
+    let tab_id = session.tabs[0].id.clone();
+    let ops = Arc::new(Interruptible { session_id: session.id.clone(), tab_id: tab_id.clone(), interrupts: Mutex::new(Vec::new()), stops: AtomicUsize::new(0) });
+    let agents = crate::cloud_agents::CloudAgents::open(&f._dir.path().join("agents"), ops.clone(), None, None, 7).unwrap();
+    f.rpc.set_agents(agents.clone());
+    // A message someone queued behind the running turn.
+    let queued = crate::cloud_agents::FollowUp { client_command_id: "cmd-1".into(), session_id: session.id.clone(), text: "then run the tests".into(), actor_id: "alice".into(), images: Vec::new() };
+    agents.follow_ups.push(&tab_id, queued).unwrap();
+    f.rpc.set_collaboration(members(json!([
+        { "userId": "admin", "role": "manager" },
+        { "userId": "alice", "role": "driver", "canApprove": false },
+        { "userId": "bob", "role": "driver" },
+        { "userId": "vic", "role": "viewer" },
+    ])));
+    let hello = |device: &'static str, authority: Authority, user: &'static str| {
+        let rpc = f.rpc.clone();
+        async move {
+            let (peer, events) = Peer::for_user(device.into(), authority, Some(user.into()));
+            call(&rpc, &peer, "rpc.hello", json!({ "protocol": PROTOCOL, "want": ["session/1", "session/2", "session/3", "collab/1"] })).await.unwrap();
+            (peer, events)
+        }
+    };
+    let (admin, _admin_events) = hello("d-admin", Authority::Manage, "admin").await;
+    let (alice, _alice_events) = hello("d-alice", Authority::Participate, "alice").await;
+    let (bob, _bob_events) = hello("d-bob", Authority::Participate, "bob").await;
+    let (vic, _vic_events) = hello("d-vic", Authority::Participate, "vic").await;
+    let params = json!({ "sessionId": session.id, "tabId": tab_id });
+    let sent = || ops.interrupts.lock().unwrap().len();
+
+    // A driver interrupts, with or without the right to approve: it is less than the stop they may already send.
+    assert_eq!(call(&f.rpc, &alice, "session.interrupt", params.clone()).await.unwrap(), json!({ "interrupted": true }));
+    assert_eq!(*ops.interrupts.lock().unwrap(), [(session.id.clone(), tab_id.clone())]);
+    // Someone who only watches does not.
+    assert_eq!(code(call(&f.rpc, &vic, "session.interrupt", params.clone()).await), "forbidden");
+    assert_eq!(sent(), 1);
+
+    // While alice drives the tab, another driver's Escape is refused as their stop would be. A manager's is not.
+    f.rpc.collab.claim(&tab_id, "alice", crate::cloud_agents::now_ms(), true, false).unwrap();
+    let refused = f.rpc.handle(&bob, &json!({ "id": "9", "method": "session.interrupt", "params": params })).await;
+    assert_eq!((refused["error"]["code"].as_str(), refused["error"]["data"]["lease"]["holderId"].as_str()), (Some("lease_held"), Some("alice")));
+    assert_eq!(sent(), 1);
+    call(&f.rpc, &alice, "session.interrupt", params.clone()).await.unwrap();
+    call(&f.rpc, &admin, "session.interrupt", params.clone()).await.unwrap();
+    // Each call reached the agent: none was answered from an earlier one.
+    assert_eq!(sent(), 3);
+    // An interrupt does not take the tab over from whoever drives it.
+    assert_eq!(agents.tabs()[0].lease.as_ref().unwrap().holder_id, "alice");
+
+    // The agent's process was never stopped, and what was queued behind the turn is still queued.
+    assert_eq!(ops.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(agents.follow_ups.list(&tab_id).len(), 1);
+
+    // A tab that is not there, and a client that never asked for `session/3`.
+    assert_eq!(code(call(&f.rpc, &admin, "session.interrupt", json!({ "sessionId": session.id, "tabId": "no-such-tab" })).await), "not_found");
+    let (old, _old_events) = hello_with(&f.rpc, "device-old", Authority::Manage, &["session/1", "session/2"]).await;
+    assert_eq!(code(call(&f.rpc, &old, "session.interrupt", params.clone()).await), "capability_not_granted");
+    assert_eq!(sent(), 3);
+}
+
+/// Before the API has listed anyone, a participant keeps what it had: it
+/// could stop a tab through the mailbox, so it may interrupt one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupt_needs_no_member_list_and_a_runtime_without_agents_says_so() {
+    let _home = crate::store::temp_home();
+    let f = fixture();
+    let session = seed_session(&f.root, "Fix login", None);
+    let tab_id = session.tabs[0].id.clone();
+    let params = json!({ "sessionId": session.id, "tabId": tab_id });
+    let (manager, _events) = hello_with(&f.rpc, "device-manage", Authority::Manage, &protocol::CAPABILITIES).await;
+    // No agents in this runtime: nothing to interrupt, said as such.
+    assert_eq!(code(call(&f.rpc, &manager, "session.interrupt", params.clone()).await), "unavailable");
+
+    let ops = Arc::new(Interruptible { session_id: session.id.clone(), tab_id, interrupts: Mutex::new(Vec::new()), stops: AtomicUsize::new(0) });
+    f.rpc.set_agents(crate::cloud_agents::CloudAgents::open(&f._dir.path().join("agents"), ops.clone(), None, None, 7).unwrap());
+    assert_eq!(call(&f.rpc, &manager, "session.interrupt", params).await.unwrap()["interrupted"], true);
+    assert_eq!(ops.interrupts.lock().unwrap().len(), 1);
 }

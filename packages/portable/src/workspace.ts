@@ -21,6 +21,8 @@ export const WORKSPACE_PROTOCOL = "terminalx-workspace-rpc/1";
  * A newer version only adds to its namespace (CS-12):
  * - `session/2`: `session.update`, `session.addTab`, `session.delete` and the
  *   `session.sessions` notification;
+ * - `session/3` (#427): `session.interrupt`, Escape for an agent tab's
+ *   running turn. Live only, never queued or resent;
  * - `pty/2`: `pty.create` takes a `sessionId`, and `pty.list` returns it;
  * - `agents/1`: `runtime.agents`;
  * - `agent-pty/1` (PRO-86): the terminal an agent tab's CLI runs in answers
@@ -37,14 +39,19 @@ export const WORKSPACE_PROTOCOL = "terminalx-workspace-rpc/1";
  * - `mirror/1` (PRO-25): `mirror.manifest`, the files a desktop may copy
  *   into its local mirror of the workspace;
  * - `cleanup/1`: the bulk worktree clean-up. The runtime inspects and removes
- *   its own worktrees; this client only names them;
+ *   its own worktrees; this client only names them. While `cleanup.remove`
+ *   runs, its caller is sent `cleanup.progress` notifications; a runtime
+ *   from before them sends none, and the answer is the same either way;
  * - `workspace/1`: one session's worktree, for the removal dialog:
  *   `workspace.disposition` and `workspace.remove`. The worktree is named by
- *   its session, never by a path.
+ *   its session, never by a path;
+ * - `workspace/2`: the removal that follows a merged pull request. The
+ *   runtime looks at its own worktrees, removes the ones that are safe and
+ *   due, and records them; this client only says that it is on.
  * An older runtime grants none of them; check `hasCapability` before offering
  * the matching action.
  */
-export const WORKSPACE_CAPABILITIES = ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1", "cleanup/1", "workspace/1"] as const;
+export const WORKSPACE_CAPABILITIES = ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "session/3", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1", "cleanup/1", "workspace/1", "workspace/2"] as const;
 export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number];
 
 /**
@@ -55,6 +62,7 @@ export const METHOD_CAPABILITIES: Readonly<Record<string, WorkspaceCapability>> 
   "session.update": "session/2",
   "session.addTab": "session/2",
   "session.delete": "session/2",
+  "session.interrupt": "session/3",
   "runtime.agents": "agents/1",
   "session.commands": "composer/1",
   "session.files": "composer/2",
@@ -67,6 +75,10 @@ export const METHOD_CAPABILITIES: Readonly<Record<string, WorkspaceCapability>> 
   "lease.acquire": "collab/1",
   "lease.release": "collab/1",
   "lease.takeOver": "collab/1",
+  "workspace.sweepMerged": "workspace/2",
+  "workspace.holdMerged": "workspace/2",
+  "workspace.removedRecords": "workspace/2",
+  "workspace.restoreRemoved": "workspace/2",
 };
 
 /**
@@ -93,6 +105,9 @@ export const MUTATING_METHODS = new Set([
   "session.delete",
   "cleanup.remove",
   "workspace.remove",
+  "workspace.sweepMerged",
+  "workspace.holdMerged",
+  "workspace.restoreRemoved",
   "pty.create",
   "fs.write",
   "fs.writePart",
@@ -203,6 +218,84 @@ export interface RuntimeWorkspaceRemoved {
   rescuedBranch?: string | null;
 }
 
+/** A pull request that merged, with the commit that was merged: its head. */
+export interface MergedPr {
+  number: number;
+  title: string;
+  url: string;
+  head: string;
+}
+
+/** What became of a branch when its workspace was removed after its pull request merged. */
+export type MergedBranchFate =
+  | { outcome: "deleted" }
+  /** It was not there any more: GitHub deletes a merged branch itself when the repository is set to. */
+  | { outcome: "alreadyGone" }
+  /** The remote branch points at another commit than the one that was merged, so it was kept. */
+  | { outcome: "moved"; at: string }
+  | { outcome: "kept"; reason: string };
+
+/** One workspace removed after its pull request merged (`merged_cleanup.rs`). Its paths are its host's. */
+export interface MergedRemoval {
+  id: string;
+  removedAt: string;
+  projectPath: string;
+  path: string;
+  name: string;
+  branch: string;
+  /** The commit the workspace was at. */
+  commit: string;
+  pr: MergedPr;
+  localBranch: MergedBranchFate;
+  remoteBranch: MergedBranchFate;
+  /** The sessions whose conversations were kept and filed under the project. */
+  sessionsKept: string[];
+  sessionsDeleted: string[];
+  restoredAt?: string | null;
+}
+
+/** A removal with why it cannot be brought back; `blocked` is null when it can. */
+export interface MergedRemovalView extends MergedRemoval {
+  blocked: string | null;
+}
+
+export type MergedPhase = "scheduled" | "kept" | "held" | "removed";
+
+/** Where one workspace whose pull request merged stands after a pass. */
+export interface MergedStatus {
+  projectPath: string;
+  path: string;
+  name: string;
+  branch: string;
+  pr: MergedPr;
+  phase: MergedPhase;
+  /** Why it stays, in a few words ("2 uncommitted files"). Only when kept. */
+  reason: string | null;
+  /** The same in full. */
+  detail: string | null;
+  /** When it goes if nothing changes. Only when scheduled. */
+  due: string | null;
+  /** The merge was first seen in this pass. */
+  fresh: boolean;
+  /** The sessions in it. */
+  sessions: string[];
+  /** What was removed. Only when removed. */
+  record: MergedRemoval | null;
+}
+
+/** One pass: where each workspace whose pull request merged stands, and the projects whose pull requests could not be read. */
+export interface MergedSwept {
+  statuses: MergedStatus[];
+  /** GitHub could not be asked about these projects, so nothing in them was looked at. */
+  unreadable: { projectPath: string; reason: string }[];
+}
+
+/** What an undo did; `notes` says what could not be put back. */
+export interface MergedRestored {
+  record: MergedRemoval;
+  notes: string[];
+}
+
 /** What the clean-up decided about one worktree (`worktree_cleanup.rs`). */
 export type CleanupVerdict = "eligible" | "ignoredData" | "protected" | "active" | "inProgress" | "dirty" | "unpushed" | "unverifiable";
 
@@ -250,6 +343,8 @@ export interface CleanupRemoveItem {
   deleteSessions?: boolean;
   /** Remove it although it holds ignored local files. */
   acceptIgnored?: boolean;
+  /** What the review measured it at. When given it is not measured again, and the result reports this as an estimate. */
+  estimatedBytes?: number;
 }
 
 export interface CleanupResult {
@@ -258,10 +353,27 @@ export interface CleanupResult {
   outcome: "removed" | "alreadyRemoved" | "skipped" | "failed";
   reason: string | null;
   freedBytes: number;
+  /** `freedBytes` is the review's estimate, not a measurement made just before the removal. Absent from an older host, which always measures. */
+  freedEstimated?: boolean;
   keptBranch: string | null;
   sessionsKept: string[];
   sessionsDeleted: string[];
 }
+
+/** What a removal is doing to the worktree it is on. */
+export type CleanupStep = "measuring" | "checking" | "removing" | "sessions";
+
+/**
+ * How far one removal call is, as its host reports it while it runs
+ * (`cleanup.progress` from a runtime, `worktree_cleanup_progress` from the
+ * desktop). `index` counts from 0 over the `total` worktrees of that call. A
+ * worktree that was not attempted is only ever `finished`. The call's answer
+ * is what happened; this is how it gets there.
+ */
+export type CleanupProgress =
+  | { kind: "started"; index: number; total: number; projectPath: string; path: string }
+  | { kind: "step"; index: number; total: number; path: string; step: CleanupStep }
+  | { kind: "finished"; index: number; total: number; result: CleanupResult };
 
 /**
  * A session in the runtime's own index (`session.list`, `session.sessions`).
@@ -855,6 +967,17 @@ export class WorkspaceRpcClient {
     await this.call("session.markRead", { sessionId, tabId });
   }
 
+  /**
+   * Escape for a tab's running turn (`session/3`): the turn is interrupted
+   * and the agent's process stays. A plain call, sent once: if the connection
+   * drops it is not sent again, because by then it could reach a later turn.
+   * `interrupted` is false when the tab had nothing running.
+   */
+  async interruptAgentTab(params: { sessionId: string; tabId: string }): Promise<{ interrupted: boolean }> {
+    const result = await this.call<{ interrupted?: boolean }>("session.interrupt", params);
+    return { interrupted: result.interrupted === true };
+  }
+
   /** The sessions this connection may see (`session.list`). */
   async listSessions(): Promise<RuntimeSession[]> {
     const result = await this.call<{ sessions?: RuntimeSession[] }>("session.list");
@@ -916,10 +1039,26 @@ export class WorkspaceRpcClient {
   /**
    * `cleanup.remove`: remove the named worktrees. The runtime inspects each
    * again and leaves alone whatever is not what its token stands for.
+   *
+   * `onProgress` hears the `cleanup.progress` notifications of this request
+   * while it runs. An older runtime sends none, and neither does a resend
+   * that is answered from what was already done: the answer never depends
+   * on them.
    */
-  async removeCleanup(items: CleanupRemoveItem[]): Promise<CleanupResult[]> {
-    const result = await this.mutate<{ results?: CleanupResult[] }>("cleanup.remove", { items });
-    return result.results ?? [];
+  async removeCleanup(items: CleanupRemoveItem[], onProgress?: (progress: CleanupProgress) => void): Promise<CleanupResult[]> {
+    const requestId = this.newRequestId();
+    const stop = onProgress
+      ? this.onNotification((notification) => {
+          if (notification.event !== "cleanup.progress" || notification.params.run !== requestId) return;
+          onProgress(notification.params as unknown as CleanupProgress);
+        })
+      : () => undefined;
+    try {
+      const result = await this.mutate<{ results?: CleanupResult[] }>("cleanup.remove", { items }, requestId);
+      return result.results ?? [];
+    } finally {
+      stop();
+    }
   }
 
   /**
@@ -940,6 +1079,35 @@ export class WorkspaceRpcClient {
    */
   async removeSessionWorkspace(sessionId: string, options: { deleteBranch: boolean; confirmedDigest: string | null; expectedSessions: string[] }): Promise<RuntimeWorkspaceRemoved> {
     return this.mutate<RuntimeWorkspaceRemoved>("workspace.remove", { sessionId, ...options });
+  }
+
+  /**
+   * `workspace.sweepMerged`: one pass of the removal that follows a merged
+   * pull request (`workspace/2`, manage only). The runtime says where each
+   * such worktree stands, and removes the ones that are safe and whose grace
+   * period has run. Calling it is what "on" means for a cloud workspace;
+   * `enabled: false` tells the runtime it was turned off, and it then looks
+   * at nothing and forgets what it had seen.
+   */
+  async sweepMergedWorkspaces(options: { enabled?: boolean; deleteSessions: boolean; graceSeconds: number }): Promise<MergedSwept> {
+    const result = await this.mutate<Partial<MergedSwept>>("workspace.sweepMerged", { ...options });
+    return { statuses: result.statuses ?? [], unreadable: result.unreadable ?? [] };
+  }
+
+  /** `workspace.holdMerged`: keep a worktree that is waiting to be removed, or let it go again. */
+  async holdMergedWorkspace(path: string, held: boolean): Promise<void> {
+    await this.mutate("workspace.holdMerged", { path, held });
+  }
+
+  /** `workspace.removedRecords`: what was removed there, newest first. */
+  async removedWorkspaceRecords(): Promise<MergedRemovalView[]> {
+    const result = await this.call<{ records?: MergedRemovalView[] }>("workspace.removedRecords");
+    return result.records ?? [];
+  }
+
+  /** `workspace.restoreRemoved`: undo one recorded removal, where it was. */
+  async restoreRemovedWorkspace(id: string): Promise<MergedRestored> {
+    return this.mutate<MergedRestored>("workspace.restoreRemoved", { id });
   }
 
   /** The agents installed on the runtime, with their models, efforts and modes (`agents/1`). */

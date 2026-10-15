@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { onOpenAgentLogins } from "@/lib/settingsLinks";
 import { PanelLeft, PanelRight } from "@/icons";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
@@ -22,21 +23,26 @@ import { agent, type ImageInput } from "@/lib/api";
 import { loadModels } from "@/lib/models";
 import { startNotifications } from "@/lib/notify";
 import { subscribeTabPty } from "@/lib/tabViews";
+import { MergedCleanupNotices } from "@/components/ui/MergedCleanupNotices";
 import { StarReminder } from "@/components/ui/StarReminder";
 import { Toasts } from "@/components/ui/Toasts";
 import { ShareSessionDialogHost } from "@/components/session/ShareSessionDialog";
 import { GuestSessionHost } from "@/components/session/GuestSession";
+import { CloudSchedulesDialogHost } from "@/components/cloud/CloudSchedulesDialog";
 import { CloudShareDialogHost } from "@/components/cloud/CloudShareDialog";
 import { NewCloudWorkspaceDialogHost } from "@/components/cloud/NewCloudWorkspaceDialog";
 import { DEV_RUNTIME_KEY } from "@/lib/devRuntime";
 import { BypassDialog } from "@/components/session/BypassDialog";
 import { SessionDialogs } from "@/components/session/SessionDialogs";
 import { bootFloating, showFloatingWindow } from "@/lib/floating";
+import { bootMergedCleanup } from "@/lib/mergedCleanup";
 import { WorkspaceRemoveDialog } from "@/components/session/WorkspaceRemoveDialog";
 import { WorktreeCleanupDialog } from "@/components/cleanup/WorktreeCleanupDialog";
+import { CleanupIndicator } from "@/components/cleanup/CleanupIndicator";
 import { bootStatus, useStatus } from "@/lib/status";
 import { AutomationsView } from "@/components/automations/AutomationsView";
 import { bootAutomations } from "@/lib/automations";
+import { bootIssuePipelines } from "@/lib/issuePipeline";
 import { RightPanel } from "@/components/layout/RightPanel";
 import { CommandPalette } from "@/components/command/CommandPalette";
 import { bootAccount } from "@/lib/account";
@@ -86,6 +92,7 @@ export function AppShell() {
     void subscribeTabPty();
     void bootSessions();
     void bootAutomations();
+    void bootIssuePipelines();
     void loadModels();
     startNotifications();
     void bootStatus();
@@ -95,6 +102,7 @@ export function AppShell() {
     void bootTerminalPerf();
     void bootCloudControl();
     void bootFloating();
+    void bootMergedCleanup();
   }, []);
 
   // The first prompt of a new session is sent right after the worktree exists.
@@ -121,8 +129,15 @@ export function AppShell() {
     setSettingsOpen(true);
     setSettingsRequest((count) => count + 1);
   }, []);
+  // A message that names Settings → Account → Agent logins offers the way there; the section scrolls itself into view.
+  useEffect(() => onOpenAgentLogins(openAccountSettings), [openAccountSettings]);
   const openAgentSettings = useCallback(() => {
     setSettingsTab("agents");
+    setSettingsOpen(true);
+    setSettingsRequest((count) => count + 1);
+  }, []);
+  const openStorageSettings = useCallback(() => {
+    setSettingsTab("storage");
     setSettingsOpen(true);
     setSettingsRequest((count) => count + 1);
   }, []);
@@ -157,11 +172,15 @@ export function AppShell() {
     <div data-app-shell className="flex h-full w-full flex-col">
       <div className="pointer-events-none fixed bottom-8 right-4 z-(--z-toast) flex max-h-[calc(100dvh-3rem)] w-[360px] max-w-[calc(100vw-2rem)] flex-col gap-2">
         <StarReminder />
+        <MergedCleanupNotices />
         <Toasts />
+        {/* Last, so it keeps the corner and the toasts stack above it. */}
+        <CleanupIndicator onOpenStorage={openStorageSettings} />
       </div>
       <BypassDialog />
       <SessionDialogs />
       <CloudShareDialogHost />
+      <CloudSchedulesDialogHost />
       <ShareSessionDialogHost />
       <GuestSessionHost />
       <NewCloudWorkspaceDialogHost />

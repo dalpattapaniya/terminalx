@@ -196,6 +196,50 @@ describe("a cloud workspace on the phone", () => {
     h.session.close();
   });
 
+  it("interrupts the running turn over the live connection, and posts nothing to the mailbox for it", async () => {
+    const h = harness();
+    const asked: unknown[] = [];
+    h.each((runtime) => (runtime.methods["session.interrupt"] = (params) => (asked.push(params), { interrupted: true })));
+    await h.session.start();
+    await connected(h);
+    expect(h.session.getSnapshot().interrupts).toBe(true);
+    expect(await h.session.interrupt("t1")).toBe(true);
+    expect(asked).toEqual([{ sessionId: "s1", tabId: "t1" }]);
+    // Escape is for the turn running now: never a stored command that could reach a later one.
+    expect(h.api.enqueue).not.toHaveBeenCalled();
+    expect(h.session.getSnapshot().outbox).toEqual([]);
+    h.session.close();
+  });
+
+  it("offers no interrupt on a runtime from before it, to a viewer, or while not connected", async () => {
+    const older = harness();
+    older.each((runtime) => (runtime.withheld = ["session/3"]));
+    await older.session.start();
+    await connected(older);
+    expect(older.session.getSnapshot().interrupts).toBe(false);
+    await expect(older.session.interrupt("t1")).rejects.toMatchObject({ code: "unavailable" });
+    expect(older.runtimes[0].requests.some((request) => request.method === "session.interrupt")).toBe(false);
+    // The stop that ends the agent's process is still there.
+    expect(await older.session.stop("t1")).toMatchObject({ kind: "stop" });
+    older.session.close();
+
+    const viewer = harness({ role: "viewer" });
+    await viewer.session.start();
+    await connected(viewer);
+    await expect(viewer.session.interrupt("t1")).rejects.toMatchObject({ code: "read-only" });
+    expect(viewer.runtimes[0].requests.some((request) => request.method === "session.interrupt")).toBe(false);
+    viewer.session.close();
+
+    const away = harness();
+    await away.session.start();
+    await connected(away);
+    // Let go of the connection: nothing is sent, and it is not turned into a stop either.
+    away.session.pause();
+    await expect(away.session.interrupt("t1")).rejects.toMatchObject({ code: "unavailable" });
+    expect(away.api.enqueue).not.toHaveBeenCalled();
+    away.session.close();
+  });
+
   it("lets a viewer read, and answer a permission request only with the right to approve; a driver without it cannot", async () => {
     const viewer = harness({ role: "viewer" });
     await viewer.session.start();
@@ -687,16 +731,25 @@ describe("a cloud workspace on the phone", () => {
       h.session.close();
     });
 
-    it("asks as before of a runtime from before sharing, which reports role none without a member list", async () => {
+    it("asks nothing until a runtime that just started knows who has access, then asks for the role it gives (#475)", async () => {
       const h = shared({ role: "driver" });
       h.each((runtime) => {
         runtime.you = { userId: "u-me", role: "none", canApprove: false, listed: false };
         runtime.methods["collab.state"] = () => undefined;
       });
+      const asked = () => h.runtimes[0].requests.map((request) => (request as { method?: string }).method).filter((method) => method === "keys.get" || method === "session.tabs");
       await h.session.start();
+      await vi.waitFor(() => expect(h.session.getSnapshot().connection.state).toBe("connected"));
+      await vi.advanceTimersByTimeAsync(100);
+      // The runtime would refuse it all: nothing is asked, no refusal is shown, and the banner does not say Live.
+      expect(asked()).toEqual([]);
+      expect(h.session.getSnapshot()).toMatchObject({ checkingAccess: true, tabs: [], error: null });
+      // The member list arrives: the runtime says so, and what the role allows is read.
+      h.runtimes[0].you = { userId: "u-me", role: "driver", canApprove: false, listed: true };
+      h.runtimes[0].encrypted({ event: "collab.you", params: { you: h.runtimes[0].you } });
       await connected(h);
-      // Keys and tabs were asked for, and the role is the list's.
-      expect(h.session.getSnapshot()).toMatchObject({ hasKey: true, role: "driver", tabs: [{ tabId: "t1" }] });
+      expect(asked()).toContain("keys.get");
+      expect(h.session.getSnapshot()).toMatchObject({ checkingAccess: false, hasKey: true, role: "driver", tabs: [{ tabId: "t1" }] });
       h.session.close();
     });
 

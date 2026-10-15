@@ -1,5 +1,5 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
-import { Archive, ChevronDown, Ellipsis, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, Palette, Pin, Plus, Settings, SquarePen, Trash2 } from "@/icons";
+import { Archive, ChevronDown, Ellipsis, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, GitPullRequest, Palette, Pin, Plus, Settings, SquarePen, Trash2 } from "@/icons";
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
 import { AccountSidebarEntry } from "@/components/account/AccountSidebarEntry";
 import { SidebarTitlebar } from "./SidebarTitlebar";
+import { IssuePipelineSettingsDialog } from "@/components/issues/IssuePipelineSettingsDialog";
 import { cn } from "@/lib/cn";
 import { errorMessage } from "@/lib/api";
 import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
@@ -311,6 +312,7 @@ function ProjectGroup({
   const [all, toggleAll] = useFold(`project-all:${canon(group.path)}`, false);
   // The project folds its branches away: its picture turns into a chevron on hover, and stays one while folded.
   const [open, toggle] = useFold(`project:${canon(group.path)}`, true);
+  const [pipelineOpen, setPipelineOpen] = useState(false);
   const { animations } = usePrefs();
   // One row per branch, newest work first; the conversations come in that order already.
   const branches = useMemo(() => {
@@ -383,11 +385,18 @@ function ProjectGroup({
               </DropdownMenuSub>
             </>
           )}
+          {group.project && group.project.kind !== "folder" && (
+            <DropdownMenuItem onSelect={() => setPipelineOpen(true)}>
+              <GitPullRequest /> Issue pipeline…
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem destructive onSelect={() => void confirmRemoveProject(group)}>
             <Trash2 /> Remove from TerminalX…
           </DropdownMenuItem>
         </DropdownMenuContent>
+        {/* Mounted only while open: a row per project would otherwise each hold a dialog. */}
+        {pipelineOpen && group.project && <IssuePipelineSettingsDialog project={group.project} open onOpenChange={setPipelineOpen} />}
       </DropdownMenu>
       {/* The branches slide open and closed: a grid row that grows from nothing to its content's height, which a height alone cannot animate. */}
       <div

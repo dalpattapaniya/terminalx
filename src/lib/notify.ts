@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { getPrefs } from "@/lib/prefs";
 import { getSessions, selectSession, subscribeSessions } from "@/lib/sessions";
+import { isTabMuted } from "@/lib/tabLayouts";
 import { isUnread, sessionColumn } from "@/lib/dashboard";
 import { createCloudAttentionTracker, getCloudDashboard, openCloudSession, subscribeCloudDashboard, type CloudAttention } from "@/lib/cloudDashboard";
 import { isCloudKey } from "@/types/target";
@@ -10,6 +11,7 @@ import { appWindow, type AppWindow } from "@/lib/appWindow";
 import { getFloating, showFloatingWindow, subscribeFloating } from "@/lib/floating";
 import { sessionStatus, type SessionEntry, type TabEntry, type TabStatus } from "@/types/session";
 import type { AutomationRun } from "@/types/automations";
+import type { IssuePipeline } from "@/types/issuePipeline";
 
 /**
  * Attention, graded by where the reader is. A turn finishing or an agent
@@ -210,6 +212,8 @@ export function noteStatusChange(session: SessionEntry, tab: TabEntry, prev: Tab
   if (next === "waiting" && prev !== "waiting") kind = "waiting";
   else if (next === "completed" && prev === "in_progress") kind = "done";
   if (!kind) return;
+  // A tab the reader muted raises nothing: no banner, no notice, no tone. Its row and the dock badge still show its state.
+  if (isTabMuted(session, tab.id)) return;
   const { title, body } = summarise(session, tab, kind);
   const onScreen = looking() && getSessions().selectedSessionId === session.id;
   if (!looking()) {
@@ -247,6 +251,31 @@ export function noteAutomationFailure(name: string, run: AutomationRun) {
     body,
     at: Date.now(),
   }];
+  emit();
+  window.setTimeout(() => dismissNotice(id), 8000);
+}
+
+/**
+ * An issue pipeline came to rest: it wants the reader, is ready for them, or
+ * merged. The same focus-aware path as a session's own attention, pointing at
+ * the session that is working on the issue.
+ */
+export function notePipelineState(pipeline: IssuePipeline) {
+  const kind: NoticeKind | null = pipeline.state === "needsYou" ? "waiting" : pipeline.state === "readyToMerge" || pipeline.state === "merged" ? "done" : null;
+  if (!kind) return;
+  const what = pipeline.state === "needsYou" ? "needs you" : pipeline.state === "merged" ? "merged" : "is ready to merge";
+  const title = `${pipeline.issue.identifier} ${what}`;
+  const body = pipeline.note ?? pipeline.issue.title;
+  const { sessionId, tabId } = pipeline.author;
+  if (!looking()) {
+    if (!sendsBanner()) return;
+    raised = { sessionId, tabId };
+    void canNotify().then((ok) => ok && sendNotification({ title, body }));
+    return;
+  }
+  playSound(kind);
+  const id = `pipeline:${pipeline.id}:${Date.now()}`;
+  notices = [...notices.filter((notice) => !notice.id.startsWith(`pipeline:${pipeline.id}:`)), { id, sessionId, tabId, kind, title, body, at: Date.now() }];
   emit();
   window.setTimeout(() => dismissNotice(id), 8000);
 }
