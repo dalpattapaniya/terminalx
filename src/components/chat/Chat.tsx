@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown } from "@/icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import type { Transcript } from "@/lib/transcript";
@@ -43,6 +43,7 @@ export function Chat({
   answerBlockedReason,
   askDetail = false,
   footer,
+  onSendQueuedNow,
 }: {
   sessionId: string;
   transcript: Transcript;
@@ -58,6 +59,8 @@ export function Chat({
   /** Quote the command, file or tool a permission request is about (a shared cloud workspace). */
   askDetail?: boolean;
   footer: React.ReactNode;
+  /** Send a message queued behind the running turn now, where the backend can (local). */
+  onSendQueuedNow?: (seq: number) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -217,6 +220,7 @@ export function Chat({
                 stream={isLast && live ? stream : []}
                 working={isLast && working && !transcript.pendingAsks.length && !transcript.compacting}
                 streamingTool={isLast && live ? streamingTool : undefined}
+                onSendQueuedNow={live ? onSendQueuedNow : undefined}
               />
             );
           })}

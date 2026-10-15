@@ -1944,6 +1944,12 @@ pub async fn stop_tab(state: State<'_, AppState>, session_id: String, tab_id: St
     tauri::async_runtime::spawn_blocking(move || m.stop(&session_id, &tab_id).map_err(err)).await.map_err(err)?
 }
 
+/// Send a message the CLI holds behind its running turn now: interrupt, then type it.
+#[tauri::command]
+pub fn send_queued_now(state: State<'_, AppState>, session_id: String, tab_id: String, seq: u64) -> CmdResult<()> {
+    state.manager().ok_or("not ready")?.send_queued_now(&session_id, &tab_id, seq).map_err(err)
+}
+
 #[tauri::command]
 pub fn cancel_queued(state: State<'_, AppState>, session_id: String, tab_id: String, message_id: String) -> CmdResult<Option<QueuedMessage>> {
     state.manager().ok_or("not ready")?.cancel_queued(&session_id, &tab_id, &message_id).map_err(err)

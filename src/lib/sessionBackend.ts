@@ -104,6 +104,8 @@ export interface SessionBackend {
    */
   send(tabId: string, text: string, images: ImageInput[], options?: { wake?: boolean }): Promise<SendResult>;
   steer(tabId: string, text: string): Promise<void>;
+  /** Local only: send a message queued behind the running turn now, interrupting the turn. `seq` is the message's event. */
+  sendQueuedNow?(tabId: string, seq: number): Promise<void>;
   stop(tabId: string): Promise<void>;
   respondPermission(tabId: string, requestId: string, optionId: string): Promise<void>;
   answerQuestions(tabId: string, requestId: string, answers: Record<string, string>): Promise<void>;
@@ -188,6 +190,7 @@ export function localSessionBackend(sessionId: string): SessionBackend {
     },
     send: (tabId, text, images) => agent.send(sessionId, tabId, text, images),
     steer: (tabId, text) => agent.send(sessionId, tabId, text, []).then(() => undefined),
+    sendQueuedNow: (tabId, seq) => agent.sendQueuedNow(sessionId, tabId, seq),
     stop: (tabId) => agent.stop(sessionId, tabId),
     respondPermission: (tabId, requestId, optionId) => agent.respondPermission(sessionId, tabId, requestId, optionId),
     answerQuestions: (tabId, requestId, answers) => agent.answerQuestions(sessionId, tabId, requestId, answers),

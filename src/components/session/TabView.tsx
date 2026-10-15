@@ -18,7 +18,7 @@ import { Composer, type Handoff } from "@/components/chat/Composer";
 import { sentMessages } from "@/components/chat/useComposerHistory";
 import { TerminalView } from "@/components/terminal/TerminalView";
 import { Button } from "@/components/ui/button";
-import { MessageSquare } from "lucide-react";
+import { MessageSquare } from "@/icons";
 import { useTerminals } from "@/lib/terminal";
 import { cn } from "@/lib/cn";
 import { clearTabViewError, isPtyFirst, leaveTerminalView, startTabAgent, terminalPaneId, useTabViews } from "@/lib/tabViews";
@@ -177,6 +177,15 @@ export function TabView({
     [backend, local, tab.id],
   );
 
+  // A message queued behind the running turn, sent now: the turn is interrupted and the message typed again.
+  const sendQueuedNow = useCallback(
+    (seq: number) => {
+      setError(null);
+      backend.sendQueuedNow?.(tab.id, seq).catch((e) => setError(local ? safeError(e) : commandError(e)));
+    },
+    [backend, local, tab.id],
+  );
+
   const stop = useCallback(() => {
     if (gate && !gate.mayStop) {
       setError("Only the person driving this tab or an admin can stop the agent.");
@@ -301,6 +310,7 @@ export function TabView({
       answering={answering || deciding}
       onAnswerPermission={answerPermission}
       onAnswerQuestions={answerQuestions}
+      onSendQueuedNow={backend.sendQueuedNow && !gate?.blocked ? sendQueuedNow : undefined}
       footer={
         <>
         {banner("composer")}

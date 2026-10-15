@@ -1410,6 +1410,8 @@ export const agent = {
   stop: (sessionId: string, tabId: string) => invoke<void>("stop_tab", { sessionId, tabId }),
   cancelQueued: (sessionId: string, tabId: string, messageId: string) =>
     invoke<QueuedMessage | null>("cancel_queued", { sessionId, tabId, messageId }),
+  /** Send a message the CLI holds behind its running turn now: the turn is interrupted and the message typed again. */
+  sendQueuedNow: (sessionId: string, tabId: string, seq: number) => invoke<void>("send_queued_now", { sessionId, tabId, seq }),
   listQueued: (sessionId: string, tabId: string) => invoke<QueuedMessage[]>("list_queued", { sessionId, tabId }),
   respondPermission: (sessionId: string, tabId: string, requestId: string, optionId: string) =>
     invoke<void>("respond_permission", { sessionId, tabId, requestId, optionId }),
