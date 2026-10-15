@@ -999,13 +999,17 @@ pub struct CodexLoginStarted {
 }
 
 /// Where a sign-in is: `waiting`, `complete` (with the stored login's public
-/// fields), `expired`, `cancelled` or `failed`.
+/// fields), `expired`, `cancelled`, `failed`, or `unconfirmed` (it was sent
+/// once and the service did not confirm storing it; it is not sent again).
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexLoginStatus {
     pub(crate) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<crate::cloud_workspaces::AgentLogin>,
+    /// `unconfirmed`: why the service did not confirm storing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
 }
 
 /// The `codex` to run, and anything a debug build adds for a local
@@ -1039,6 +1043,9 @@ pub async fn cloud_agent_codex_login_start(
     // Starting again abandons the sign-in that was open, and its code.
     drop(CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?.take());
     let (program, args) = codex_login_program().ok_or_else(|| CloudWorkspaceClientError::local(crate::codex_device_login::DeviceLoginError::CliMissing.code(), false))?;
+    if !crate::codex_device_login::trusted_program(&program) {
+        return Err(CloudWorkspaceClientError::local(crate::codex_device_login::DeviceLoginError::CliUntrusted.code(), false));
+    }
     let path = crate::binpath::login_path();
     let (login, code) = tauri::async_runtime::spawn_blocking(move || crate::codex_device_login::start(&program, &args, &path, &crate::codex_device_login::homes_parent()))
         .await
@@ -1060,6 +1067,13 @@ pub async fn cloud_agent_codex_login_start(
 #[tauri::command]
 pub fn cloud_agent_codex_login_open(app: AppHandle, attempt_id: String) -> Result<(), crate::cloud_workspaces::CloudWorkspaceClientError> {
     use tauri_plugin_opener::OpenerExt;
+    let url = codex_sign_in_page(&attempt_id)?;
+    app.opener().open_url(&url, None::<&str>).map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_workspace_request_invalid", false))
+}
+
+/// The page of the open sign-in `attempt_id`, checked against OpenAI's own
+/// pages again here, whatever was stored.
+pub(crate) fn codex_sign_in_page(attempt_id: &str) -> Result<String, crate::cloud_workspaces::CloudWorkspaceClientError> {
     let url = {
         let open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
         let open = open.as_ref().filter(|open| open.attempt_id == attempt_id).ok_or_else(codex_sign_in_gone)?;
@@ -1068,7 +1082,19 @@ pub fn cloud_agent_codex_login_open(app: AppHandle, attempt_id: String) -> Resul
     if !crate::codex_device_login::verification_page(&url) {
         return Err(crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_workspace_request_invalid", false));
     }
-    app.opener().open_url(&url, None::<&str>).map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_workspace_request_invalid", false))
+    Ok(url)
+}
+
+/// The app is quitting: the open sign-in's CLI is killed and its home
+/// wiped before this returns.
+pub(crate) fn shutdown_codex_sign_in() {
+    let held = match CODEX_SIGN_IN.lock() {
+        Ok(mut open) => open.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(held) = held {
+        held.login.shutdown();
+    }
 }
 
 /// How the sign-in is going. Once the CLI has finished, this stores its
@@ -1112,9 +1138,9 @@ pub(crate) fn codex_sign_in_status(
         (phase, organization_id)
     };
     match phase {
-        Phase::Waiting => return Ok(CodexLoginStatus { status: "waiting", credential: None }),
+        Phase::Waiting => return Ok(CodexLoginStatus { status: "waiting", credential: None, error_code: None }),
         Phase::SignedIn => {}
-        over => return Ok(CodexLoginStatus { status: over.as_str(), credential: None }),
+        over => return Ok(CodexLoginStatus { status: over.as_str(), credential: None, error_code: None }),
     }
     let authorization = service.authorize_agent_login(AgentLoginProvider::Codex, consent)?;
     if authorization.organization_id() != organization_id {
@@ -1122,23 +1148,38 @@ pub(crate) fn codex_sign_in_status(
         drop(CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?.take());
         return Err(CloudWorkspaceClientError::local("account_context_changed", false));
     }
-    let sign_in = {
-        let open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
-        open.as_ref().filter(|open| open.attempt_id == attempt_id).and_then(|open| open.login.sign_in()).ok_or_else(codex_sign_in_gone)?
+    // Sent at most once. Until here (a replace not yet chosen, another organization) the
+    // sign-in is kept so it can still be stored. From here it is let go whatever the answer:
+    // a PUT whose answer was lost may have been stored, and the service may since have renewed
+    // the login, so sending this copy again could put back a refresh token already spent.
+    let held = {
+        let mut open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
+        if !open.as_ref().is_some_and(|open| open.attempt_id == attempt_id) {
+            return Err(codex_sign_in_gone());
+        }
+        open.take().ok_or_else(codex_sign_in_gone)?
     };
-    let stored = service.save_agent_login(authorization, AgentLoginProvider::Codex, AgentLoginKind::LoginDocument, sign_in.secret, sign_in.account.as_deref())?;
-    // Stored: the copy held here goes. A failure above keeps it, so trying again needs no new code.
-    let mut open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
-    if open.as_ref().is_some_and(|open| open.attempt_id == attempt_id) {
-        open.take();
+    let sign_in = held.login.sign_in().ok_or_else(codex_sign_in_gone)?;
+    drop(held);
+    match service.save_agent_login(authorization, AgentLoginProvider::Codex, AgentLoginKind::LoginDocument, sign_in.secret, sign_in.account.as_deref()) {
+        Ok(stored) => Ok(CodexLoginStatus { status: "complete", credential: Some(stored), error_code: None }),
+        Err(error) => Ok(CodexLoginStatus { status: "unconfirmed", credential: None, error_code: Some(error.code) }),
     }
-    Ok(CodexLoginStatus { status: "complete", credential: Some(stored) })
 }
 
 /// Hold `login` as the open sign-in, as a start would.
+/// Tests that use the one open sign-in take this first.
+#[cfg(test)]
+pub(crate) static CODEX_SIGN_IN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 pub(crate) fn hold_codex_sign_in_for_test(attempt_id: &str, organization_id: &str, login: crate::codex_device_login::DeviceLogin) {
-    *CODEX_SIGN_IN.lock().unwrap() = Some(CodexSignIn { attempt_id: attempt_id.into(), organization_id: organization_id.into(), verification_url: "https://auth.openai.com/codex/device".into(), login });
+    hold_codex_sign_in_at_for_test(attempt_id, organization_id, "https://auth.openai.com/codex/device", login);
+}
+
+#[cfg(test)]
+pub(crate) fn hold_codex_sign_in_at_for_test(attempt_id: &str, organization_id: &str, url: &str, login: crate::codex_device_login::DeviceLogin) {
+    *CODEX_SIGN_IN.lock().unwrap() = Some(CodexSignIn { attempt_id: attempt_id.into(), organization_id: organization_id.into(), verification_url: url.into(), login });
 }
 
 #[cfg(test)]

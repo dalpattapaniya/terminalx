@@ -166,12 +166,21 @@ pub fn claude_account_from_raw(raw: &str) -> Option<String> {
     display_address(parsed.get("oauthAccount")?.get("emailAddress")?.as_str()?)
 }
 
+/// A login document, read only up to just over the largest one used: a
+/// larger file is refused as invalid without being read whole.
 fn read_file(path: PathBuf) -> Result<Zeroizing<String>, LocalLoginError> {
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => Ok(Zeroizing::new(raw)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(LocalLoginError::NotFound),
-        Err(_) => Err(LocalLoginError::Denied),
+    use std::io::Read;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(LocalLoginError::NotFound),
+        Err(_) => return Err(LocalLoginError::Denied),
+    };
+    let mut raw = Zeroizing::new(String::new());
+    file.take(MAX_LOGIN_BYTES as u64 + 1).read_to_string(&mut raw).map_err(|_| LocalLoginError::Denied)?;
+    if raw.len() > MAX_LOGIN_BYTES {
+        return Err(LocalLoginError::Invalid);
     }
+    Ok(raw)
 }
 
 fn env_dir(name: &str) -> Option<PathBuf> {
@@ -316,6 +325,9 @@ pub(crate) mod tests {
         // A directory where the file should be cannot be read as one.
         std::fs::create_dir(dir.path().join("auth.json")).unwrap();
         assert_eq!(read_file(dir.path().join("auth.json")).err(), Some(LocalLoginError::Denied));
+        // A huge file is refused as invalid, and not read whole.
+        std::fs::write(dir.path().join("huge.json"), vec![b' '; 8 * 1024 * 1024]).unwrap();
+        assert_eq!(read_file(dir.path().join("huge.json")).err(), Some(LocalLoginError::Invalid));
     }
 
     pub(crate) fn jwt(claims: Value) -> String {

@@ -3972,6 +3972,7 @@ mod tests {
     // stored like any other login: consent, organization and the replace choice first, then one PUT.
     #[test]
     fn a_finished_codex_sign_in_is_stored_once_for_its_organization_and_then_let_go() {
+        let _one_at_a_time = crate::commands::CODEX_SIGN_IN_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         use crate::codex_device_login::{DeviceLogin, Phase, SignIn};
         let revision = AccountManager::context_revision(&context());
         let consented = |replace| AgentLoginConsent { replace_existing: replace, ..consent(&revision, true, true) };
@@ -4005,6 +4006,23 @@ mod tests {
         assert!(!crate::commands::codex_sign_in_held_for_test());
         assert_eq!(crate::commands::codex_sign_in_status(&service, "codex-login-1", &consented(true)).err().unwrap().code, "cloud_agent_login_attempt_gone");
 
+        // Sent once, and the service did not confirm it (here a 503; a lost answer is the same):
+        // it is let go and never sent again, as the service may have stored and since renewed it.
+        crate::commands::hold_codex_sign_in_for_test("codex-login-4", "org-1", signed_in());
+        let (base, requests) = serve_each(vec![
+            response("200 OK", r#"{"credentials":[]}"#, ""),
+            response("503 Service Unavailable", r#"{"error":"cloud_workspace_unavailable"}"#, ""),
+            response("200 OK", saved, ""),
+        ]);
+        let (_, service) = test_service(&base);
+        let status = crate::commands::codex_sign_in_status(&service, "codex-login-4", &consented(false)).unwrap();
+        assert_eq!(status.status, "unconfirmed");
+        assert!(status.error_code.is_some() && status.credential.is_none());
+        assert!(!crate::commands::codex_sign_in_held_for_test());
+        assert_eq!(crate::commands::codex_sign_in_status(&service, "codex-login-4", &consented(false)).err().unwrap().code, "cloud_agent_login_attempt_gone");
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.iter().filter(|request| request.starts_with("PUT ")).count(), 1, "the login was sent more than once");
+
         // Still waiting, or over: the account service is not asked anything.
         for (phase, said) in [(Phase::Waiting, "waiting"), (Phase::Expired, "expired"), (Phase::Cancelled, "cancelled"), (Phase::Failed, "failed")] {
             crate::commands::hold_codex_sign_in_for_test("codex-login-2", "org-1", DeviceLogin::finished_for_test(phase, None));
@@ -4019,6 +4037,22 @@ mod tests {
         let (_, service) = test_service(&base);
         assert_eq!(crate::commands::codex_sign_in_status(&service, "codex-login-3", &consented(false)).err().unwrap().code, "account_context_changed");
         assert_eq!(requests.join().unwrap().len(), 1);
+        assert!(!crate::commands::codex_sign_in_held_for_test());
+    }
+
+    // Security review of #483: the page is checked against OpenAI's own again when it is opened.
+    #[test]
+    fn only_an_openai_page_of_the_open_sign_in_is_ever_opened() {
+        let _one_at_a_time = crate::commands::CODEX_SIGN_IN_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crate::codex_device_login::{DeviceLogin, Phase};
+        crate::commands::hold_codex_sign_in_at_for_test("codex-login-5", "org-1", "https://auth.openai.com/codex/device", DeviceLogin::finished_for_test(Phase::Waiting, None));
+        assert_eq!(crate::commands::codex_sign_in_page("codex-login-5").unwrap(), "https://auth.openai.com/codex/device");
+        assert_eq!(crate::commands::codex_sign_in_page("codex-login-other").err().unwrap().code, "cloud_agent_login_attempt_gone");
+        for stored in ["https://auth.openai.com.evil.test/codex/device", "http://auth.openai.com/codex/device", "https://user:pw@auth.openai.com/", "file:///etc/passwd", "javascript:alert(1)"] {
+            crate::commands::hold_codex_sign_in_at_for_test("codex-login-5", "org-1", stored, DeviceLogin::finished_for_test(Phase::Waiting, None));
+            assert_eq!(crate::commands::codex_sign_in_page("codex-login-5").err().unwrap().code, "cloud_workspace_request_invalid", "{stored}");
+        }
+        crate::commands::shutdown_codex_sign_in();
         assert!(!crate::commands::codex_sign_in_held_for_test());
     }
 

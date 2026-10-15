@@ -785,8 +785,10 @@ export interface CodexLoginStarted {
 }
 
 export interface CodexLoginStatus {
-  status: "waiting" | "complete" | "expired" | "cancelled" | "failed" | (string & {});
+  status: "waiting" | "complete" | "expired" | "cancelled" | "failed" | "unconfirmed" | (string & {});
   credential?: AgentLogin;
+  /** `unconfirmed`: why the service did not confirm storing it. */
+  errorCode?: string;
 }
 
 export interface AgentLoginConsent {

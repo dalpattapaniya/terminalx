@@ -230,6 +230,9 @@ pub fn run() {
         .manage(cloud_remote.clone())
         .manage(cloud_agents)
         .setup(move |app| {
+            // A Codex sign-in home left by an app that crashed or was force-quit (PRO-79).
+            #[cfg(feature = "desktop")]
+            std::thread::spawn(|| codex_device_login::sweep_stale(&codex_device_login::homes_parent()));
             // Shells ended with the last run of the app; a tab layout that still names one names nothing.
             if let Err(error) = store::index::forget_shell_tabs() {
                 log::warn!("forget the shell tabs of the last run: {error:#}");
@@ -741,6 +744,9 @@ pub fn run() {
                 }
             }
             if matches!(event, tauri::RunEvent::Exit) {
+                // A Codex sign-in still open: its CLI is killed and its home wiped before the app goes.
+                #[cfg(feature = "desktop")]
+                commands::shutdown_codex_sign_in();
                 let state = app.state::<AppState>();
                 state.stats_usage.shutdown();
                 // Cmd+Q and `relaunch()` end the run loop without necessarily

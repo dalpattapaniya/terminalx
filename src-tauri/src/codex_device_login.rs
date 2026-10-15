@@ -24,8 +24,16 @@
 //!   `CODEX_HOME` point into a new private (0700) directory, and the CLI
 //!   gets no other environment than `PATH`, proxy and certificate settings,
 //!   so neither `~/.codex` nor an `OPENAI_API_KEY` reaches it. The directory
-//!   is wiped (the auth file overwritten first) as soon as the CLI ends,
-//!   and when the attempt is canceled or dropped.
+//!   is wiped (the auth file overwritten first, never through a link) as
+//!   soon as the CLI ends, and at once when the attempt is canceled, dropped
+//!   or the app quits ([`DeviceLogin::shutdown`]).
+//! - **The CLI never outlives the app.** It runs under a small `sh`
+//!   watchdog in its own process group: the watchdog holds the read end of
+//!   a pipe whose write end only this process has, and kills the whole
+//!   group when that pipe closes, which the kernel does however the app
+//!   ends (quit, crash, force quit). A home left by an app that died is
+//!   removed at the next start ([`sweep_stale`]): each home names the
+//!   process that made it.
 //! - **The code stays on this Mac.** It goes from the CLI's output to the
 //!   one dialog that shows it, and nowhere else: not to the account
 //!   service, not to a log. The CLI's output and errors are never logged.
@@ -34,7 +42,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,12 +61,28 @@ const MAX_AUTH_BYTES: u64 = 64 * 1024;
 const DOCUMENTED_PAGE: &str = "https://auth.openai.com/codex/device";
 /// What the CLI is given besides its throwaway home: where programs are, and how to reach the network.
 const PASSED_ENV: &[&str] = &["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "USER", "LOGNAME"];
+/// Runs the CLI (`"$@"`) and kills its whole process group once stdin, the
+/// app's end of the lifeline, closes: when the app lets go of it, or dies.
+/// The CLI's own stdin is /dev/null; its exit status is the watchdog's.
+const WATCHDOG: &str = r#"exec 3<&0
+"$@" </dev/null 3<&- &
+cli=$!
+( cat <&3; kill -KILL 0 ) </dev/null >/dev/null 2>&1 &
+watch=$!
+wait "$cli"
+status=$?
+kill "$watch" 2>/dev/null
+exit "$status""#;
+/// Names the app process that made a home, so a later start can tell a home whose app is gone.
+const OWNER_FILE: &str = "owner";
 const CONFIG: &str = "check_for_update_on_startup = false\ncli_auth_credentials_store = \"file\"\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceLoginError {
     /// No `codex` on this Mac.
     CliMissing,
+    /// The `codex` found could be replaced by another user: not run.
+    CliUntrusted,
     /// The CLI could not begin a login (offline, the service refused, an unexpected answer).
     Unavailable,
 }
@@ -67,6 +91,7 @@ impl DeviceLoginError {
     pub fn code(self) -> &'static str {
         match self {
             Self::CliMissing => "cloud_agent_codex_cli_missing",
+            Self::CliUntrusted => "cloud_agent_codex_cli_untrusted",
             Self::Unavailable => "cloud_agent_codex_login_unavailable",
         }
     }
@@ -114,6 +139,18 @@ struct Inner {
     phase: Phase,
     sign_in: Option<SignIn>,
     cancel: bool,
+    /// The CLI's watchdog, until it has been reaped.
+    child: Option<Child>,
+    /// The app's end of the watchdog's lifeline.
+    lifeline: Option<ChildStdin>,
+    /// The throwaway home, until it is wiped.
+    home: Option<tempfile::TempDir>,
+}
+
+impl Inner {
+    fn new(phase: Phase, sign_in: Option<SignIn>) -> Self {
+        Self { phase, sign_in, cancel: false, child: None, lifeline: None, home: None }
+    }
 }
 
 /// One running login. Dropping it cancels it and wipes its home.
@@ -132,14 +169,27 @@ impl DeviceLogin {
         inner.sign_in.as_ref().map(|held| SignIn { secret: held.secret.clone(), account: held.account.clone() })
     }
 
-    /// Stop the CLI if it still runs. A login it already wrote is dropped.
-    pub fn cancel(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.cancel = true;
-            inner.sign_in = None;
-            if matches!(inner.phase, Phase::Waiting | Phase::SignedIn) {
-                inner.phase = Phase::Cancelled;
-            }
+    /// Stop the CLI if it still runs, now: its whole process group is
+    /// killed and reaped, and its home wiped, before this returns. A login
+    /// it already wrote is dropped. For a cancel, a new start, and the app
+    /// quitting.
+    pub fn shutdown(&self) {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.cancel = true;
+        inner.sign_in = None;
+        if matches!(inner.phase, Phase::Waiting | Phase::SignedIn) {
+            inner.phase = Phase::Cancelled;
+        }
+        if let Some(mut child) = inner.child.take() {
+            kill_group(&mut child);
+            let _ = child.wait();
+        }
+        inner.lifeline = None;
+        if let Some(home) = inner.home.take() {
+            wipe(home);
         }
     }
 }
@@ -148,13 +198,18 @@ impl DeviceLogin {
 impl DeviceLogin {
     /// A login whose CLI has already finished, as the waiter leaves it.
     pub(crate) fn finished_for_test(phase: Phase, sign_in: Option<SignIn>) -> Self {
-        Self { inner: Arc::new(Mutex::new(Inner { phase, sign_in, cancel: false })) }
+        Self { inner: Arc::new(Mutex::new(Inner::new(phase, sign_in))) }
+    }
+
+    /// Let go of the lifeline without killing anything, as the app dying would.
+    pub(crate) fn drop_lifeline_for_test(&self) {
+        self.inner.lock().unwrap().lifeline = None;
     }
 }
 
 impl Drop for DeviceLogin {
     fn drop(&mut self) {
-        self.cancel();
+        self.shutdown();
     }
 }
 
@@ -273,28 +328,75 @@ pub fn sign_in_from_raw(raw: &str) -> Option<SignIn> {
     Some(SignIn { secret: Zeroizing::new(secret.to_string()), account: crate::agent_local_login::codex_account(id_token) })
 }
 
-/// Overwrite the auth file, then remove the whole home.
-fn wipe(home: tempfile::TempDir) {
-    let auth = home.path().join(".codex/auth.json");
-    if let Ok(meta) = std::fs::symlink_metadata(&auth) {
-        if meta.is_file() {
-            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&auth) {
-                let _ = file.write_all(&vec![0u8; meta.len() as usize]);
-                let _ = file.sync_all();
-            }
-        }
-    }
-    let _ = home.close();
+/// Open a file that is a regular file at `path` itself, never through a link.
+fn open_regular(path: &Path, write: bool) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(!write).write(write);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).ok()?;
+    file.metadata().ok().filter(|meta| meta.is_file()).map(|_| file)
 }
 
-/// Homes left by an earlier run that ended without cleaning up (a crash, a
-/// force quit). Only this module's own, and only ones older than a code lives.
+/// `<home>/.codex/auth.json`, when `.codex` is a real directory inside the home (not a link out of it).
+fn auth_path(home: &Path) -> Option<PathBuf> {
+    let codex_home = home.join(".codex");
+    std::fs::symlink_metadata(&codex_home).ok().filter(|meta| meta.is_dir()).map(|_| codex_home.join("auth.json"))
+}
+
+/// The auth file the CLI wrote, read without following links.
+fn read_auth(home: &Path) -> Option<Zeroizing<String>> {
+    let file = open_regular(&auth_path(home)?, false)?;
+    let mut raw = Zeroizing::new(String::new());
+    file.take(MAX_AUTH_BYTES + 1).read_to_string(&mut raw).ok()?;
+    Some(raw)
+}
+
+/// Overwrite the auth file (never through a link), then remove the whole
+/// home; `remove_dir_all` does not follow links either.
+fn wipe_dir(home: &Path) {
+    if let Some(mut file) = auth_path(home).and_then(|auth| open_regular(&auth, true)) {
+        if let Ok(meta) = file.metadata() {
+            let _ = file.write_all(&vec![0u8; meta.len().min(MAX_AUTH_BYTES * 4) as usize]);
+            let _ = file.sync_all();
+        }
+    }
+    let _ = std::fs::remove_dir_all(home);
+}
+
+fn wipe(home: tempfile::TempDir) {
+    wipe_dir(&home.keep());
+}
+
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: i32) -> bool {
+    true
+}
+
+/// Homes left by an app that ended without cleaning up (a crash, a force
+/// quit): only this module's own, and only those whose app is gone or that
+/// are older than a code lives. Their CLI already died with that app (the
+/// watchdog). Run at every start, and before each sign-in.
 pub fn sweep_stale(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else { return };
     for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(HOME_PREFIX) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
         let old = entry.metadata().ok().and_then(|meta| meta.modified().ok()).and_then(|at| at.elapsed().ok()).is_some_and(|age| age > CODE_LIFETIME + GRACE);
-        if old && entry.file_name().to_string_lossy().starts_with(HOME_PREFIX) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        let owner = open_regular(&path.join(OWNER_FILE), false).and_then(|mut file| {
+            let mut text = String::new();
+            file.read_to_string(&mut text).ok()?;
+            text.trim().parse::<i32>().ok()
+        });
+        if old || owner.is_some_and(|pid| !process_alive(pid)) {
+            wipe_dir(&path);
         }
     }
 }
@@ -321,7 +423,12 @@ fn kill_group(child: &mut Child) {
 pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Path) -> Result<(DeviceLogin, DeviceCode), DeviceLoginError> {
     let unavailable = |_| DeviceLoginError::Unavailable;
     sweep_stale(parent);
-    let home = tempfile::Builder::new().prefix(HOME_PREFIX).tempdir_in(parent).map_err(unavailable)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(HOME_PREFIX);
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let home = builder.tempdir_in(parent).map_err(unavailable)?;
+    std::fs::write(home.path().join(OWNER_FILE), std::process::id().to_string()).map_err(unavailable)?;
     let codex_home = home.path().join(".codex");
     let mut dir = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -329,8 +436,14 @@ pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Pat
     dir.create(&codex_home).map_err(unavailable)?;
     std::fs::write(codex_home.join("config.toml"), CONFIG).map_err(unavailable)?;
 
-    let mut command = Command::new(program);
+    // Spawning `program` directly would report a missing one; through the watchdog it would not.
+    if !program.is_file() {
+        return Err(DeviceLoginError::CliMissing);
+    }
+    let mut command = Command::new("/bin/sh");
     command
+        .args(["-c", WATCHDOG, "codex-login"])
+        .arg(program)
         .args(["login", "--device-auth", "-c", "cli_auth_credentials_store=\"file\""])
         .args(extra_args)
         .env_clear()
@@ -339,7 +452,7 @@ pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Pat
         .env("CODEX_HOME", &codex_home)
         .env("TMPDIR", home.path())
         .current_dir(home.path())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for name in PASSED_ENV {
@@ -351,6 +464,7 @@ pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Pat
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().map_err(|error| if error.kind() == std::io::ErrorKind::NotFound { DeviceLoginError::CliMissing } else { DeviceLoginError::Unavailable })?;
 
+    let lifeline = child.stdin.take();
     let stdout = child.stdout.take().ok_or(DeviceLoginError::Unavailable)?;
     let stderr = child.stderr.take().ok_or(DeviceLoginError::Unavailable)?;
     let (code_tx, code_rx) = mpsc::sync_channel::<DeviceCode>(1);
@@ -379,48 +493,52 @@ pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Pat
         String::from_utf8_lossy(&text).contains("timed out")
     });
 
-    let inner = Arc::new(Mutex::new(Inner { phase: Phase::Waiting, sign_in: None, cancel: false }));
+    let inner = Arc::new(Mutex::new(Inner { child: Some(child), lifeline, home: Some(home), ..Inner::new(Phase::Waiting, None) }));
     let watched = inner.clone();
     let started = Instant::now();
     std::thread::spawn(move || {
+        // The child is reaped here or by `shutdown`, always under the lock, so a pid is never killed after it was reaped.
         let status = loop {
-            let stop = watched.lock().map(|inner| inner.cancel).unwrap_or(true);
-            let late = started.elapsed() > CODE_LIFETIME + GRACE;
-            if stop || late {
-                kill_group(&mut child);
-                let _ = child.wait();
+            {
+                let Ok(mut inner) = watched.lock() else { return };
+                let late = started.elapsed() > CODE_LIFETIME + GRACE;
+                let Some(child) = inner.child.as_mut() else { break None };
                 if late {
-                    if let Ok(mut inner) = watched.lock() {
-                        if inner.phase == Phase::Waiting {
-                            inner.phase = Phase::Expired;
-                        }
+                    kill_group(child);
+                    let _ = child.wait();
+                    inner.child = None;
+                    inner.lifeline = None;
+                    if inner.phase == Phase::Waiting {
+                        inner.phase = Phase::Expired;
                     }
+                    break None;
                 }
-                break None;
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        inner.child = None;
+                        inner.lifeline = None;
+                        break Some(status);
+                    }
+                    Ok(None) => {}
+                    Err(_) => break None,
+                }
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-                Err(_) => break None,
-            }
+            std::thread::sleep(Duration::from_millis(200));
         };
         let _ = out_reader.join();
         let timed_out = err_reader.join().unwrap_or(false);
-        let written = status.filter(|status| status.success()).and_then(|_| {
-            let file = std::fs::File::open(codex_home.join("auth.json")).ok()?;
-            let mut raw = Zeroizing::new(String::new());
-            file.take(MAX_AUTH_BYTES + 1).read_to_string(&mut raw).ok()?;
-            Some(sign_in_from_raw(&raw))
-        });
+        let Ok(mut inner) = watched.lock() else { return };
+        inner.lifeline = None;
+        // Shut down meanwhile: the home is already gone, and so is anything it held.
+        let Some(home) = inner.home.take() else { return };
+        let written = status.filter(|status| status.success()).map(|_| read_auth(home.path()).and_then(|raw| sign_in_from_raw(&raw)));
         wipe(home);
-        if let Ok(mut inner) = watched.lock() {
-            if inner.phase == Phase::Waiting && !inner.cancel {
-                (inner.phase, inner.sign_in) = match (status, written) {
-                    (_, Some(Some(sign_in))) => (Phase::SignedIn, Some(sign_in)),
-                    (Some(_), _) if timed_out => (Phase::Expired, None),
-                    _ => (Phase::Failed, None),
-                };
-            }
+        if inner.phase == Phase::Waiting && !inner.cancel {
+            (inner.phase, inner.sign_in) = match (status, written) {
+                (_, Some(Some(sign_in))) => (Phase::SignedIn, Some(sign_in)),
+                (Some(_), _) if timed_out => (Phase::Expired, None),
+                _ => (Phase::Failed, None),
+            };
         }
     });
 
@@ -430,6 +548,26 @@ pub fn start(program: &Path, extra_args: &[String], path_env: &str, parent: &Pat
         // The CLI ended, or said nothing usable in time: dropping the login stops it and wipes its home.
         Err(_) => Err(DeviceLoginError::Unavailable),
     }
+}
+
+/// Whether `program` may be run for a sign-in: it, what it links to, and
+/// the directories holding either belong to this user or to root and
+/// cannot be written by anyone else. The same `codex` a Codex tab runs is
+/// used (`binpath`), so it is the one the person installed; this refuses
+/// only one that another account on this Mac could have swapped.
+#[cfg(unix)]
+pub fn trusted_program(program: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let me = unsafe { libc::getuid() };
+    let safe = |path: &Path| std::fs::metadata(path).is_ok_and(|meta| (meta.uid() == me || meta.uid() == 0) && meta.mode() & 0o022 == 0);
+    let Ok(real) = std::fs::canonicalize(program) else { return false };
+    let checked = [Some(real.as_path()), real.parent(), program.parent()].into_iter().all(|path| path.is_some_and(safe));
+    checked
+}
+
+#[cfg(not(unix))]
+pub fn trusted_program(_program: &Path) -> bool {
+    true
 }
 
 /// Where throwaway homes go: this user's own temporary directory.
@@ -512,7 +650,7 @@ mod tests {
         let id = jwt(json!({ "email": "ada@example.com" }));
         let body = format!(
             r#"#!/bin/sh
-printf '%s|%s|%s|%s|%s\n' "$*" "$HOME" "$CODEX_HOME" "${{OPENAI_API_KEY:-none}}" "$(cat "$CODEX_HOME/config.toml" | tr '\n' ';')" > '{record}'
+printf '%s|%s|%s|%s|%s|%s|%s\n' "$*" "$HOME" "$CODEX_HOME" "${{TERMINALX_P79_FROM_THE_APP:-none}}" "$(cat "$CODEX_HOME/config.toml" | tr '\n' ';')" "$(stat -f %Lp "$HOME")" "$$" > '{record}'
 printf '{prompt}'
 case '{behaviour}' in
   expire) echo 'Error logging in with device code: device auth timed out after 15 minutes' >&2; exit 1 ;;
@@ -548,6 +686,8 @@ echo 'Successfully logged in' >&2
         let bin = tempfile::tempdir().unwrap();
         let parent = tempfile::tempdir().unwrap();
         let cli = fake_cli(bin.path(), "succeed");
+        // Something only the app's own environment has: the CLI must not see it.
+        std::env::set_var("TERMINALX_P79_FROM_THE_APP", "leaked");
         let (login, code) = start(&cli, &[], "/usr/bin:/bin", parent.path()).unwrap();
         assert_eq!(code.user_code.as_str(), "WXYZ-12345");
         assert_eq!(login.phase(), Phase::Waiting);
@@ -564,8 +704,9 @@ echo 'Successfully logged in' >&2
         assert_eq!(Path::new(fields[2]), home.join(".codex"));
         assert_eq!(fields[3], "none", "the app's own environment does not reach the CLI");
         assert!(fields[4].contains("cli_auth_credentials_store = \"file\""));
+        assert_eq!(fields[5], "700", "the throwaway home is private to this user");
         // Canceling after the fact drops what was held.
-        login.cancel();
+        login.shutdown();
         assert!(login.sign_in().is_none());
         assert_eq!(login.phase(), Phase::Cancelled);
     }
@@ -580,7 +721,7 @@ echo 'Successfully logged in' >&2
             assert!(login.sign_in().is_none());
         }
         let (login, _) = start(&fake_cli(bin.path(), "wait"), &[], "/usr/bin:/bin", parent.path()).unwrap();
-        login.cancel();
+        login.shutdown();
         assert_eq!(login.phase(), Phase::Cancelled);
         let deadline = Instant::now() + Duration::from_secs(10);
         while homes(parent.path()) > 0 && Instant::now() < deadline {
@@ -692,5 +833,120 @@ echo 'Successfully logged in' >&2
         let requests = seen.lock().unwrap().join("\n");
         // The code goes only to the issuer, never anywhere else.
         assert!(requests.contains("/api/accounts/deviceauth/token {\"device_auth_id\":\"dev-1\",\"user_code\":\"TEST-12345\"}"), "{requests}");
+    }
+
+    fn record_of(bin: &Path) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(bin.join("record")) {
+                if text.ends_with('\n') {
+                    return text.trim_end().split('|').map(str::to_owned).collect();
+                }
+            }
+            assert!(Instant::now() < deadline, "the fake CLI never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn gone(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !process_alive(pid)
+    }
+
+    // Security review of #483: quitting left the CLI running and its auth.json behind.
+    #[test]
+    fn shutting_down_kills_the_cli_and_wipes_its_home_before_it_returns() {
+        let bin = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let (login, _) = start(&fake_cli(bin.path(), "wait"), &[], "/usr/bin:/bin", parent.path()).unwrap();
+        let pid: i32 = record_of(bin.path())[6].parse().unwrap();
+        assert!(process_alive(pid));
+        login.shutdown();
+        // No waiting: by the time it returns, the CLI's group is dead and reaped and the home is gone.
+        assert!(!process_alive(pid), "the CLI outlived shutdown");
+        assert_eq!(homes(parent.path()), 0);
+        assert_eq!(login.phase(), Phase::Cancelled);
+    }
+
+    #[test]
+    fn the_cli_dies_with_the_app_however_the_app_ends() {
+        let bin = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let (login, _) = start(&fake_cli(bin.path(), "wait"), &[], "/usr/bin:/bin", parent.path()).unwrap();
+        let pid: i32 = record_of(bin.path())[6].parse().unwrap();
+        // What a crash or a force quit does: the app's end of the lifeline closes, and nothing else happens.
+        login.drop_lifeline_for_test();
+        assert!(gone(pid), "the CLI outlived its lifeline");
+        drop(login);
+    }
+
+    #[test]
+    fn links_are_never_followed_when_reading_or_wiping() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious.json");
+        std::fs::write(&target, "keep me").unwrap();
+        // `.codex` itself a link out of the home.
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".codex")).unwrap();
+        std::fs::write(outside.path().join("auth.json"), "{}").unwrap();
+        assert!(read_auth(home.path()).is_none());
+        wipe_dir(home.path());
+        assert_eq!(std::fs::read_to_string(outside.path().join("auth.json")).unwrap(), "{}");
+        // `auth.json` a link to a file elsewhere.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join(".codex/auth.json")).unwrap();
+        assert!(read_auth(home.path()).is_none());
+        let kept = home.path().to_path_buf();
+        wipe_dir(&kept);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn a_home_whose_app_is_gone_is_swept_at_once_and_a_live_ones_is_kept() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut ended = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = ended.id();
+        ended.wait().unwrap();
+        let orphan = parent.path().join(format!("{HOME_PREFIX}orphan"));
+        let live = parent.path().join(format!("{HOME_PREFIX}live"));
+        for (dir, owner) in [(&orphan, dead), (&live, std::process::id())] {
+            std::fs::create_dir_all(dir.join(".codex")).unwrap();
+            std::fs::write(dir.join(".codex/auth.json"), r#"{"tokens":{"refresh_token":"rt"}}"#).unwrap();
+            std::fs::write(dir.join(OWNER_FILE), owner.to_string()).unwrap();
+        }
+        sweep_stale(parent.path());
+        assert!(!orphan.exists() && live.exists());
+    }
+
+    #[test]
+    fn a_codex_another_account_could_swap_is_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = fake_cli(dir.path(), "succeed");
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(trusted_program(&cli));
+        // Writable by the group or by anyone: the file, or the directory it is in.
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+        assert!(!trusted_program(&cli));
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o775)).unwrap();
+        assert!(!trusted_program(&cli));
+        // A link from a safe place to one that is not.
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o757)).unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(safe.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&cli, safe.path().join("codex")).unwrap();
+        assert!(!trusted_program(&safe.path().join("codex")));
+        std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(trusted_program(&safe.path().join("codex")));
+        assert!(!trusted_program(Path::new("/nonexistent/codex")));
+        // The codex on this Mac, if there is one, passes.
+        if let Some(real) = crate::binpath::resolve("codex") {
+            assert!(trusted_program(&real), "{}", real.display());
+        }
     }
 }

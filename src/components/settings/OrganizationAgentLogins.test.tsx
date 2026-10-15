@@ -492,6 +492,7 @@ describe("agent logins in Settings (PRO-79)", () => {
       vi.mocked(api.cloudAgentCodexLoginStart).mockResolvedValue(started);
       vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValue({ status: "waiting" });
       vi.mocked(api.cloudAgentCodexLoginOpen).mockResolvedValue(undefined);
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockResolvedValue(undefined);
     });
     afterEach(() => vi.useRealTimers());
     const begin = async () => {
@@ -594,6 +595,33 @@ describe("agent logins in Settings (PRO-79)", () => {
       expect(within(row("codex")).getByTestId("agent-login-status").textContent).toBe("Not connected");
     });
 
+    // Security review of #483: closing Settings with a code shown left Codex running.
+    it("cancels the sign-in when Settings closes with a code shown, and not once it is over", async () => {
+      await begin();
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockResolvedValue(undefined);
+      cleanup();
+      expect(api.cloudAgentCodexLoginCancel).toHaveBeenCalledWith("codex-login-1");
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockClear();
+      await begin();
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValueOnce({ status: "expired" });
+      await check();
+      await waitFor(() => expect(status()).toContain("expired"));
+      cleanup();
+      expect(api.cloudAgentCodexLoginCancel).not.toHaveBeenCalled();
+    });
+
+    it("says so when the service did not confirm storing the login, and does not send it again", async () => {
+      await begin();
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValueOnce({ status: "unconfirmed", errorCode: "cloud_workspace_unavailable" });
+      await check();
+      await waitFor(() => expect(status()).toBe("The account service did not confirm storing this login. Refresh to see whether Codex is connected; if it is not, get a new code."));
+      expect(screen.getByTestId("codex-sign-in").textContent).toContain("Refresh to see what is stored");
+      const calls = vi.mocked(api.cloudAgentCodexLoginStatus).mock.calls.length;
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenCalledTimes(calls);
+      expect(screen.getByRole("button", { name: "Get a new code" })).toBeTruthy();
+    });
+
     it("asks for the replace choice when a login was stored meanwhile, and waits for it", async () => {
       const dialog = await begin();
       vi.mocked(api.cloudAgentCodexLoginStatus).mockRejectedValueOnce({ code: "cloud_agent_login_replace_unconfirmed" });
@@ -635,6 +663,7 @@ describe("agent logins in Settings (PRO-79)", () => {
         "only workspaces that nobody but owners and admins can drive",
       );
       expect(agentLoginMessage({ code: "cloud_agent_codex_login_unavailable" }, "codex")).toContain("it needs to reach OpenAI");
+      expect(agentLoginMessage({ code: "cloud_agent_codex_cli_untrusted" }, "codex")).toContain("so it was not run");
     });
   });
 });

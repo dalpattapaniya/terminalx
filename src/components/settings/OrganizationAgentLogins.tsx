@@ -59,7 +59,8 @@ export interface CodexSignIn {
   verificationUrl: string;
   expiresInSeconds: number;
   consent: AgentLoginConsent;
-  state: "waiting" | "complete" | "expired" | "cancelled" | "failed";
+  /** `unconfirmed`: the login was sent once and the service did not confirm it; it is not sent again. */
+  state: "waiting" | "complete" | "expired" | "cancelled" | "failed" | "unconfirmed";
   /** Counts the checks so far; each answer schedules the next. */
   checks: number;
   /** Someone stored a login for Codex after this sign-in began: storing it needs the replace choice made now. */
@@ -87,6 +88,8 @@ export function codexSignInLine(signIn: Pick<CodexSignIn, "state" | "credential"
       return { text: "This code expired before the sign-in was finished. Nothing was stored. Get a new code to try again.", warn: true };
     case "cancelled":
       return { text: "Sign-in cancelled. Nothing was stored.", warn: false };
+    case "unconfirmed":
+      return { text: "The account service did not confirm storing this login. Refresh to see whether Codex is connected; if it is not, get a new code.", warn: true };
     default:
       return { text: "Codex could not finish the sign-in. Nothing was stored. Get a new code to try again.", warn: true };
   }
@@ -177,6 +180,8 @@ export function agentLoginMessage(error: unknown, agent?: AgentLoginProvider): s
         : "The Claude Code sign-in on this Mac has expired or is about to. Run claude once so it renews, then try again.";
     case "cloud_agent_codex_cli_missing":
       return "Codex is not installed on this Mac, so its sign-in cannot run here. Install Codex, or connect with an API key.";
+    case "cloud_agent_codex_cli_untrusted":
+      return "The codex found on this Mac could be changed by another account on it (it, or its folder, is writable by others), so it was not run. Fix its permissions, or connect with an API key.";
     case "cloud_agent_codex_login_unavailable":
       return "Codex could not start a sign-in just now; it needs to reach OpenAI. Nothing was stored; try again in a moment.";
     case "cloud_agent_local_login_cancelled":
@@ -545,11 +550,13 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
 
   const applyCodexStatus = useCallback(
     (attemptId: string, result: CodexLoginStatus) => {
-      const over = ["complete", "expired", "cancelled", "failed"] as const;
+      const over = ["complete", "expired", "cancelled", "failed", "unconfirmed"] as const;
       const state: CodexSignIn["state"] = over.find((status) => status === result.status) ?? "waiting";
+      const detail = state === "unconfirmed" && result.errorCode ? agentLoginMessage({ code: result.errorCode }, "codex") : undefined;
       setCodex((current) =>
-        current?.attemptId === attemptId ? { ...current, state, checks: current.checks + 1, detail: undefined, credential: result.credential } : current,
+        current?.attemptId === attemptId ? { ...current, state, checks: current.checks + 1, detail, credential: result.credential } : current,
       );
+      if (state === "unconfirmed") void load();
       if (state === "complete") {
         setPending(null);
         void load().then(() => setNotice(`${connectedNotice("Codex", result.credential)} The account service keeps this login and renews it.`));
@@ -592,6 +599,16 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
       clearTimeout(timer);
     };
   }, [codex, applyCodexStatus, load]);
+
+  // Leaving Settings with a code shown cancels the sign-in: Codex is stopped on this Mac and its home wiped.
+  const openCodex = useRef<string | null>(null);
+  openCodex.current = codex?.state === "waiting" ? codex.attemptId : null;
+  useEffect(
+    () => () => {
+      if (openCodex.current) void api.cloudAgentCodexLoginCancel(openCodex.current).catch(() => undefined);
+    },
+    [],
+  );
 
   const cancelCodexSignIn = async () => {
     if (!codex) return;
