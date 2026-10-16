@@ -2,6 +2,145 @@
 
 ## Unreleased
 
+## 0.2.13
+
+A chat-first sidebar with a flat chat list, folding projects and one title
+bar; TerminalX's own icon set; prompt delivery that is confirmed instead of
+doubted; the GitHub account a project pushes as; Screen Recording granted to
+the computer-use helper itself; the Ports panel reachable from a cloud
+session; the price before a workspace is created; sharing refusals that say
+why; and a runtime that gives a participant nothing before its role is known.
+The sidebar's cloud organizations are back as sections after Local, each
+listing its cloud projects and their sessions.
+
+### Sidebar and chats
+
+- Start a chat without a project. **New chat** runs the agent in a Chats
+  folder the app owns, in place, and never registers it as a project. Chats
+  lead the sidebar as one row that folds to the latest chat. (#484)
+- A second sidebar layout lists every chat flat, as a messenger does, with
+  the project and branch as the subtitle and a drawn bot face per chat that
+  moves while the chat is working. The project view stays the default. Both
+  layouts share one title bar: hide, group by project, search and new chat.
+  The workspace tree layout is gone, the sidebar can be dragged wider, and
+  Skills and Usage moved from the sidebar into Settings. (#484)
+- In the project view a project folds its branches away from its row, and
+  a branch row offers a new session where the branch is checked out, or a
+  new workspace branched from it when it is checked out nowhere. A chat's
+  state sits at the end of its row, where a working chat shows three bars
+  rising and falling in turn. (#484)
+- A chat links itself to the folder its agent works in, read off each tool
+  call, and registers the repository as a project when needed. A repository
+  with no project files at its root that tracks nothing under the folder
+  does not own the work, so a stray `git init` in a parent folder no longer
+  files a chat under that folder. **Move to a project** starts the same
+  agent in the project, in place or on a new worktree branch, hands it the
+  chat, and archives the chat. (#484)
+- The header leads with the GitHub mark, which names on hover the account
+  the project pushes as, asked from inside the folder over SSH with the gh
+  CLI's active account as the fallback, and reads project / branch. Project
+  rows wear the picture of the repository's owner until a logo is chosen.
+  (#484)
+- A request Claude Code refuses on the plan's usage limit says which window
+  ran out and when it resets, with a countdown, and offers another model,
+  instead of a generic error with a retry that could only fail again.
+  Attachments show when `TERMINALX_HOME` points at another data folder.
+  (#484)
+
+- The cloud organizations follow the local projects in both layouts, each
+  a section named after it: a row per cloud project that folds to its
+  sessions, a repository with several workspaces naming each workspace over
+  its sessions, **+** on a project starting a session there, and the local
+  projects labelled **Local** once an organization is listed. A cloud
+  session is also started from the new chat screen's project picker or the
+  command palette, which offers **New cloud workspace…** and **Go to cloud
+  session…** too. (#486)
+- Gone with the tree: the sidebar's unread and needs-you filter, archived
+  cloud workspaces, personal sections and the in-sidebar tab rows. A cloud
+  session's tabs are switched with the tab shortcuts. (#484)
+- Beside the tabs, the branch crumb keeps its icon and about its first ten
+  characters when the tabs press on it, instead of folding to nothing.
+  (#485)
+
+### Icons
+
+- TerminalX has an icon set of its own: 747 glyphs on a 16-unit grid with
+  one 1.25 stroke, covering every icon the app uses and every name in
+  Cursor's icon picker, so a project can wear any of them. Brand marks come
+  from Simple Icons; the few no open library carries get neutral stand-ins.
+  (#484)
+
+### Prompt delivery
+
+- "Prompt delivery could not be confirmed" no longer appears for prompts
+  that were taken. A prompt ending in an `@path` mention or a backslash is
+  padded so the Enter sends it instead of picking a file or adding a line
+  break, an Enter left unacknowledged for four seconds is written once more
+  while the CLI is asking nothing, and image labels are matched the way
+  Claude Code numbers them across the session. (#484)
+- **Send now** on a message queued behind a running turn interrupts the turn
+  and types the held text once the CLI reports the turn over. (#484)
+- A prompt typed in the terminal after a slash command that never ended
+  (`/help`, `/model`) counts its own "Worked for" time instead of the time
+  since the command, and a composer prompt is no longer shown as queued
+  behind a bare command. (#474)
+
+### Cloud workspaces
+
+- **Ports** is a tab in a cloud session's side panel, next to Changes, Repo,
+  PR and Files, and **Ports and previews** in the New tab menu and the
+  workspace menu opens it. The panel says "Looking for ports…" until the
+  runtime first answers and reads the list every two seconds; connecting,
+  reconnecting, restarting and update-needed each have their own text; a
+  preview that closed with its connection is marked expired, struck through,
+  with **Start again**. **Start preview** only forwards the port and shows
+  its address: the browser opens only from **Open in browser**, and there is
+  a **Copy** button. (#470)
+- Search lists local and cloud project rows, each labelled with where it
+  is. Personal sections for an organization's projects were also written,
+  but the sidebar does not draw them in this release. (#469)
+- Settings → Account opens on the provider the organization connected, and
+  **New cloud workspace** shows the machine and its price first; only
+  **Create workspace** under the price creates. (#473)
+- A second person opening a cloud session sees "Loading the conversation…"
+  instead of "Nothing here yet", the New tab hint for a driver reads as a
+  sentence, and refused commands stay in a bar of their own instead of
+  overlapping the transcript. (#471)
+- A refused share change says why: can send is not available while the
+  organization has an agent login that only owners and admins may use.
+  People who always have access are not offered, and the desktop passes the
+  server's reason through instead of reading it as unavailable. (#472, #479)
+- A scheduled task paused for an approval nobody could give no longer offers
+  **Resume**, and says why; it can still be deleted. (#468)
+- The runtime refuses a participant everything until it knows the member
+  list, instead of serving files, Git and terminal output in the window
+  after a restart. The runtime part needs a runtime release. (#475, #478)
+
+### Computer use
+
+- The computer-use helper runs from a copy outside TerminalX.app, under
+  Application Support, so macOS charges Screen Recording to the helper
+  itself and not to TerminalX: the prompt names the helper, its row is the
+  one consulted, and TerminalX needs no Screen Recording of its own. Only
+  the helper the app shipped with may run: before every start, and again on
+  its socket, the running code's signature is checked against the bundled
+  helper's exact build, and a copy that differs is stopped before its first
+  instruction. Reset re-registers the bundled helper, and the Grant window
+  offers only the bundled helper to drag into System Settings. (#481)
+
+### Mobile companion
+
+These source changes require a separately updated mobile app.
+
+- A conversation opens at its newest message, and the back button reads
+  "Cloud". (#472)
+- **Add someone** leaves out owners, admins, the workspace's creator and
+  yourself, and a refused share says why. (#472)
+- The connection banner follows your role: "No access" when the workspace
+  is not shared with you, "Checking your access…" until the runtime knows,
+  and Live only with a role. Nothing is asked of a runtime before the role
+  is known. (#475, #478)
+
 ## 0.2.12
 
 A browser-style tab strip in the title bar, workspaces that remove themselves
