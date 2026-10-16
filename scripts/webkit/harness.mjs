@@ -51,3 +51,49 @@ export function report(name, checks, detail) {
   if (failed && detail !== undefined) console.log(JSON.stringify(detail));
   return failed;
 }
+
+/**
+ * The sidebar, once the app has drawn it. Since the chat-first sidebar (#484)
+ * there is no tree: the conversations are a `nav` (`conversation-list`) under
+ * the titlebar and the destinations, above the account row.
+ */
+export async function sidebar(page) {
+  const rail = page.locator('[data-testid="sidebar-rail"]');
+  await rail.waitFor();
+  return rail;
+}
+
+/**
+ * Open a conversation from the sidebar by its name. In the project view a row
+ * alone on its branch is named "<branch>, <title>" ("No branch, …" until the
+ * branch is known); in the flat list it is named by its title alone. Resolves
+ * once the title bar's row of tabs is there.
+ */
+export async function openConversation(page, title) {
+  await sidebar(page);
+  const list = page.locator('[data-testid="conversation-list"]');
+  await list.getByRole("button", { name: new RegExp(`(^|, )${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) }).first().click();
+  await page.getByRole("tablist", { name: "Workspace tabs" }).waitFor();
+}
+
+/** A tab in the title bar's row of tabs, by its label. */
+export const tab = (page, label) => page.getByRole("tab", { name: label, exact: true });
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Open a cloud session by its title. The chat-first sidebar (#484) lists no
+ * cloud workspaces, so the way in is the command palette: "Go to cloud
+ * session…" narrows it to cloud sessions, and the title picks one. Resolves
+ * once the session header names it; what the session then shows (lease,
+ * transcript) is each check's own to wait for.
+ */
+export async function openCloudSession(page, title) {
+  await sidebar(page);
+  await page.keyboard.press("Meta+K");
+  const palette = page.getByRole("dialog");
+  await palette.locator("input").fill("Go to cloud session");
+  await palette.getByRole("option", { name: /^Go to cloud session/ }).click();
+  await palette.getByRole("option", { name: new RegExp(`^${escapeRegExp(title)}`) }).first().click();
+  await page.locator('main header [data-testid="session-title"]').filter({ hasText: title }).waitFor();
+}

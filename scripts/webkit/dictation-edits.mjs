@@ -19,8 +19,12 @@
 // - a key pressed while holding Right Option to talk edits the draft, and the
 //   result that settles afterwards does not undo the edit.
 //
+// Since the chat-first sidebar (#484) a local session is opened from its
+// conversation row and its tabs from the title bar's strip; a cloud session is
+// not listed in the sidebar, so it is opened from the Dashboard destination.
+//
 //   pnpm build && npx playwright install webkit && pnpm test:webkit-dictation-edits
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, openConversation, report, serve, sidebar, tab } from "./harness.mjs";
 
 const server = await serve();
 const browser = await launch();
@@ -64,9 +68,8 @@ async function composer(page, selector) {
 const SURFACES = {
   "a session's composer": async () => {
     const page = await app({ cloud: false, localProjects: 1, localSession: true });
-    await page.getByRole("button", { name: "Expand main", exact: true }).click();
-    await page.getByRole("button", { name: "Local long session", exact: true }).click();
-    await page.locator('[role="treeitem"][aria-label="gemini tab"]').click();
+    await openConversation(page, "claude tab");
+    await tab(page, "gemini tab").click();
     return { page, field: await composer(page, "textarea[data-composer]") };
   },
   "the composer that starts a session": async () => {
@@ -76,9 +79,9 @@ const SURFACES = {
   "a cloud tab's composer": async () => {
     const page = await app({ cloud: true, localProjects: 0, session: { role: "manager", lines: 2 } });
     const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-    const row = page.locator('[data-testid="cloud-session-node"]');
-    await row.waitFor();
-    await row.getByRole("button", { name: title, exact: true }).click();
+    // The Dashboard lists the finished cloud session under Done, as "<title>, <agent>, in <org> cloud".
+    await (await sidebar(page)).getByRole("button", { name: /^Dashboard, / }).click();
+    await page.getByRole("region", { name: "Done" }).getByRole("button", { name: new RegExp(`^${title}, `) }).click();
     await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
     return { page, field: await composer(page, "main textarea[data-composer]") };
   },

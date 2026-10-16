@@ -85,6 +85,21 @@ window.__PW_FIXTURE__ = window.__PW_FIXTURE__ || { cloud: true, localProjects: 3
     answers.list_workspaces = [{ path: projects[0].path, name: "main", branch: "main", head: "abc", isMain: true, managed: false, uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0 }];
     answers.load_tab_events = ({ tabId }) => events(tabId, tabId === "lt-pty" ? "claude" : "gemini");
   }
+  // `localSessions`: that many more local conversations, one per local project
+  // in turn (the sidebar lists no project without one), each on its own branch
+  // with its own title and newest first, so the sidebar's list is long enough
+  // to scroll. Added to whatever `localSession` lists.
+  if (f.localSessions) {
+    const at = (i) => new Date(now - i * 60_000).toISOString();
+    answers.list_sessions = [
+      ...answers.list_sessions,
+      ...Array.from({ length: f.localSessions }, (_, i) => {
+        const project = projects[i % projects.length];
+        const tab = { id: `many-s${i}-t`, harness: "claude", title: `Chat ${i}`, model: "", permissionMode: "default", status: "idle", created: at(i), modified: at(i) };
+        return { id: `many-s${i}`, projectPath: project.path, cwd: project.path, branch: `topic/${i}`, worktreeRemoved: false, title: `Chat ${i}`, created: at(i), modified: at(i), archived: false, pinned: false, tabs: [tab], activeTab: tab.id };
+      }),
+    ];
+  }
   if (f.chatLinks) {
     const opened = window.__PW_LINK_OPENS__ = { system: [], terminalx: [] };
     const pages = [];

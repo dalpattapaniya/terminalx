@@ -5,16 +5,14 @@
 // nothing was said, and the history shows once the replay comes.
 //
 //   pnpm build && npx playwright install webkit && node scripts/webkit/cloud-history.mjs [screenshot-dir]
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, openCloudSession, report, serve } from "./harness.mjs";
 
 const shots = process.argv[2];
 const server = await serve();
 const browser = await launch();
 const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "driver", lines: 25, replayDelayMs: 2500 } }, { width: 1280, height: 760 });
-const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-const row = page.locator('[data-testid="cloud-session-node"]');
-await row.waitFor();
-await row.getByRole("button", { name: title, exact: true }).click();
+// The session is reached through the command palette (the sidebar lists no cloud sessions since #484).
+await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
 await page.locator("[data-chat-scroller]").waitFor();
 await page.waitForTimeout(800);
 const waiting = {

@@ -15,11 +15,22 @@
 //   the way, and Escape puts it back;
 // - the tab shortcuts and the arrow keys work, and a right-click opens the menu.
 //
+// Since the chat-first sidebar (#484) a local session's header places it by
+// its branch (`session-branch`, with the session's name on its hover) where
+// its name (`session-title`) was, so the crumb's checks measure that.
+//
+// Not checked since the chat-first sidebar (#484): that the sidebar lists the
+// session's tabs in the strip's order (the sidebar has no tab rows; the strip
+// is the one list of a workspace's tabs), the branch chip beside the crumb
+// giving way below 650 px (a local session has no branch chip: its branch is
+// the crumb), and the project on the crumb's hover (the crumb's hover is the
+// session's name and its workspace).
+//
 //   pnpm build && npx playwright install webkit && node scripts/webkit/tab-strip.mjs
 //   Set TAB_STRIP_SHOTS to a directory to also save screenshots.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { launch, report, serve } from "./harness.mjs";
+import { launch, report, serve, sidebar } from "./harness.mjs";
 
 const stub = `${await readFile(new URL("./tauri-stub.js", import.meta.url), "utf8")}`;
 const shots = process.env.TAB_STRIP_SHOTS;
@@ -107,9 +118,13 @@ async function app(fixture, viewport) {
   const page = await browser.newPage({ viewport });
   await page.addInitScript(`window.__PW_FIXTURE__ = { cloud: false, localProjects: 1 };\n${stub}\n(${setup})(${JSON.stringify(fixture)});`);
   await page.goto(server.url);
-  await page.locator('[data-testid="sidebar-tree"]').waitFor();
-  await page.getByRole("button", { name: "Expand tab-strip", exact: true }).click();
-  await page.getByRole("button", { name: "Tab strip in the title bar", exact: true }).click();
+  // The two sessions share a branch, so the sidebar folds them under its row. A
+  // conversation goes by its open tab's title (the first session's is its first
+  // tab's), which is also its row's hover; the other session's first tab is
+  // that title and a number, so the row is picked by its hover, not by a prefix.
+  const list = (await sidebar(page)).locator('[data-testid="conversation-list"]');
+  await list.getByRole("button", { name: /^raccoon\/438-browser-style-tab-strip/, expanded: false }).click();
+  await list.locator('[title="Refactor the authentication middleware to use the new token service everywhere"]').getByRole("button").first().click();
   // Attached, not visible: the narrowest header draws the row as its menu alone.
   await page.locator('[data-testid="workspace-tab-strip"] [role="tab"]').first().waitFor({ state: "attached" });
   await page.waitForTimeout(250);
@@ -149,7 +164,8 @@ const measure = (page) =>
     };
     const handle = document.querySelector('[data-testid="session-header-handle"]');
     const handleBox = handle.getBoundingClientRect();
-    const title = header.querySelector('[data-testid="session-title"]');
+    // The crumb: where the session is placed (its branch), with the session's name on its hover.
+    const crumb = header.querySelector('[data-testid="session-branch"]');
     return {
       window: innerWidth,
       header: rect(header),
@@ -172,7 +188,7 @@ const measure = (page) =>
       handle: rect(handle),
       handleDrags: handleBox.width > 0 ? drags(document.elementFromPoint(handleBox.left + handleBox.width / 2, handleBox.top + handleBox.height / 2)) : null,
       tabDrags: tabs.length ? drags(tabs[0].querySelector('[role="tab"]')) : null,
-      title: { visible: visible(title), hover: title?.getAttribute("title") ?? "", ...(rect(title) ?? {}) },
+      crumb: { visible: visible(crumb), text: crumb?.textContent.trim() ?? "", hover: crumb?.getAttribute("title") ?? "", ...(rect(crumb) ?? {}) },
       issue: visible([...header.querySelectorAll("button")].find((button) => button.textContent.trim() === "#438")),
       automation: visible(header.querySelector('[data-testid="session-automation"]')),
       pipeline: (() => {
@@ -185,7 +201,6 @@ const measure = (page) =>
         // Its words are a label that is in view (whole, or cut with an ellipsis) or out of it; `slack` is what is left empty at the chip's end.
         return { ...rect(chip), text: chip.textContent.trim(), dot: shown(dot), label: shown(label) ? Math.round(label.width) : 0, slack: Math.round(box.right - (shown(label) ? label.right : dot.right)) };
       })(),
-      branch: visible(header.querySelector('[data-testid="session-branch"]')),
     };
   });
 
@@ -210,8 +225,7 @@ function fits(layout, { sidebarHidden = false } = {}) {
 function tier(layout) {
   const width = layout.content;
   return {
-    [`at ${width}px the branch chip is ${width < 650 ? "left out" : "shown"}`]: layout.branch === width >= 650,
-    [`at ${width}px the session's name is ${width < 540 ? "left out" : "shown"}`]: layout.title.visible === width >= 540,
+    [`at ${width}px the branch crumb is ${width < 540 ? "left out" : "shown"}`]: layout.crumb.visible === width >= 540,
     [`at ${width}px Share ${width < 540 ? "keeps only its icon" : "has its label"}`]: !!layout.share === width >= 540,
     [`at ${width}px the row of tabs is ${width < 415 ? "its menu alone" : "drawn"}`]: layout.list.hidden === width < 415,
   };
@@ -235,7 +249,8 @@ function tier(layout) {
       "a long title is cut and a short one is not": layout.tabs[0].cut && !layout.tabs[3].cut,
       "the open tab is marked": layout.tabs.filter((tab) => tab.selected).length === 1 && layout.tabs[0].selected,
       "the empty title bar after the + drags the window": layout.handle.width >= 24 && layout.handleDrags === true,
-      "the session's name is there, with the project and session on its hover": layout.title.visible && layout.title.hover.startsWith("local-0 / Tab strip in the title bar"),
+      // A session in a worktree is placed by the worktree's name (editable there); one in the project's own checkout by its branch.
+      "the branch crumb is there, with the session's name and its workspace on its hover": layout.crumb.visible && layout.crumb.text === "tab-strip" && layout.crumb.hover.split("\n")[0] === "Tab strip in the title bar" && layout.crumb.hover.includes("/repos/p0/.raccoon/worktrees/tab-strip"),
       "the row does not scroll": layout.list.scrollWidth <= layout.list.clientWidth + SLACK && !layout.allTabs,
     },
     layout,
@@ -279,8 +294,8 @@ function tier(layout) {
   await page.keyboard.press(`${mod}+9`);
   await page.waitForTimeout(250);
   const last = await measure(page);
-  // The last tab belongs to the workspace's other session: opening it opens that session.
-  const crumb = await page.locator('[data-testid="session-title"]').textContent();
+  // The last tab belongs to the workspace's other session: opening it opens that session (named first on the crumb's hover).
+  const crumb = (await page.locator('[data-testid="session-branch"]').getAttribute("title")).split("\n")[0];
   await page.keyboard.press(`${mod}+7`);
   await page.waitForTimeout(150);
   const none = (await measure(page)).tabs.findIndex((item) => item.selected);
@@ -347,7 +362,6 @@ function tier(layout) {
   await page.waitForTimeout(250);
   const afterDrop = await order();
   const saved = await page.evaluate(() => window.__LAYOUTS__.at(-1));
-  const sidebar = await page.evaluate(() => [...document.querySelector('[role="treeitem"][aria-label="Tab strip in the title bar"]').querySelectorAll('[role="treeitem"][aria-controls]')].map((row) => row.getAttribute("aria-label")));
   await snap(page, "dropped");
   failed += report(
     "dragging a tab",
@@ -356,10 +370,9 @@ function tier(layout) {
       "Escape puts it back and saves nothing": gone && afterEscape === start && savedAfterEscape === 0,
       "dropped, it is where it was put": afterDrop === "agent:a4,agent:a1,agent:a2,agent:a3,agent:b1",
       "the new order is saved for the workspace": saved?.workspace === "/repos/p0/.raccoon/worktrees/tab-strip" && saved.layout.order.join() === "agent:a4,agent:a1,agent:a2,agent:a3,agent:b1",
-      "the sidebar lists the session's tabs in the same order": sidebar.join("|") === ["Docs", "Refactor the authentication middleware to use the new token service everywhere", "Fix flaky checkout test", "Investigate why the nightly export job times out on large accounts"].join("|"),
       "the drop did not also open the tab": (await measure(page)).tabs.find((tab) => tab.selected)?.key === "agent:a1",
     },
-    { indicator, start, afterEscape, afterDrop, saved, sidebar },
+    { indicator, start, afterEscape, afterDrop, saved },
   );
   await page.close();
 }
@@ -378,7 +391,7 @@ function tier(layout) {
     "the row scrolls": layout.list.scrollWidth > layout.list.clientWidth + SLACK,
     "a menu at the end of the row lists the tabs, and says how many": !!layout.allTabs && layout.allTabs.left >= layout.list.right - SLACK && layout.allTabs.right <= layout.plus.left + SLACK && layout.allTabsText === "23",
     "the session's name and chips are not under the tabs": layout.breadcrumbParts.every((part) => part.right <= layout.strip.left + SLACK),
-    "the session's name keeps its first characters": layout.title.width >= 60,
+    "the branch crumb keeps its first characters": layout.crumb.width >= 60,
     "the chips beside it are down to their icons": layout.breadcrumbParts.slice(2).every((part) => part.width <= 26),
   };
   // The last tab, opened from the menu, is scrolled into view.

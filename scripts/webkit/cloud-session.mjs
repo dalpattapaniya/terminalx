@@ -7,9 +7,9 @@
 //   transcript stay unscrolled, the app shell stays at the window's top, and
 //   the header and the composer stay inside the window;
 // - the transcript follows the bottom through a turn someone else drives;
-// - a terminal someone else opens gets a sidebar row under its session
-//   without reopening it, and the selected row is the tab that shows;
-// - a session row's title keeps its first 12 characters next to its chips;
+// - a terminal someone else opens joins the session's tabs without reopening
+//   it: its panel arrives, the latest-shell shortcut shows it (and hides the
+//   chat), and switching to tab 1 shows the agent tab again;
 // - the session header at 960 px with the side panel open: the title keeps
 //   its first 12 characters and the chips give way to their icons;
 // - the composer's toolbar at 1000x520 and 1280x760, with the Notes drawer
@@ -22,8 +22,21 @@
 //   word or not at all (never a single letter), and the mode's dot, the
 //   chevron and the tooltip stay.
 //
+// A cloud session is reached through the command palette ("Go to cloud
+// session…", then its title): the chat-first sidebar lists no cloud sessions.
+//
+// Not checked since the chat-first sidebar (#484): the session's sidebar row
+// (its title keeping its first 12 characters next to its location, access and
+// share chips, at the sidebar's width and in a tighter row with a pin and a
+// 236 px sidebar, and the lock chip collapsing to its icon), the terminal's
+// row under its session and which row is selected (a cloud session has no
+// tab strip and no sidebar rows; its tabs are switched by shortcut), and the
+// "Workspace terminals" group of an older runtime's session-less terminals
+// (listed nowhere now). All were rows of the cloud tree the sidebar no
+// longer mounts.
+//
 //   pnpm build && npx playwright install webkit && pnpm test:webkit-layout
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, openCloudSession, openConversation, report, serve, sidebar, tab } from "./harness.mjs";
 
 const VIEWPORT = { width: 1280, height: 700 };
 const SLACK = 1;
@@ -46,7 +59,7 @@ const measure = (page) =>
       rootTop: document.getElementById("root").scrollTop,
       shell: box(document.querySelector("[data-app-shell]")),
       header: box(document.querySelector("main header")),
-      sidebar: box(document.querySelector('[role="tree"]')?.parentElement),
+      sidebar: box(document.querySelector('[data-testid="sidebar-rail"]')),
       composer: box(document.querySelector("main textarea[placeholder]")?.closest("form, div")),
       banner: box(document.querySelector('[aria-label="Session recovery"]')),
       notes: box(document.querySelector('[aria-label="Note for teammates"]')),
@@ -78,40 +91,9 @@ for (const role of ["manager", "viewer"]) {
   const name = `cloud session (${role})`;
   const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role, lines: 25 } }, VIEWPORT);
   const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-  await page.locator('[role="tree"]').waitFor();
-  const row = page.locator('[data-testid="cloud-session-node"]');
-  await row.waitFor();
-
-  // ---- the sidebar row: the title keeps its place next to the chips
-  const rowLayout = () =>
-    row.evaluate((node) => {
-      const label = node.querySelector("[data-tree-row] button[title] span.truncate");
-      // The first 12 characters in the label's own font, measured off to the side.
-      const probe = document.createElement("span");
-      probe.textContent = label.textContent.slice(0, 12);
-      probe.style.cssText = `position:fixed;left:-9999px;top:0;white-space:pre;font:${getComputedStyle(label).font}`;
-      document.body.append(probe);
-      const needed = probe.getBoundingClientRect().width;
-      probe.remove();
-      const chips = [...node.querySelectorAll('[data-testid="cloud-location-chip"], [data-testid="cloud-access-chip"], [data-testid="cloud-share-badge"]')];
-      const line = node.querySelector("[data-tree-row]").getBoundingClientRect();
-      return {
-        title: label.textContent,
-        shown: Math.round(label.getBoundingClientRect().width),
-        needed: Math.round(needed),
-        chips: chips.map((chip) => ({ id: chip.dataset.testid, width: Math.round(chip.getBoundingClientRect().width), title: chip.title.length > 0 })),
-        inRow: chips.every((chip) => chip.getBoundingClientRect().right <= line.right + 1),
-      };
-    });
-  const rowChecks = (measured) => ({
-    "the session title shows at least its first 12 characters": measured.title.length >= 12 && measured.shown >= measured.needed,
-    "its chips stay in the row, each with a tooltip": measured.chips.length > 0 && measured.inRow && measured.chips.every((chip) => chip.title && chip.width > 0),
-  });
-  let rowMeasured = await rowLayout();
-  failed += report(name, rowChecks(rowMeasured), rowMeasured);
 
   // ---- repro: a long transcript
-  await row.getByRole("button", { name: title, exact: true }).click();
+  await openCloudSession(page, title);
   await page.getByText("chunk 25 of 25", { exact: true }).waitFor();
   await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
   await page.waitForTimeout(300);
@@ -181,42 +163,41 @@ for (const role of ["manager", "viewer"]) {
   });
   failed += report(`${name}`, { "the document, body, root and app shell cannot be scrolled": forced.every((top) => top === 0) }, forced);
 
-  // ---- a terminal someone else opens shows up under the session
-  const agentRow = row.locator('[role="treeitem"][aria-controls^="session-agent-panel"]');
-  const before = await row.locator('[role="treeitem"][aria-controls^="session-terminal-panel"]').count();
+  // ---- a terminal someone else opens joins the session's tabs
+  // A cloud session draws no tab strip: its tabs are the panels, one shown
+  // (`aria-hidden="false"`) and the rest hidden, switched by shortcut. The
+  // terminal's panel arrives through the terminal poll, without reopening.
+  const agentPanel = page.locator('[role="tabpanel"][id^="session-agent-panel"]');
+  const terminalPanel = page.locator('[role="tabpanel"][id^="session-terminal-panel"]');
+  const before = await terminalPanel.count();
   await page.evaluate(() => window.__PW_RUNTIME__.openTerminal(true));
-  const terminalRow = row.locator('[role="treeitem"][aria-controls^="session-terminal-panel"]');
-  const appeared = await terminalRow.waitFor({ timeout: 12_000 }).then(() => true, () => false);
+  const appeared = await terminalPanel.waitFor({ timeout: 12_000, state: "attached" }).then(() => true, () => false);
   const selection = async () => ({
-    agent: await agentRow.getAttribute("aria-selected"),
-    terminal: appeared ? await terminalRow.getAttribute("aria-selected") : null,
+    agent: await agentPanel.getAttribute("aria-hidden"),
+    terminal: appeared ? await terminalPanel.getAttribute("aria-hidden") : null,
     terminalShown: await page.locator('[data-testid="cloud-terminal"]').isVisible(),
     chatShown: await page.locator("[data-chat-scroller]").isVisible(),
   });
   const atFirst = await selection();
-  if (appeared) await terminalRow.click();
+  // "Activate latest shell tab" (session.latestShell), then "Switch to tab 1" (session.tab1).
+  await page.keyboard.press("Meta+J");
   await page.waitForTimeout(200);
   const onTerminal = await selection();
-  await agentRow.click();
+  await page.keyboard.press("Meta+1");
   await page.waitForTimeout(200);
   const onAgent = await selection();
   failed += report(
-    `${name}, terminals in the sidebar`,
+    `${name}, terminals among the tabs`,
     {
-      "a terminal opened by someone else gets a row without reopening the session": before === 0 && appeared,
-      "the agent row is selected while the agent tab shows": atFirst.agent === "true" && atFirst.terminal === "false" && atFirst.chatShown,
-      "clicking the terminal row shows the terminal and selects its row only": onTerminal.terminal === "true" && onTerminal.agent === "false" && onTerminal.terminalShown && !onTerminal.chatShown,
-      "clicking the agent row shows the agent tab again": onAgent.agent === "true" && onAgent.terminal === "false" && onAgent.chatShown && !onAgent.terminalShown,
+      "a terminal opened by someone else gets a tab panel without reopening the session": before === 0 && appeared,
+      "the agent tab shows at first, the terminal's panel hidden": atFirst.agent === "false" && atFirst.terminal === "true" && atFirst.chatShown && !atFirst.terminalShown,
+      "the latest-shell shortcut shows the terminal, and only it": onTerminal.terminal === "false" && onTerminal.agent === "true" && onTerminal.terminalShown && !onTerminal.chatShown,
+      "switching to tab 1 shows the agent tab again": onAgent.agent === "false" && onAgent.terminal === "true" && onAgent.chatShown && !onAgent.terminalShown,
     },
     { before, appeared, atFirst, onTerminal, onAgent },
   );
   layout = await measure(page);
   failed += report(`${name}, after switching tabs`, inPlace(layout), layout);
-  // The row again, selected and with its tab rows, once the pointer has left it.
-  await page.mouse.move(700, 400);
-  await page.waitForTimeout(200);
-  rowMeasured = await rowLayout();
-  failed += report(`${name}, selected row`, rowChecks(rowMeasured), rowMeasured);
   if (process.env.WEBKIT_LAYOUT_SCREENSHOTS) await page.screenshot({ path: `${process.env.WEBKIT_LAYOUT_SCREENSHOTS}/cloud-session-${role}.png` });
   await page.close();
 }
@@ -279,10 +260,7 @@ for (const viewport of [{ width: 1000, height: 520 }, { width: 1280, height: 760
   ]) {
     const name = `composer toolbar (${viewport.width}x${viewport.height}, ${session.role})`;
     const page = await open(browser, server.url, { cloud: true, localProjects: 0, session }, viewport);
-    const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-    const row = page.locator('[data-testid="cloud-session-node"]');
-    await row.waitFor();
-    await row.getByRole("button", { name: title, exact: true }).click();
+    await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
     await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
     await page.locator("main [data-composer-toolbar]").waitFor();
     await page.getByRole("button", { name: /^Transcription audio input: System default/ }).waitFor();
@@ -357,76 +335,29 @@ for (const viewport of [{ width: 1000, height: 520 }, { width: 1280, height: 760
   }
 }
 
-// A row with less room (a pin before its title, a narrower sidebar): the lock chip gives up its label, not the title its characters.
-{
-  const name = "cloud session (viewer, tight row)";
-  const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "viewer", lines: 3, pinned: true } }, VIEWPORT);
-  const row = page.locator('[data-testid="cloud-session-node"]');
-  await row.waitFor();
-  await page.addStyleTag({ content: ":root { --sidebar-w: 236px; }" });
-  await page.waitForTimeout(300);
-  const measured = await row.evaluate((node) => {
-    const label = node.querySelector("[data-tree-row] button[title] span.truncate");
-    const probe = document.createElement("span");
-    probe.textContent = label.textContent.slice(0, 12);
-    probe.style.cssText = `position:fixed;left:-9999px;top:0;white-space:pre;font:${getComputedStyle(label).font}`;
-    document.body.append(probe);
-    const needed = probe.getBoundingClientRect().width;
-    probe.remove();
-    const lock = node.querySelector('[data-testid="cloud-access-chip"]');
-    const icon = lock.querySelector("svg").getBoundingClientRect();
-    const box = lock.getBoundingClientRect();
-    const line = node.querySelector("[data-tree-row]").getBoundingClientRect();
-    return { shown: Math.round(label.getBoundingClientRect().width), needed: Math.round(needed), lock: Math.round(box.width), iconInside: icon.width >= 9 && icon.left >= box.left && icon.right <= box.right, tooltip: lock.title, inRow: box.right <= line.right + 1 };
-  });
-  failed += report(
-    name,
-    {
-      "the session title shows at least its first 12 characters": measured.shown >= measured.needed,
-      "the lock chip collapses to its icon, with its tooltip": measured.lock <= 20 && measured.iconInside && measured.tooltip.length > 0 && measured.inRow,
-    },
-    measured,
-  );
-  if (process.env.WEBKIT_LAYOUT_SCREENSHOTS) await page.screenshot({ path: `${process.env.WEBKIT_LAYOUT_SCREENSHOTS}/cloud-session-tight-row.png`, clip: { x: 0, y: 360, width: 270, height: 110 } });
-  await page.close();
-}
-
-// A runtime without pty/2: its terminals belong to no session, and are listed once for the workspace.
+// A runtime without pty/2: its terminals belong to no session, so none is
+// put among the session's tabs. (Where they are listed instead, the sidebar's
+// "Workspace terminals" group, is gone with the cloud tree.)
 {
   const name = "cloud session (older runtime)";
   const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "manager", lines: 3, sessionTerminals: false } }, VIEWPORT);
-  const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-  const row = page.locator('[data-testid="cloud-session-node"]');
-  await row.waitFor();
-  await row.getByRole("button", { name: title, exact: true }).click();
+  await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
   await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
   await page.evaluate(() => window.__PW_RUNTIME__.openTerminal(false));
-  const group = page.locator('[data-testid="cloud-workspace-terminals"]');
-  const appeared = await group.waitFor({ timeout: 12_000 }).then(() => true, () => false);
-  const terminalRow = group.locator('[role="treeitem"][aria-controls]');
-  if (appeared) await terminalRow.click();
-  await page.waitForTimeout(300);
-  failed += report(
-    name,
-    {
-      'a terminal with no session is listed under "Workspace terminals"': appeared && (await group.getByText("Workspace terminals").count()) === 1,
-      "no terminal row is put under the session": (await row.locator('[role="treeitem"][aria-controls^="session-terminal-panel"]').count()) === 0,
-      "selecting it shows the terminal and selects its row": appeared && (await terminalRow.getAttribute("aria-selected")) === "true" && (await page.locator('[data-testid="cloud-terminal"]').isVisible()),
-    },
-  );
+  // Well past the terminal poll (3 s): a session terminal would have arrived by now.
+  const putUnderSession = await page.locator('[role="tabpanel"][id^="session-terminal-panel"]').waitFor({ timeout: 8_000, state: "attached" }).then(() => true, () => false);
+  failed += report(name, { "no terminal with no session is put among the session's tabs": !putUnderSession });
   await page.close();
 }
 
 // Local sessions keep the same frame: a PTY-first agent tab, and one that is not.
 {
   const page = await open(browser, server.url, { cloud: false, localProjects: 1, localSession: true }, VIEWPORT);
-  await page.locator('[role="tree"]').waitFor();
-  const session = page.getByRole("button", { name: "Local long session", exact: true });
-  await page.getByRole("button", { name: "Expand main", exact: true }).click();
-  await session.click();
-  for (const tab of ["claude tab", "gemini tab"]) {
-    const name = `local session (${tab})`;
-    await page.locator(`[role="treeitem"][aria-label="${tab}"]`).click();
+  await sidebar(page);
+  await openConversation(page, "claude tab");
+  for (const label of ["claude tab", "gemini tab"]) {
+    const name = `local session (${label})`;
+    await tab(page, label).click();
     const panel = page.locator('[role="tabpanel"]:not([aria-hidden="true"])');
     await panel.getByText("chunk 30 of 30", { exact: true }).waitFor();
     await panel.locator('[aria-label="Session recovery"]').waitFor();
@@ -526,7 +457,7 @@ function headerChecks(measured, { collapsed, terminalSwitch = false }) {
   const checks = {
     "the session title shows at least its first 12 characters": measured.title.text.length >= 12 && measured.title.shown >= measured.title.needed,
     "the title is inside the breadcrumb, which stops before the buttons on the right": measured.title.right <= measured.crumb.right + SLACK && measured.crumb.right <= measured.right.left + SLACK,
-    // A working terminal-view switch takes the location chip's place in a header this narrow (the sidebar row has both).
+    // A working terminal-view switch takes the location chip's place in a header this narrow.
     [terminalSwitch && collapsed ? "the terminal switch is there, and every chip shown keeps its icon and tooltip, wide enough to press" : "the location chip is there, and every chip shown keeps its icon and tooltip, wide enough to press"]:
       (terminalSwitch && collapsed ? measured.parts.some((part) => part.name === "Show terminal view") : measured.chips.some((chip) => chip.id === "session-location")) &&
       measured.chips.every((chip) => chip.tooltip && chip.iconInside && chip.width >= 20),
@@ -551,10 +482,7 @@ for (const { viewport, collapsed, terminalSwitch = false } of [
 ]) {
   const name = `session header (${viewport.width}x${viewport.height}, side panel open${terminalSwitch ? ", terminal switch" : ""})`;
   const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "driver", canApprove: true, lines: 4, branch: "terminalx/share-demo-57f2a9c0", agentTerminal: terminalSwitch } }, viewport);
-  const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-  const row = page.locator('[data-testid="cloud-session-node"]');
-  await row.waitFor();
-  await row.getByRole("button", { name: title, exact: true }).click();
+  await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
   await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
   // The side panel is the one `aside` inside the main slot, next to the header.
   if (!(await page.locator("main aside").count())) await page.getByRole("button", { name: "Toggle panel" }).click();
@@ -616,10 +544,7 @@ function permissionChecks(measured) {
 
 for (const permissionMode of ["bypassPermissions", "manual", "plan"]) {
   const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "manager", lines: 4, permissionMode } }, { width: 960, height: 700 });
-  const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-  const row = page.locator('[data-testid="cloud-session-node"]');
-  await row.waitFor();
-  await row.getByRole("button", { name: title, exact: true }).click();
+  await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
   await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
   if (!(await page.locator("main aside").count())) await page.getByRole("button", { name: "Toggle panel" }).click();
   await page.locator("main aside").first().waitFor();

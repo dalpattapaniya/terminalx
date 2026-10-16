@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // Run after pnpm build. Covers a secret host dialog and a scoped guest screen.
-import { launch, open, report, serve } from "./harness.mjs";
+// The host opens the session from its conversation row (the chat-first sidebar,
+// #484); the Share button is in the session's header.
+import { launch, open, openConversation, report, serve } from "./harness.mjs";
 
 const server = await serve();
 const browser = await launch();
 let failed = 0;
 try {
   const host = await open(browser, server.url, { cloud: false, localProjects: 1, localSession: true, localSharing: "host" }, { width: 1280, height: 760 });
-  await host.getByRole("button", { name: "Expand main", exact: true }).click();
-  await host.getByRole("button", { name: "Local long session", exact: true }).click();
+  await openConversation(host, "claude tab");
   await host.getByRole("button", { name: "Share session…" }).click();
   await host.getByRole("button", { name: "Create share link" }).click();
   await host.getByLabel("Secret share link").waitFor();

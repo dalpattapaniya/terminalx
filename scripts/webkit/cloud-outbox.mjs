@@ -6,7 +6,7 @@
 // height, and they read as their own bar above the transcript.
 //
 //   pnpm build && npx playwright install webkit && node scripts/webkit/cloud-outbox.mjs [screenshot-dir]
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, openCloudSession, report, serve } from "./harness.mjs";
 
 const SLASH = "/model: only someone who can approve permissions may send it. Without that right you can send /clear, /compact, /help.";
 const SHELL = "a message that starts with ! runs as a shell command in the agent's terminal, which needs someone who can approve permissions.";
@@ -23,10 +23,8 @@ let failed = 0;
 for (const width of [1280, 900]) {
   const name = `refused commands at ${width} px`;
   const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "driver", lines: 25, outbox } }, { width, height: 760 });
-  const title = await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle);
-  const row = page.locator('[data-testid="cloud-session-node"]');
-  await row.waitFor();
-  await row.getByRole("button", { name: title, exact: true }).click();
+  // The session is reached through the command palette (the sidebar lists no cloud sessions since #484).
+  await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
   await page.getByText("chunk 25 of 25", { exact: true }).waitFor();
   await page.locator('[data-testid="cloud-agent-outbox"]').waitFor();
   await page.waitForTimeout(400);

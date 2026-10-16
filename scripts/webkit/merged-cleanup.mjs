@@ -2,16 +2,20 @@
 // WebKit check for the removal that follows a merged pull request (#432), in
 // the built app (`pnpm build`) with a stubbed backend:
 //
-// - a workspace's row says why it is kept or when it goes, inside the
-//   sidebar, with a long reason cut short rather than pushed out of it;
 // - the notices (about to go, with Keep; gone, with Undo) are inside the
-//   window, and Keep reaches the backend;
+//   window, and Keep reaches the backend and withdraws its notice;
 // - Settings → Storage shows the setting, each project's own answer, GitHub's
 //   own head-branch setting and what was removed, at 960 px and at 720 px,
 //   with nothing leaving its column or running into its neighbour.
 //
+// Not checked since the chat-first sidebar (#484): a workspace's row saying
+// why it is kept or when it goes (`merged-note`: its words inside the sidebar
+// on one line, a long reason cut short, none under its button, and the row
+// saying "Stop keeping" after Keep), since the sidebar lists conversations
+// and has no workspace rows; what stands where is in Settings → Storage.
+//
 //   pnpm build && npx playwright install webkit && node scripts/webkit/merged-cleanup.mjs [screenshot-dir]
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, report, serve, sidebar } from "./harness.mjs";
 
 const shots = process.argv[2];
 const server = await serve();
@@ -36,41 +40,29 @@ const leaving = (page, root, selector) =>
 
 for (const width of [960, 720]) {
   const page = await open(browser, server.url, { cloud: true, localProjects: 3, mergedCleanup: true }, { width, height: 760 });
-  await page.locator('[role="tree"]').first().waitFor();
-  const notes = page.locator('[data-testid="merged-note"]');
-  await notes.first().waitFor();
-  await page.locator('[data-testid="merged-notice"]').first().waitFor();
+  await sidebar(page);
+  const notices = page.locator('[data-testid="merged-notice"]');
+  await notices.nth(1).waitFor();
   // The notices fade in; measure and picture them once they have.
   await page.waitForTimeout(400);
-  if (shots) await page.screenshot({ path: `${shots}/merged-${width}-sidebar.png` });
+  if (shots) await page.screenshot({ path: `${shots}/merged-${width}-notices.png` });
 
-  const sidebar = await page.evaluate((slack) => {
-    const rail = document.querySelector('[data-testid="sidebar-rail"]').getBoundingClientRect();
-    const notes = [...document.querySelectorAll('[data-testid="merged-note"]')].map((note) => {
-      const rect = note.getBoundingClientRect();
-      const words = note.querySelector("span");
-      const text = words.getBoundingClientRect();
-      const button = note.querySelector("button")?.getBoundingClientRect();
-      return { text: note.textContent, inside: rect.left >= rail.left - slack && rect.right <= rail.right + slack, lines: Math.round(rect.height / text.height), overlaps: !!button && text.right > button.left + slack, cut: words.scrollWidth > words.clientWidth };
-    });
-    const notices = [...document.querySelectorAll('[data-testid="merged-notice"]')].map((notice) => notice.getBoundingClientRect()).map((rect) => ({ top: rect.top, bottom: rect.bottom, inside: rect.left >= 0 && rect.right <= innerWidth && rect.top >= 0 && rect.bottom <= innerHeight }));
-    return { notes, notices, scroll: document.scrollingElement.scrollWidth - document.scrollingElement.clientWidth };
-  }, SLACK);
-  const texts = sidebar.notes.map((note) => note.text);
-  failed += report(`sidebar at ${width}px`, {
-    "each waiting workspace says where it stands": texts.length === 4 && texts.includes("merged: deleting in 8 minKeep") && texts.includes("kept: 2 uncommitted files") && texts.includes("kept: your choiceStop keeping"),
-    "every note is inside the sidebar, on one line": sidebar.notes.every((note) => note.inside && note.lines === 1),
-    "a long reason is cut short, not pushed out": sidebar.notes.some((note) => note.cut) && sidebar.scroll === 0,
-    "no note runs under its button": sidebar.notes.every((note) => !note.overlaps),
-    "the notices are inside the window and apart": sidebar.notices.length === 2 && sidebar.notices.every((notice) => notice.inside) && sidebar.notices[0].bottom <= sidebar.notices[1].top + SLACK,
-  }, sidebar);
+  const shown = await notices.evaluateAll((elements) => {
+    const boxes = elements.map((notice) => notice.getBoundingClientRect()).map((rect) => ({ top: rect.top, bottom: rect.bottom, inside: rect.left >= 0 && rect.right <= innerWidth && rect.top >= 0 && rect.bottom <= innerHeight }));
+    return { notices: boxes, scroll: document.scrollingElement.scrollWidth - document.scrollingElement.clientWidth };
+  });
+  failed += report(`notices at ${width}px`, {
+    "the notices are inside the window and apart": shown.notices.length === 2 && shown.notices.every((notice) => notice.inside) && shown.notices[0].bottom <= shown.notices[1].top + SLACK,
+    "nothing pushes the page sideways": shown.scroll === 0,
+  }, shown);
 
-  // Keep, from the notice: the backend is told, and the row then says so.
-  await page.locator('[data-testid="merged-notice"]').getByRole("button", { name: "Keep workspace" }).click();
-  await page.locator('[data-testid="merged-note"]', { hasText: "Stop keeping" }).nth(1).waitFor();
+  // Keep, from the notice: the backend is told, and the notice goes.
+  const keep = notices.getByRole("button", { name: "Keep workspace" });
+  await keep.click();
+  await keep.waitFor({ state: "detached" });
   failed += report(`keep at ${width}px`, {
     "Keep reaches the backend with the workspace's path": (await page.evaluate(() => window.__PW_MERGED__.held)).join() === "/repos/p0/.raccoon/worktrees/quiet-amber-fox",
-    "its notice is withdrawn and the removal's stays": (await page.locator('[data-testid="merged-notice"]').count()) === 1,
+    "its notice is withdrawn and the removal's stays": (await notices.count()) === 1 && (await notices.getByRole("button", { name: "Undo" }).count()) === 1,
   });
 
   await page.locator('[data-testid="sidebar-rail"]').getByRole("button", { name: "Settings", exact: true }).click();

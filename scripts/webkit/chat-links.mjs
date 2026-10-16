@@ -1,30 +1,36 @@
 #!/usr/bin/env node
-// #210: real mouse/keyboard activation, focus, Settings, and browser/sidebar routing.
+// #210: real mouse/keyboard activation, focus, Settings, and browser routing.
+// A page opened in the TerminalX browser is a tab of the workspace: since the
+// chat-first sidebar (#484) it is counted in the title bar's tab strip, where a
+// browser page's tab is described as "Browser page".
+//
+// Not checked since the chat-first sidebar (#484): the browser page's row in the
+// sidebar tree, which no longer exists; the strip is the only list of tabs.
+//
 // pnpm build && pnpm exec playwright install webkit && pnpm test:webkit-chat-links
 import assert from "node:assert/strict";
-import { launch, open, serve } from "./harness.mjs";
+import { launch, open, openConversation, serve, sidebar, tab } from "./harness.mjs";
 
 const server = await serve();
 let browser;
 try {
   browser = await launch();
   const page = await open(browser, server.url, { cloud: false, localProjects: 1, localSession: true, chatLinks: true }, { width: 1100, height: 720 });
-  await page.getByRole("button", { name: "Expand main", exact: true }).click();
-  await page.getByRole("button", { name: "Local long session", exact: true }).click();
-  await page.locator('[role="treeitem"][aria-label="gemini tab"]').click();
+  await openConversation(page, "claude tab");
+  await tab(page, "gemini tab").click();
   const link = page.getByRole("link", { name: "website", exact: true });
   const chooser = page.getByRole("dialog", { name: "Open website link" });
   const system = chooser.getByRole("button", { name: "Open in system browser", exact: true });
   const internal = chooser.getByRole("button", { name: "Open in TerminalX browser", exact: true });
   const remember = chooser.getByRole("checkbox", { name: "Remember my choice" });
   const opened = () => page.evaluate(() => window.__PW_LINK_OPENS__);
-  const browserRows = page.locator('[role="treeitem"][aria-label$="browser page"]');
+  const browserTabs = page.getByRole("tablist", { name: "Workspace tabs" }).locator('[role="tab"][aria-description^="Browser page"]');
   const focused = (locator) => locator.evaluate((element) => document.activeElement === element);
 
   await link.click();
   await chooser.waitFor();
   assert.deepEqual(await opened(), { system: [], terminalx: [] });
-  assert.equal(await browserRows.count(), 0);
+  assert.equal(await browserTabs.count(), 0);
   const anchorBox = await link.boundingBox();
   const chooserBox = await chooser.boundingBox();
   assert.ok(Math.abs(chooserBox.x - anchorBox.x) < 2, "chooser is anchored to the link");
@@ -56,14 +62,14 @@ try {
   await page.keyboard.press("Enter");
   await chooser.waitFor({ state: "hidden" });
   assert.deepEqual(await opened(), { system: ["https://example.test/docs"], terminalx: [] });
-  assert.equal(await browserRows.count(), 0, "system browser creates no sidebar row");
+  assert.equal(await browserTabs.count(), 0, "system browser creates no browser tab");
   assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("raccoon.prefs")).linkBrowser), "system");
   await link.click();
   assert.equal(await chooser.count(), 0);
   assert.equal((await opened()).system.length, 2);
-  console.log("ok  keyboard selection remembers the system browser; subsequent clicks open directly without a browser row");
+  console.log("ok  keyboard selection remembers the system browser; subsequent clicks open directly without a browser tab");
 
-  await page.locator('[data-testid="sidebar-rail"]').getByRole("button", { name: "Settings", exact: true }).click();
+  await (await sidebar(page)).getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "General", exact: true }).click();
   const preference = page.getByRole("radiogroup", { name: "Website links" });
   assert.equal(await preference.getByRole("radio").count(), 3);
@@ -88,11 +94,11 @@ try {
   await remember.check();
   await internal.click();
   await page.waitForFunction(() => window.__PW_LINK_OPENS__.terminalx.length === 1);
-  await browserRows.waitFor();
+  await browserTabs.waitFor();
   assert.deepEqual((await opened()).terminalx, [{ workspace: "/repos/p0", url: "https://example.test/docs" }]);
-  console.log("ok  context menu still opens the system browser; choosing TerminalX creates its workspace browser page and sidebar row");
+  console.log("ok  context menu still opens the system browser; choosing TerminalX creates its workspace browser page and its tab in the strip");
   await page.reload();
-  await page.locator('[role="tree"]').waitFor();
+  await sidebar(page);
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem("raccoon.prefs")));
   assert.equal(saved.linkBrowser, "terminalx");
   assert.equal(saved.linkBrowserChosen, true);

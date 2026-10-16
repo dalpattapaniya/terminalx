@@ -468,6 +468,8 @@ export function SessionView({
   const switching = !!activeTab && !!tabViews.switching[activeTab.id];
   const workspaceLabel = session.worktreeRemoved ? workspaceName(session) : session.branch;
   const workspaceTitle = session.removedWorkspace?.path ?? session.cwd;
+  // What the branch crumb shows: a worktree by its name, any other checkout by its branch.
+  const workspaceShown = session.worktreeName && !session.worktreeRemoved ? session.worktreeName : workspaceLabel;
   const baseNote = session.worktreeBase && !session.worktreeBase.warning ? `Base ${session.worktreeBase.commit.slice(0, 7)}${session.worktreeBase.fetched ? " · fetched at creation" : ""}` : null;
   const [continuationSource, setContinuationSource] = useState<TabEntry | null>(null);
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -562,6 +564,8 @@ export function SessionView({
               /* A local chat is placed by its branch, not named by its title (the sidebar names it): "terminalx / main". */
               <span
                 className={cn("flex min-w-0 items-center gap-1 text-foreground", strip && cn("ml-1 max-w-56", STRIP_TITLE_YIELDS, STRIP_TIGHT))}
+                // Beside the tabs the branch keeps its icon and about its first ten characters, as the title does, instead of folding to nothing.
+                style={strip ? { minWidth: `calc(${Math.min(workspaceShown?.length ?? 0, 10)}ch + 1.125rem)` } : undefined}
                 title={[session.title, workspaceTitle, baseNote].filter(Boolean).join("\n")}
                 data-testid="session-branch"
               >

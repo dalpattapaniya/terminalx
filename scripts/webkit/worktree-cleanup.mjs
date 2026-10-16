@@ -15,8 +15,11 @@
 //   leads back to the dialog by mouse or keyboard; a result with anything
 //   skipped stays there until it is read.
 //
+// The session under the corner is opened from its conversation row and its chat
+// tab from the title bar's strip (the chat-first sidebar, #484).
+//
 //   pnpm build && npx playwright install webkit && node scripts/webkit/worktree-cleanup.mjs [screenshot-dir]
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, openConversation, report, serve, sidebar, tab } from "./harness.mjs";
 
 const shots = process.argv[2];
 const server = await serve();
@@ -89,9 +92,9 @@ const measure = (page) =>
 
 for (const width of [960, 720]) {
   const page = await open(browser, server.url, { cloud: true, localProjects: 3 }, { width, height: 720 });
-  await page.locator('[role="tree"]').waitFor();
+  const rail = await sidebar(page);
   await page.evaluate(stub);
-  await page.locator('[data-testid="sidebar-rail"]').getByRole("button", { name: "Settings", exact: true }).click();
+  await rail.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Storage", exact: true }).click();
   await page.getByRole("button", { name: "Clean up worktrees…" }).click();
   const dialog = page.getByRole("dialog", { name: "Clean up worktrees" });
@@ -140,14 +143,13 @@ for (const width of [960, 720]) {
 // A removal that takes a while, in a session whose composer sits under the corner.
 for (const width of [1100, 760]) {
   const page = await open(browser, server.url, { cloud: false, localProjects: 3, localSession: true }, { width, height: 720 });
-  await page.locator('[role="tree"]').waitFor();
-  await page.getByRole("button", { name: "Expand main", exact: true }).click();
-  await page.getByRole("button", { name: "Local long session", exact: true }).click();
-  await page.locator('[role="treeitem"][aria-label="gemini tab"]').click();
+  const rail = await sidebar(page);
+  await openConversation(page, "claude tab");
+  await tab(page, "gemini tab").click();
   await page.locator('[role="tabpanel"]:not([aria-hidden="true"]) [data-composer-box]').waitFor();
   await page.evaluate(stub);
   await page.evaluate(() => { window.__PW_CLEANUP__.hold = true; });
-  await page.locator('[data-testid="sidebar-rail"]').getByRole("button", { name: "Settings", exact: true }).click();
+  await rail.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Storage", exact: true }).click();
   await page.getByRole("button", { name: "Clean up worktrees…" }).click();
   const dialog = page.getByRole("dialog", { name: "Clean up worktrees" });

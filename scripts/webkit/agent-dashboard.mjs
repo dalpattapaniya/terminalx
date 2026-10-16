@@ -122,7 +122,8 @@ try {
       });
       await page.addInitScript(`window.__PW_FIXTURE__ = ${JSON.stringify({ cloud: true, localProjects: 2, dashboardCount: count })};\n${stub}`);
       await page.goto(server.url);
-      await page.getByRole("button", { name: /Agent Dashboard/ }).click();
+      // The sidebar's destination is "Dashboard, <counts>" since the chat-first sidebar (#484); it was "Agent Dashboard".
+      await page.getByRole("button", { name: /^Dashboard/ }).click();
       await page.getByRole("heading", { name: "Agents", exact: true }).waitFor();
       await page.getByText(`${count * 6} total`, { exact: true }).waitFor();
       if (count) await page.getByText("Check the synthetic layout", { exact: true }).first().waitFor();

@@ -217,9 +217,10 @@ try {
       }, pipelineLayout);
       if (shots) await page.screenshot({ path: join(shots, `issue-pipeline-${mode}-${provider}-${width}.png`) });
 
-      // The project's own settings for all of this, from the project menu.
-      // The row's buttons are not drawn until it is hovered.
-      await page.getByRole("treeitem", { name: "local-0", exact: true }).locator("[data-tree-row]").first().hover();
+      // The project's own settings for all of this, from the project menu. Since
+      // the chat-first sidebar (#484) the project is a group named after it, with
+      // its fold button first in its row; the row's buttons are not drawn until it is hovered.
+      await page.getByRole("group", { name: "local-0", exact: true }).getByRole("button", { name: /^(Collapse|Expand) local-0$/ }).hover();
       await page.getByRole("button", { name: "Project menu for local-0", exact: true }).click();
       await page.getByRole("menuitem", { name: "Issue pipeline…", exact: true }).click();
       const dialog = page.getByRole("dialog", { name: "Issue pipeline · local-0", exact: true });

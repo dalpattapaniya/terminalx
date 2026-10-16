@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // #378: the real resource popover over a live xterm and chat, using only synthetic data.
+// The session is opened from its conversation row (the chat-first sidebar, #484),
+// which is named after its one tab, "claude tab"; the header shows the session's title.
 // pnpm build && node scripts/webkit/app-resources.mjs
 // APP_RESOURCES_SHOTS=docs/screenshots/issue-378 also saves rendered evidence.
 import assert from "node:assert/strict";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { launch, serve } from "./harness.mjs";
+import { launch, openConversation, serve } from "./harness.mjs";
 
 const stub = await readFile(new URL("./tauri-stub.js", import.meta.url), "utf8");
 const shots = process.env.APP_RESOURCES_SHOTS;
@@ -81,8 +83,7 @@ try {
       page.on("pageerror", (error) => console.error(error.message));
       await page.addInitScript(`window.__PW_FIXTURE__ = { cloud: false, localProjects: 1, localSession: true };\n${stub}\n(${setup})(${JSON.stringify({ theme, mode })});`);
       await page.goto(server.url);
-      await page.getByRole("button", { name: "Expand main", exact: true }).click();
-      await page.getByRole("button", { name: "Synthetic resource review", exact: true }).click();
+      await openConversation(page, "claude tab");
       await page.locator("[data-chat-scroller]").waitFor();
       await page.evaluate(() => document.fonts.ready);
       for (const view of ["terminal", "chat"]) {

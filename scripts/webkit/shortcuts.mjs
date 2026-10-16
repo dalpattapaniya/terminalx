@@ -12,16 +12,15 @@
 //   closes it; Left Option and a Right Option combination never do.
 //
 //   pnpm build && npx playwright install webkit && pnpm test:webkit-layout
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, openConversation, report, serve, sidebar, tab } from "./harness.mjs";
 
 const server = await serve();
 const browser = await launch();
 let failed = 0;
 
 const openShortcuts = async (page) => {
-  await page.locator('[role="tree"]').waitFor();
   // The gear at the end of the account row (PRO-49): icon-only, named for assistive technology.
-  await page.locator('[data-testid="sidebar-rail"]').getByRole("button", { name: "Settings", exact: true }).click();
+  await (await sidebar(page)).getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Shortcuts", exact: true }).click();
   await page.locator('[data-testid="shortcuts-tab"]').waitFor();
 };
@@ -99,7 +98,7 @@ const fits = (layout) => ({
 // The keys themselves.
 {
   const page = await open(browser, server.url, { cloud: false, localProjects: 1, localSession: true }, { width: 1280, height: 760 });
-  await page.locator('[role="tree"]').waitFor();
+  await sidebar(page);
   await page.evaluate(() => {
     window.__dictation = [];
     const { answers, emit } = window.__PW_STUB__;
@@ -115,7 +114,7 @@ const fits = (layout) => ({
     };
   });
   const dictation = () => page.evaluate(() => window.__dictation.join(","));
-  const sidebar = () => page.locator('[data-testid="sidebar-rail"]').isVisible();
+  const sidebarShown = () => page.locator('[data-testid="sidebar-rail"]').isVisible();
 
   // A changed shortcut works at the next keypress.
   await openShortcuts(page);
@@ -124,15 +123,15 @@ const fits = (layout) => ({
   await page.getByTestId("shortcut-editor").getByRole("button", { name: "Save", exact: true }).click();
   const shown = await page.locator('[data-shortcut="app.toggleSidebar"] button[data-binding]').textContent();
   await page.getByRole("button", { name: "Close", exact: true }).click();
-  await page.locator('[role="tree"]').waitFor();
+  await sidebar(page);
   await page.keyboard.press("Meta+B");
   await page.waitForTimeout(150);
-  const afterOld = await sidebar();
+  const afterOld = await sidebarShown();
   await page.keyboard.press("Meta+Shift+Y");
   await page.waitForTimeout(150);
-  const afterNew = await sidebar();
+  const afterNew = await sidebarShown();
   await page.keyboard.press("Meta+Shift+Y");
-  await page.locator('[role="tree"]').waitFor();
+  await sidebar(page);
   // The command palette shows the keys in force.
   await page.keyboard.press("Meta+K");
   await page.getByRole("dialog").locator("input").fill("Toggle sidebar");
@@ -152,9 +151,8 @@ const fits = (layout) => ({
   );
 
   // Hold Right Option to talk, in a chat tab's composer.
-  await page.getByRole("button", { name: "Expand main", exact: true }).click();
-  await page.getByRole("button", { name: "Local long session", exact: true }).click();
-  await page.locator('[role="treeitem"][aria-label="gemini tab"]').click();
+  await openConversation(page, "claude tab");
+  await tab(page, "gemini tab").click();
   const composer = page.locator('[role="tabpanel"]:not([aria-hidden="true"]) textarea[data-composer]');
   await composer.waitFor();
   await composer.click();

@@ -17,7 +17,7 @@
 //   scrolls as a whole, so the buttons are reached by scrolling, never cut off.
 //
 //   pnpm build && npx playwright install webkit && node scripts/webkit/dialog-lists.mjs [screenshot-dir]
-import { launch, open, report, serve } from "./harness.mjs";
+import { launch, open, report, serve, sidebar } from "./harness.mjs";
 
 const shots = process.argv[2];
 const server = await serve();
@@ -141,9 +141,9 @@ for (const size of windows) {
   const slug = size.name.replaceAll(/[^a-z]+/g, "-");
   const start = async (counts) => {
     const page = await open(browser, server.url, { cloud: true, localProjects: 3 }, { width: 1360, height: 860 });
-    await page.locator('[role="tree"]').waitFor();
+    const rail = await sidebar(page);
     await page.evaluate(stub, counts);
-    await page.locator('[data-testid="sidebar-rail"]').getByRole("button", { name: "Settings", exact: true }).click();
+    await rail.getByRole("button", { name: "Settings", exact: true }).click();
     await page.getByRole("button", { name: "Storage", exact: true }).click();
     await page.getByRole("button", { name: "Select all removable" }).waitFor();
     await page.setViewportSize({ width: size.width, height: size.height });

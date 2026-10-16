@@ -293,11 +293,14 @@ describe("a local session's title bar with the tabs in it (#438)", () => {
     expect(actions.contains(plus)).toBe(false);
     expect(within(actions as HTMLElement).getByRole("button", { name: "Toggle panel" })).toBeTruthy();
 
-    // One label for the session, with the project and the session on its hover, and where it runs.
+    // A local session is placed by its branch, not named: the project is not spelled out, and the
+    // session's name, where it runs and its base are on the branch's hover.
     expect(screen.queryByTestId("session-project")).toBeNull();
-    const title = screen.getByTestId("session-title");
-    expect(title.textContent).toBe("Fix the login loop");
-    expect(title.getAttribute("title")).toBe("project / Fix the login loop\n/Users/me/api/.raccoon/worktrees/fix\nBase 1234567 · fetched at creation");
+    expect(screen.queryByTestId("session-title")).toBeNull();
+    const branch = screen.getByTestId("session-branch");
+    expect(branch.getAttribute("title")).toBe("Fix the login loop\n/Users/me/api/.raccoon/worktrees/fix\nBase 1234567 · fetched at creation");
+    // Pressed by the tabs, the branch keeps its icon and its first characters rather than folding to nothing.
+    expect(branch.style.minWidth).toBe("calc(3ch + 1.125rem)");
     // The issue and automation chips are still there, and so is the branch.
     expect(within(header).getByRole("button", { name: "#12" })).toBeTruthy();
     expect(screen.getByTestId("session-automation").textContent).toBe("Nightly #3");

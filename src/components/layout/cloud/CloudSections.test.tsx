@@ -513,7 +513,7 @@ describe("personal named sections (PRO-23)", () => {
     // A project a section names that is not shown now is simply not listed.
     expect(projectIn(sectionTree("Active"))).toEqual([`cloud:${ORG}:${API}`]);
     // The pin still marks the project inside its section.
-    expect(within(sectionTree("Active")).getByTestId("cloud-project-row").querySelector("svg.lucide-pin")).toBeTruthy();
+    expect(within(sectionTree("Active")).getByTestId("cloud-project-row").querySelector('svg[data-icon="pin"]')).toBeTruthy();
     fireEvent.click(within(sectionTree("Parked")).getByRole("button", { name: "Expand Parked section" }));
     expect(prefs.getPrefs().sidebarSections["cloud-section:s1"]).toBe("expanded");
     cleanup();
