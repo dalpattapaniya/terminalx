@@ -20,6 +20,7 @@ import { sessionStatus, type SessionEntry } from "@/types/session";
 import { RowTime } from "./SidebarRows";
 import { StatusMark } from "@/components/ui/StatusMark";
 import { AppDestinations, ProjectAppearance, ProjectGlyph, type RailProps } from "./ProjectRail";
+import { CloudOrganizations, useHasCloudOrganizations } from "./CloudOrganizations";
 import { AgentMark } from "@/components/AgentMark";
 
 const canon = (path: string) => path.replace(/\/+$/, "");
@@ -147,7 +148,7 @@ const ShowAgents = createContext(false);
 const PEEK = 3;
 
 /** A fold the sidebar remembers between launches. */
-function useFold(key: string, byDefault: boolean): [boolean, () => void] {
+export function useFold(key: string, byDefault: boolean): [boolean, () => void] {
   const { sidebarSections } = usePrefs();
   const stored = sidebarSections[key];
   const open = stored ? stored === "expanded" : byDefault;
@@ -166,6 +167,7 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
   const chatsPath = store.chatsPath ? canon(store.chatsPath) : null;
   const projects = store.projects.filter((project) => !project.archived && canon(project.path) !== chatsPath).sort((a, b) => a.name.localeCompare(b.name));
   const showAgents = useMemo(() => mixesAgents(store.sessions.filter((session) => !session.archived)), [store.sessions]);
+  const sectioned = useHasCloudOrganizations();
   const { groups, chats } = useMemo(
     () => groupConversations(store.sessions, store.projects, chatsPath, store.workspaces, store.selectedSessionId),
     [store.sessions, store.projects, chatsPath, store.workspaces, store.selectedSessionId],
@@ -208,7 +210,7 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
         ) : (
           <>
             {groups.length > 0 && (
-              <ListSection id="projects" label="Projects">
+              <ListSection id="projects" label={sectioned ? "Local" : "Projects"}>
                 {groups.map((group) => (
                   <ProjectGroup
                     key={group.path}
@@ -246,6 +248,7 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
             )}
           </>
         )}
+        <CloudOrganizations />
       </nav>
       </ShowAgents.Provider>
 
@@ -265,10 +268,10 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
   );
 }
 
-function ListSection({ id, label, children }: { id: string; label: string; children: ReactNode }) {
+export function ListSection({ id, label, children, ...rest }: { id: string; label: string; children: ReactNode } & Record<`data-${string}`, string>) {
   const [open, toggle] = useFold(`list:${id}`, true);
   return (
-    <section aria-labelledby={`list-${id}`} className="mb-3">
+    <section aria-labelledby={`list-${id}`} className="mb-3" {...rest}>
       <button
         type="button"
         id={`list-${id}`}

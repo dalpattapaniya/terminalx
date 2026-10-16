@@ -23,6 +23,7 @@ import { AppDestinations, ProjectGlyph, type RailProps } from "./ProjectRail";
 import { PROJECT_COLORS, colorCss } from "./PixelMascot";
 import { BotFace } from "./BotFace";
 import { conversationAgent, conversationLink, conversationTitle, mixesAgents, orderConversations } from "./SessionSidebar";
+import { CloudOrganizations } from "./CloudOrganizations";
 
 const canon = (path: string) => path.replace(/\/+$/, "");
 
@@ -102,6 +103,7 @@ export function ChatListSidebar({ onHide, onOpenSettings, onOpenAccount, onSearc
             ))}
           </ul>
         )}
+        <CloudOrganizations />
       </nav>
 
       <div className="flex shrink-0 items-center gap-1 border-t border-hairline px-2 pb-2 pt-1" data-testid="sidebar-account-row">
