@@ -46,6 +46,8 @@ mod cloud_remote;
 #[cfg(feature = "desktop")]
 mod agent_local_login;
 #[cfg(feature = "desktop")]
+mod codex_device_login;
+#[cfg(feature = "desktop")]
 mod cloud_workspaces;
 #[cfg(feature = "desktop")]
 mod organization_github_app;
@@ -230,6 +232,9 @@ pub fn run() {
         .manage(cloud_remote.clone())
         .manage(cloud_agents)
         .setup(move |app| {
+            // A Codex sign-in home left by an app that crashed or was force-quit (PRO-79).
+            #[cfg(feature = "desktop")]
+            std::thread::spawn(|| codex_device_login::sweep_stale(&codex_device_login::homes_parent()));
             // Attachments are shown from the data folder, wherever
             // TERMINALX_HOME put it; the scope in tauri.conf.json only names
             // the default one.
@@ -411,6 +416,10 @@ pub fn run() {
             commands::cloud_agent_claude_login_open,
             commands::cloud_agent_claude_login_complete,
             commands::cloud_agent_claude_login_cancel,
+            commands::cloud_agent_codex_login_start,
+            commands::cloud_agent_codex_login_open,
+            commands::cloud_agent_codex_login_status,
+            commands::cloud_agent_codex_login_cancel,
             commands::cloud_workspace_setup,
             commands::cloud_workspace_quote,
             commands::cloud_workspace_create,
@@ -751,6 +760,9 @@ pub fn run() {
                 }
             }
             if matches!(event, tauri::RunEvent::Exit) {
+                // A Codex sign-in still open: its CLI is killed and its home wiped before the app goes.
+                #[cfg(feature = "desktop")]
+                commands::shutdown_codex_sign_in();
                 let state = app.state::<AppState>();
                 state.stats_usage.shutdown();
                 // Cmd+Q and `relaunch()` end the run loop without necessarily

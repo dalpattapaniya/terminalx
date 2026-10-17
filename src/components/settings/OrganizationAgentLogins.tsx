@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, RefreshCw } from "@/icons";
+import { ExternalLink, Loader2, RefreshCw } from "@/icons";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { onOpenAgentLogins, takeAgentLoginsRequest } from "@/lib/settingsLinks";
-import { api, type AgentLogin, type AgentLoginConsent, type AgentLoginProvider, type AgentLoginSource, type ClaudeLoginOutcome } from "@/lib/api";
+import { api, type AgentLogin, type AgentLoginConsent, type AgentLoginProvider, type AgentLoginSource, type ClaudeLoginOutcome, type CodexLoginStatus } from "@/lib/api";
 
 /**
  * Agent logins for the organization's cloud workspaces (PRO-79): which
@@ -14,12 +15,16 @@ import { api, type AgentLogin, type AgentLoginConsent, type AgentLoginProvider, 
  * A login is never typed into or shown by this page: an API key goes into a
  * native secure dialog, and "use this Mac's login" is read by the app, both
  * after the consent below. Once stored it is never shown again.
+ *
+ * "Log in with ChatGPT" runs Codex's own device-code login on this Mac, in a
+ * throwaway home: the one-time code it prints is shown in a dialog here (and
+ * nowhere else), and the login it writes is stored by the app, never here.
  */
 const AGENTS: { id: AgentLoginProvider; name: string; local: string | null; signIn?: string; launch: string }[] = [
   // Claude has the account service's own sign-in ("Log in with Claude"): the lasting way, and so the first one offered.
   { id: "claude", name: "Claude Code", local: "Claude Code", signIn: "Claude", launch: "claude" },
-  // Codex's own login cannot be used without its refresh token, which must not leave this Mac: no local option.
-  { id: "codex", name: "Codex", local: null, launch: "codex" },
+  // Codex: its own device-code login, run here in a throwaway home; lending this Mac's sign-in is the second choice.
+  { id: "codex", name: "Codex", local: "Codex", signIn: "ChatGPT", launch: "codex" },
   // `launch` is the agent as a workspace starts it, which is how the create check names it.
   { id: "cursor", name: "Cursor", local: null, launch: "cursor-agent" },
 ];
@@ -44,6 +49,50 @@ interface SignIn {
   consent: AgentLoginConsent;
   /** Someone stored a login for the agent after this sign-in began: finishing it needs the replace choice made now. */
   replaceAsked?: boolean;
+}
+
+/** A Codex sign-in that has begun: its code, what the person agreed to, and how it is going. */
+export interface CodexSignIn {
+  attemptId: string;
+  /** Shown in the sign-in dialog and nowhere else. */
+  userCode: string;
+  verificationUrl: string;
+  expiresInSeconds: number;
+  consent: AgentLoginConsent;
+  /** `unconfirmed`: the login was sent once and the service did not confirm it; it is not sent again. */
+  state: "waiting" | "complete" | "expired" | "cancelled" | "failed" | "unconfirmed";
+  /** Counts the checks so far; each answer schedules the next. */
+  checks: number;
+  /** Someone stored a login for Codex after this sign-in began: storing it needs the replace choice made now. */
+  replaceAsked?: boolean;
+  /** A passing problem, or why it ended. */
+  detail?: string;
+  credential?: AgentLogin;
+}
+
+/** How long between checks on a Codex sign-in. */
+export const CODEX_CHECK_MS = 2000;
+
+/** The live status line of the Codex sign-in dialog. */
+export function codexSignInLine(signIn: Pick<CodexSignIn, "state" | "credential" | "replaceAsked" | "consent">): { text: string; warn: boolean } {
+  switch (signIn.state) {
+    case "waiting":
+      return signIn.replaceAsked && !signIn.consent.replaceExisting
+        ? { text: "Waiting for your choice below before the login is stored.", warn: true }
+        : { text: "Waiting for you to sign in to ChatGPT and enter the code…", warn: false };
+    case "complete": {
+      const who = signIn.credential?.displayIdentity ? ` as ${signIn.credential.displayIdentity}` : "";
+      return { text: `Signed in${who}. ${connectedNotice("Codex", signIn.credential)} The account service keeps this login and renews it.`, warn: false };
+    }
+    case "expired":
+      return { text: "This code expired before the sign-in was finished. Nothing was stored. Get a new code to try again.", warn: true };
+    case "cancelled":
+      return { text: "Sign-in cancelled. Nothing was stored.", warn: false };
+    case "unconfirmed":
+      return { text: "The account service did not confirm storing this login. Refresh to see whether Codex is connected; if it is not, get a new code.", warn: true };
+    default:
+      return { text: "Codex could not finish the sign-in. Nothing was stored. Get a new code to try again.", warn: true };
+  }
 }
 
 const MANAGERS_ONLY = "only workspaces that nobody but owners and admins can drive";
@@ -107,7 +156,7 @@ export function signInOutcome(outcome: ClaudeLoginOutcome): { done: boolean; ove
   }
 }
 
-export function agentLoginMessage(error: unknown): string {
+export function agentLoginMessage(error: unknown, agent?: AgentLoginProvider): string {
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
   switch (code) {
     case "organization_admin_required":
@@ -126,7 +175,15 @@ export function agentLoginMessage(error: unknown): string {
     case "cloud_agent_local_login_invalid":
       return "The login found on this Mac is not one the service can use. Sign in again with the agent's own CLI, or use an API key.";
     case "cloud_agent_local_login_expired":
-      return "The Claude Code sign-in on this Mac has expired or is about to. Run claude once so it renews, then try again.";
+      return agent === "codex"
+        ? "The Codex sign-in on this Mac has expired or is about to. Run codex once so it renews, then try again."
+        : "The Claude Code sign-in on this Mac has expired or is about to. Run claude once so it renews, then try again.";
+    case "cloud_agent_codex_cli_missing":
+      return "Codex is not installed on this Mac, so its sign-in cannot run here. Install Codex, or connect with an API key.";
+    case "cloud_agent_codex_cli_untrusted":
+      return "The codex found on this Mac, or the node it runs on, could be changed by another account on it (it, or its folder, is writable by others), so it was not run. Fix the permissions, or connect with an API key.";
+    case "cloud_agent_codex_login_unavailable":
+      return "Codex could not start a sign-in just now; it needs to reach OpenAI. Nothing was stored; try again in a moment.";
     case "cloud_agent_local_login_cancelled":
       return "Canceled in the confirmation. Nothing was sent.";
     case "cloud_agent_login_flow_unavailable":
@@ -197,6 +254,131 @@ export function agentLoginConfigurerLeft(login: AgentLogin | undefined): boolean
   return login?.configurerLeft === true && login.state === "connected";
 }
 
+/**
+ * The Codex sign-in: the one-time code, large and copyable, the button that
+ * opens OpenAI's page and copies the code, and a status line that follows
+ * the sign-in. The code is shown here and nowhere else.
+ */
+export function CodexSignInDialog({
+  signIn,
+  busy,
+  onOpenPage,
+  onCancel,
+  onRestart,
+  onClose,
+  onReplace,
+}: {
+  signIn: CodexSignIn;
+  busy: boolean;
+  onOpenPage: () => void;
+  onCancel: () => void;
+  onRestart: () => void;
+  onClose: () => void;
+  onReplace: (replace: boolean) => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const waiting = signIn.state === "waiting";
+  const line = codexSignInLine(signIn);
+  const copy = () =>
+    void navigator.clipboard?.writeText(signIn.userCode).then(
+      () => setCopied(true),
+      () => setCopied(false),
+    );
+  return (
+    <Dialog open onOpenChange={(open) => !open && (waiting ? onCancel() : onClose())}>
+      <DialogContent width="max-w-[28rem]" showClose={false} data-testid="codex-sign-in">
+        <DialogHeader>
+          <DialogTitle>Log in with ChatGPT</DialogTitle>
+          <DialogDescription>
+            {waiting
+              ? `Open OpenAI's page, sign in to ChatGPT and enter this code. It works for ${Math.round(signIn.expiresInSeconds / 60)} minutes. Enter it only because you started this sign-in here; if someone else gave you a code, cancel.`
+              : "Codex's own sign-in, run on this Mac for this organization's cloud workspaces."}
+          </DialogDescription>
+        </DialogHeader>
+        {waiting && (
+          <div className="flex flex-col items-center gap-3">
+            <output
+              aria-label="One-time code"
+              className="select-all rounded-lg bg-well px-4 py-3 font-mono text-3xl font-semibold tracking-widest"
+              data-testid="codex-sign-in-code"
+            >
+              {signIn.userCode}
+            </output>
+            <div className="flex flex-wrap justify-center gap-1.5">
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => {
+                  copy();
+                  onOpenPage();
+                }}
+              >
+                Open the ChatGPT page and copy the code
+              </Button>
+              <Button size="sm" variant="outline" onClick={copy}>
+                {copied ? "Copied" : "Copy code"}
+              </Button>
+            </div>
+            {/* Where the code goes, as the CLI printed it: visible, and there to open again if the browser tab was closed. */}
+            <p className="text-xs text-muted-foreground" data-testid="codex-sign-in-page">
+              Enter the code at{" "}
+              <a
+                href={signIn.verificationUrl}
+                className="inline-flex items-center gap-1 break-all text-foreground underline underline-offset-2"
+                onClick={(event) => {
+                  // Never in this window: the app opens it in the default browser.
+                  event.preventDefault();
+                  onOpenPage();
+                }}
+              >
+                {signIn.verificationUrl}
+                <ExternalLink aria-hidden className="size-3 shrink-0" />
+              </a>
+            </p>
+          </div>
+        )}
+        {signIn.replaceAsked && waiting && (
+          <label className="mt-3 flex items-start gap-2 rounded-md border border-destructive/25 p-2 text-xs" data-testid="agent-login-replace">
+            <input type="checkbox" checked={signIn.consent.replaceExisting} disabled={busy} onChange={(event) => onReplace(event.target.checked)} />
+            <span>
+              <strong>Replace the login now stored for Codex.</strong> It was stored after this sign-in began. The organization has one login per
+              agent, so finishing this sign-in removes it.
+            </span>
+          </label>
+        )}
+        <p role="status" aria-live="polite" className={`mt-3 text-xs ${line.warn ? "text-warning" : "text-muted-foreground"}`} data-testid="codex-sign-in-status">
+          {waiting && !signIn.replaceAsked && <Loader2 className="mr-1.5 inline size-3.5 animate-spin" />}
+          {line.text}
+        </p>
+        {signIn.detail && (
+          <p role="alert" className="mt-1 text-xs text-destructive">
+            {signIn.detail}
+          </p>
+        )}
+        <DialogFooter>
+          {waiting ? (
+            <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+              Cancel
+            </Button>
+          ) : (
+            <>
+              {signIn.state !== "complete" && (
+                <Button size="sm" disabled={busy} onClick={onRestart}>
+                  {busy && <Loader2 className="animate-spin" />}
+                  Get a new code
+                </Button>
+              )}
+              <Button size="sm" variant={signIn.state === "complete" ? "default" : "ghost"} disabled={busy} onClick={onClose}>
+                {signIn.state === "complete" ? "Done" : "Close"}
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function OrganizationAgentLogins({ contextRevision, organizationName }: { contextRevision: string; organizationName?: string | null }) {
   const organization = organizationName?.trim() || "this organization";
   const [logins, setLogins] = useState<AgentLogin[] | null>(null);
@@ -211,6 +393,7 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
   const [machines, setMachines] = useState(false);
   const [replace, setReplace] = useState(false);
   const [signIn, setSignIn] = useState<SignIn | null>(null);
+  const [codex, setCodex] = useState<CodexSignIn | null>(null);
   // An expiry shown as "in 3 h" is re-read every minute, so it turns to Expired without a refresh.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -346,7 +529,102 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
     setBusy(false);
   };
 
-  const run = async <T,>(action: () => Promise<T>, done: string | ((result: T) => string)) => {
+  /** Begin "Log in with ChatGPT": Codex's own sign-in starts on this Mac and its code is shown in the dialog. */
+  const startCodexSignIn = async (consent: AgentLoginConsent) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const started = await api.cloudAgentCodexLoginStart(consent);
+      setCodex({ ...started, consent, state: "waiting", checks: 0 });
+    } catch (failure) {
+      const message = agentLoginMessage(failure, "codex");
+      // A new code asked for from the dialog says why there is none in the dialog; the first one, on the page.
+      setCodex((current) => (current ? { ...current, detail: message } : current));
+      if (!codex) setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyCodexStatus = useCallback(
+    (attemptId: string, result: CodexLoginStatus) => {
+      const over = ["complete", "expired", "cancelled", "failed", "unconfirmed"] as const;
+      const state: CodexSignIn["state"] = over.find((status) => status === result.status) ?? "waiting";
+      const detail = state === "unconfirmed" && result.errorCode ? agentLoginMessage({ code: result.errorCode }, "codex") : undefined;
+      setCodex((current) =>
+        current?.attemptId === attemptId ? { ...current, state, checks: current.checks + 1, detail, credential: result.credential } : current,
+      );
+      if (state === "unconfirmed") void load();
+      if (state === "complete") {
+        setPending(null);
+        void load().then(() => setNotice(`${connectedNotice("Codex", result.credential)} The account service keeps this login and renews it.`));
+      }
+    },
+    [load],
+  );
+
+  // While the code is shown, ask how the sign-in is going; once Codex has finished, that stores the login.
+  useEffect(() => {
+    if (!codex || codex.state !== "waiting" || (codex.replaceAsked && !codex.consent.replaceExisting)) return;
+    let stopped = false;
+    const { attemptId, consent } = codex;
+    const timer = setTimeout(() => {
+      api.cloudAgentCodexLoginStatus(attemptId, consent).then(
+        (result) => {
+          if (!stopped) applyCodexStatus(attemptId, result);
+        },
+        (failure: unknown) => {
+          if (stopped) return;
+          const code = failure && typeof failure === "object" && "code" in failure ? String(failure.code) : "";
+          setCodex((current) => {
+            if (current?.attemptId !== attemptId) return current;
+            if (code === "cloud_agent_login_replace_unconfirmed") {
+              // A login was stored for Codex while the code was shown. The sign-in stays; the choice is asked for here.
+              return { ...current, replaceAsked: true, checks: current.checks + 1, detail: "A login was stored for Codex after you started. Choose to replace it below, or cancel. Nothing was changed." };
+            }
+            if (code === "cloud_agent_login_attempt_gone" || code === "account_context_changed") {
+              return { ...current, state: "failed", detail: agentLoginMessage(failure, "codex") };
+            }
+            // Anything else may pass: say so, and check again.
+            return { ...current, checks: current.checks + 1, detail: agentLoginMessage(failure, "codex") };
+          });
+          if (code === "cloud_agent_login_replace_unconfirmed") void load();
+        },
+      );
+    }, CODEX_CHECK_MS);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [codex, applyCodexStatus, load]);
+
+  // Leaving Settings with a code shown cancels the sign-in: Codex is stopped on this Mac and its home wiped.
+  const openCodex = useRef<string | null>(null);
+  openCodex.current = codex?.state === "waiting" ? codex.attemptId : null;
+  useEffect(
+    () => () => {
+      if (openCodex.current) void api.cloudAgentCodexLoginCancel(openCodex.current).catch(() => undefined);
+    },
+    [],
+  );
+
+  const cancelCodexSignIn = async () => {
+    if (!codex) return;
+    const { attemptId } = codex;
+    // The CLI is stopped and its throwaway home wiped on this Mac; nothing was stored.
+    await api.cloudAgentCodexLoginCancel(attemptId).catch(() => undefined);
+    setCodex((current) => (current?.attemptId === attemptId ? { ...current, state: "cancelled", detail: undefined } : current));
+  };
+
+  const closeCodexSignIn = () => {
+    const done = codex?.state === "complete";
+    setCodex(null);
+    if (done) setPending(null);
+  };
+
+  const run = async <T,>(action: () => Promise<T>, done: string | ((result: T) => string), agent?: AgentLoginProvider) => {
     if (busy) return;
     setBusy(true);
     setError(null);
@@ -357,7 +635,7 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
       await load();
       setNotice(typeof done === "string" ? done : done(result));
     } catch (failure) {
-      setError(agentLoginMessage(failure));
+      setError(agentLoginMessage(failure, agent));
       await load();
     } finally {
       setBusy(false);
@@ -436,20 +714,20 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
                     </div>
                     <div className="flex flex-wrap gap-1.5">
                       {agent.signIn && (
-                        <Button size="xs" disabled={busy || !!signIn} onClick={() => choose({ agent: agent.id, source: "sign-in" })}>
+                        <Button size="xs" disabled={busy || !!signIn || !!codex} onClick={() => choose({ agent: agent.id, source: "sign-in" })}>
                           {stored ? `Replace by logging in with ${agent.signIn}` : `Log in with ${agent.signIn}`}
                         </Button>
                       )}
-                      <Button size="xs" variant="outline" disabled={busy || !!signIn} onClick={() => choose({ agent: agent.id, source: "api-key" })}>
+                      <Button size="xs" variant="outline" disabled={busy || !!signIn || !!codex} onClick={() => choose({ agent: agent.id, source: "api-key" })}>
                         {stored ? "Replace with an API key" : "Connect with an API key"}
                       </Button>
                       {agent.local && (
-                        <Button size="xs" variant="outline" disabled={busy || !!signIn} onClick={() => choose({ agent: agent.id, source: "local-login" })}>
+                        <Button size="xs" variant="outline" disabled={busy || !!signIn || !!codex} onClick={() => choose({ agent: agent.id, source: "local-login" })}>
                           {stored ? `Replace with this Mac's ${agent.local} sign-in (temporary)` : `Lend this Mac's ${agent.local} sign-in (temporary)`}
                         </Button>
                       )}
                       {stored && (
-                        <Button size="xs" variant="ghost" disabled={busy || !!signIn} onClick={() => choose({ agent: agent.id, source: "disconnect" })}>
+                        <Button size="xs" variant="ghost" disabled={busy || !!signIn || !!codex} onClick={() => choose({ agent: agent.id, source: "disconnect" })}>
                           Disconnect
                         </Button>
                       )}
@@ -491,10 +769,12 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
                     </div>
                   )}
 
-                  {open && open.source !== "disconnect" && !(open.source === "sign-in" && signIn) && (
+                  {open && open.source !== "disconnect" && !(open.source === "sign-in" && (signIn || codex)) && (
                     <div className="mt-2 space-y-2 rounded-md border border-hairline bg-background p-2" data-testid="agent-login-consent">
                       <p>
-                        {open.source === "sign-in"
+                        {open.source === "sign-in" && agent.id === "codex"
+                          ? `Codex's own sign-in runs on this Mac in a separate, temporary home, so the Codex login you use here is not touched. TerminalX shows a one-time code; you sign in to ChatGPT in your browser, enter the code and approve access for ${organization}. The login Codex receives goes to the account service, which stores it encrypted and keeps it working, and the temporary home is deleted. It is your own subscription: usage in these workspaces counts against it. If you later leave the organization, the login stays until an owner or admin disconnects it.`
+                          : open.source === "sign-in"
                           ? `You sign in to Claude in your browser and approve access for ${organization}. The account service receives a login it can renew, stores it encrypted and keeps it working; nothing is read from this Mac. It is your own subscription: usage in these workspaces counts against it. If you later leave the organization, the login stays until an owner or admin disconnects it.`
                           : open.source === "local-login"
                           ? `TerminalX will read the ${agent.name} sign-in on this Mac and lend its short-lived access token to ${organization}. The refresh token stays on this Mac, so what is uploaded cannot be renewed: it stops working when it expires, usually within hours, and has to be lent again. Before anything is sent, a confirmation from the app names the organization, the account and the expiry. It is your own subscription: usage in these workspaces counts against it.`
@@ -536,7 +816,9 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
                           size="xs"
                           disabled={busy || !sharing || !machines || (stored && !replace)}
                           onClick={() =>
-                            open.source === "sign-in"
+                            open.source === "sign-in" && agent.id === "codex"
+                              ? void startCodexSignIn({ contextRevision, organizationSharing: sharing, machineInstallation: machines, replaceExisting: stored && replace })
+                              : open.source === "sign-in"
                               ? void startSignIn(stored)
                               : void run(
                               () =>
@@ -547,11 +829,12 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
                                   replaceExisting: stored && replace,
                                 }),
                               (saved) => connectedNotice(agent.name, saved),
+                              agent.id,
                             )
                           }
                         >
                           {busy && <Loader2 className="animate-spin" />}
-                          {open.source === "sign-in" ? "Open Claude to sign in" : open.source === "local-login" ? "Read this Mac's sign-in and confirm" : "Enter the key"}
+                          {open.source === "sign-in" ? (agent.id === "codex" ? "Get a code to sign in with ChatGPT" : "Open Claude to sign in") : open.source === "local-login" ? "Read this Mac's sign-in and confirm" : "Enter the key"}
                         </Button>
                         <Button size="xs" variant="ghost" disabled={busy} onClick={() => choose(null)}>
                           Cancel
@@ -589,6 +872,20 @@ export function OrganizationAgentLogins({ contextRevision, organizationName }: {
             })}
           </ul>
         )
+      )}
+
+      {codex && (
+        <CodexSignInDialog
+          signIn={codex}
+          busy={busy}
+          onOpenPage={() =>
+            void api.cloudAgentCodexLoginOpen(codex.attemptId).catch((failure: unknown) => setCodex((current) => (current ? { ...current, detail: agentLoginMessage(failure, "codex") } : current)))
+          }
+          onCancel={() => void cancelCodexSignIn()}
+          onRestart={() => void startCodexSignIn(codex.consent)}
+          onClose={closeCodexSignIn}
+          onReplace={(replaceExisting) => setCodex((current) => (current ? { ...current, consent: { ...current.consent, replaceExisting } } : current))}
+        />
       )}
 
       {notice && !error && (

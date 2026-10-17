@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, type AgentLogin } from "@/lib/api";
 import { openAgentLogins } from "@/lib/settingsLinks";
-import { agentLoginConfigurerLeft, agentLoginReach, agentLoginStatus, connectedNotice, lentUntil, OrganizationAgentLogins, signInOutcome } from "./OrganizationAgentLogins";
+import { agentLoginConfigurerLeft, agentLoginMessage, agentLoginReach, agentLoginStatus, codexSignInLine, connectedNotice, lentUntil, OrganizationAgentLogins, signInOutcome } from "./OrganizationAgentLogins";
 
 vi.mock("@/lib/api", () => ({
   api: {
@@ -13,6 +13,10 @@ vi.mock("@/lib/api", () => ({
     cloudAgentClaudeLoginOpen: vi.fn(),
     cloudAgentClaudeLoginComplete: vi.fn(),
     cloudAgentClaudeLoginCancel: vi.fn(),
+    cloudAgentCodexLoginStart: vi.fn(),
+    cloudAgentCodexLoginOpen: vi.fn(),
+    cloudAgentCodexLoginStatus: vi.fn(),
+    cloudAgentCodexLoginCancel: vi.fn(),
     cloudWorkspacePreflight: vi.fn(),
   },
 }));
@@ -40,9 +44,9 @@ describe("agent logins in Settings (PRO-79)", () => {
     expect(within(row("claude")).getByTestId("agent-login-status").textContent).toMatch(/^Connected · subscription login · ada@example\.com · updated /);
     expect(within(row("codex")).getByTestId("agent-login-status").textContent).toMatch(/^Revoked \(API key\)/);
     expect(within(row("cursor")).getByTestId("agent-login-status").textContent).toBe("Not connected");
-    // Only Claude Code's sign-in can be lent from this Mac (Codex's cannot be used without its refresh token).
+    // Claude Code's and Codex's sign-ins can be lent from this Mac; Cursor has none to lend.
     expect(within(row("cursor")).queryByRole("button", { name: /this Mac/ })).toBeNull();
-    expect(within(row("codex")).queryByRole("button", { name: /this Mac/ })).toBeNull();
+    expect(within(row("codex")).getByRole("button", { name: "Replace with this Mac's Codex sign-in (temporary)" })).toBeTruthy();
     // A stored login is replaced, and the button says so.
     expect(within(row("claude")).getByRole("button", { name: "Replace with this Mac's Claude Code sign-in (temporary)" })).toBeTruthy();
     expect(within(row("cursor")).queryByRole("button", { name: "Disconnect" })).toBeNull();
@@ -159,6 +163,10 @@ describe("agent logins in Settings (PRO-79)", () => {
     );
     expect(within(row("claude")).getByTestId("agent-login-status").textContent).toMatch(/^Connected · subscription login · ada@example\.com/);
     expect(within(row("codex")).queryByTestId("agent-login-configurer-left")).toBeNull();
+    cleanup();
+    stored = [login({ provider: "codex", displayIdentity: "ada@example.com", configurerLeft: true })];
+    await show();
+    expect(within(row("codex")).getByTestId("agent-login-configurer-left").textContent).toContain("To take it over, log in with ChatGPT again: that replaces it with a login of your own.");
     expect(agentLoginConfigurerLeft(login({ configurerLeft: true }))).toBe(true);
     // Only a working login is flagged, and only on the service's word.
     expect(agentLoginConfigurerLeft(login({ configurerLeft: true, state: "revoked" }))).toBe(false);
@@ -346,7 +354,7 @@ describe("agent logins in Settings (PRO-79)", () => {
       await show();
       const labels = within(row("claude")).getAllByRole("button").map((button) => button.textContent);
       expect(labels).toEqual(["Log in with Claude", "Connect with an API key", "Lend this Mac's Claude Code sign-in (temporary)"]);
-      expect(within(row("codex")).queryByRole("button", { name: /Log in with/ })).toBeNull();
+      // Codex has its own, "Log in with ChatGPT"; Cursor has none.
       expect(within(row("cursor")).queryByRole("button", { name: /Log in with/ })).toBeNull();
     });
 
@@ -470,6 +478,192 @@ describe("agent logins in Settings (PRO-79)", () => {
         expect(result).toMatchObject({ done: false, over: true });
         expect(result.text).not.toContain("something-new");
       }
+    });
+  });
+
+  // The owner's design: Codex's own device-code login, run on this Mac in a throwaway home, its code shown in one dialog.
+  describe("Log in with ChatGPT (Codex)", () => {
+    const started = { attemptId: "codex-login-1", userCode: "WXYZ-12345", verificationUrl: "https://auth.openai.com/codex/device", expiresInSeconds: 900 };
+    const writeText = vi.fn();
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      writeText.mockReset().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      vi.mocked(api.cloudAgentCodexLoginStart).mockResolvedValue(started);
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValue({ status: "waiting" });
+      vi.mocked(api.cloudAgentCodexLoginOpen).mockResolvedValue(undefined);
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockResolvedValue(undefined);
+    });
+    afterEach(() => vi.useRealTimers());
+    const begin = async () => {
+      await show();
+      fireEvent.click(within(row("codex")).getByRole("button", { name: "Log in with ChatGPT" }));
+      const panel = within(row("codex")).getByTestId("agent-login-consent");
+      const go = within(panel).getByRole("button", { name: "Get a code to sign in with ChatGPT" });
+      expect(go.hasAttribute("disabled")).toBe(true);
+      consent(panel.parentElement!.querySelector('[data-testid="agent-login-consent"]') as HTMLElement);
+      fireEvent.click(go);
+      return within(await screen.findByTestId("codex-sign-in"));
+    };
+    const check = () => vi.advanceTimersByTimeAsync(2000);
+    const status = () => screen.getByTestId("codex-sign-in-status").textContent;
+
+    it("is the first way for Codex, with the lend of this Mac's sign-in as the second choice", async () => {
+      await show();
+      const labels = within(row("codex")).getAllByRole("button").map((button) => button.textContent);
+      expect(labels).toEqual(["Log in with ChatGPT", "Connect with an API key", "Lend this Mac's Codex sign-in (temporary)"]);
+      fireEvent.click(within(row("codex")).getByRole("button", { name: "Log in with ChatGPT" }));
+      const panel = within(row("codex")).getByTestId("agent-login-consent");
+      expect(panel.textContent).toContain("runs on this Mac in a separate, temporary home, so the Codex login you use here is not touched");
+      expect(panel.textContent).toContain("approve access for Acme Robotics");
+      expect(panel.textContent).toContain("It is your own subscription");
+      expect(panel.textContent).toContain("the login stays until an owner or admin disconnects it");
+      expect(panel.textContent).toContain("Disconnecting does not sign you out at the provider");
+    });
+
+    it("shows the code large and copyable, opens OpenAI's page with it copied, and stores the login once Codex has it", async () => {
+      const dialog = await begin();
+      expect(api.cloudAgentCodexLoginStart).toHaveBeenCalledWith({ contextRevision: "org-revision", organizationSharing: true, machineInstallation: true, replaceExisting: false });
+      expect(dialog.getByTestId("codex-sign-in-code").textContent).toBe("WXYZ-12345");
+      expect(status()).toBe("Waiting for you to sign in to ChatGPT and enter the code…");
+      fireEvent.click(dialog.getByRole("button", { name: "Open the ChatGPT page and copy the code" }));
+      expect(writeText).toHaveBeenCalledWith("WXYZ-12345");
+      expect(api.cloudAgentCodexLoginOpen).toHaveBeenCalledWith("codex-login-1");
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenCalledTimes(1);
+      expect(status()).toContain("Waiting");
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockImplementation(async () => {
+        stored = [login({ provider: "codex", displayIdentity: "ada@example.com" })];
+        return { status: "complete", credential: stored[0] };
+      });
+      await check();
+      await waitFor(() => expect(status()).toBe("Signed in as ada@example.com. Codex is connected for this organization's cloud workspaces. The account service keeps this login and renews it."));
+      await waitFor(() => expect(within(row("codex")).getByTestId("agent-login-status").textContent).toMatch(/^Connected · subscription login · ada@example\.com/));
+      // The code went to the clipboard and the dialog only: never to the app's other calls.
+      for (const call of [...vi.mocked(api.cloudAgentCodexLoginStatus).mock.calls, ...vi.mocked(api.cloudAgentCodexLoginOpen).mock.calls]) {
+        expect(JSON.stringify(call)).not.toContain("WXYZ-12345");
+      }
+      expect(row("codex").textContent).not.toContain("WXYZ-12345");
+      fireEvent.click(dialog.getByRole("button", { name: "Done" }));
+      await waitFor(() => expect(screen.queryByTestId("codex-sign-in")).toBeNull());
+      expect(screen.getByTestId("agent-logins-notice").textContent).toContain("Codex is connected");
+      // No more checks once it is over.
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenCalledTimes(2);
+    });
+
+    it("shows the page the CLI printed as a link that opens in the browser", async () => {
+      vi.mocked(api.cloudAgentCodexLoginStart).mockResolvedValue({ ...started, verificationUrl: "https://auth.openai.com/codex/device?from=cli-output" });
+      const dialog = await begin();
+      const line = dialog.getByTestId("codex-sign-in-page");
+      expect(line.textContent).toBe("Enter the code at https://auth.openai.com/codex/device?from=cli-output");
+      const link = within(line).getByRole("link", { name: "https://auth.openai.com/codex/device?from=cli-output" });
+      expect(link.getAttribute("href")).toBe("https://auth.openai.com/codex/device?from=cli-output");
+      // A click opens it through the app (the default browser), not in this window, and copies nothing.
+      const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+      link.dispatchEvent(click);
+      expect(click.defaultPrevented).toBe(true);
+      expect(api.cloudAgentCodexLoginOpen).toHaveBeenCalledWith("codex-login-1");
+      expect(writeText).not.toHaveBeenCalled();
+    });
+
+    it("says so when the code expired, and gets a new one", async () => {
+      const dialog = await begin();
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValueOnce({ status: "expired" });
+      await check();
+      await waitFor(() => expect(status()).toBe("This code expired before the sign-in was finished. Nothing was stored. Get a new code to try again."));
+      expect(dialog.queryByTestId("codex-sign-in-code")).toBeNull();
+      vi.mocked(api.cloudAgentCodexLoginStart).mockResolvedValueOnce({ ...started, attemptId: "codex-login-2", userCode: "NEWC-67890" });
+      fireEvent.click(dialog.getByRole("button", { name: "Get a new code" }));
+      await waitFor(() => expect(dialog.getByTestId("codex-sign-in-code").textContent).toBe("NEWC-67890"));
+      expect(api.cloudAgentCodexLoginStart).toHaveBeenCalledTimes(2);
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenLastCalledWith("codex-login-2", expect.objectContaining({ organizationSharing: true }));
+    });
+
+    it("cancels: Codex is stopped on this Mac and nothing is stored", async () => {
+      const dialog = await begin();
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockResolvedValue(undefined);
+      fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(status()).toBe("Sign-in cancelled. Nothing was stored."));
+      expect(api.cloudAgentCodexLoginCancel).toHaveBeenCalledWith("codex-login-1");
+      const checks = vi.mocked(api.cloudAgentCodexLoginStatus).mock.calls.length;
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenCalledTimes(checks);
+      fireEvent.click(dialog.getByRole("button", { name: "Close" }));
+      await waitFor(() => expect(screen.queryByTestId("codex-sign-in")).toBeNull());
+      expect(within(row("codex")).getByTestId("agent-login-status").textContent).toBe("Not connected");
+    });
+
+    // Security review of #483: closing Settings with a code shown left Codex running.
+    it("cancels the sign-in when Settings closes with a code shown, and not once it is over", async () => {
+      await begin();
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockResolvedValue(undefined);
+      cleanup();
+      expect(api.cloudAgentCodexLoginCancel).toHaveBeenCalledWith("codex-login-1");
+      vi.mocked(api.cloudAgentCodexLoginCancel).mockClear();
+      await begin();
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValueOnce({ status: "expired" });
+      await check();
+      await waitFor(() => expect(status()).toContain("expired"));
+      cleanup();
+      expect(api.cloudAgentCodexLoginCancel).not.toHaveBeenCalled();
+    });
+
+    it("says so when the service did not confirm storing the login, and does not send it again", async () => {
+      await begin();
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockResolvedValueOnce({ status: "unconfirmed", errorCode: "cloud_workspace_unavailable" });
+      await check();
+      await waitFor(() => expect(status()).toBe("The account service did not confirm storing this login. Refresh to see whether Codex is connected; if it is not, get a new code."));
+      expect(screen.getByTestId("codex-sign-in").textContent).toContain("Refresh to see what is stored");
+      const calls = vi.mocked(api.cloudAgentCodexLoginStatus).mock.calls.length;
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenCalledTimes(calls);
+      expect(screen.getByRole("button", { name: "Get a new code" })).toBeTruthy();
+    });
+
+    it("asks for the replace choice when a login was stored meanwhile, and waits for it", async () => {
+      const dialog = await begin();
+      vi.mocked(api.cloudAgentCodexLoginStatus).mockRejectedValueOnce({ code: "cloud_agent_login_replace_unconfirmed" });
+      await check();
+      const choice = await dialog.findByTestId("agent-login-replace");
+      expect(choice.textContent).toContain("Replace the login now stored for Codex.");
+      expect(status()).toBe("Waiting for your choice below before the login is stored.");
+      const calls = vi.mocked(api.cloudAgentCodexLoginStatus).mock.calls.length;
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenCalledTimes(calls);
+      fireEvent.click(within(choice).getByRole("checkbox"));
+      await check();
+      expect(api.cloudAgentCodexLoginStatus).toHaveBeenLastCalledWith("codex-login-1", expect.objectContaining({ replaceExisting: true }));
+    });
+
+    it("says why a sign-in could not start, and lends this Mac's Codex sign-in as the second choice", async () => {
+      vi.mocked(api.cloudAgentCodexLoginStart).mockRejectedValueOnce({ code: "cloud_agent_codex_cli_missing" });
+      await show();
+      fireEvent.click(within(row("codex")).getByRole("button", { name: "Log in with ChatGPT" }));
+      consent(within(row("codex")).getByTestId("agent-login-consent"));
+      fireEvent.click(within(row("codex")).getByRole("button", { name: "Get a code to sign in with ChatGPT" }));
+      expect((await screen.findByRole("alert")).textContent).toBe("Codex is not installed on this Mac, so its sign-in cannot run here. Install Codex, or connect with an API key.");
+      expect(screen.queryByTestId("codex-sign-in")).toBeNull();
+
+      vi.mocked(api.cloudAgentLoginConnect).mockRejectedValueOnce({ code: "cloud_agent_local_login_expired" });
+      fireEvent.click(within(row("codex")).getByRole("button", { name: "Lend this Mac's Codex sign-in (temporary)" }));
+      const panel = within(row("codex")).getByTestId("agent-login-consent");
+      expect(panel.textContent).toContain("TerminalX will read the Codex sign-in on this Mac and lend its short-lived access token to Acme Robotics");
+      consent(panel);
+      fireEvent.click(within(row("codex")).getByRole("button", { name: "Read this Mac's sign-in and confirm" }));
+      expect((await screen.findByRole("alert")).textContent).toBe("The Codex sign-in on this Mac has expired or is about to. Run codex once so it renews, then try again.");
+      expect(api.cloudAgentLoginConnect).toHaveBeenCalledWith("codex", "local-login", expect.objectContaining({ organizationSharing: true, machineInstallation: true }));
+    });
+
+    it("words every state of the sign-in", () => {
+      const consent_ = { contextRevision: "r", organizationSharing: true, machineInstallation: true, replaceExisting: false };
+      expect(codexSignInLine({ state: "failed", consent: consent_ }).text).toBe("Codex could not finish the sign-in. Nothing was stored. Get a new code to try again.");
+      expect(codexSignInLine({ state: "complete", consent: consent_, credential: login({ provider: "codex", sharedUse: "managers" }) }).text).toContain(
+        "only workspaces that nobody but owners and admins can drive",
+      );
+      expect(agentLoginMessage({ code: "cloud_agent_codex_login_unavailable" }, "codex")).toContain("it needs to reach OpenAI");
+      expect(agentLoginMessage({ code: "cloud_agent_codex_cli_untrusted" }, "codex")).toContain("or the node it runs on");
     });
   });
 });

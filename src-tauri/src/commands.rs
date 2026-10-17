@@ -643,6 +643,16 @@ pub enum AgentLoginSource {
     LocalLogin,
 }
 
+/// Whose subscription a sign-in for the agent runs on.
+fn subscription_label(provider: crate::cloud_workspaces::AgentLoginProvider) -> &'static str {
+    use crate::cloud_workspaces::AgentLoginProvider::*;
+    match provider {
+        Codex => "ChatGPT",
+        Claude => "Claude",
+        Cursor => "Cursor",
+    }
+}
+
 fn agent_label(provider: crate::cloud_workspaces::AgentLoginProvider) -> &'static str {
     use crate::cloud_workspaces::AgentLoginProvider::*;
     match provider {
@@ -671,8 +681,8 @@ pub async fn cloud_agent_login_connect(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<crate::cloud_workspaces::AgentLogin, crate::cloud_workspaces::CloudWorkspaceClientError> {
     use crate::cloud_workspaces::{AgentLoginKind, AgentLoginProvider, CloudWorkspaceClientError, RequestRisk};
-    // Only Claude Code's sign-in can be lent without its refresh token.
-    if source == AgentLoginSource::LocalLogin && provider != AgentLoginProvider::Claude {
+    // Claude Code's and Codex's sign-ins can be lent without their refresh tokens; Cursor keeps none to lend.
+    if source == AgentLoginSource::LocalLogin && provider == AgentLoginProvider::Cursor {
         return Err(CloudWorkspaceClientError::local("cloud_workspace_request_invalid", false));
     }
     static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -710,7 +720,8 @@ pub async fn cloud_agent_login_connect(
             (AgentLoginKind::ApiKey, entered.map_err(ProviderPromptError::client_error)?, None)
         }
         AgentLoginSource::LocalLogin => {
-            let read = tauri::async_runtime::spawn_blocking(crate::agent_local_login::claude)
+            let reader = if provider == AgentLoginProvider::Codex { crate::agent_local_login::codex } else { crate::agent_local_login::claude };
+            let read = tauri::async_runtime::spawn_blocking(reader)
                 .await
                 .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Read))?;
             let login = read.map_err(|error| CloudWorkspaceClientError::local(error.code(), false))?;
@@ -718,11 +729,13 @@ pub async fn cloud_agent_login_connect(
             // request: this dialog is drawn by the app itself, names the organization and the
             // account, and nothing is uploaded unless its own button is pressed. Every time.
             let expires = local_time(login.expires_at_ms);
-            let account = login.account.clone().unwrap_or_else(|| "the Claude Code account signed in on this Mac (its name is not recorded here)".into());
-            let text = local_login_confirmation(&organization, &account, &expires, replaces, &authorization.reach(AgentLoginKind::LoginDocument));
+            let agent = agent_label(provider);
+            let account = login.account.clone().unwrap_or_else(|| format!("the {agent} account signed in on this Mac (its name is not recorded here)"));
+            let text = local_login_confirmation(provider, &organization, &account, &expires, replaces, &authorization.reach(AgentLoginKind::LoginDocument));
+            let title = format!("Lend this Mac's {agent} sign-in?");
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             app.run_on_main_thread(move || {
-                let _ = sender.send(native_confirm("Lend this Mac's Claude Code sign-in?", &text, "Upload access token"));
+                let _ = sender.send(native_confirm(&title, &text, "Upload access token"));
             })
             .map_err(|_| unavailable())?;
             let confirmed = tauri::async_runtime::spawn_blocking(move || receiver.recv()).await.map_err(|_| unavailable())?.map_err(|_| unavailable())?;
@@ -736,7 +749,7 @@ pub async fn cloud_agent_login_connect(
                 return Err(CloudWorkspaceClientError::local(crate::agent_local_login::LocalLoginError::Expired.code(), false));
             }
             // The expiry travels as a time (UTC), so whoever looks at the list sees it in their own zone.
-            let identity = lent_identity(login.account.as_deref(), login.expires_at_ms);
+            let identity = lent_identity(provider, login.account.as_deref(), login.expires_at_ms);
             (AgentLoginKind::LoginDocument, login.secret, Some(identity))
         }
     };
@@ -782,13 +795,14 @@ fn dialog_text(raw: &str) -> String {
 /// What the stored login is called: whose sign-in it is, and when it stops
 /// working as a UTC time the list can read back ("… · lent until
 /// 2026-10-03T21:40:00Z").
-fn lent_identity(account: Option<&str>, expires_at_ms: i64) -> String {
+fn lent_identity(provider: crate::cloud_workspaces::AgentLoginProvider, account: Option<&str>, expires_at_ms: i64) -> String {
     use chrono::TimeZone;
     let until = match chrono::Utc.timestamp_millis_opt(expires_at_ms) {
         chrono::LocalResult::Single(at) => at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         _ => "an unknown time".into(),
     };
-    format!("{} · lent until {until}", account.unwrap_or("Claude Code on a Mac"))
+    let fallback = format!("{} on a Mac", agent_label(provider));
+    format!("{} · lent until {until}", account.unwrap_or(&fallback))
 }
 
 /// When a lent sign-in stops working, in this computer's own time.
@@ -804,6 +818,7 @@ fn local_time(at_ms: i64) -> String {
 /// which organization gets it, whose it is, what exactly leaves this Mac,
 /// who can use it, and when and how it ends.
 fn local_login_confirmation(
+    provider: crate::cloud_workspaces::AgentLoginProvider,
     organization: &str,
     account: &str,
     expires: &str,
@@ -812,20 +827,27 @@ fn local_login_confirmation(
 ) -> String {
     use crate::cloud_workspaces::AgentLoginKind;
     let reach = reach.sentence();
+    let agent = agent_label(provider);
+    let subscription = subscription_label(provider);
+    let what = match provider {
+        // Codex reads the account and plan from the ID token; it signs nothing in.
+        crate::cloud_workspaces::AgentLoginProvider::Codex => "this sign-in's short-lived access token, with its ID token (which names the account and plan),",
+        _ => "this sign-in's short-lived access token",
+    };
     let replacing = match replaces {
         Some(AgentLoginKind::ApiKey) => format!(
-            "THIS REPLACES the API key now stored for Claude Code in {organization}. The key is removed; when the lent sign-in expires, Claude Code agents in every workspace of the organization stop until a login is connected again.\n\n"
+            "THIS REPLACES the API key now stored for {agent} in {organization}. The key is removed; when the lent sign-in expires, {agent} agents in every workspace of the organization stop until a login is connected again.\n\n"
         ),
         Some(AgentLoginKind::LoginDocument) => format!(
-            "THIS REPLACES the login now stored for Claude Code in {organization}. When the lent sign-in expires, Claude Code agents in every workspace of the organization stop until a login is connected again.\n\n"
+            "THIS REPLACES the login now stored for {agent} in {organization}. When the lent sign-in expires, {agent} agents in every workspace of the organization stop until a login is connected again.\n\n"
         ),
         None => String::new(),
     };
     format!(
-        "Organization: {organization}\nAccount (as Claude Code on this Mac records it): {account}\n\n{replacing}\
-         TerminalX will upload this sign-in's short-lived access token to the account service, for agents in the cloud workspaces of {organization}. \
+        "Organization: {organization}\nAccount (as {agent} on this Mac records it): {account}\n\n{replacing}\
+         TerminalX will upload {what} to the account service, for agents in the cloud workspaces of {organization}. \
          The refresh token stays on this Mac, so this Mac's sign-in keeps working and the uploaded token cannot be renewed: it stops working on {expires}.\n\n\
-         Until then agents run on your Claude subscription. {reach} \
+         Until then agents run on your {subscription} subscription. {reach} \
          Anyone who can drive one of those workspaces can read the token off its machine.\n\n\
          To end it sooner, disconnect it in Settings: that reaches every workspace of the organization, running ones included."
     )
@@ -948,6 +970,235 @@ pub async fn cloud_agent_claude_login_cancel(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<(), crate::cloud_workspaces::CloudWorkspaceClientError> {
     cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.cancel_claude_login(&attempt_id, context_revision))
+}
+
+// "Log in with ChatGPT" for Codex (PRO-79): Codex's own device-code login,
+// run here in a throwaway home (`codex_device_login`). The code is shown in
+// the page's dialog and nowhere else; the login the CLI writes is uploaded
+// like any other and never reaches the webview.
+
+/// The one sign-in that may be open: whose organization it is for, and
+/// where its page is. Replaced (and so canceled) by a new start.
+struct CodexSignIn {
+    attempt_id: String,
+    organization_id: String,
+    verification_url: String,
+    login: crate::codex_device_login::DeviceLogin,
+}
+
+static CODEX_SIGN_IN: std::sync::Mutex<Option<CodexSignIn>> = std::sync::Mutex::new(None);
+
+/// What the dialog shows once the CLI has printed its code.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLoginStarted {
+    attempt_id: String,
+    user_code: String,
+    verification_url: String,
+    expires_in_seconds: u64,
+}
+
+/// Where a sign-in is: `waiting`, `complete` (with the stored login's public
+/// fields), `expired`, `cancelled`, `failed`, or `unconfirmed` (it was sent
+/// once and the service did not confirm storing it; it is not sent again).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLoginStatus {
+    pub(crate) status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<crate::cloud_workspaces::AgentLogin>,
+    /// `unconfirmed`: why the service did not confirm storing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+}
+
+/// The `codex` to run, and anything a debug build adds for a local
+/// stand-in issuer (`TERMINALX_DEV_CODEX_ISSUER`) or CLI (`TERMINALX_DEV_CODEX_BIN`).
+fn codex_login_program() -> Option<(std::path::PathBuf, Vec<String>)> {
+    let dev = |name: &str| if cfg!(debug_assertions) { std::env::var(name).ok().filter(|value| !value.is_empty()) } else { None };
+    let program = dev("TERMINALX_DEV_CODEX_BIN").map(std::path::PathBuf::from).or_else(|| crate::binpath::resolve("codex"))?;
+    let args = dev("TERMINALX_DEV_CODEX_ISSUER").map(|issuer| vec!["--experimental_issuer".to_string(), issuer]).unwrap_or_default();
+    Some((program, args))
+}
+
+fn codex_sign_in_gone() -> crate::cloud_workspaces::CloudWorkspaceClientError {
+    crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_agent_login_attempt_gone", false)
+}
+
+/// Begin "Log in with ChatGPT". Consent, the active organization, the
+/// owner-or-admin check and the explicit choice to replace a stored login
+/// come first, as for any other way to connect; only then does the CLI run.
+#[tauri::command]
+pub async fn cloud_agent_codex_login_start(
+    consent: crate::cloud_workspaces::AgentLoginConsent,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<CodexLoginStarted, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    use crate::cloud_workspaces::{AgentLoginProvider, CloudWorkspaceClientError, RequestRisk};
+    static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = GUARD.try_lock().map_err(|_| CloudWorkspaceClientError::local("cloud_provider_operation_in_progress", true))?;
+    let service = state.cloud_workspaces.clone();
+    let authorization = tauri::async_runtime::spawn_blocking(move || service.authorize_agent_login(AgentLoginProvider::Codex, &consent))
+        .await
+        .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Read))??;
+    // Starting again abandons the sign-in that was open, and its code.
+    drop(CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?.take());
+    let (program, args) = codex_login_program().ok_or_else(|| CloudWorkspaceClientError::local(crate::codex_device_login::DeviceLoginError::CliMissing.code(), false))?;
+    if !crate::codex_device_login::trusted_program(&program) {
+        return Err(CloudWorkspaceClientError::local(crate::codex_device_login::DeviceLoginError::CliUntrusted.code(), false));
+    }
+    // Only directories no other account can write: `codex` from npm runs whichever `node` PATH finds first.
+    let path = crate::codex_device_login::trusted_path(&crate::binpath::login_path());
+    if !crate::codex_device_login::runs_trusted(&program, &path) {
+        return Err(CloudWorkspaceClientError::local(crate::codex_device_login::DeviceLoginError::CliUntrusted.code(), false));
+    }
+    let (login, code) = tauri::async_runtime::spawn_blocking(move || crate::codex_device_login::start(&program, &args, &path, &crate::codex_device_login::homes_parent()))
+        .await
+        .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Mutation))?
+        .map_err(|error| CloudWorkspaceClientError::local(error.code(), false))?;
+    let attempt_id = format!("codex-login-{}", uuid::Uuid::new_v4());
+    let started = CodexLoginStarted {
+        attempt_id: attempt_id.clone(),
+        user_code: code.user_code.to_string(),
+        verification_url: code.verification_url.clone(),
+        expires_in_seconds: crate::codex_device_login::CODE_LIFETIME.as_secs(),
+    };
+    *CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())? =
+        Some(CodexSignIn { attempt_id, organization_id: authorization.organization_id().to_owned(), verification_url: code.verification_url, login });
+    Ok(started)
+}
+
+/// Open the sign-in's page: the one the CLI printed, whatever the webview says.
+#[tauri::command]
+pub fn cloud_agent_codex_login_open(app: AppHandle, attempt_id: String) -> Result<(), crate::cloud_workspaces::CloudWorkspaceClientError> {
+    use tauri_plugin_opener::OpenerExt;
+    let url = codex_sign_in_page(&attempt_id)?;
+    app.opener().open_url(&url, None::<&str>).map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_workspace_request_invalid", false))
+}
+
+/// The page of the open sign-in `attempt_id`, checked against OpenAI's own
+/// pages again here, whatever was stored.
+pub(crate) fn codex_sign_in_page(attempt_id: &str) -> Result<String, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    let url = {
+        let open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
+        let open = open.as_ref().filter(|open| open.attempt_id == attempt_id).ok_or_else(codex_sign_in_gone)?;
+        open.verification_url.clone()
+    };
+    if !crate::codex_device_login::verification_page(&url) {
+        return Err(crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_workspace_request_invalid", false));
+    }
+    Ok(url)
+}
+
+/// The app is quitting: the open sign-in's CLI is killed and its home
+/// wiped before this returns.
+pub(crate) fn shutdown_codex_sign_in() {
+    let held = match CODEX_SIGN_IN.lock() {
+        Ok(mut open) => open.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(held) = held {
+        held.login.shutdown();
+    }
+}
+
+/// How the sign-in is going. Once the CLI has finished, this stores its
+/// login for the organization: consent, the organization and the choice to
+/// replace are checked again first, and a login stored by someone else in
+/// the meantime needs that choice (`cloud_agent_login_replace_unconfirmed`;
+/// the sign-in stays, so it can be stored once chosen).
+#[tauri::command]
+pub async fn cloud_agent_codex_login_status(
+    attempt_id: String,
+    consent: crate::cloud_workspaces::AgentLoginConsent,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<CodexLoginStatus, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    use crate::cloud_workspaces::{CloudWorkspaceClientError, RequestRisk};
+    static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = GUARD.try_lock().map_err(|_| CloudWorkspaceClientError::local("cloud_provider_operation_in_progress", true))?;
+    let service = state.cloud_workspaces.clone();
+    tauri::async_runtime::spawn_blocking(move || codex_sign_in_status(&service, &attempt_id, &consent))
+        .await
+        .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Mutation))?
+}
+
+/// Where the open sign-in `attempt_id` is, storing its login once Codex has
+/// finished. Blocking: it may talk to the account service.
+pub(crate) fn codex_sign_in_status(
+    service: &crate::cloud_workspaces::CloudWorkspaceService,
+    attempt_id: &str,
+    consent: &crate::cloud_workspaces::AgentLoginConsent,
+) -> Result<CodexLoginStatus, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    use crate::cloud_workspaces::{AgentLoginKind, AgentLoginProvider, CloudWorkspaceClientError};
+    use crate::codex_device_login::Phase;
+    let (phase, organization_id) = {
+        let mut open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
+        let current = open.as_ref().filter(|open| open.attempt_id == attempt_id).ok_or_else(codex_sign_in_gone)?;
+        let phase = current.login.phase();
+        let organization_id = current.organization_id.clone();
+        if !matches!(phase, Phase::Waiting | Phase::SignedIn) {
+            // Over: nothing is held, and the next start begins afresh.
+            open.take();
+        }
+        (phase, organization_id)
+    };
+    match phase {
+        Phase::Waiting => return Ok(CodexLoginStatus { status: "waiting", credential: None, error_code: None }),
+        Phase::SignedIn => {}
+        over => return Ok(CodexLoginStatus { status: over.as_str(), credential: None, error_code: None }),
+    }
+    let authorization = service.authorize_agent_login(AgentLoginProvider::Codex, consent)?;
+    if authorization.organization_id() != organization_id {
+        // Signed in for one organization, now looking at another: it is stored for neither.
+        drop(CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?.take());
+        return Err(CloudWorkspaceClientError::local("account_context_changed", false));
+    }
+    // Sent at most once. Until here (a replace not yet chosen, another organization) the
+    // sign-in is kept so it can still be stored. From here it is let go whatever the answer:
+    // a PUT whose answer was lost may have been stored, and the service may since have renewed
+    // the login, so sending this copy again could put back a refresh token already spent.
+    let held = {
+        let mut open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
+        if !open.as_ref().is_some_and(|open| open.attempt_id == attempt_id) {
+            return Err(codex_sign_in_gone());
+        }
+        open.take().ok_or_else(codex_sign_in_gone)?
+    };
+    let sign_in = held.login.sign_in().ok_or_else(codex_sign_in_gone)?;
+    drop(held);
+    match service.save_agent_login(authorization, AgentLoginProvider::Codex, AgentLoginKind::LoginDocument, sign_in.secret, sign_in.account.as_deref()) {
+        Ok(stored) => Ok(CodexLoginStatus { status: "complete", credential: Some(stored), error_code: None }),
+        Err(error) => Ok(CodexLoginStatus { status: "unconfirmed", credential: None, error_code: Some(error.code) }),
+    }
+}
+
+/// Hold `login` as the open sign-in, as a start would.
+/// Tests that use the one open sign-in take this first.
+#[cfg(test)]
+pub(crate) static CODEX_SIGN_IN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn hold_codex_sign_in_for_test(attempt_id: &str, organization_id: &str, login: crate::codex_device_login::DeviceLogin) {
+    hold_codex_sign_in_at_for_test(attempt_id, organization_id, "https://auth.openai.com/codex/device", login);
+}
+
+#[cfg(test)]
+pub(crate) fn hold_codex_sign_in_at_for_test(attempt_id: &str, organization_id: &str, url: &str, login: crate::codex_device_login::DeviceLogin) {
+    *CODEX_SIGN_IN.lock().unwrap() = Some(CodexSignIn { attempt_id: attempt_id.into(), organization_id: organization_id.into(), verification_url: url.into(), login });
+}
+
+#[cfg(test)]
+pub(crate) fn codex_sign_in_held_for_test() -> bool {
+    CODEX_SIGN_IN.lock().unwrap().is_some()
+}
+
+/// Cancel the sign-in: the CLI is stopped and its home wiped. Nothing was stored.
+#[tauri::command]
+pub fn cloud_agent_codex_login_cancel(attempt_id: String) -> Result<(), crate::cloud_workspaces::CloudWorkspaceClientError> {
+    let mut open = CODEX_SIGN_IN.lock().map_err(|_| codex_sign_in_gone())?;
+    if open.as_ref().is_some_and(|open| open.attempt_id == attempt_id) {
+        open.take();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3111,22 +3362,22 @@ mod command_tests {
     // PRO-79: the app's own confirmation before a local sign-in is uploaded.
     #[test]
     fn the_local_sign_in_confirmation_names_the_organization_the_account_and_the_expiry() {
-        use crate::cloud_workspaces::{AgentLoginKind, AgentLoginReach};
+        use crate::cloud_workspaces::{AgentLoginKind, AgentLoginProvider, AgentLoginReach};
         let new = AgentLoginReach::ServiceDefault;
-        let text = super::local_login_confirmation("Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", None, &new);
+        let text = super::local_login_confirmation(AgentLoginProvider::Claude, "Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", None, &new);
         assert!(text.starts_with("Organization: Acme Robotics\nAccount (as Claude Code on this Mac records it): ada@example.com\n"));
         assert!(!text.contains("REPLACES") && !text.contains("sign out of Claude Code"));
         // Review of #293: replacing a stored login is said, in the dialog too.
-        let replacing = super::local_login_confirmation("Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", Some(AgentLoginKind::ApiKey), &new);
+        let replacing = super::local_login_confirmation(AgentLoginProvider::Claude, "Acme Robotics", "ada@example.com", "3 Oct 2026, 21:40", Some(AgentLoginKind::ApiKey), &new);
         assert!(replacing.contains("THIS REPLACES the API key now stored for Claude Code in Acme Robotics"));
         assert!(replacing.contains("agents in every workspace of the organization stop"));
-        assert!(super::local_login_confirmation("Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument), &new).contains("THIS REPLACES the login now stored"));
+        assert!(super::local_login_confirmation(AgentLoginProvider::Claude, "Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument), &new).contains("THIS REPLACES the login now stored"));
         // Review of #293: the API-key and the sign-in dialogs say it too.
         assert_eq!(super::replacement_notice("Claude Code", "Acme", Some(AgentLoginKind::ApiKey)), "THIS REPLACES the API key now stored for Claude Code in Acme.\n\n");
         assert_eq!(super::replacement_notice("Cursor", "Acme", Some(AgentLoginKind::LoginDocument)), "THIS REPLACES the login now stored for Cursor in Acme.\n\n");
         assert_eq!(super::replacement_notice("Cursor", "Acme", None), "");
         // The expiry is stored as a UTC time, and dialog text is cleaned.
-        assert_eq!(super::lent_identity(Some("ada@example.com"), 1_790_000_000_000), "ada@example.com · lent until 2026-09-21T14:13:20Z");
+        assert_eq!(super::lent_identity(AgentLoginProvider::Claude, Some("ada@example.com"), 1_790_000_000_000), "ada@example.com · lent until 2026-09-21T14:13:20Z");
         assert_eq!(super::dialog_text(" Acme\u{202E}\n Robotics "), "Acme Robotics");
         assert!(text.contains("stops working on 3 Oct 2026, 21:40"));
         assert!(text.contains("The refresh token stays on this Mac"));
@@ -3134,7 +3385,7 @@ mod command_tests {
         assert!(text.contains("By default, agents in every member's cloud workspaces of the organization may run on it"));
         // Review of #429: a login narrowed to managers keeps that scope when it is replaced, and no dialog says otherwise.
         let narrowed = AgentLoginReach::Kept("managers".into());
-        let kept = super::local_login_confirmation("Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument), &narrowed);
+        let kept = super::local_login_confirmation(AgentLoginProvider::Claude, "Acme", "a@b.c", "x", Some(AgentLoginKind::LoginDocument), &narrowed);
         assert!(kept.contains("This keeps who can use the login now: only workspaces that nobody but owners and admins can drive."));
         assert!(!kept.contains("every member"));
         let code = super::claude_code_prompt("Acme", Some(AgentLoginKind::LoginDocument), &narrowed);
@@ -3147,6 +3398,24 @@ mod command_tests {
         // #450: a running workspace does not stop a disconnect.
         assert!(text.contains("To end it sooner, disconnect it in Settings: that reaches every workspace of the organization, running ones included."));
         assert!(!text.contains("refuses while a workspace still uses the login"));
+    }
+
+    // PRO-79: lending this Mac's Codex sign-in says the same things, for Codex and ChatGPT.
+    #[test]
+    fn the_codex_lend_confirmation_says_the_same_for_codex() {
+        use crate::cloud_workspaces::{AgentLoginKind, AgentLoginProvider, AgentLoginReach};
+        let claude = super::local_login_confirmation(AgentLoginProvider::Claude, "Acme", "ada@example.com", "3 Oct 2026, 21:40", Some(AgentLoginKind::ApiKey), &AgentLoginReach::ServiceDefault);
+        let codex = super::local_login_confirmation(AgentLoginProvider::Codex, "Acme", "ada@example.com", "3 Oct 2026, 21:40", Some(AgentLoginKind::ApiKey), &AgentLoginReach::ServiceDefault);
+        assert!(codex.starts_with("Organization: Acme\nAccount (as Codex on this Mac records it): ada@example.com\n"));
+        assert!(codex.contains("THIS REPLACES the API key now stored for Codex in Acme. The key is removed; when the lent sign-in expires, Codex agents in every workspace"));
+        assert!(codex.contains("short-lived access token, with its ID token (which names the account and plan), to the account service"));
+        assert!(codex.contains("The refresh token stays on this Mac") && codex.contains("stops working on 3 Oct 2026, 21:40"));
+        assert!(codex.contains("Until then agents run on your ChatGPT subscription."));
+        assert!(!codex.contains("Claude"));
+        // Everything else is word for word the Claude Code dialog.
+        let same = |text: &str| text.replace("Claude Code", "AGENT").replace("Codex", "AGENT").replace("Claude subscription", "SUB subscription").replace("ChatGPT subscription", "SUB subscription").replace(", with its ID token (which names the account and plan),", "");
+        assert_eq!(same(&claude), same(&codex));
+        assert_eq!(super::lent_identity(AgentLoginProvider::Codex, None, 1_790_000_000_000), "Codex on a Mac · lent until 2026-09-21T14:13:20Z");
     }
     use crate::session_ops::{
         create_session_entry, new_tab_entry, notify_workspace_deleted,

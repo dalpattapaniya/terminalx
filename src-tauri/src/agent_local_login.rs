@@ -23,8 +23,15 @@
 //! `Claude Code-credentials` (or `<config dir>/.credentials.json`), and the
 //! signed-in account's address in `.claude.json`.
 //!
-//! Codex is not offered: its `auth.json` cannot be used without its refresh
-//! token, so there is nothing safe to upload from it.
+//! Codex keeps a ChatGPT sign-in in `$CODEX_HOME/auth.json` (default
+//! `~/.codex`): `tokens.{id_token, access_token, refresh_token, account_id}`.
+//! What is lent from it is the access token, the ID token (the account and
+//! plan Codex shows; it signs nothing in) and the account id, with no refresh
+//! token. A workspace's runtime writes them into Codex's own `auth.json` with
+//! an empty refresh token, so Codex runs on the lent access token until its
+//! expiry (the token's `exp`) and never tries to renew it. A login Codex
+//! keeps in the Keychain (`cli_auth_credentials_store = "keyring"`) is not
+//! read: it reads as not found.
 
 use std::path::PathBuf;
 
@@ -61,7 +68,7 @@ impl LocalLoginError {
 
 /// What is lent: the access token's document, when it stops working, and
 /// whose sign-in it is when this Mac says.
-pub struct LocalClaudeLogin {
+pub struct LocalLogin {
     pub secret: Zeroizing<String>,
     pub expires_at_ms: i64,
     pub account: Option<String>,
@@ -75,6 +82,55 @@ fn object(raw: &str) -> Result<Map<String, Value>, LocalLoginError> {
         Ok(Value::Object(map)) => Ok(map),
         _ => Err(LocalLoginError::Invalid),
     }
+}
+
+/// What a JWT says about itself, unverified: display and expiry only.
+pub(crate) fn jwt_claims(token: &str) -> Option<Map<String, Value>> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    match serde_json::from_slice::<Value>(&bytes).ok()? {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// An address fit to name an account in a dialog and on the stored login.
+fn display_address(raw: &str) -> Option<String> {
+    let address = raw.trim();
+    (address.len() <= 120 && address.contains('@') && !address.chars().any(|c| c.is_control() || c.is_whitespace())).then(|| address.to_string())
+}
+
+/// The ChatGPT account a Codex ID token names, for display.
+pub(crate) fn codex_account(id_token: &str) -> Option<String> {
+    display_address(jwt_claims(id_token)?.get("email")?.as_str()?)
+}
+
+fn non_empty<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    map.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// What may be lent from a Codex `auth.json`: the access token, the ID token
+/// and the account id, never the refresh token. Only a ChatGPT sign-in; an
+/// API key kept there is not a sign-in and is connected as an API key.
+pub fn codex_from_raw(raw: &str, now_ms: i64) -> Result<(Zeroizing<String>, i64, Option<String>), LocalLoginError> {
+    let parsed = object(raw)?;
+    let tokens = parsed.get("tokens").and_then(Value::as_object).ok_or(LocalLoginError::Invalid)?;
+    let access_token = non_empty(tokens, "access_token").ok_or(LocalLoginError::Invalid)?;
+    let id_token = non_empty(tokens, "id_token").ok_or(LocalLoginError::Invalid)?;
+    // Without an expiry nobody could be told how long it lasts.
+    let expires_at = jwt_claims(access_token).and_then(|claims| claims.get("exp").and_then(Value::as_i64)).ok_or(LocalLoginError::Invalid)? * 1000;
+    if expires_at < now_ms + MIN_REMAINING_MS {
+        return Err(LocalLoginError::Expired);
+    }
+    let mut kept = Map::new();
+    kept.insert("id_token".into(), Value::String(id_token.into()));
+    kept.insert("access_token".into(), Value::String(access_token.into()));
+    if let Some(account_id) = non_empty(tokens, "account_id") {
+        kept.insert("account_id".into(), Value::String(account_id.into()));
+    }
+    let secret = json!({ "auth_mode": "chatgpt", "tokens": kept });
+    Ok((Zeroizing::new(secret.to_string()), expires_at, codex_account(id_token)))
 }
 
 /// The access token of a Claude Code credentials document, with its expiry
@@ -107,16 +163,24 @@ pub fn still_worth_lending(expires_at_ms: i64) -> bool {
 /// and on the stored login.
 pub fn claude_account_from_raw(raw: &str) -> Option<String> {
     let parsed = object(raw).ok()?;
-    let address = parsed.get("oauthAccount")?.get("emailAddress")?.as_str()?.trim();
-    (address.len() <= 120 && address.contains('@') && !address.chars().any(|c| c.is_control() || c.is_whitespace())).then(|| address.to_string())
+    display_address(parsed.get("oauthAccount")?.get("emailAddress")?.as_str()?)
 }
 
+/// A login document, read only up to just over the largest one used: a
+/// larger file is refused as invalid without being read whole.
 fn read_file(path: PathBuf) -> Result<Zeroizing<String>, LocalLoginError> {
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => Ok(Zeroizing::new(raw)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(LocalLoginError::NotFound),
-        Err(_) => Err(LocalLoginError::Denied),
+    use std::io::Read;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(LocalLoginError::NotFound),
+        Err(_) => return Err(LocalLoginError::Denied),
+    };
+    let mut raw = Zeroizing::new(String::new());
+    file.take(MAX_LOGIN_BYTES as u64 + 1).read_to_string(&mut raw).map_err(|_| LocalLoginError::Denied)?;
+    if raw.len() > MAX_LOGIN_BYTES {
+        return Err(LocalLoginError::Invalid);
     }
+    Ok(raw)
 }
 
 fn env_dir(name: &str) -> Option<PathBuf> {
@@ -173,12 +237,12 @@ fn now_ms() -> i64 {
 }
 
 /// This computer's Claude Code sign-in, as far as it may be lent.
-pub fn claude() -> Result<LocalClaudeLogin, LocalLoginError> {
+pub fn claude() -> Result<LocalLogin, LocalLoginError> {
     let account_in = |dir: PathBuf| std::fs::read_to_string(dir.join(".claude.json")).ok().and_then(|raw| claude_account_from_raw(&raw));
     // A custom config directory never falls back to another account's Keychain item.
     if let Some(dir) = env_dir("CLAUDE_CONFIG_DIR") {
         let (secret, expires_at_ms) = claude_from_raw(&read_file(dir.join(".credentials.json"))?, now_ms())?;
-        return Ok(LocalClaudeLogin { secret, expires_at_ms, account: account_in(dir) });
+        return Ok(LocalLogin { secret, expires_at_ms, account: account_in(dir) });
     }
     let home = dirs::home_dir();
     let raw = match claude_keychain() {
@@ -187,11 +251,19 @@ pub fn claude() -> Result<LocalClaudeLogin, LocalLoginError> {
         Err(error) => return Err(error),
     };
     let (secret, expires_at_ms) = claude_from_raw(&raw, now_ms())?;
-    Ok(LocalClaudeLogin { secret, expires_at_ms, account: home.and_then(account_in) })
+    Ok(LocalLogin { secret, expires_at_ms, account: home.and_then(account_in) })
+}
+
+/// This computer's Codex sign-in, as far as it may be lent. A custom
+/// `CODEX_HOME` is where Codex itself would look, so it is read instead.
+pub fn codex() -> Result<LocalLogin, LocalLoginError> {
+    let home = env_dir("CODEX_HOME").or_else(|| dirs::home_dir().map(|home| home.join(".codex"))).ok_or(LocalLoginError::NotFound)?;
+    let (secret, expires_at_ms, account) = codex_from_raw(&read_file(home.join("auth.json"))?, now_ms())?;
+    Ok(LocalLogin { secret, expires_at_ms, account })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const NOW: i64 = 1_790_000_000_000;
@@ -253,5 +325,56 @@ mod tests {
         // A directory where the file should be cannot be read as one.
         std::fs::create_dir(dir.path().join("auth.json")).unwrap();
         assert_eq!(read_file(dir.path().join("auth.json")).err(), Some(LocalLoginError::Denied));
+        // A huge file is refused as invalid, and not read whole.
+        std::fs::write(dir.path().join("huge.json"), vec![b' '; 8 * 1024 * 1024]).unwrap();
+        assert_eq!(read_file(dir.path().join("huge.json")).err(), Some(LocalLoginError::Invalid));
+    }
+
+    pub(crate) fn jwt(claims: Value) -> String {
+        use base64::Engine;
+        let part = |value: &Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string());
+        format!("{}.{}.sig", part(&json!({ "alg": "none" })), part(&claims))
+    }
+
+    #[test]
+    fn a_codex_sign_in_is_lent_without_its_refresh_token() {
+        let access = jwt(json!({ "exp": LATER / 1000 }));
+        let id = jwt(json!({ "email": "ada@example.com", "https://api.openai.com/auth": { "chatgpt_plan_type": "plus" } }));
+        let raw = json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": { "id_token": id, "access_token": access, "refresh_token": "rt-must-stay-here", "account_id": "acct_1" },
+            "last_refresh": "2026-10-01T00:00:00Z",
+        })
+        .to_string();
+        let (secret, expires_at, account) = codex_from_raw(&raw, NOW).unwrap();
+        let kept: Value = serde_json::from_str(&secret).unwrap();
+        assert_eq!(kept, json!({ "auth_mode": "chatgpt", "tokens": { "id_token": id, "access_token": access, "account_id": "acct_1" } }));
+        assert_eq!(expires_at, LATER / 1000 * 1000);
+        assert_eq!(account.as_deref(), Some("ada@example.com"));
+        assert!(!secret.contains("rt-must-stay-here") && !secret.contains("refresh"));
+    }
+
+    #[test]
+    fn a_codex_file_that_cannot_be_lent_is_refused() {
+        let access = jwt(json!({ "exp": LATER / 1000 }));
+        let id = jwt(json!({ "email": "ada@example.com" }));
+        for raw in [
+            // An API key is not a sign-in.
+            json!({ "auth_mode": "apikey", "OPENAI_API_KEY": "sk-secret" }).to_string(),
+            json!({ "tokens": { "access_token": access, "refresh_token": "rt" } }).to_string(),
+            json!({ "tokens": { "id_token": id, "refresh_token": "rt" } }).to_string(),
+            // No readable expiry: nobody could be told how long it lasts.
+            json!({ "tokens": { "id_token": id, "access_token": "opaque", "refresh_token": "rt" } }).to_string(),
+            "nope".to_string(),
+        ] {
+            assert_eq!(codex_from_raw(&raw, NOW).err(), Some(LocalLoginError::Invalid), "{raw}");
+        }
+        let soon = jwt(json!({ "exp": (NOW + 60_000) / 1000 }));
+        let raw = json!({ "tokens": { "id_token": id, "access_token": soon } }).to_string();
+        assert_eq!(codex_from_raw(&raw, NOW).err(), Some(LocalLoginError::Expired));
+        // An ID token without a usable address names no account, and lends all the same.
+        let raw = json!({ "tokens": { "id_token": jwt(json!({ "email": "a@b.c\nUpload elsewhere" })), "access_token": access } }).to_string();
+        assert_eq!(codex_from_raw(&raw, NOW).unwrap().2, None);
     }
 }
