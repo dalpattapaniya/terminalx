@@ -778,6 +778,65 @@ describe.each(["github", "linear"] as const)("%s issue agent choices", (provider
   });
 });
 
+describe.each(["github", "linear"] as const)("the %s issue's discussion", (provider) => {
+  const comments = [
+    { id: "c1", author: { id: "alex", name: "alex", login: "alex" }, body: "Seen it on staging too.", createdAt: "2026-09-01T12:00:00Z", viewerCanEdit: false, viewerCanDelete: false },
+    { id: "c2", author: { id: "sam", name: "sam", login: "sam" }, body: "I'll take it.", createdAt: "2026-09-01T13:00:00Z", viewerCanEdit: true, viewerCanDelete: true },
+  ];
+  function withComments(answer: () => unknown) {
+    const backend = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => (command === "issue_comments" ? answer() : backend(command, args)));
+  }
+
+  it("shows the comments under the description and sends them to the agent", async () => {
+    withComments(() => ({ comments, nextCursor: null }));
+    const onCreated = vi.fn();
+    await openIssue(provider, onCreated);
+    const thread = await screen.findByRole("region", { name: "Comments" });
+    await within(thread).findByText("Seen it on staging too.");
+    expect(invoke).toHaveBeenCalledWith("issue_comments", { projectPath: "/repo", provider, id: provider === "github" ? "11" : "linear-1", cursor: null });
+    await startIssue();
+    const issue = provider === "github" ? issues[0] : linearIssues[0];
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    // The thread the pane read is the one sent: it is not read again.
+    expect(invoke.mock.calls.filter(([command]) => command === "issue_comments")).toHaveLength(1);
+    const prompt = onCreated.mock.calls[0][2] as string;
+    expect(prompt.startsWith(issuePrompt(issue, comments))).toBe(true);
+    expect(prompt).toContain("First issue body.\n\n## Comments\n\n**alex** (2026-09-01):\nSeen it on staging too.\n\n**sam** (2026-09-01):\nI'll take it.");
+  });
+
+  it("keeps the description when the comments cannot be read, and starts the session without them", async () => {
+    withComments(() => Promise.reject({ kind: "network", message: "Couldn't reach the provider. Check your connection, then try again." }));
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onCreated = vi.fn();
+    await openIssue(provider, onCreated);
+    const thread = await screen.findByRole("region", { name: "Comments" });
+    expect((await within(thread).findByRole("alert")).textContent).toContain("Couldn't reach the provider.");
+    expect(screen.getByText("First issue body.")).toBeTruthy();
+    await startIssue();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(onCreated.mock.calls[0][2]).toContain(issuePrompt(provider === "github" ? issues[0] : linearIssues[0]));
+    // With no thread on screen it is read once more, before the session is made.
+    const commands = invoke.mock.calls.map(([command]) => command);
+    expect(commands.filter((command) => command === "issue_comments")).toHaveLength(2);
+    expect(commands.lastIndexOf("issue_comments")).toBeLessThan(commands.indexOf("create_session"));
+    logged.mockRestore();
+  });
+
+  it("shows nothing of the last issue's thread while the next one's is read", async () => {
+    const backend = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command !== "issue_comments") return backend(command, args);
+      return args?.id === (provider === "github" ? "11" : "linear-1") ? { comments, nextCursor: null } : new Promise(() => undefined);
+    });
+    await openIssue(provider);
+    await screen.findByText("Seen it on staging too.");
+    fireEvent.click(screen.getByText("Repair session target"));
+    expect(screen.queryByText("Seen it on staging too.")).toBeNull();
+    expect(await screen.findByText("Loading comments…")).toBeTruthy();
+  });
+});
+
 describe("assignees", () => {
   let tracker: IssueOpsMock;
   const kim = () => tracker.viewer.github;

@@ -11,6 +11,7 @@ import { AutomationEditor, type AutomationEditorPrefill } from "@/components/aut
 import { AssigneePicker } from "@/components/issues/AssigneePicker";
 import { IssueListItem } from "@/components/issues/IssueListItem";
 import { IssuePipelinePanel } from "@/components/issues/IssuePipelinePanel";
+import { IssueCommentThread } from "@/components/issues/IssueCommentThread";
 import { IssueStatusPicker } from "@/components/issues/IssueStatusPicker";
 import { issueKey as writeKey, useIssueWrites } from "@/components/issues/issueWrites";
 import { IssueDescription, IssueLabels, IssuePriority, IssueTitle, editableIssue, useIssueEdits } from "@/components/issues/IssueFields";
@@ -23,7 +24,8 @@ import { setPrefs, usePrefs } from "@/lib/prefs";
 import { PERMISSION_MODES } from "@/lib/models";
 import { chooseMode } from "@/lib/dialogs";
 import { cn } from "@/lib/cn";
-import { issuePrompt, issueWorktreeName } from "@/lib/issueSession";
+import { issuePrompt, issuePromptWithComments, issueWorktreeName } from "@/lib/issueSession";
+import type { IssueThread } from "@/lib/issueComments";
 import type { IssueDetails } from "@/lib/issueOps";
 import { useIssueViewer } from "@/lib/issueViewer";
 import { pipelineForIssue, pipelineSettings, startPipeline, unlistedPipelines, useIssuePipelines } from "@/lib/issuePipeline";
@@ -271,12 +273,23 @@ export function IssuesView({
     };
   }, [selected, project, tick]);
 
+  // The open issue's thread as the pane last read it, for the agent's prompt; named by the issue it belongs to.
+  const thread = useRef<{ key: string; thread: IssueThread } | null>(null);
+  const threadKey = selected && project ? `${project.path}\n${selected.provider}\n${selected.id}` : null;
+  const onThread = useCallback((key: string, value: IssueThread) => {
+    thread.current = { key, thread: value };
+  }, []);
+
   const start = useCallback(async () => {
     const issue = detail ?? selected;
     if (!issue || !project || !harness) return;
     setStarting(true);
     setError(null);
     try {
+      // The discussion goes with the first prompt: the pane's thread when it was read, else read now, before the session exists.
+      const key = `${project.path}\n${issue.provider}\n${issue.id}`;
+      const read = thread.current?.key === key ? thread.current.thread : null;
+      let prompt = read ? issuePrompt(issue, read) : await issuePromptWithComments(project.path, issue);
       const s = await api.createSession({
         projectPath: project.path,
         title: `${issue.identifier} ${issue.title}`.slice(0, 80),
@@ -294,7 +307,6 @@ export function IssuesView({
       upsertSession(s);
       // The pipeline starts with the session, and tells the author how to hand
       // its work over. A session it cannot serve still starts, as it always did.
-      let prompt = issuePrompt(issue);
       if (pipelineOffered) {
         try {
           const started = await startPipeline(s.id, s.tabs[0].id, mergeChoice && !pipelineDefaults.requirePerson);
@@ -330,6 +342,8 @@ export function IssuesView({
     setUseWorktree(prefs.useWorktree);
     setAutoMerge(pipelineDefaults.autoMerge);
   };
+  // The description alone: a Linear issue read whole carries its first comments pasted under its body, and the thread shows them.
+  const detailText = detail ? ((detail as Partial<IssueDetails>).description ?? detail.body ?? "") : null;
   const isOpen = (issue: Issue) => selected?.id === issue.id && selected.provider === issue.provider;
   // A status change, as it shows while on its way and then as the tracker answers: the page and its row together.
   const statusChanged = (issue: Issue) => {
@@ -665,12 +679,24 @@ export function IssuesView({
               {pipeline && <IssuePipelinePanel key={pipeline.id} pipeline={pipeline} />}
               <div className="px-5 py-4">
                 {detailLoading && <div className="text-xs text-faint">Loading…</div>}
-                {detail && (
+                {detailText != null && (
                   <IssueDescription key={issueKey} edits={edits}>
-                    {detail.body?.trim() ? <Markdown text={detail.body} /> : <div className="text-sm text-faint">No description.</div>}
+                    {detailText.trim() ? <Markdown text={detailText} /> : <div className="text-sm text-faint">No description.</div>}
                   </IssueDescription>
                 )}
               </div>
+              {project && (
+                <div className="border-t border-hairline px-5 pb-5 pt-3">
+                  <IssueCommentThread
+                    key={threadKey}
+                    projectPath={project.path}
+                    provider={selected.provider}
+                    issueId={selected.id}
+                    refreshKey={tick}
+                    onComments={(value) => threadKey && onThread(threadKey, value)}
+                  />
+                </div>
+              )}
             </div>
           </>
         )}
