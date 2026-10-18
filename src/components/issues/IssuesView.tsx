@@ -8,6 +8,7 @@ import { WithTooltip } from "@/components/ui/tooltip";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/menu";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "@/components/ui/menu";
 import { AutomationEditor, type AutomationEditorPrefill } from "@/components/automations/AutomationEditor";
+import { AssigneePicker } from "@/components/issues/AssigneePicker";
 import { IssueListItem } from "@/components/issues/IssueListItem";
 import { IssuePipelinePanel } from "@/components/issues/IssuePipelinePanel";
 import { IssueDescription, IssueLabels, IssuePriority, IssueTitle, editableIssue, useIssueEdits } from "@/components/issues/IssueFields";
@@ -22,6 +23,7 @@ import { chooseMode } from "@/lib/dialogs";
 import { cn } from "@/lib/cn";
 import { issuePrompt, issueWorktreeName } from "@/lib/issueSession";
 import type { IssueDetails } from "@/lib/issueOps";
+import { useIssueViewer } from "@/lib/issueViewer";
 import { pipelineForIssue, pipelineSettings, startPipeline, unlistedPipelines, useIssuePipelines } from "@/lib/issuePipeline";
 import type { IssuePipeline } from "@/types/issuePipeline";
 import type { WorkStatus } from "@/types/session";
@@ -42,6 +44,15 @@ const AFTER_MERGE_MS = 3000;
 function issueOfPipeline(pipeline: IssuePipeline): Issue {
   const { provider, id, identifier, title, url } = pipeline.issue;
   return { provider: provider === "linear" ? "linear" : "github", id, identifier, number: Number(id) || 0, title, url, state: "", stateType: "completed", labels: [], updatedAt: pipeline.modified };
+}
+
+/**
+ * `next`, unless `now` is the same issue read later: an answer that was
+ * slower than a write must not put back what the write changed.
+ */
+function newer(now: Issue | null, next: Issue): Issue {
+  const same = now && now.provider === next.provider && now.id === next.id;
+  return same && Date.parse(now.updatedAt) > Date.parse(next.updatedAt) ? now : next;
 }
 
 /**
@@ -72,6 +83,9 @@ export function IssuesView({
   const [list, setList] = useState<Issue[]>([]);
   // Which project and tracker `list` was read for. Until it is this one, nothing can be said to be missing from it.
   const [listOf, setListOf] = useState<string | null>(null);
+  // Who has each issue whose assignees changed here since the list was read, by `provider:id`. A row of the
+  // "Assigned to me" list assigned away from the reader stays until the next read, marked, rather than vanish under the pointer.
+  const [assignedHere, setAssignedHere] = useState<ReadonlyMap<string, string[]>>(new Map());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Issue | null>(null);
@@ -100,6 +114,8 @@ export function IssuesView({
   // Once an issue has a pipeline its switch is the pipeline's, on the panel
   // below; a session started on it again keeps what was chosen there.
   const mergeChoice = pipeline ? pipeline.autoMerge : autoMerge;
+  // Read again when the Linear key or its connection changes, and on a refresh (another `gh` login, or a failed read).
+  const viewer = useIssueViewer(project?.path, provider, provider === "linear" ? `${linear?.connected}:${linear?.viewer ?? ""}` : `${ghOk}:${tick}`);
   const agentSelection = useSessionAgent(store.harnesses);
   const { harness, modelId, effort } = agentSelection;
   const linkedIssueUrls = useMemo(
@@ -189,6 +205,7 @@ export function IssuesView({
         if (live) {
           setList(r);
           setListOf(`${project.path}\n${provider}`);
+          setAssignedHere(new Map());
         }
       } catch (e) {
         if (live) {
@@ -228,7 +245,7 @@ export function IssuesView({
     if (!again && !rowFirst) setDetailLoading(true);
     issuesApi
       .details(project.path, selected.provider, selected.id)
-      .then((d) => live && setDetail(d))
+      .then((d) => live && setDetail((now) => newer(now, d)))
       .catch((e) => live && setError(errorMessage(e)))
       .finally(() => live && setDetailLoading(false));
     return () => {
@@ -295,13 +312,26 @@ export function IssuesView({
     setAutoMerge(pipelineDefaults.autoMerge);
   };
   const isOpen = (issue: Issue) => selected?.id === issue.id && selected.provider === issue.provider;
+  // An issue as a write answered with it: the open one shows it (even before its details came), and its row shows who has it now.
+  const selectedNow = useRef(selected);
+  selectedNow.current = selected;
+  const assigned = (changed: IssueDetails) => {
+    const same = (issue: Issue) => issue.provider === changed.provider && issue.id === changed.id;
+    setDetail((now) => (selectedNow.current && same(selectedNow.current) ? newer(now, changed) : now));
+    setList((rows) => rows.map((row) => (same(row) ? { ...row, assignee: changed.assignee, assignees: changed.assignees, updatedAt: changed.updatedAt } : row)));
+    setAssignedHere((map) => new Map(map).set(`${changed.provider}:${changed.id}`, changed.assignees.map((person) => person.id)));
+  };
+  const notMine = (issue: Issue) => {
+    const who = assignedHere.get(`${issue.provider}:${issue.id}`);
+    return assignedToMe && !!viewer && !!who && !who.includes(viewer.id);
+  };
   // What the tracker says of the open issue now, once that has been read; the row it was opened from until then.
   const current = detail && isOpen(detail) ? detail : selected;
   // A write answers with the issue as the provider has it now: the page and its row follow.
   const changed = useCallback((next: IssueDetails) => {
     const same = (issue: Issue | null) => !!issue && issue.provider === next.provider && issue.id === next.id;
-    setDetail((now) => (same(now) ? next : now));
-    setList((rows) => rows.map((row) => (same(row) ? { ...row, title: next.title, labels: next.labels, state: next.state, stateType: next.stateType, assignee: next.assignee, updatedAt: next.updatedAt } : row)));
+    setDetail((now) => (same(now) ? newer(now, next) : now));
+    setList((rows) => rows.map((row) => (same(row) ? { ...row, title: next.title, labels: next.labels, state: next.state, stateType: next.stateType, assignee: next.assignee, assignees: next.assignees, updatedAt: next.updatedAt } : row)));
   }, []);
   const edits = useIssueEdits(project?.path ?? null, editableIssue(current), changed);
   // The editors are the open issue's own: a switch starts them afresh.
@@ -438,6 +468,7 @@ export function IssuesView({
                         issue={i}
                         selected={isOpen(i)}
                         linked={linkedIssueUrls.has(i.url)}
+                        notMine={notMine(i)}
                         pipeline={project ? pipelineForIssue(pipelines, project.path, i.url) : null}
                         onSelect={() => open(i)}
                       />
@@ -490,7 +521,9 @@ export function IssuesView({
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
                 {current?.state && <span>{current.state}</span>}
                 {current?.team && <span>{current.team.name}</span>}
-                {current?.assignee && <span>Assigned to {current.assignee.name}</span>}
+                {project && current && (current.assignees || current.assignee || !detailLoading) && (
+                  <AssigneePicker key={`${current.provider}:${current.id}`} projectPath={project.path} issue={current} viewer={viewer} onChange={assigned} />
+                )}
                 <button type="button" onClick={() => void openUrl(selected.url)} className="flex items-center gap-1 hover:text-foreground">
                   Open in browser <ExternalLink className="size-3" />
                 </button>
