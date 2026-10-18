@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ExternalLink, FolderGit2, GitBranch, Loader2, RefreshCw, Search, Settings2, UserRound } from "@/icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
-import { bindingText, useKeymap } from "@/lib/shortcuts";
+import { bindingText, matchesShortcut, useKeymap } from "@/lib/shortcuts";
 import { Segmented, Switch } from "@/components/ui/controls";
 import { WithTooltip } from "@/components/ui/tooltip";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/menu";
@@ -11,6 +11,8 @@ import { AutomationEditor, type AutomationEditorPrefill } from "@/components/aut
 import { AssigneePicker } from "@/components/issues/AssigneePicker";
 import { IssueListItem } from "@/components/issues/IssueListItem";
 import { IssuePipelinePanel } from "@/components/issues/IssuePipelinePanel";
+import { IssueStatusPicker } from "@/components/issues/IssueStatusPicker";
+import { issueKey as writeKey, useIssueWrites } from "@/components/issues/issueWrites";
 import { IssueDescription, IssueLabels, IssuePriority, IssueTitle, editableIssue, useIssueEdits } from "@/components/issues/IssueFields";
 import { SessionAgentControls } from "@/components/session/SessionAgentControls";
 import { useSessionAgent } from "@/lib/useSessionAgent";
@@ -45,6 +47,16 @@ function issueOfPipeline(pipeline: IssuePipeline): Issue {
   const { provider, id, identifier, title, url } = pipeline.issue;
   return { provider: provider === "linear" ? "linear" : "github", id, identifier, number: Number(id) || 0, title, url, state: "", stateType: "completed", labels: [], updatedAt: pipeline.modified };
 }
+
+/** True when the target of a key is somewhere text is typed. */
+function typingIn(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || !!target.closest('[contenteditable]:not([contenteditable="false"])');
+}
+
+/** A row as read, with the state a later write gave it kept when the read is older than that write. */
+const keepState = (read: Issue, shown: Issue | undefined): Issue =>
+  shown ? { ...read, state: shown.state, stateType: shown.stateType, updatedAt: shown.updatedAt } : read;
 
 /**
  * `next`, unless `now` is the same issue read later: an answer that was
@@ -99,6 +111,8 @@ export function IssuesView({
   const [status, setStatus] = useState<WorkStatus | null>(null);
   const [tick, setTick] = useState(0);
   const [automationPrefill, setAutomationPrefill] = useState<AutomationEditorPrefill | null>(null);
+  const [statusOpen, setStatusOpen] = useState(false);
+  const writes = useIssueWrites();
   const setUseWorktree = onUseWorktreeChange ?? setLocalUseWorktree;
 
   const project = store.projects.find((p) => p.path === prefs.lastProject) ?? store.projects[0] ?? null;
@@ -200,10 +214,12 @@ export function IssuesView({
     const t = window.setTimeout(async () => {
       setLoading(true);
       setError(null);
+      const started = writes.readStarted();
       try {
         const r = await issuesApi.list(project.path, provider, { assignedToMe, teamId, search });
         if (live) {
-          setList(r);
+          // A row written to since the read started keeps the state the write gave it.
+          setList((rows) => r.map((row) => (writes.outdated(writeKey(row), started) ? keepState(row, rows.find((each) => writeKey(each) === writeKey(row))) : row)));
           setListOf(`${project.path}\n${provider}`);
           setAssignedHere(new Map());
         }
@@ -242,10 +258,12 @@ export function IssuesView({
     const rowFirst = !again && selected.body != null && selected.provider === "linear" && selectedAtTick.current === tick;
     if (rowFirst) setDetail(selected);
     let live = true;
+    const started = writes.readStarted();
     if (!again && !rowFirst) setDetailLoading(true);
     issuesApi
       .details(project.path, selected.provider, selected.id)
-      .then((d) => live && setDetail((now) => newer(now, d)))
+      // Not over a status change that began or ended since the read started.
+      .then((d) => live && setDetail((now) => (now && writeKey(now) === writeKey(d) && writes.outdated(writeKey(d), started) ? now : newer(now, d))))
       .catch((e) => live && setError(errorMessage(e)))
       .finally(() => live && setDetailLoading(false));
     return () => {
@@ -308,10 +326,17 @@ export function IssuesView({
   const mode = PERMISSION_MODES.find((m) => m.id === prefs.lastMode);
   const open = (issue: Issue) => {
     setSelected(issue);
+    setStatusOpen(false);
     setUseWorktree(prefs.useWorktree);
     setAutoMerge(pipelineDefaults.autoMerge);
   };
   const isOpen = (issue: Issue) => selected?.id === issue.id && selected.provider === issue.provider;
+  // A status change, as it shows while on its way and then as the tracker answers: the page and its row together.
+  const statusChanged = (issue: Issue) => {
+    const same = (each: Issue) => each.id === issue.id && each.provider === issue.provider;
+    setDetail((d) => (d && same(d) ? { ...d, ...issue } : d));
+    setList((rows) => rows.map((row) => (same(row) ? { ...row, state: issue.state, stateType: issue.stateType, updatedAt: issue.updatedAt } : row)));
+  };
   // An issue as a write answered with it: the open one shows it (even before its details came), and its row shows who has it now.
   const selectedNow = useRef(selected);
   selectedNow.current = selected;
@@ -508,7 +533,19 @@ export function IssuesView({
         </div>
       </div>
 
-      <div className="flex w-[46%] min-w-[20rem] max-w-[40rem] flex-col">
+      <div
+        className="flex w-[46%] min-w-[20rem] max-w-[40rem] flex-col outline-none"
+        tabIndex={-1}
+        data-testid="issue-detail"
+        onKeyDown={(e) => {
+          if (!current || typingIn(e.target) || !matchesShortcut(e.nativeEvent, "issues.status")) return;
+          // Only an issue read whole has a picker to open, and not while a change to it is on its way.
+          const capabilities = (current as Partial<IssueDetails>).capabilities;
+          if (!capabilities || !(capabilities.workflowStates || capabilities.closeReasons) || writes.writing.has(writeKey(current))) return;
+          e.preventDefault();
+          setStatusOpen(true);
+        }}
+      >
         {!selected ? (
           <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-faint">Pick an issue to read it and start a session on it.</div>
         ) : (
@@ -519,7 +556,23 @@ export function IssuesView({
                 <IssueTitle key={issueKey} edits={edits} title={current?.title ?? selected.title} />
               </div>
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                {current?.state && <span>{current.state}</span>}
+                {current && project && (
+                  <IssueStatusPicker
+                    key={`status:${writeKey(current)}`}
+                    projectPath={project.path}
+                    issue={current}
+                    pipeline={pipeline}
+                    open={statusOpen}
+                    onOpenChange={setStatusOpen}
+                    busy={writes.writing.has(writeKey(current))}
+                    onWriting={(on) => {
+                      // The menu is closed by the choice; it never comes back on its own once the answer is in.
+                      if (on) setStatusOpen(false);
+                      (on ? writes.begin : writes.end)(writeKey(current));
+                    }}
+                    onChange={statusChanged}
+                  />
+                )}
                 {current?.team && <span>{current.team.name}</span>}
                 {project && current && (current.assignees || current.assignee || !detailLoading) && (
                   <AssigneePicker key={`${current.provider}:${current.id}`} projectPath={project.path} issue={current} viewer={viewer} onChange={assigned} />
