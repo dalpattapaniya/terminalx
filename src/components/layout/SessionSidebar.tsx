@@ -253,7 +253,7 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
             )}
           </>
         )}
-        <CloudOrganizations onOpenAccount={onOpenAccount} onOpenOrganizations={() => onOpenSettings("organizations")} />
+        <CloudOrganizations onOpenOrganizations={() => onOpenSettings("organizations")} />
         <DevelopmentSection />
       </nav>
       </ShowAgents.Provider>

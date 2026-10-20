@@ -260,7 +260,7 @@ export function CloudCreateWorkspace({
           </p>
         )}
         {selected?.length === 0 && (
-          <p className="text-muted-foreground">No repositories are selected for cloud workspaces. An admin chooses them in Settings → GitHub.</p>
+          <p className="text-muted-foreground">No repositories are selected for cloud workspaces. An admin chooses them on the organization's page in Settings → Organizations, under GitHub.</p>
         )}
         {form.repositories.map((repository, index) => (
           <div key={repository.cloneUrl} className="flex items-center gap-2" data-testid="cloud-create-repository">
@@ -351,7 +351,7 @@ export function CloudCreateWorkspace({
       {error && (
         <div className="flex items-center gap-2 text-xs" role="alert" data-testid="cloud-create-error">
           <span className="text-red-500">{error.message}</span>
-          <AgentLoginsLink message={error.message} />
+          <AgentLoginsLink message={error.message} organizationId={organizationId} />
           {error.retry && pending && (
             <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void submit(true)}>
               <RotateCcw className="size-3" /> Retry
@@ -517,7 +517,7 @@ export function CreationProgress({
       )}
       {phase === "failed" && (
         <p className="text-xs text-red-500">
-          {failureMessage(snapshot)} <AgentLoginsLink message={failureMessage(snapshot)} className="ml-1 align-baseline text-foreground" />
+          {failureMessage(snapshot)} <AgentLoginsLink message={failureMessage(snapshot)} organizationId={snapshot.workspace.orgId} className="ml-1 align-baseline text-foreground" />
         </p>
       )}
       {phase === "canceled" && <p className="text-xs text-muted-foreground">Canceled. Its compute is released and the first prompt was not sent.</p>}
