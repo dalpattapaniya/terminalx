@@ -198,8 +198,9 @@ describe("buildTranscript", () => {
     events.push(ev({ type: "turn_started", promptSeq: queued[0].seq }), ev({ type: "assistant_text", text: "on it" }), ev({ type: "turn_completed", status: "ok", authFailed: false }));
     t = buildTranscript(events, true);
     expect(t.turns.map((turn) => turn.prompt?.text)).toEqual(["go", "then this"]);
-    expect(t.turns[0].work.filter((w) => w.kind === "queued").map((w) => w.kind === "queued" && w.text)).toEqual(["and after that"]);
-    expect(t.turns[1].work.map((w) => w.kind)).toEqual(["text"]);
+    // The other now waits behind the turn the first started (#551), where it can still be sent now.
+    expect(t.turns[0].work.map((w) => w.kind)).toEqual(["text"]);
+    expect(t.turns[1].work.map((w) => (w.kind === "queued" ? `queued: ${w.text}` : w.kind))).toEqual(["queued: and after that", "text"]);
     expect(t.turns[1].prompt?.seq).toBe(queued[0].seq);
     expect(t.turns[1].ts).toBe(events[5].ts);
 
@@ -225,8 +226,95 @@ describe("buildTranscript", () => {
       false,
     );
     expect(t.turns).toHaveLength(2);
-    expect(t.turns[0].work.some((w) => w.kind === "queued")).toBe(true);
+    // A log from before `prompt_absorbed` (#551) does not say it was taken, so it is shown as it was sent.
+    expect(t.turns[0].work.map((w) => w.kind)).toEqual(["queued", "text"]);
     expect(t.turns[1].prompt).toBeUndefined();
+  });
+
+  it("leaves an older log's note taken mid-turn in the turn that read it when a later one starts the next turn", () => {
+    const [taken, held] = [ev({ type: "user_message", text: "taken mid-turn", queued: true }), ev({ type: "user_message", text: "held to the end", queued: true })];
+    const t = buildTranscript(
+      [
+        ev({ type: "user_message", text: "go", queued: false }),
+        taken,
+        held,
+        ev({ type: "assistant_text", text: "done" }),
+        ev({ type: "turn_completed", status: "ok", authFailed: false }),
+        ev({ type: "turn_started", promptSeq: held.seq }),
+        ev({ type: "assistant_text", text: "and that" }),
+      ],
+      true,
+    );
+    expect(t.turns.map((turn) => turn.prompt?.text)).toEqual(["go", "held to the end"]);
+    expect(t.turns[0].work.map((w) => (w.kind === "queued" ? `queued: ${w.text}` : w.kind))).toEqual(["queued: taken mid-turn", "text"]);
+    expect(t.turns[1].work.map((w) => w.kind)).toEqual(["text"]);
+  });
+
+  it("keeps a queued message in the last turn waiting once that turn is over: it may yet start the next", () => {
+    const queued = ev({ type: "user_message", text: "then this", queued: true });
+    const events = [ev({ type: "user_message", text: "go", queued: false }), queued, ev({ type: "assistant_text", text: "done" }), ev({ type: "turn_completed", status: "ok", authFailed: false })];
+    for (const live of [true, false]) expect(buildTranscript(events, live).turns[0].work.map((w) => w.kind)).toEqual(["queued", "text"]);
+    events.push(ev({ type: "turn_started", promptSeq: queued.seq }));
+    expect(buildTranscript(events, true).turns.map((turn) => turn.prompt?.text)).toEqual(["go", "then this"]);
+  });
+
+  // #551: the message reached the agent, and then went from the chat when the turn ended.
+  it("makes a queued message the agent took mid-turn the reader's message, where it was taken, through the end of the turn", () => {
+    const queued = ev({ type: "user_message", text: "use the staging config", queued: true, author: { userId: "u1", displayName: "Sam" } });
+    const events = [ev({ type: "user_message", text: "go", queued: false }), toolStart("a", "Bash"), toolDone("a"), queued, toolStart("b", "Read"), toolDone("b")];
+    const kinds = (t: ReturnType<typeof buildTranscript>) => t.turns[0].work.map((w) => w.kind);
+    expect(kinds(buildTranscript(events, true))).toEqual(["tool", "queued", "tool"]);
+
+    // The CLI delivered it with the next tool result.
+    events.push(ev({ type: "prompt_absorbed", promptSeq: queued.seq }), ev({ type: "assistant_text", text: "switching to staging" }));
+    let t = buildTranscript(events, true);
+    expect(kinds(t)).toEqual(["tool", "tool", "message", "text"]);
+    expect(t.turns[0].work[2]).toMatchObject({ kind: "message", text: "use the staging config", seq: queued.seq, author: { userId: "u1", displayName: "Sam" } });
+
+    events.push(toolStart("c", "Bash"), toolDone("c"), ev({ type: "assistant_text", text: "done" }), ev({ type: "turn_completed", status: "ok", authFailed: false }));
+    for (const live of [true, false]) {
+      t = buildTranscript(events, live);
+      expect(t.turns).toHaveLength(1);
+      expect(t.turns[0].completed?.status).toBe("ok");
+      expect(kinds(t)).toEqual(["tool", "tool", "message", "text", "tool", "text"]);
+    }
+  });
+
+  it("draws a message sent now as the prompt of the turn typed for it, and the rest as they are taken", () => {
+    const [first, second] = [ev({ type: "user_message", text: "first held", queued: true }), ev({ type: "user_message", text: "second held", queued: true })];
+    const events = [ev({ type: "user_message", text: "go", queued: false }), toolStart("a", "Bash"), first, second, ev({ type: "turn_completed", status: "aborted", authFailed: false })];
+    // "Send now" on the second: the stopped turn, and then the turn typed for it.
+    events.push(ev({ type: "turn_started", promptSeq: second.seq }));
+    let t = buildTranscript(events, true);
+    expect(t.turns.map((turn) => turn.prompt?.text)).toEqual(["go", "second held"]);
+    expect(t.turns[1].live).toBe(true);
+    // Sent before the one sent now, and still held: it waits behind the turn
+    // typed for that one, where it can be sent now in its turn.
+    expect(t.turns[0].work.map((w) => w.kind)).toEqual(["tool"]);
+    expect(t.turns[1].work.map((w) => (w.kind === "queued" ? `queued: ${w.text}` : w.kind))).toEqual(["queued: first held"]);
+
+    events.push(toolStart("b", "Read"), toolDone("b"), ev({ type: "prompt_absorbed", promptSeq: first.seq }), ev({ type: "assistant_text", text: "both" }), ev({ type: "turn_completed", status: "ok", authFailed: false }));
+    t = buildTranscript(events, false);
+    expect(t.turns[1].work.map((w) => (w.kind === "message" ? `message: ${w.text}` : w.kind))).toEqual(["tool", "message: first held", "text"]);
+  });
+
+  it("takes what was queued after a message moved to where the agent took it along with it (#540, #551)", () => {
+    const goal = ev({ type: "user_message", text: "a goal for the work", queued: false });
+    const after = ev({ type: "user_message", text: "and then this", queued: true });
+    const events = [goal, ev({ type: "turn_started", startedBy: "Scheduled check" }), toolStart("date", "Bash"), after, ev({ type: "turn_completed", status: "ok", authFailed: false }), ev({ type: "turn_started", promptSeq: goal.seq })];
+    const t = buildTranscript(events, true);
+    expect(t.turns.map((turn) => turn.prompt?.text)).toEqual([undefined, "a goal for the work"]);
+    expect(t.turns[0].work.map((w) => w.kind)).toEqual(["status", "tool"]);
+    expect(t.turns[1].live).toBe(true);
+    expect(t.turns[1].work.map((w) => (w.kind === "queued" ? `queued: ${w.text}` : w.kind))).toEqual(["queued: and then this"]);
+  });
+
+  it("ignores a taken message it holds no queued note for", () => {
+    const prompt = ev({ type: "user_message", text: "go", queued: false });
+    const t = buildTranscript([prompt, ev({ type: "prompt_absorbed", promptSeq: prompt.seq }), ev({ type: "prompt_absorbed", promptSeq: 99_999 }), ev({ type: "assistant_text", text: "ok" })], true);
+    expect(t.turns).toHaveLength(1);
+    expect(t.turns[0].prompt?.text).toBe("go");
+    expect(t.turns[0].work.map((w) => w.kind)).toEqual(["text"]);
   });
 
   // #540: a `/loop` check started by the agent, and a goal sent while it ran.

@@ -43,11 +43,11 @@ function sentToAgent(note: ChatNote, tabId: string, prompts: SentPrompt[]): bool
     && (!prompt.author || prompt.author.userId === note.author.userId));
 }
 
-/** Every message sent to the agent: turn prompts, and messages still queued inside a turn. */
+/** Every message sent to the agent: turn prompts, and messages sent inside a turn, still queued or taken mid-turn (#551). */
 function sentPrompts(turns: Turn[]): SentPrompt[] {
   return turns.flatMap((turn) => [
     ...(turn.prompt ? [{ text: turn.prompt.text.trim(), at: Date.parse(turn.prompt.ts), author: turn.prompt.author }] : []),
-    ...turn.work.flatMap((item) => item.kind === "queued" ? [{ text: item.text.trim(), at: Date.parse(item.ts ?? ""), author: item.author }] : []),
+    ...turn.work.flatMap((item) => item.kind === "queued" || item.kind === "message" ? [{ text: item.text.trim(), at: Date.parse(item.ts ?? ""), author: item.author }] : []),
   ]);
 }
 

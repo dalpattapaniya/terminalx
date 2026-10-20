@@ -33,4 +33,9 @@ describe("one row per message sent to the agent (#541)", () => {
     const running: Turn = { ...turn("Earlier prompt"), ts: new Date(at - 60_000).toISOString(), prompt: undefined, work: [{ kind: "queued", text: "Then this", key: "q9", seq: 9, ts }] };
     expect(kinds([running], [note("Then this", at - 800)])).toEqual(["turn"]);
   });
+
+  it("matches a message the agent took mid-turn (#551)", () => {
+    const running: Turn = { ...turn("Earlier prompt"), ts: new Date(at - 60_000).toISOString(), prompt: undefined, work: [{ kind: "message", text: "Then this", key: "m9", seq: 9, ts }] };
+    expect(kinds([running], [note("Then this", at - 800)])).toEqual(["turn"]);
+  });
 });
