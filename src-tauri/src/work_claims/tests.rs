@@ -238,6 +238,20 @@ fn lists_every_visible_claim_but_this_machines_own_local_ones() {
 }
 
 #[test]
+fn a_cloud_project_is_read_by_the_repository_its_key_names() {
+    let _home = crate::store::temp_home();
+    let (base, requests) = serve(r#"{"now":1000,"liveForSeconds":300,"claims":[]}"#);
+    let claims = service(&base);
+    // A cloud project (#433) has no checkout here, and its key is never read as one.
+    assert_eq!(claims.remote("cloud:org_01H:github.com/Acme/Widgets").as_deref(), Some("github.com/acme/widgets"));
+    assert_eq!(claims.remote("cloud:org_01H:blank/scratch"), None);
+    let answer = claims.list("cloud:org_01H:github.com/acme/widgets", "github", &["https://github.com/acme/widgets/issues/441".into()]);
+    assert!(answer.available);
+    let request = &requests.lock().unwrap()[0];
+    assert!(request.starts_with("GET /v1/desktop/work-claims?provider=github&scope=github.com%2Facme%2Fwidgets "), "{request}");
+}
+
+#[test]
 fn signing_out_withdraws_this_devices_claims() {
     let _home = crate::store::temp_home();
     let project = tempfile::tempdir().unwrap();

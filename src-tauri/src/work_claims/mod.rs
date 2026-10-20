@@ -254,6 +254,10 @@ impl WorkClaims {
     }
 
     fn remote(&self, project_path: &str) -> Option<String> {
+        // A cloud project (#433) has no checkout here: its key names its repository.
+        if let Some(repository) = crate::issues::cloud_project_repo(std::path::Path::new(project_path)) {
+            return claims::normalize_remote(&format!("https://github.com/{repository}"));
+        }
         if let Some((at, remote)) = self.state.lock().unwrap().remotes.get(project_path) {
             if at.elapsed() < REMOTE_FOR {
                 return remote.clone();

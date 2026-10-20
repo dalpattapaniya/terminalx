@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{Pipeline, State};
@@ -17,6 +18,8 @@ use super::{Pipeline, State};
 /// Finished pipelines kept for the record; ones still in flight are never dropped.
 const RETENTION: usize = 200;
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// When each pipeline waiting on GitHub began to wait, as of the last read or write.
+static WAITING: Mutex<Vec<DateTime<Utc>>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +33,37 @@ fn file_path() -> Result<PathBuf> {
 }
 
 pub fn list() -> Result<Vec<Pipeline>> {
-    Ok(crate::store::read_json::<PipelineFile>(&file_path()?)?.unwrap_or_default().pipelines)
+    let pipelines = crate::store::read_json::<PipelineFile>(&file_path()?)?.unwrap_or_default().pipelines;
+    note_waiting(&pipelines);
+    Ok(pipelines)
+}
+
+fn note_waiting(pipelines: &[Pipeline]) {
+    let since = pipelines.iter().filter(|pipeline| !pipeline.stopped && pipeline.state == State::Waiting).filter_map(waiting_since).collect();
+    *WAITING.lock().unwrap_or_else(|error| error.into_inner()) = since;
+}
+
+/// When a pipeline began to wait on GitHub: for its checks, for a merge
+/// GitHub took into a queue, or for a new head's checks to be listed. What
+/// bounds the wait, whether or not GitHub can be read meanwhile.
+pub fn waiting_since(pipeline: &Pipeline) -> Option<DateTime<Utc>> {
+    let request = pipeline.merge_requested.as_ref().map(|request| request.at.as_str());
+    [pipeline.waiting_since.as_deref(), request, pipeline.review_requested_at.as_deref(), Some(pipeline.modified.as_str())]
+        .into_iter()
+        .flatten()
+        .find_map(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+}
+
+/// When each pipeline waiting on GitHub (checks, mergeability, a merge
+/// queue) began to wait.
+pub fn waits() -> Vec<DateTime<Utc>> {
+    WAITING.lock().unwrap_or_else(|error| error.into_inner()).clone()
+}
+
+fn write(pipelines: Vec<Pipeline>) -> Result<()> {
+    crate::store::write_json(&file_path()?, &PipelineFile { pipelines })?;
+    Ok(())
 }
 
 pub fn get(id: &str) -> Result<Pipeline> {
@@ -41,7 +74,8 @@ fn update<R>(change: impl FnOnce(&mut Vec<Pipeline>) -> Result<R>) -> Result<R> 
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let mut pipelines = list()?;
     let out = change(&mut pipelines)?;
-    crate::store::write_json(&file_path()?, &PipelineFile { pipelines })?;
+    note_waiting(&pipelines);
+    write(pipelines)?;
     Ok(out)
 }
 
@@ -77,7 +111,8 @@ pub fn commit(working: &mut Pipeline) -> Result<bool> {
     }
     working.modified = crate::store::index::now();
     *stored = working.clone();
-    crate::store::write_json(&file_path()?, &PipelineFile { pipelines })?;
+    note_waiting(&pipelines);
+    write(pipelines)?;
     Ok(true)
 }
 
@@ -98,4 +133,10 @@ pub fn set_switches(id: &str, change: impl FnOnce(&mut Pipeline)) -> Result<Pipe
 /// The newest one, for a session whose earlier pipeline was replaced.
 pub fn for_session(session_id: &str) -> Result<Option<Pipeline>> {
     Ok(list()?.into_iter().rev().find(|pipeline| pipeline.author.session_id == session_id || pipeline.reviewer.as_ref().is_some_and(|reviewer| reviewer.session_id == session_id)))
+}
+
+/// Whether a tab is the author or the reviewer of some pipeline. Asked on
+/// every turn that ends anywhere, so it reads the store and nothing else.
+pub fn takes_part(session_id: &str, tab_id: &str) -> bool {
+    for_session(session_id).ok().flatten().is_some_and(|pipeline| pipeline.role_of(session_id, tab_id).is_some())
 }

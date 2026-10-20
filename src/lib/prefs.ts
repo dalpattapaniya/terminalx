@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { SHORTCUTS_VERSION, migrateShortcuts, shortcutsVersionOf } from "@/lib/shortcutMigration";
 import type { IssueListFilter } from "@/lib/issueListFilter";
+import type { IssuePipelineSettings } from "@/types/issuePipeline";
 
 /**
  * UI preferences that the frontend can read for itself live in localStorage.
@@ -37,6 +38,10 @@ export interface Prefs {
   lastEffort: Record<string, string>;
   lastMode: string;
   issueProvider: "github" | "linear";
+  /** The cloud project the Issues view shows (`cloud:<orgId>:<identity>`); null for `lastProject`, a project on this computer. */
+  issueCloudProject: string | null;
+  /** Issue pipeline settings of cloud projects, by project key. Kept here; each issue session started from here takes them to its workspace. */
+  cloudIssuePipelines: Record<string, IssuePipelineSettings>;
   /** The Issues list's filter and sort, by project and tracker (`issueFilterKey`). */
   issueFilters: Record<string, Partial<IssueListFilter>>;
   useWorktree: boolean;
@@ -121,6 +126,8 @@ const DEFAULTS: Prefs = {
   lastEffort: {},
   lastMode: "bypassPermissions",
   issueProvider: "github",
+  issueCloudProject: null,
+  cloudIssuePipelines: {},
   issueFilters: {},
   useWorktree: true,
   bypassConfirmed: false,
@@ -179,6 +186,9 @@ function load(): Prefs {
     prefs.sidebarLayout = prefs.sidebarLayout === "list" ? "list" : "simple";
     prefs.autocorrect = prefs.autocorrect === true;
     prefs.cloudSections = cleanCloudSections(prefs.cloudSections);
+    prefs.issueCloudProject = typeof prefs.issueCloudProject === "string" && prefs.issueCloudProject.startsWith("cloud:") ? prefs.issueCloudProject : null;
+    const pipelines = prefs.cloudIssuePipelines;
+    prefs.cloudIssuePipelines = pipelines && typeof pipelines === "object" && !Array.isArray(pipelines) ? Object.fromEntries(Object.entries(pipelines).filter(([, value]) => !!value && typeof value === "object" && !Array.isArray(value))) : {};
     // Each entry is checked as it is read (`issueFilterFor`); only the map itself is checked here.
     if (!prefs.issueFilters || typeof prefs.issueFilters !== "object" || Array.isArray(prefs.issueFilters)) prefs.issueFilters = {};
     let migrated = false;

@@ -51,6 +51,7 @@ import { bootCloudCatalog } from "@/lib/cloudCatalog";
 import { bootCloudSelection } from "@/lib/cloudSelection";
 import { bootCloudMirrors } from "@/lib/cloudMirror";
 import { bootCloudSessions } from "@/lib/cloudSessions";
+import { bootCloudPipelines } from "@/lib/cloudPipelines";
 import { bootPairing } from "@/lib/pairing";
 import { bootTerminalPerf } from "@/lib/terminalPerf";
 import { bootCloudControl } from "@/lib/cloudControl";
@@ -106,6 +107,7 @@ export function AppShell() {
     // Live session lists and local mirrors (PRO-25) follow the connections other surfaces open,
     // from launch and whatever is on screen: hidden sidebar or Settings included (#498).
     bootCloudSessions();
+    bootCloudPipelines();
     bootCloudMirrors();
     // The reader's cloud sessions say which issues they work on, as this Mac's do (#441).
     bootCloudWorkClaims();

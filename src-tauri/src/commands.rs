@@ -3344,8 +3344,8 @@ pub fn issue_pipelines_list() -> CmdResult<Vec<crate::issue_pipeline::Pipeline>>
 #[tauri::command]
 pub async fn issue_pipeline_start(app: AppHandle, session_id: String, tab_id: String, auto_merge: Option<bool>) -> CmdResult<StartedIssuePipeline> {
     tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::LocalHost::of(&app).map_err(err)?;
-        let pipeline = crate::issue_pipeline::engine::start(&host, &session_id, &tab_id, auto_merge).map_err(err)?;
+        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
+        let pipeline = crate::issue_pipeline::engine::start(&host, &session_id, &tab_id, auto_merge, None).map_err(err)?;
         Ok(StartedIssuePipeline { pipeline, author_brief: crate::issue_pipeline::prompts::author_brief() })
     })
     .await
@@ -3355,7 +3355,7 @@ pub async fn issue_pipeline_start(app: AppHandle, session_id: String, tab_id: St
 #[tauri::command]
 pub async fn issue_pipeline_set_auto_merge(app: AppHandle, id: String, value: bool) -> CmdResult<crate::issue_pipeline::Pipeline> {
     tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::LocalHost::of(&app).map_err(err)?;
+        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
         crate::issue_pipeline::engine::set_auto_merge(&host, &id, value).map_err(err)
     })
     .await
@@ -3365,8 +3365,39 @@ pub async fn issue_pipeline_set_auto_merge(app: AppHandle, id: String, value: bo
 #[tauri::command]
 pub async fn issue_pipeline_act(app: AppHandle, id: String, action: crate::issue_pipeline::engine::Action) -> CmdResult<crate::issue_pipeline::Pipeline> {
     tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::LocalHost::of(&app).map_err(err)?;
+        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
         crate::issue_pipeline::engine::act(&host, &id, action).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Move a cloud workspace's Linear issue to its team's review state with the
+/// reader's own Linear key: the workspace has none. What it did, as the
+/// pipeline's record says it.
+#[tauri::command]
+pub async fn issue_pipeline_linear_to_review(id: String, identifier: String) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let moved = crate::issues::linear_move_to_review(&linear_key()?, &id).map_err(err)?;
+        Ok(crate::issue_pipeline::host::review_move_line(&identifier, moved))
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Merge a cloud workspace's pull request as the reader, with their own `gh`
+/// (`issue_pipeline::cloud_merge`): a cloud workspace never merges by itself.
+/// `pipeline` is as the workspace reported it, and `repository` the cloud
+/// project's own (`owner/name`), which its pull request must be in.
+#[tauri::command]
+pub async fn issue_pipeline_merge_cloud(
+    pipeline: crate::issue_pipeline::Pipeline,
+    repository: String,
+    settings: Option<crate::store::projects::IssuePipelineSettings>,
+) -> CmdResult<crate::issue_pipeline::cloud_merge::CloudMerge> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = settings.unwrap_or_default();
+        crate::issue_pipeline::cloud_merge::merge(&crate::issue_pipeline::cloud_merge::ReadersGh, &pipeline, &repository, &settings).map_err(err)
     })
     .await
     .map_err(err)?
