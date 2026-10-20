@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo } from "@/lib/api";
 import { closeBypass, useDialogs } from "@/lib/dialogs";
 import { getPrefs, setPrefs } from "@/lib/prefs";
-import type { HarnessInfo } from "@/types/session";
-import { launchDefaults, useSessionAgent, type LaunchSettings } from "./useSessionAgent";
+import type { HarnessInfo, TabEntry } from "@/types/session";
+import { handoffStart, launchDefaults, launchSettingsOf, useSessionAgent, type LaunchSettings } from "./useSessionAgent";
 
 const catalog = vi.hoisted(() => ({ models: [] as ModelInfo[] }));
 vi.mock("@/lib/models", async (original) => ({
@@ -123,5 +123,55 @@ describe("a form's own launch settings", () => {
     act(() => dialogs.result.current.bypass?.confirm());
     expect(result.current.value).toMatchObject({ model: "sonnet", permissionMode: "bypassPermissions" });
     expect(getPrefs().lastMode).toBe("manual");
+  });
+});
+
+describe("where a handoff starts", () => {
+  const source: LaunchSettings = { harness: "claude", model: "sonnet", effort: "low", permissionMode: "plan" };
+  const start = (from: Partial<LaunchSettings>, harnesses = HARNESSES) => handoffStart({ ...source, ...from }, harnesses, catalog.models, getPrefs());
+  beforeEach(() => {
+    setPrefs({ lastAgent: "codex", lastModel: { claude: "opus", codex: "gpt-5.6-sol" }, lastEffort: { claude: "max", codex: "medium" }, lastMode: "auto" });
+  });
+
+  it("is the source conversation's provider, model, effort and mode, not the preferences", () => {
+    expect(start({})).toEqual(source);
+  });
+
+  it("takes what the source tab was last asked to run, pending or not", () => {
+    const tab = { harness: "claude", model: "opus", requestedModel: "sonnet", effort: "high", requestedEffort: "low", permissionMode: "auto", requestedPermissionMode: "plan" } as TabEntry;
+    expect(launchSettingsOf(tab)).toEqual(source);
+    expect(launchSettingsOf({ harness: "codex", model: "gpt-6-astra", permissionMode: "manual" } as TabEntry)).toEqual({ harness: "codex", model: "gpt-6-astra", effort: null, permissionMode: "manual" });
+  });
+
+  it("keeps the source's effort only while its model takes it, then the saved one, then the model's own default", () => {
+    expect(start({ model: "opus", effort: "max" })?.effort).toBe("max");
+    // Sonnet takes neither the source's "max" nor the saved "max": null, which the form shows as Sonnet's default.
+    expect(start({ effort: "max" })?.effort).toBeNull();
+  });
+
+  it("drops a model the provider no longer lists for the saved one", () => {
+    expect(start({ model: "claude-opus-4-1-20250805" })).toEqual({ harness: "claude", model: "opus", effort: "low", permissionMode: "plan" });
+  });
+
+  it("starts an uninstalled source provider's handoff on the saved provider, with that provider's own model and effort", () => {
+    expect(start({ harness: "gemini", model: "gemini-pro", effort: "high" })).toEqual({ harness: "codex", model: "gpt-5.6-sol", effort: "medium", permissionMode: "plan" });
+  });
+
+  it("falls back to the first installed provider, and to nothing when none is", () => {
+    setPrefs({ lastAgent: "gemini" });
+    expect(start({ harness: "gemini" })?.harness).toBe("claude");
+    expect(start({}, HARNESSES.map((h) => ({ ...h, available: false })))).toBeNull();
+  });
+
+  it("starts a mode the picker does not offer in Ask every time, never in a looser saved mode", () => {
+    setPrefs({ lastMode: "bypassPermissions" });
+    for (const reported of ["dontAsk", "untrusted, read-only", "never, workspace-write", "never, danger-full-access", "terminal"]) {
+      expect(start({ permissionMode: reported })?.permissionMode).toBe("manual");
+    }
+    // An older spelling of a picker mode is that mode.
+    expect(start({ permissionMode: "ask" })?.permissionMode).toBe("manual");
+    expect(start({ permissionMode: "accept_edits" })?.permissionMode).toBe("acceptEdits");
+    // A source that names no mode at all starts from the saved one.
+    expect(start({ permissionMode: "" })?.permissionMode).toBe("bypassPermissions");
   });
 });

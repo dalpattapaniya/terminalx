@@ -4,7 +4,8 @@ import { DEFAULT_PERMISSION_MODE, pickerMode, useModels } from "@/lib/models";
 import { usePickerModels } from "@/lib/cloudModels";
 import { chooseMode } from "@/lib/dialogs";
 import { getPrefs, setPrefs, usePrefs, type Prefs } from "@/lib/prefs";
-import type { HarnessInfo } from "@/types/session";
+import type { ModelInfo } from "@/lib/api";
+import type { HarnessInfo, TabEntry } from "@/types/session";
 
 /** One launch: the agent, its model and effort, and the permission mode it starts in. */
 export interface LaunchSettings {
@@ -31,6 +32,48 @@ export function launchDefaults(prefs: Prefs = getPrefs()): LaunchSettings {
     effort: prefs.lastEffort[prefs.lastAgent] ?? null,
     permissionMode: prefs.lastMode,
   };
+}
+
+/** A tab's settings, as what it was last asked to run, pending or not. */
+export function launchSettingsOf(tab: TabEntry): LaunchSettings {
+  return {
+    harness: tab.harness,
+    model: tab.requestedModel || tab.model,
+    effort: tab.requestedEffort ?? tab.effort ?? null,
+    permissionMode: tab.requestedPermissionMode || tab.permissionMode,
+  };
+}
+
+/**
+ * Where a start's mode lands when the picker does not offer it: one its agent
+ * reported (Claude Code's `dontAsk`, a Codex approval and sandbox, a mode set
+ * in the terminal). Never the saved mode, which may be looser than the source
+ * (Bypass): the new session asks before anything until the reader picks.
+ */
+const UNOFFERED_START_MODE = "manual";
+
+/**
+ * Where a handoff's form starts: its source conversation's settings, each
+ * kept only while it is valid, else the saved preference for the provider,
+ * else its default. The provider must be installed, the model one it lists,
+ * the effort one that model takes. The mode is never swapped for a looser one
+ * (see `UNOFFERED_START_MODE`). `null` when no provider is installed.
+ */
+export function handoffStart(source: LaunchSettings, harnesses: HarnessInfo[], models: ModelInfo[], prefs: Prefs = getPrefs()): LaunchSettings | null {
+  const installed = (id: string) => harnesses.some((h) => h.id === id && h.available);
+  const harness = [source.harness, prefs.lastAgent].find(installed) ?? harnesses.find((h) => h.available)?.id;
+  if (!harness) return null;
+  const own = harness === source.harness;
+  const listed = models.filter((m) => m.harness === harness);
+  const model = [own ? source.model : undefined, prefs.lastModel[harness]]
+    .map((wanted) => (wanted ? listed.find((m) => m.id === wanted) : undefined))
+    .find(Boolean) ?? listed.find((m) => m.isDefault) ?? listed[0];
+  // Nothing valid saved: null, so the form shows the model's own default.
+  const effort = [own ? source.effort : undefined, prefs.lastEffort[harness]].find((wanted) => !!wanted && !!model?.efforts.includes(wanted)) ?? null;
+  const permissionMode = source.permissionMode
+    ? (pickerMode(source.permissionMode)?.id ?? UNOFFERED_START_MODE)
+    : (pickerMode(prefs.lastMode)?.id ?? DEFAULT_PERMISSION_MODE);
+  return { harness, model: model?.id ?? "", effort, permissionMode };
 }
 
 /**
