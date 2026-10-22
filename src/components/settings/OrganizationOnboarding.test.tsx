@@ -17,13 +17,25 @@ vi.mock("@/lib/api", () => ({
 }));
 vi.mock("@/lib/account", () => ({ refreshAccount: vi.fn() }));
 vi.mock("./ProviderControls", () => ({
-  ProviderControls: () => <div>Provider setup</div>,
+  ProviderControls: ({ providersChanged, onChange }: { providersChanged: number; onChange: () => void }) => (
+    <>
+      <div>Provider setup</div>
+      <button data-testid="controls-read" onClick={onChange}>
+        {providersChanged}
+      </button>
+    </>
+  ),
 }));
 vi.mock("./OrganizationSetupSteps", () => ({
-  OrganizationSetupSteps: ({ record }: { record: { organizationId: string; step: string } }) => (
-    <div data-testid="steps">
-      {record.organizationId}:{record.step}
-    </div>
+  OrganizationSetupSteps: ({ record, providersChanged, onProvidersChange }: { record: { organizationId: string; step: string }; providersChanged: number; onProvidersChange: () => void }) => (
+    <>
+      <div data-testid="steps">
+        {record.organizationId}:{record.step}
+      </div>
+      <button data-testid="steps-read" onClick={onProvidersChange}>
+        {providersChanged}
+      </button>
+    </>
   ),
 }));
 const KEY = "terminalx.organization-setup.v2.owner%40example%2Etest";
@@ -206,6 +218,24 @@ it("never applies a setup record to a different active organization, and keeps i
   // Back on the organization it was made for, its setup carries on.
   view.rerender(<OrganizationOnboarding {...props} organizationName="Team" organizationId="org-1" organizations={[other, organization]} />);
   expect(screen.getByTestId("steps").textContent).toBe("org-1:compute");
+});
+
+// PRO-112: neither waits on a "Check again" or a "Refresh" for what the other changed.
+it("has the setup steps read a provider change made in the compute controls, and the other way round", async () => {
+  vi.mocked(api.organizationCreate).mockResolvedValue(organization);
+  const view = render(<OrganizationOnboarding {...props} />);
+  start();
+  await waitFor(() => expect(refreshAccount).toHaveBeenCalledOnce());
+  view.rerender(<OrganizationOnboarding {...props} organizationName="Team" organizationId="org-1" organizations={[organization]} />);
+  const controls = screen.getByTestId("controls-read");
+  const steps = screen.getByTestId("steps-read");
+  expect([controls.textContent, steps.textContent]).toEqual(["0", "0"]);
+  // New machines allowed in the compute controls: the steps read the setup again.
+  fireEvent.click(controls);
+  expect([controls.textContent, steps.textContent]).toEqual(["0", "1"]);
+  // Allowed in the steps: the controls read their provider again.
+  fireEvent.click(steps);
+  expect([controls.textContent, steps.textContent]).toEqual(["1", "1"]);
 });
 
 it("reads the record left by the previous version once, as the same creation request", async () => {

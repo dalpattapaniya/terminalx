@@ -24,6 +24,15 @@ export function creatableProviders(providers: CloudProviderSummary[], orgId?: st
   return usableProviders(providers).filter((provider) => provider.id !== "machine0" || machine0Offered(orgId));
 }
 
+/**
+ * The connected providers whose new machines are paused (PRO-79): offered to
+ * a new workspace once an owner or admin allows them. A hidden Machine0 is
+ * not among them, since allowing it would not offer it.
+ */
+export function pausedProviders(providers: CloudProviderSummary[], orgId?: string | null): CloudProviderSummary[] {
+  return providers.filter((provider) => provider.availability === "disabled-for-create" && (provider.id !== "machine0" || machine0Offered(orgId)));
+}
+
 /** The providers settings list: a hidden one only while the organization is still connected to it. */
 export function listedProviders(providers: CloudProviderSummary[], orgId?: string | null): CloudProviderSummary[] {
   return providers.filter((provider) => provider.id !== "machine0" || Boolean(provider.connection) || machine0Offered(orgId));

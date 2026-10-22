@@ -10,7 +10,7 @@
 // on every resume (`reconcileSetup`); the stored `step` is only what the
 // last reconciliation found, shown until the server answers.
 
-import type { AgentLoginProvider, CloudWorkspaceListItem } from "@/lib/api";
+import type { AgentLoginProvider, CloudProviderSummary, CloudWorkspaceListItem } from "@/lib/api";
 import type { PendingCreate } from "@/lib/cloudCreate";
 
 export const SETUP_VERSION = 2;
@@ -227,6 +227,12 @@ export interface SetupFacts {
   activeOrganizationId: string | null;
   /** A compute provider is connected and usable. */
   compute: boolean | null;
+  /**
+   * The connected providers whose new machines are paused (PRO-112). Their
+   * connection is done but not usable: the compute step waits on allowing
+   * new machines, and says so.
+   */
+  paused: readonly CloudProviderSummary[] | null;
   /** The agents with a login the organization's workspaces can use (PRO-107). */
   logins: readonly AgentLoginProvider[] | null;
   /** At least one repository is chosen and accessible. */
@@ -262,7 +268,8 @@ function stepFrom(record: OrganizationSetupRecord, facts: SetupFacts): SetupStep
   // ordinary life, not setup.
   if (record.completedAt !== null) return "done";
   const at = (step: SetupStep) => STEPS.indexOf(record.step) >= STEPS.indexOf(step);
-  // An unknown fact holds the setup where it was last seen.
+  // An unknown fact holds the setup where it was last seen. A connected
+  // provider whose new machines are paused is not usable compute either.
   if (facts.compute === false || (facts.compute === null && !at("logins"))) return "compute";
   // The agent logins, chosen once: the person goes on with one connected, or sets them up later. A record
   // from before the step that is past it already goes on where a login is connected, and is held where unknown;

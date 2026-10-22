@@ -18,7 +18,7 @@ vi.mock("@/lib/account", async (original) => ({
   }),
 }));
 
-const { creatableProviders, listedProviders, machine0Offered } = await import("@/lib/hiddenProviders");
+const { creatableProviders, listedProviders, machine0Offered, pausedProviders } = await import("@/lib/hiddenProviders");
 
 const summary = (id: CloudProviderSummary["id"], overrides: Partial<CloudProviderSummary> = {}): CloudProviderSummary => ({
   id,
@@ -62,5 +62,13 @@ describe("hidden providers (Machine0)", () => {
     const providers = [summary("machine0", { availability: "disabled-for-create", connection: connected }), summary("box")];
     expect(listedProviders(providers).map((provider) => provider.id)).toEqual(["machine0", "box"]);
     expect(listedProviders([summary("machine0", { availability: "not-connected" }), summary("box")]).map((provider) => provider.id)).toEqual(["box"]);
+  });
+
+  // PRO-112: what allowing new machines would offer, and a hidden Machine0 is not that.
+  it("counts a connected provider with new machines paused, but never a hidden Machine0", () => {
+    const providers = [summary("machine0", { availability: "disabled-for-create", connection: connected }), summary("box", { availability: "disabled-for-create", connection: connected }), summary("hetzner")];
+    expect(pausedProviders(providers).map((provider) => provider.id)).toEqual(["box"]);
+    account.flags = { "cloud.machine0-byok-pilot.v1": true };
+    expect(pausedProviders(providers).map((provider) => provider.id)).toEqual(["machine0", "box"]);
   });
 });

@@ -47,6 +47,11 @@ export function OrganizationOnboarding({
   const [createOpen, setCreateOpen] = useState(Boolean(attempt));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A provider change made in the compute controls is read by the setup
+  // steps, and new machines allowed in the steps by the controls (PRO-112):
+  // neither waits on a "Check again" or a "Refresh".
+  const [controlsChanged, setControlsChanged] = useState(0);
+  const [stepsChanged, setStepsChanged] = useState(0);
   const draftStorageKey = `terminalx.organization-setup.v1.${accountEmail}.name`;
   const identityEpoch = useRef(0);
   const mounted = useRef(true);
@@ -181,6 +186,8 @@ export function OrganizationOnboarding({
           <ProviderControls
             key={`${accountEmail}:${contextRevision}:${organizationName}`}
             contextRevision={contextRevision}
+            providersChanged={stepsChanged}
+            onChange={() => setControlsChanged((count) => count + 1)}
           />
           {setup && activeId && (
             <OrganizationSetupSteps
@@ -189,6 +196,8 @@ export function OrganizationOnboarding({
               organizationId={activeId}
               organizationName={organizationName}
               contextRevision={contextRevision}
+              providersChanged={controlsChanged}
+              onProvidersChange={() => setStepsChanged((count) => count + 1)}
               onRecord={persist}
             />
           )}

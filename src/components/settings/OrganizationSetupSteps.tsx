@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2 } from "@/icons";
 import { Button } from "@/components/ui/button";
-import { api, errorMessage, type AgentLogin, type AgentLoginProvider, type CloudWorkspaceQuote } from "@/lib/api";
+import { api, errorMessage, type AgentLogin, type AgentLoginProvider, type CloudProviderSummary, type CloudWorkspaceQuote } from "@/lib/api";
 import { createErrorMessage, createWorkspace, failureMessage, isClientError, launchInput, preflightCreate, repositoriesInput, CreateRefused, type CreateForm, type PendingCreate } from "@/lib/cloudCreate";
-import { creatableProviders } from "@/lib/hiddenProviders";
+import { creatableProviders, pausedProviders } from "@/lib/hiddenProviders";
 import { formatMicros } from "@/lib/organizationCompute";
 import { organizationGithubApp } from "@/lib/organizationGithubApp";
 import { openAgentLogins, openOrganizationSettings } from "@/lib/settingsLinks";
 import { AgentLoginsLink } from "@/components/cloud/AgentLoginsLink";
 import { agentLoginUsable, OrganizationAgentLogins } from "./OrganizationAgentLogins";
+import { providerActionMessage } from "./ProviderControls";
 import {
   ENVIRONMENT_CHECK_PROMPT,
   reconcileSetup,
@@ -62,6 +63,9 @@ function failureText(failure: unknown): string {
   return errorMessage(failure);
 }
 
+/** The compute step's label while its provider is connected but new machines are paused (PRO-112). */
+const COMPUTE_PAUSED = "Compute provider connected, new machines paused";
+
 /**
  * The steps from a selected organization to a working first workspace
  * (PRO-16), read from the server every time this is shown. `record` is that
@@ -74,16 +78,22 @@ export function OrganizationSetupSteps({
   organizationId,
   organizationName,
   contextRevision,
+  providersChanged = 0,
+  onProvidersChange,
   onRecord,
 }: {
   record: OrganizationSetupRecord;
   organizationId: string;
   organizationName: string;
-  /** The account's context revision, for the agent logins step. */
+  /** The account's context revision, for the agent logins step and for allowing new machines. */
   contextRevision: string;
+  /** Counts the provider changes made in the compute controls above: each one reads the setup again. */
+  providersChanged?: number;
+  /** New machines were allowed here, so the compute controls above read their provider again. */
+  onProvidersChange?: () => void;
   onRecord: (record: OrganizationSetupRecord) => void;
 }) {
-  const [facts, setFacts] = useState<SetupFacts>({ activeOrganizationId: organizationId, compute: null, logins: null, repository: null, workspaces: null });
+  const [facts, setFacts] = useState<SetupFacts>({ activeOrganizationId: organizationId, compute: null, paused: null, logins: null, repository: null, workspaces: null });
   const [checking, setChecking] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,9 +127,9 @@ export function OrganizationSetupSteps({
   // Looking only reads lists: it never wakes or starts a workspace.
   const check = useCallback(async () => {
     setChecking(true);
-    const [providers, logins, github, list] = await Promise.all([
+    const [summaries, logins, github, list] = await Promise.all([
       api.cloudProviders().then(
-        (response) => creatableProviders(response.providers),
+        (response) => response.providers,
         () => null,
       ),
       api.cloudAgentLogins(organizationId).then(
@@ -136,9 +146,12 @@ export function OrganizationSetupSteps({
       ),
     ]);
     if (!mounted.current) return null;
+    const providers = summaries && creatableProviders(summaries);
+    const paused = summaries && pausedProviders(summaries);
     const next: SetupFacts = {
       activeOrganizationId: organizationId,
       compute: providers ? providers.length > 0 : null,
+      paused,
       logins,
       repository: github ? github.length > 0 : null,
       workspaces: list,
@@ -147,12 +160,31 @@ export function OrganizationSetupSteps({
     setChecking(false);
     const reconciled = reconcileSetup(current.current, next);
     if (reconciled !== current.current) store(reconciled);
-    return { providers, github };
+    return { providers, paused, github };
   }, [organizationId, store]);
 
   useEffect(() => {
     void check();
-  }, [check]);
+  }, [check, providersChanged]);
+
+  // Allowing new machines is all a paused connection needs (PRO-112): the
+  // setup reads the server again and goes on, without a "Check again".
+  const allow = async (provider: CloudProviderSummary) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.cloudProviderSetCreationEnabled(provider.id, contextRevision, true);
+      onProvidersChange?.();
+      const found = await check();
+      // Allowed for the organization, and still not offered: the server is not taking new machines there.
+      if (mounted.current && found?.paused?.some((other) => other.id === provider.id))
+        setError(`New machines are allowed for ${organizationName}, but ${provider.displayName} isn't offered for new workspaces right now. Check again later.`);
+    } catch (failure) {
+      if (mounted.current) setError(providerActionMessage(failure));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
 
   const prepare = async (terminalOnly: boolean) => {
     setBusy(true);
@@ -255,6 +287,8 @@ export function OrganizationSetupSteps({
   // Resent only while the server still answers it as the same create.
   const unsent = resendable(record);
   const unsettled = unsettledRequest(record);
+  // The compute step waits on allowing new machines rather than on a connection (PRO-112).
+  const paused = step === "compute" ? (facts.paused ?? []) : [];
 
   if (step === "done") {
     return (
@@ -278,13 +312,35 @@ export function OrganizationSetupSteps({
       <ol className="mt-1 space-y-1 text-xs">
         {SHOWN.filter((name) => name !== "agent" || record.agent === "required").map((name) => (
           <li key={name} className={reached(name) ? "text-muted-foreground" : name === step ? "text-foreground" : "text-faint"} aria-current={name === step ? "step" : undefined}>
-            <span className="inline-flex w-4 justify-center">{reached(name) ? <Check className="size-3" aria-label="done" /> : name === step ? "→" : "·"}</span> {STEP_LABELS[name]}
+            <span className="inline-flex w-4 justify-center">{reached(name) ? <Check className="size-3" aria-label="done" /> : name === step ? "→" : "·"}</span>{" "}
+            {name === "compute" && paused.length ? COMPUTE_PAUSED : STEP_LABELS[name]}
           </li>
         ))}
       </ol>
 
-      {/* The provider controls are drawn above these steps, in the same setup section. */}
-      {step === "compute" && <p className="mt-2 text-xs text-muted-foreground">Connect a compute provider above, then check again.</p>}
+      {/* The provider controls are drawn above these steps, in the same setup section; a change made there is read here. */}
+      {step === "compute" && !paused.length && <p className="mt-2 text-xs text-muted-foreground">Connect a compute provider above.</p>}
+      {step === "compute" && paused.length > 0 && (
+        <div className="mt-2 text-xs text-muted-foreground" data-testid="organization-setup-compute-paused">
+          <p>
+            New machines are paused for {organizationName} on {listed(paused.map((provider) => provider.displayName))}. The connection is done; setup goes on once
+            new machines are allowed.
+          </p>
+          {paused.some((provider) => provider.canManage) ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {paused
+                .filter((provider) => provider.canManage)
+                .map((provider) => (
+                  <Button key={provider.id} size="sm" disabled={busy || checking} onClick={() => void allow(provider)}>
+                    {busy ? <Loader2 className="animate-spin" /> : paused.length > 1 ? `Allow new machines on ${provider.displayName}` : "Allow new machines"}
+                  </Button>
+                ))}
+            </div>
+          ) : (
+            <p className="mt-1">An organization owner or administrator can allow them.</p>
+          )}
+        </div>
+      )}
       {step === "logins" && (
         <div className="mt-2 text-xs text-muted-foreground" data-testid="organization-setup-logins">
           <p>

@@ -39,8 +39,14 @@ export function providerActionMessage(error: unknown): string {
 
 export function ProviderControls({
   contextRevision,
+  providersChanged = 0,
+  onChange,
 }: {
   contextRevision: string;
+  /** Counts the provider changes made elsewhere on the page (the setup steps' "Allow new machines"): each one is read here. */
+  providersChanged?: number;
+  /** A change made here went through, for the rest of the page to read (PRO-112). */
+  onChange?: () => void;
 }) {
   const [providers, setProviders] = useState<CloudProviderSummary[]>([]);
   const [selected, setSelected] = useState("");
@@ -95,6 +101,12 @@ export function ProviderControls({
       epoch.current++;
     };
   }, [refresh]);
+  const seenChange = useRef(providersChanged);
+  useEffect(() => {
+    if (seenChange.current === providersChanged) return;
+    seenChange.current = providersChanged;
+    void refresh(selected);
+  }, [providersChanged, refresh, selected]);
   const manage = Boolean(
     provider?.canManage && connection?.canManage && !loading,
   );
@@ -108,6 +120,7 @@ export function ProviderControls({
     try {
       await action();
       if (request !== epoch.current) return;
+      onChange?.();
       setReplacing(false);
       setConsented(false);
       setDisconnecting(false);
