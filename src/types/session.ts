@@ -165,6 +165,11 @@ export interface Workspace {
   uncommitted: number;
   additions: number;
   deletions: number;
+  /** Lines the branch adds and removes against the default branch, committed or not (its pull request's size). */
+  branchAdditions?: number;
+  branchDeletions?: number;
+  /** The branch still has the name drawn for its worktree: nobody has named it yet. */
+  placeholder?: boolean;
   unpushed: number;
   /** Commits ahead of this checkout's configured upstream. */
   ahead: number;

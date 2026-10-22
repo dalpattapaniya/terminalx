@@ -25,6 +25,14 @@ pub struct Workspace {
     pub uncommitted: u32,
     pub additions: u32,
     pub deletions: u32,
+    /// Lines the branch adds against the default branch, committed or not:
+    /// what its pull request would show. Untracked files are not counted.
+    pub branch_additions: u32,
+    pub branch_deletions: u32,
+    /// The branch still has the name drawn for its worktree
+    /// (`calm-ember-panda`): nobody has named it, so it is not yet a branch
+    /// worth showing; its conversation goes by its title until it is.
+    pub placeholder: bool,
     /// Commits on this branch that no remote has.
     pub unpushed: u32,
     /// Commits ahead of this checkout's configured upstream.
@@ -35,8 +43,24 @@ pub struct Workspace {
     pub state: crate::landed::State,
 }
 
+/// A branch named only by a drawn worktree name, after any branch prefix
+/// (`dc/calm-ember-panda`).
+fn placeholder_branch(branch: &str) -> bool {
+    crate::names::is_worktree_name(branch.rsplit('/').next().unwrap_or(branch))
+}
+
 fn shortstat(cwd: &Path) -> (u32, u32) {
-    let out = git::run(cwd, &["diff", "--shortstat", "HEAD", "--"]).unwrap_or_default();
+    diffstat(cwd, &["diff", "--shortstat", "HEAD", "--"])
+}
+
+/// The files as they are now against where the branch left `base`: its
+/// commits and its uncommitted edits together.
+fn branch_shortstat(cwd: &Path, base: &str) -> (u32, u32) {
+    diffstat(cwd, &["diff", "--shortstat", "--merge-base", base, "--"])
+}
+
+fn diffstat(cwd: &Path, args: &[&str]) -> (u32, u32) {
+    let out = git::run(cwd, args).unwrap_or_default();
     let mut add = 0;
     let mut del = 0;
     for part in out.split(',') {
@@ -72,7 +96,7 @@ pub fn list(project: &Path) -> Result<Vec<Workspace>> {
             name: crate::store::projects::project_name(&root.to_string_lossy()),
             path: root.to_string_lossy().into_owned(),
             branch: None, head: None, is_main: true, managed: false,
-            uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0,
+            uncommitted: 0, additions: 0, deletions: 0, branch_additions: 0, branch_deletions: 0, placeholder: false, unpushed: 0, ahead: 0, behind: 0,
             state: crate::landed::State::Unknown,
         }]);
     }
@@ -92,6 +116,12 @@ pub fn list(project: &Path) -> Result<Vec<Workspace>> {
         let managed = p.parent().map(|parent| parent == managed_root).unwrap_or(false);
         let branch = branch.or_else(|| git::current_branch(&p));
         let (additions, deletions) = shortstat(&p);
+        // The project's own checkout is the default branch, or wherever it was switched: no branch of its own to measure.
+        let (branch_additions, branch_deletions) = match context.base() {
+            Some(base) if !is_main => branch_shortstat(&p, base),
+            _ => (0, 0),
+        };
+        let placeholder = !is_main && branch.as_deref().is_some_and(placeholder_branch);
         let (ahead, behind) = git::upstream_counts(&p);
         let changed = uncommitted(&p);
         // The project's own checkout is never removed, so only whether it
@@ -120,6 +150,9 @@ pub fn list(project: &Path) -> Result<Vec<Workspace>> {
             uncommitted: changed,
             additions,
             deletions,
+            branch_additions,
+            branch_deletions,
+            placeholder,
         });
     }
     out.sort_by_key(|w| (!w.is_main, !w.managed));
@@ -372,6 +405,44 @@ mod tests {
         assert!((300 * 1024..2 * 1024 * 1024).contains(&bytes), "{bytes}");
         assert!(size(&p, &outside).is_err(), "not one of this project's workspaces");
         assert!(size(&p, dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_branch_counts_its_committed_and_uncommitted_lines_against_the_default_branch() {
+        let _home = crate::store::temp_home();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("project");
+        std::fs::create_dir_all(&p).unwrap();
+        let commit = |cwd: &Path, message: &str| sh(cwd, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", message]);
+        sh(&p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("a.txt"), "one\ntwo\n").unwrap();
+        sh(&p, &["add", "a.txt"]);
+        commit(&p, "init");
+        let wt = dir.path().join("wt-feature");
+        sh(&p, &["worktree", "add", "-q", "-b", "feature", wt.to_str().unwrap()]);
+        // Two lines committed on the branch, one more not committed yet, one removed.
+        std::fs::write(wt.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        commit(&wt, "more");
+        std::fs::write(wt.join("a.txt"), "one\nthree\nfour\nfive\n").unwrap();
+        // The default branch moving on does not count against the branch.
+        std::fs::write(p.join("b.txt"), "elsewhere\n").unwrap();
+        sh(&p, &["add", "b.txt"]);
+        commit(&p, "main moves");
+
+        let listed = list(&p).unwrap();
+        let feature = listed.iter().find(|w| w.branch.as_deref() == Some("feature")).unwrap();
+        assert_eq!((feature.branch_additions, feature.branch_deletions), (3, 1));
+        assert_eq!((feature.additions, feature.deletions), (1, 1), "uncommitted alone, as before");
+        let root = listed.iter().find(|w| w.is_main).unwrap();
+        assert_eq!((root.branch_additions, root.branch_deletions), (0, 0));
+    }
+
+    #[test]
+    fn a_drawn_branch_name_is_a_placeholder_until_the_branch_is_named() {
+        assert!(placeholder_branch("calm-ember-panda"));
+        assert!(placeholder_branch("dc/calm-ember-panda-2"));
+        assert!(!placeholder_branch("dc/prd"));
+        assert!(!placeholder_branch("main"));
     }
 
     #[test]

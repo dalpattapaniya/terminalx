@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Popover as PopoverPrimitive } from "radix-ui";
 import { ChevronRight, Cpu, History, Loader2, RefreshCw, RotateCcw, SquareTerminal, Trash2, TriangleAlert } from "@/icons";
 import { AgentMark, agentName } from "@/components/AgentMark";
@@ -483,11 +483,24 @@ function refreshPaused(refresh: ProviderRefresh | undefined, now: number): refre
   return refresh?.retryAt != null && refresh.retryAt > now;
 }
 
-function refreshNotice(agent: UsageAgent, refresh: ProviderRefresh | undefined, now: number): string | null {
+/** A provider's refresh trouble in a few words: what happened, then why, with the raw error kept for the tooltip. */
+function refreshNotice(agent: UsageAgent, refresh: ProviderRefresh | undefined, now: number): { title: string; detail: string | null; raw: string } | null {
   if (!refresh) return null;
-  return refreshPaused(refresh, now)
-    ? `${agentName(agent)} refresh paused; retry in ${formatResetCountdown(refresh.retryAt, now, "")}. ${refresh.error ?? ""}`
-    : refresh.error;
+  if (refreshPaused(refresh, now)) {
+    return { title: `${agentName(agent)} refresh paused · retry in ${formatResetCountdown(refresh.retryAt, now, "")}`, detail: refresh.error ? errorReason(refresh.error) : null, raw: refresh.error ?? "" };
+  }
+  return refresh.error ? { title: `Couldn't refresh ${agentName(agent)} usage`, detail: errorReason(refresh.error), raw: refresh.error } : null;
+}
+
+/**
+ * The cause at the end of a chained error, without the addresses before it:
+ * "Could not reach …: https://…: Network Error: timed out reading response"
+ * reads "Timed out reading response".
+ */
+function errorReason(error: string): string {
+  const parts = error.replace(/https?:\/\/\S+/g, "").split(/:\s+/).map((part) => part.trim()).filter(Boolean);
+  const last = parts[parts.length - 1] ?? error.trim();
+  return last.charAt(0).toUpperCase() + last.slice(1);
 }
 
 function formatCreditBalance(balance: string): string {
@@ -531,11 +544,11 @@ function UsageCluster({ tier, onOpenAgentSettings, onOpenUsageDetails }: UsageCl
   const detailGroup = groups.find(({ agent }) => agent === detailAgent) ?? null;
   // Claude's notice also explains an empty popover; Codex's only matters beside its windows.
   const notices = usageError
-    ? [{ key: "app", text: usageError }]
+    ? [{ key: "app", title: "Couldn't refresh usage", detail: errorReason(usageError), raw: usageError }]
     : AGENTS.filter((agent) => agent === "claude" || groups.some((group) => group.agent === agent))
       .flatMap((agent) => {
-        const text = refreshNotice(agent, providerRefresh(usage, agent), now);
-        return text ? [{ key: agent, text }] : [];
+        const notice = refreshNotice(agent, providerRefresh(usage, agent), now);
+        return notice ? [{ key: agent, ...notice }] : [];
       });
 
   const closeAnd = (action?: () => void) => {
@@ -628,60 +641,55 @@ function UsageCluster({ tier, onOpenAgentSettings, onOpenUsageDetails }: UsageCl
           data-usage-popover
           data-status-context-exempt
           onContextMenu={(event) => event.stopPropagation()}
-          className="relative z-(--z-menu) w-[410px] rounded-xl bg-(--surface-card) p-3 text-popover-foreground shadow-surface hairline outline-none data-[state=open]:animate-fade-in"
+          className="relative z-(--z-menu) w-[380px] rounded-xl bg-(--surface-card) p-3 text-popover-foreground shadow-surface hairline outline-none data-[state=open]:animate-fade-in"
         >
-          <div className="mb-2.5 flex items-center gap-2">
-            <div>
-              <div className="text-xs font-medium">Agent usage</div>
-              <div className="mt-0.5 text-[10.5px] text-faint">
-                {compactMode ? "Closest limit per agent" : "All rolling windows, closest limit first"}
-              </div>
+          <div className="flex items-center gap-2 px-1 pb-3">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-medium leading-none text-foreground">Usage</div>
+              <div className="mt-1.5 text-[11px] leading-none text-faint">Rolling limits, closest first</div>
             </div>
-            <div className="ml-auto flex rounded-md bg-well p-0.5 text-[10px]">
-              {(["used", "remaining"] as const).map((percent) => (
-                <button
-                  key={percent}
-                  type="button"
-                  onClick={() => void setStatusSettings({ percent })}
-                  className={cn("rounded px-1.5 py-1 capitalize", settings.percent === percent ? "bg-raised text-foreground shadow-button" : "text-faint")}
-                >
-                  {percent}
-                </button>
-              ))}
-            </div>
+            <Segmented
+              aria-label="Show usage as"
+              value={settings.percent}
+              onChange={(percent) => void setStatusSettings({ percent })}
+              className="h-6 text-[11px]"
+              options={[
+                { value: "used", label: "Used" },
+                { value: "remaining", label: "Left" },
+              ]}
+            />
             <button
               type="button"
               aria-label="Refresh usage"
               disabled={usageRefreshing}
               onClick={() => void refreshUsage(true)}
-              className="rounded-md p-1 text-faint hover:bg-veil-raised hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
+              className="flex size-6 items-center justify-center rounded-md text-faint hover:bg-veil-raised hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
             >
               <RefreshCw className={cn("size-3.5", usageRefreshing && "animate-spin")} />
             </button>
           </div>
           {notices.length ? (
-            <div role="status" className="mb-2 flex flex-col gap-0.5 text-[10.5px] text-muted-foreground">
-              {notices.map((notice) => <div key={notice.key} className="break-words">{notice.text}</div>)}
+            <div role="status" className="mb-2.5 flex flex-col gap-1.5">
+              {notices.map((notice) => (
+                <div key={notice.key} title={notice.raw} className="flex items-start gap-2 rounded-lg bg-warning/8 px-2.5 py-2 ring-1 ring-inset ring-warning/15">
+                  <TriangleAlert className="mt-px size-3.5 shrink-0 text-warning" aria-hidden />
+                  <div className="min-w-0 text-[11.5px] leading-snug">
+                    <div className="text-foreground">{notice.title}</div>
+                    {notice.detail ? <div className="mt-0.5 truncate text-muted-foreground">{notice.detail}</div> : null}
+                  </div>
+                </div>
+              ))}
             </div>
           ) : null}
-          <Segmented
-            aria-label="Usage layout"
-            value={settings.usageMode}
-            onChange={(usageMode) => void setStatusSettings({ usageMode })}
-            className="mb-2.5 w-full"
-            options={[
-              { value: "detailed", label: "Detailed" },
-              { value: "compact", label: "Compact" },
-            ]}
-          />
           {windows.length ? (
-            <ul className="flex flex-col gap-1.5">
-              {groups.map(({ agent, windows: agentWindows, tightest }) => {
+            <ul className="overflow-hidden rounded-lg bg-well/50 ring-1 ring-inset ring-hairline">
+              {groups.map(({ agent, windows: agentWindows, tightest }, index) => {
                 // Compact pairs the tightest window's percent with that window's own reset;
                 // Detailed lists every window, so its headline reset is the soonest one.
                 const reset = compactMode ? tightest.resetsAt : nextReset(agentWindows);
+                const lastKnown = agentWindows.some((window) => usageStale(window, now));
                 return (
-                  <li key={agent}>
+                  <li key={agent} className={cn(index > 0 && "border-t border-hairline")}>
                     <button
                       type="button"
                       data-usage-compact-agent={compactMode ? agent : undefined}
@@ -689,71 +697,81 @@ function UsageCluster({ tier, onOpenAgentSettings, onOpenUsageDetails }: UsageCl
                       aria-label={`${agentName(agent)}${reset == null ? "" : `, ${usageResetLabel(agent, reset, now)}`}`}
                       onClick={() => setDetailAgent((current) => current === agent ? null : agent)}
                       className={cn(
-                        "flex w-full items-center gap-2 rounded-lg bg-well/60 px-2.5 text-left outline-none transition-colors hover:bg-veil-raised focus-visible:ring-1 focus-visible:ring-ring/50",
-                        compactMode ? "py-2" : "py-2.5",
-                        detailAgent === agent && "bg-selected",
+                        "group/agent flex w-full flex-col gap-2.5 px-3 py-2.5 text-left outline-none transition-colors hover:bg-veil-raised focus-visible:bg-veil-raised",
+                        detailAgent === agent && "bg-selected hover:bg-selected",
                       )}
                     >
-                      <AgentMark id={agent} className="size-4 shrink-0 text-faint" decorative brand />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-baseline gap-2">
-                          <span className="text-[12px] font-medium">{agentName(agent)}</span>
-                          {reset != null ? (
-                            <span className="truncate text-[10px] tabular-nums text-faint">
-                              {usageResetLabel(agent, reset, now)}
-                            </span>
-                          ) : null}
-                        </div>
-                        {!compactMode ? (
-                          <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
-                            {orderedWindows(agentWindows).map((window) => {
-                              const isTightest = window.key === tightest.key;
-                              return (
-                                <span key={window.key} className="flex min-w-0 items-center gap-1.5 text-[10px] tabular-nums">
-                                  <span className="shrink-0 text-faint">{windowLabel(window)}</span>
-                                  <span className="h-1 w-8 shrink-0 overflow-hidden rounded-full bg-hairline-strong">
-                                    <span
-                                      className={cn("block h-full rounded-full", isTightest ? usageMeterClass(window, now) : "bg-muted-foreground/45")}
-                                      style={{ width: `${shownPercent(window, settings.percent)}%` }}
-                                    />
-                                  </span>
-                                  <span className={cn("shrink-0", isTightest ? usageTextClass(window, now) : "text-muted-foreground")}>
-                                    {Math.round(shownPercent(window, settings.percent))}%{usageExpired(window, now) ? " expired" : window.stale ? " stale" : ""}
-                                  </span>
-                                </span>
-                              );
-                            })}
-                          </div>
+                      <div className="flex w-full items-center gap-2">
+                        <AgentMark id={agent} className="size-3.5 shrink-0" decorative brand />
+                        <span className="text-[12.5px] font-medium text-foreground">{agentName(agent)}</span>
+                        {lastKnown ? (
+                          <span className="rounded px-1 py-px text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-hairline-strong" title="These numbers are from the last successful refresh">
+                            Last known
+                          </span>
                         ) : null}
-                      </div>
-                      {compactMode ? (
-                        <span className={cn("flex shrink-0 items-center gap-1 text-[11px] font-medium tabular-nums", usageTextClass(tightest, now))}>
-                          {usageStale(tightest, now) ? <TriangleAlert className="size-3" aria-label="Stale usage data" /> : null}
-                          {Math.round(shownPercent(tightest, settings.percent))}%
+                        <span className="ml-auto truncate text-[11px] tabular-nums text-faint">
+                          {reset != null ? usageResetLabel(agent, reset, now) : null}
                         </span>
+                        {compactMode ? (
+                          <span className={cn("shrink-0 text-[12px] font-medium tabular-nums", usageTextClass(tightest, now))}>
+                            {Math.round(shownPercent(tightest, settings.percent))}%
+                          </span>
+                        ) : null}
+                        <ChevronRight className={cn("size-3.5 shrink-0 text-faint transition-transform", detailAgent === agent && "text-muted-foreground")} />
+                      </div>
+                      {!compactMode ? (
+                        <div className="grid w-full grid-cols-[2.75rem_minmax(0,1fr)_2.5rem] items-center gap-x-3 gap-y-2 pl-[22px] pr-[22px]">
+                          {orderedWindows(agentWindows).map((window) => {
+                            const isTightest = window.key === tightest.key;
+                            const percent = Math.round(shownPercent(window, settings.percent));
+                            return (
+                              <Fragment key={window.key}>
+                                <span className="truncate text-[11px] text-muted-foreground">{windowLabel(window)}</span>
+                                <span className="h-1 overflow-hidden rounded-full bg-hairline-strong">
+                                  <span
+                                    className={cn("block h-full rounded-full", isTightest ? usageMeterClass(window, now) : "bg-muted-foreground/40")}
+                                    style={{ width: `${shownPercent(window, settings.percent)}%` }}
+                                  />
+                                </span>
+                                <span className={cn("text-right text-[11px] font-medium tabular-nums", isTightest ? usageTextClass(window, now) : "text-muted-foreground")}>
+                                  {percent}%
+                                </span>
+                              </Fragment>
+                            );
+                          })}
+                        </div>
                       ) : null}
-                      <ChevronRight className="size-3.5 shrink-0 text-faint" />
                     </button>
                   </li>
                 );
               })}
             </ul>
           ) : (
-            <div className="rounded-lg bg-well/60 px-3 py-5 text-center text-[11px] text-faint">
+            <div className="rounded-lg bg-well/50 px-3 py-6 text-center text-[11.5px] text-faint ring-1 ring-inset ring-hairline">
               Usage appears after a Claude turn or a Codex refresh.
             </div>
           )}
-          <div className="mt-2.5 border-t border-hairline pt-1.5">
+          <div className="mt-3 flex items-center gap-2 border-t border-hairline px-1 pt-2.5">
             <button
               type="button"
               disabled={!onOpenUsageDetails}
               onClick={() => closeAnd(onOpenUsageDetails)}
-              className="flex w-full items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-[11px] text-muted-foreground outline-none hover:bg-veil-raised hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-60"
+              className="-ml-1 flex items-center gap-1.5 rounded-md px-1 py-1 text-[11.5px] text-muted-foreground outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-60"
             >
               <History className="size-3.5" />
               <span>Open Stats &amp; Usage</span>
-              <ChevronRight className="ml-auto size-3.5 text-faint" />
             </button>
+            <span className="ml-auto text-[11px] text-faint">Status bar</span>
+            <Segmented
+              aria-label="Usage layout"
+              value={settings.usageMode}
+              onChange={(usageMode) => void setStatusSettings({ usageMode })}
+              className="h-6 text-[11px]"
+              options={[
+                { value: "detailed", label: "Detailed" },
+                { value: "compact", label: "Compact" },
+              ]}
+            />
           </div>
           {detailGroup ? (
             <AgentUsageDetail

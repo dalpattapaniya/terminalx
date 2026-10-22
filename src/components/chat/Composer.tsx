@@ -1,15 +1,19 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, AtSign, ChevronDown, FileText, SlashSquare, Square } from "@/icons";
+import { ArrowUp, AtSign, ChevronDown, FileText, Settings2, SlashSquare, Square } from "@/icons";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
 import { useRowMenu } from "@/components/ui/useRowMenu";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/menu";
 import { AgentMark } from "@/components/AgentMark";
@@ -24,6 +28,7 @@ import { chooseMode } from "@/lib/dialogs";
 import { files as filesApi, type FileHit, type ImageInput, type SlashCommand } from "@/lib/api";
 import type { TabEntry } from "@/types/session";
 import { DictationStatus, MicButton, useDictationInto, useDictationShortcuts } from "./Dictation";
+import { TranscriptionInputSubmenu } from "./TranscriptionInputPicker";
 import { PickerMenu, type PickerItem } from "./PickerMenu";
 import { AttachButton, AttachmentThumbs, DropHint, useImageAttachments } from "./useImageAttachments";
 import { useComposerHistory } from "./useComposerHistory";
@@ -72,8 +77,13 @@ export function insertNewLine(el: HTMLTextAreaElement) {
 // Matches the textarea's max-h-60: about ten lines before it scrolls.
 const MAX_HEIGHT = 240;
 const NO_HISTORY: string[] = [];
-/** The least of its label the permission picker shows: about a first word ("Bypass…"). With less room it shows none. */
-const PERMISSION_LABEL_MIN_CHARS = 9;
+
+/**
+ * The radius of the button in the composer's bottom-right corner: the box's
+ * own (rounded-2xl, 20px) less its padding (p-2.5, 10px), so the two curves
+ * run parallel instead of meeting at different arcs.
+ */
+const CORNER = "rounded-[calc(var(--radius-2xl)-10px)]";
 
 /** A one-click next step above the input. */
 export type Handoff = { label: string; prompt: string } | { label: string; run: () => void };
@@ -188,7 +198,7 @@ export function Composer({
   const [sending, setSending] = useState(false);
   // The model and permission pickers open on a click and an accessibility press too.
   const modelMenu = useRowMenu({ onOpenChange: (open) => open && void refreshPickerModels() });
-  const modeMenu = useRowMenu();
+  const [optionsOpen, setOptionsOpen] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
   const textProps = usePromptTextProps();
   // A file dropped from this computer can be mentioned only to an agent that runs here.
@@ -418,7 +428,7 @@ export function Composer({
       }
     }
     // An open menu owns the arrows (the pickers above, the model and permission menus); dictation owns the draft.
-    if (!pickerOpen && !modelMenu.open && !modeMenu.open && !dictation.dictating && recall.onKeyDown(e)) return;
+    if (!pickerOpen && !modelMenu.open && !optionsOpen && !dictation.dictating && recall.onKeyDown(e)) return;
     if (e.nativeEvent.isComposing) return;
     if (matchesShortcut(e.nativeEvent, "composer.send")) {
       e.preventDefault();
@@ -519,30 +529,6 @@ export function Composer({
         <div className="mt-1 flex items-center gap-1" data-composer-toolbar>
           {/* Nothing can be sent: attaching and dictating into it are off too. */}
           <AttachButton attach={attach} disabled={disabled} />
-          <MicButton dictation={dictation} disabled={disabled} />
-          {fileSource && (
-            <WithTooltip label="Mention a file">
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className="shrink-0"
-                aria-label="Mention a file"
-                onClick={() => {
-                  const sep = draft && !/\s$/.test(draft) ? " " : "";
-                  const next = draft + sep + "@";
-                  onDraftChange(next);
-                  setDismissedToken(null);
-                  requestAnimationFrame(() => {
-                    ref.current?.focus({ preventScroll: true });
-                    ref.current?.setSelectionRange(next.length, next.length);
-                    setCaret(next.length);
-                  });
-                }}
-              >
-                <AtSign />
-              </Button>
-            </WithTooltip>
-          )}
 
           <DropdownMenu {...modelMenu.root}>
             <DropdownMenuTrigger asChild {...modelMenu.trigger}>
@@ -592,54 +578,34 @@ export function Composer({
             </DropdownMenuContent>
           </DropdownMenu>
 
-          <DropdownMenu {...modeMenu.root}>
-            <DropdownMenuTrigger asChild {...modeMenu.trigger}>
-              {/*
-                In a narrow composer the label truncates down to about its first word, never to a
-                single letter: with no room for that it wraps out of sight below the button's one
-                line, leaving the mode's dot and the chevron. The tooltip names the mode either way.
-              */}
-              <Button variant="ghost" size="sm" className="min-w-11 shrink gap-1.5 overflow-hidden px-2 text-muted-foreground" disabled={!!modeLock} title={modeLock ?? `Permission mode: ${permissionLabel}`} aria-label={modeLock ? `Permission mode: ${modeLock}` : undefined} data-testid="permission-mode">
-                <span
-                  className={cn(
-                    "size-2 shrink-0 rounded-full",
-                    modeIsUnguarded(tab.permissionMode) ? "bg-destructive" : pickedMode === "plan" ? "bg-info" : "bg-add",
-                  )}
-                />
-                <span className="flex h-5 min-w-0 flex-wrap content-start overflow-hidden leading-5">
-                  {/* Holds the one visible line, so a label that does not fit starts below it. */}
-                  <span aria-hidden className="h-5 w-0 shrink-0" />
-                  <span className="grow basis-0 truncate" style={{ minWidth: `${Math.min(permissionLabel.length, PERMISSION_LABEL_MIN_CHARS) * 0.8}ch` }} data-testid="permission-mode-label">
-                    {permissionLabel}
-                  </span>
-                </span>
-                <ChevronDown className="size-3 text-faint" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="min-w-[16rem]">
-              <DropdownMenuLabel>Permissions</DropdownMenuLabel>
-              <DropdownMenuRadioGroup value={pickedMode ?? tab.permissionMode} onValueChange={(v) => chooseMode(tab.harness, v, onSetMode)}>
-                {/* A mode set in the terminal that the picker does not offer is still the one in force. */}
-                {!pickedMode && (
-                  <DropdownMenuRadioItem value={tab.permissionMode} className="flex-col items-start gap-0" data-testid="permission-mode-reported">
-                    <span>{permissionLabel}</span>
-                    <span className="text-[11px] text-faint">Set in the terminal.</span>
-                  </DropdownMenuRadioItem>
-                )}
-                {PERMISSION_MODES.map((m) => (
-                  <DropdownMenuRadioItem key={m.id} value={m.id} className="flex-col items-start gap-0">
-                    <span>
-                      {m.label}
-                      {m.id === tab.requestedPermissionMode ? <span className="ml-1.5 text-faint">switching…</span> : null}
-                    </span>
-                    <span className="text-[11px] text-faint">{m.hint}</span>
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
 
           <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {/* Dictation and the less used controls sit with Send, out of the way of the pickers. */}
+            <MicButton dictation={dictation} disabled={disabled} />
+            <ComposerOptions
+              onMention={fileSource ? () => {
+                const sep = draft && !/\s$/.test(draft) ? " " : "";
+                const next = draft + sep + "@";
+                onDraftChange(next);
+                setDismissedToken(null);
+                requestAnimationFrame(() => {
+                  ref.current?.focus({ preventScroll: true });
+                  ref.current?.setSelectionRange(next.length, next.length);
+                  setCaret(next.length);
+                });
+              } : null}
+              microphone={dictation.available === true}
+              onOpen={setOptionsOpen}
+              permissions={{
+                label: permissionLabel,
+                tone: modeIsUnguarded(tab.permissionMode) ? "danger" : pickedMode === "plan" ? "plan" : null,
+                lock: modeLock,
+                picked: pickedMode ?? null,
+                reported: tab.permissionMode,
+                requested: tab.requestedPermissionMode ?? null,
+                onChoose: (mode) => chooseMode(tab.harness, mode, onSetMode),
+              }}
+            />
             {pct != null && (
               <WithTooltip label={`Context ${pct}% used (${Math.round((contextUsed ?? 0) / 1000)}k of ${Math.round((contextMax ?? 0) / 1000)}k)`}>
                 <div className="relative size-4" aria-label={`Context ${pct}%`}>
@@ -659,10 +625,12 @@ export function Composer({
                 </div>
               </WithTooltip>
             )}
-            {busy && canStop ? (
+            {/* One button: Stop while the agent works and nothing is typed, Send (a queued message while it works) once something is. Stop's shortcut works either way. */}
+            {busy && canStop && !draft.trim() && !attachments.length ? (
               <WithTooltip label={stopMode === "force" ? "Stop session" : "Stop"} keys={keysOf(stopMode === "interrupt" ? "session.interrupt" : "session.stop")}>
                 <Button
                   size="icon-sm"
+                  className={CORNER}
                   variant={stopMode === "force" ? "destructive" : "secondary"}
                   aria-label={stopMode === "force" ? "Stop session" : "Stop"}
                   onClick={onStop}
@@ -670,18 +638,20 @@ export function Composer({
                   <Square className="size-3 fill-current" />
                 </Button>
               </WithTooltip>
-            ) : null}
-            <WithTooltip label={busy ? "Queue" : "Send"} keys={keysOf("composer.send")}>
-              <Button
-                size="icon-sm"
-                variant={draft.trim() || attachments.length ? "accent" : "secondary"}
-                aria-label="Send"
-                disabled={disabled || sending || (!draft.trim() && !attachments.length)}
-                onClick={() => void send()}
-              >
-                <ArrowUp />
-              </Button>
-            </WithTooltip>
+            ) : (
+              <WithTooltip label={busy ? "Queue" : "Send"} keys={keysOf("composer.send")}>
+                <Button
+                  size="icon-sm"
+                  className={CORNER}
+                  variant={draft.trim() || attachments.length ? "accent" : "secondary"}
+                  aria-label="Send"
+                  disabled={disabled || sending || (!draft.trim() && !attachments.length)}
+                  onClick={() => void send()}
+                >
+                  <ArrowUp />
+                </Button>
+              </WithTooltip>
+            )}
           </div>
         </div>
       </div>
@@ -696,5 +666,101 @@ export function Composer({
         </div>
       )}
     </div>
+  );
+}
+
+/** The permission mode, as the options menu shows and changes it. */
+interface PermissionChoice {
+  label: string;
+  /** A mode worth seeing without opening the menu: one that asks nothing (danger), or plan. */
+  tone: "danger" | "plan" | null;
+  /** Why it cannot be changed from here, if it cannot. */
+  lock: string | null;
+  /** The picker's own id for the tab's mode; none when the agent reported one the picker does not offer (#417). */
+  picked: string | null;
+  reported: string;
+  requested: string | null;
+  onChoose: (mode: string) => void;
+}
+
+const TONE_DOT = { danger: "bg-destructive", plan: "bg-info" } as const;
+
+/**
+ * The composer's less used controls, behind one button so the toolbar keeps
+ * to what most turns touch: the permission mode, mentioning a file (typing
+ * `@` does the same) and the microphone dictation records from. A mode that
+ * asks nothing, or plan mode, marks the button with its dot, so it is never
+ * in force unseen.
+ */
+function ComposerOptions({ onMention, microphone, permissions, onOpen }: { onMention: (() => void) | null; microphone: boolean; permissions: PermissionChoice; onOpen: (open: boolean) => void }) {
+  // A mention goes on in the text box: the menu must not hand focus back to its button as it closes.
+  const mentioning = useRef(false);
+  const { tone } = permissions;
+  // Opens on a click and an accessibility press too, like the model picker.
+  const menu = useRowMenu({ onOpenChange: onOpen });
+  return (
+    <DropdownMenu {...menu.root}>
+      <WithTooltip label={`More options · ${permissions.label}`}>
+        <DropdownMenuTrigger asChild {...menu.trigger}>
+          <Button variant="ghost" size="icon-sm" className="relative shrink-0" aria-label="More options" data-testid="composer-options">
+            <Settings2 />
+            {tone && <span className={cn("absolute right-1 top-1 size-1.5 rounded-full ring-2 ring-card", TONE_DOT[tone])} data-testid="permission-mode-dot" />}
+          </Button>
+        </DropdownMenuTrigger>
+      </WithTooltip>
+      <DropdownMenuContent
+        align="end"
+        className="min-w-[14rem]"
+        onCloseAutoFocus={(event) => {
+          if (mentioning.current) event.preventDefault();
+          mentioning.current = false;
+        }}
+      >
+        <PermissionSubmenu permissions={permissions} />
+        {(onMention || microphone) && <DropdownMenuSeparator />}
+        {onMention && (
+          <DropdownMenuItem onSelect={() => { mentioning.current = true; onMention(); }}>
+            <AtSign /> Mention a file
+            <span className="ml-auto pl-3 text-faint">@</span>
+          </DropdownMenuItem>
+        )}
+        {microphone && <TranscriptionInputSubmenu />}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function PermissionSubmenu({ permissions: p }: { permissions: PermissionChoice }) {
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger disabled={!!p.lock} title={p.lock ?? `Permission mode: ${p.label}`} aria-label={`Permission mode: ${p.lock ?? p.label}`} data-testid="permission-mode">
+        <span className={cn("size-2 shrink-0 rounded-full", p.tone ? TONE_DOT[p.tone] : "bg-add")} />
+        Permissions
+        <span className="ml-auto max-w-32 truncate pl-3 text-faint" data-testid="permission-mode-label">
+          {p.label}
+        </span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="min-w-[16rem]">
+        <DropdownMenuLabel>Permissions</DropdownMenuLabel>
+        <DropdownMenuRadioGroup value={p.picked ?? p.reported} onValueChange={p.onChoose}>
+          {/* A mode set in the terminal that the picker does not offer is still the one in force. */}
+          {!p.picked && (
+            <DropdownMenuRadioItem value={p.reported} className="flex-col items-start gap-0" data-testid="permission-mode-reported">
+              <span>{p.label}</span>
+              <span className="text-[11px] text-faint">Set in the terminal.</span>
+            </DropdownMenuRadioItem>
+          )}
+          {PERMISSION_MODES.map((m) => (
+            <DropdownMenuRadioItem key={m.id} value={m.id} className="flex-col items-start gap-0">
+              <span>
+                {m.label}
+                {m.id === p.requested ? <span className="ml-1.5 text-faint">switching…</span> : null}
+              </span>
+              <span className="text-[11px] text-faint">{m.hint}</span>
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
   );
 }

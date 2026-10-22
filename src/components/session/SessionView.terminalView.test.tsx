@@ -222,7 +222,9 @@ describe("the chat / terminal switch on a local agent tab", () => {
     const view = render(wrap(<SessionView session={local} sidebarOpen onToggleSidebar={() => undefined} />));
     expect(screen.getByText("Base may be out of date").getAttribute("title")).toBe(local.worktreeBase.warning);
     view.rerender(wrap(<SessionView session={{ ...local, worktreeBase: { ...local.worktreeBase, fetched: true, warning: null } }} sidebarOpen onToggleSidebar={() => undefined} />));
-    expect(screen.getByText("Base 1234567 · fetched at creation")).toBeTruthy();
+    // Fetched as it should be: a detail, in the branch's tooltip rather than on the bar.
+    expect(screen.queryByText("Base 1234567 · fetched at creation")).toBeNull();
+    expect(screen.getByTestId("session-branch").getAttribute("title")).toContain("Base 1234567 · fetched at creation");
     const toggle = await screen.findByRole("button", { name: "Show terminal view" });
     expect(screen.queryByTestId("terminal-view-unavailable")).toBeNull();
     fireEvent.click(toggle);
@@ -236,7 +238,7 @@ describe("the chat / terminal switch on a local agent tab", () => {
   });
 });
 
-describe("a local session's title bar with the tabs in it (#438)", () => {
+describe("a local session's row of tabs under the title bar", () => {
   const tab = (id: string, harness: string, title: string | null) => ({ id, harness, title, model: "", permissionMode: "bypassPermissions", status: "idle" as const, created: `2026-10-01T00:00:0${id.at(-1)}.000Z`, modified: "" });
   const local = (patch: Partial<SessionEntry> = {}): SessionEntry => ({
     id: "strip-1",
@@ -282,34 +284,36 @@ describe("a local session's title bar with the tabs in it (#438)", () => {
     dropSessionTerminals(["strip-1"]);
   });
 
-  it("holds the session's tabs with the + after them and the actions at the right, and leaves the session's name and branch to the sidebar", () => {
+  it("names the place in the title bar, with the actions at the right, and puts the tabs in a row under it with the + after them", () => {
     const header = show();
-    const strip = within(header).getByRole("tablist", { name: "Workspace tabs" });
-    expect(within(strip).getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(["Investigate", "Write the fix"]);
-    const plus = within(header).getByRole("button", { name: "New tab" });
-    expect(strip.compareDocumentPosition(plus) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // The + ends the row of tabs: it is not among the session's actions at the right any more.
-    const actions = header.lastElementChild!;
-    expect(actions.contains(plus)).toBe(false);
-    expect(within(actions as HTMLElement).getByRole("button", { name: "Toggle panel" })).toBeTruthy();
-
-    // Nothing before the tabs names the session or its branch (#477): the sidebar's rows show both.
-    expect(screen.queryByTestId("session-project")).toBeNull();
-    expect(screen.queryByTestId("session-title")).toBeNull();
-    expect(screen.queryByTestId("session-branch")).toBeNull();
-    expect(within(header).queryByText("Fix the login loop")).toBeNull();
-    expect(within(header).queryByText("fix")).toBeNull();
-    // The actions are pushed to the right edge, whatever room the tabs leave.
-    expect(actions.className).toContain("ml-auto");
-    // The issue and automation chips are still there.
+    // The title bar: the project and the branch, with the session's chips.
+    expect(screen.getByTestId("session-project").textContent).toBe("project");
+    expect(within(screen.getByTestId("session-branch")).getByText("fix")).toBeTruthy();
     expect(within(header).getByRole("button", { name: "#12" })).toBeTruthy();
     expect(screen.getByTestId("session-automation").textContent).toBe("Nightly #3");
-    // An ordinary base is not spelled out beside the tabs.
-    expect(screen.queryByText("Base 1234567 · fetched at creation")).toBeNull();
-    // What is left between the + and the actions is empty: the window is dragged from there, and from no tab.
+    expect(screen.getByTestId("session-branch").getAttribute("title")).toContain("Base 1234567 · fetched at creation");
+    expect(within(header).getByRole("button", { name: "Workspace details" })).toBeTruthy();
+    expect(within(header).queryByRole("tablist")).toBeNull();
+    // The row of tabs is right under the title bar, and the + ends it.
+    const row = header.nextElementSibling as HTMLElement;
+    expect(row.getAttribute("data-testid")).toBe("workspace-tab-strip");
+    const strip = within(row).getByRole("tablist", { name: "Workspace tabs" });
+    expect(within(strip).getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(["Investigate", "Write the fix"]);
+    const plus = within(row).getByRole("button", { name: "New tab" });
+    expect(strip.compareDocumentPosition(plus) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The + is not among the session's actions at the right of the title bar.
+    const actions = header.lastElementChild!;
+    expect(actions.contains(plus)).toBe(false);
+    expect(actions.className).toContain("ml-auto");
+    expect(within(actions as HTMLElement).getByRole("button", { name: "Toggle panel" })).toBeTruthy();
+    // The open tab is the underlined one.
+    const [open, other] = within(strip).getAllByRole("tab");
+    expect(open.getAttribute("aria-selected")).toBe("true");
+    expect(open.parentElement!.className).toContain("after:bg-foreground");
+    expect(other.parentElement!.className).not.toContain("after:bg-foreground");
+    // The title bar is where the window is dragged from; the row is not part of it.
     expect(header.getAttribute("data-tauri-drag-region")).toBe("deep");
-    expect(screen.getByTestId("session-header-handle").children).toHaveLength(0);
-    for (const item of within(strip).getAllByRole("tab")) expect(item.closest("[data-tauri-drag-region]")!.getAttribute("data-tauri-drag-region")).toBe("false");
+    expect(row.closest("[data-tauri-drag-region]")).toBeNull();
   });
 
   it("names each tab's panel by its tab in the strip", () => {
@@ -328,12 +332,11 @@ describe("a local session's title bar with the tabs in it (#438)", () => {
     expect(screen.getByRole("status").textContent).toBe("Base may be out of date");
   });
 
-  it("goes back to the breadcrumb, with the tabs in the sidebar alone, when the strip is turned off", () => {
+  it("leaves the tabs to the sidebar alone, with the + among the title bar's actions, when the row is turned off", () => {
     mocks.prefs.tabStrip = false;
     const header = show();
-    expect(within(header).queryByRole("tablist")).toBeNull();
+    expect(screen.queryByRole("tablist")).toBeNull();
     expect(screen.getByTestId("session-project").textContent).toBe("project");
-    expect(screen.getByText("Base 1234567 · fetched at creation")).toBeTruthy();
     expect(header.lastElementChild!.contains(within(header).getByRole("button", { name: "New tab" }))).toBe(true);
     expect(document.querySelector('[role="tabpanel"]')!.getAttribute("aria-labelledby")).toBe("session-agent-tab-st-1");
   });
@@ -345,7 +348,8 @@ describe("a local session's title bar with the tabs in it (#438)", () => {
   });
 
   it("leaves the reader on the terminal they are in when the last agent tab is closed from the strip", async () => {
-    const header = show({ tabs: [tab("st-1", "claude", "Investigate")] });
+    // The title bar and the row of tabs under it.
+    const header = show({ tabs: [tab("st-1", "claude", "Investigate")] }).parentElement!;
     fireEvent.click(within(header).getByRole("button", { name: "New tab" }));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Terminal on this computer" }));
     await waitFor(() => expect(spawned()).toHaveLength(1));
@@ -366,7 +370,7 @@ describe("a local session's title bar with the tabs in it (#438)", () => {
   });
 
   it("opens a shell, as before, when the last tab of any kind closes", async () => {
-    const header = show({ tabs: [tab("st-1", "claude", "Investigate")] });
+    const header = show({ tabs: [tab("st-1", "claude", "Investigate")] }).parentElement!;
     expect(spawned()).toHaveLength(0);
     fireEvent.click(header.querySelector('[aria-label="Close Investigate"]') as HTMLElement);
     await waitFor(() => expect(spawned()).toHaveLength(1));
@@ -411,7 +415,6 @@ describe("a quick chat in the floating window's compact chrome", () => {
     expect(screen.getByRole("button", { name: "Open in main window" })).toBeTruthy();
     // And everything a session can do in the main window.
     expect(screen.getByRole("button", { name: "New tab" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Continue in New Session…" })).toBeTruthy();
     expect(await screen.findByRole("button", { name: "Show terminal view" })).toBeTruthy();
     // No git was asked about a scratch folder.
     expect(guard.calls.map((call) => call.command)).not.toContain("work_status");

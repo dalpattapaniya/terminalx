@@ -1,19 +1,16 @@
 import { useEffect } from "react";
-import { ChevronDown } from "@/icons";
+import { ChevronDown, Mic } from "@/icons";
 import { Button } from "@/components/ui/button";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "@/components/ui/menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from "@/components/ui/menu";
 import { useRowMenu } from "@/components/ui/useRowMenu";
 import { useDictation } from "@/lib/dictation";
 import { refreshTranscriptionInputs, selectTranscriptionInput, useTranscriptionInput } from "@/lib/transcriptionInput";
 
-export function TranscriptionInputPicker({ compact = false }: { compact?: boolean }) {
+/** The saved input, what it is called on a control, and why, for either way of choosing it. */
+function useInputChoice() {
   const input = useTranscriptionInput();
   const { phase } = useDictation();
   const busy = phase !== "idle" || input.saving;
-  // Opens on a click and an accessibility press too; the list is re-read each time it opens.
-  const menu = useRowMenu({ onOpenChange: (next) => { if (next && !busy) void refreshTranscriptionInputs(); } });
-  const { open, setOpen } = menu;
-  useEffect(() => { if (busy) setOpen(false); }, [busy]);
   const missing = input.selected !== null && input.inputs !== null && !input.inputs.some((device) => device.id === input.selected);
   const noInputs = input.inputs?.length === 0;
   const noDefault = input.inputs !== null && !input.inputs.some((device) => device.isDefault);
@@ -37,6 +34,71 @@ export function TranscriptionInputPicker({ compact = false }: { compact?: boolea
   } else if (needsDefault && noDefault) {
     detail = "No system default microphone is available. Choose an available input.";
   }
+  return { input, busy, missing, noInputs, noDefault, needsDefault, label, detail };
+}
+
+type InputChoice = ReturnType<typeof useInputChoice>;
+
+/** The inputs to choose from, and what stands in the way of recording, inside a menu. */
+function InputChoices({ choice, onPicked }: { choice: InputChoice; onPicked: () => void }) {
+  const { input, busy, missing, noInputs, noDefault, needsDefault, detail } = choice;
+  return (
+    <>
+      <p className="px-2 py-1.5 text-xs text-muted-foreground">Audio input for the next recording</p>
+      <DropdownMenuRadioGroup value={input.loaded ? input.selected ?? "" : undefined} onValueChange={(value) => {
+        onPicked();
+        if (!busy) void selectTranscriptionInput(value || null);
+      }}>
+        <DropdownMenuRadioItem value="">System default</DropdownMenuRadioItem>
+        {missing && <DropdownMenuRadioItem value={input.selected!} disabled className="whitespace-normal break-words">
+          {input.selected} · unavailable
+        </DropdownMenuRadioItem>}
+        {input.inputs?.map((device) => (
+          <DropdownMenuRadioItem key={device.id} value={device.id} className="whitespace-normal break-words">
+            <span className="min-w-0 break-words">{device.name}{device.isDefault && <span className="text-faint"> · default</span>}</span>
+          </DropdownMenuRadioItem>
+        ))}
+      </DropdownMenuRadioGroup>
+      {input.loading && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">Looking for audio inputs…</p>}
+      {noInputs && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">No audio inputs available. Connect a microphone and reopen this picker.</p>}
+      {!missing && !noInputs && needsDefault && noDefault && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">{detail}</p>}
+      {missing && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">{detail} Your saved preference is unchanged.</p>}
+      {input.error && <p role="alert" className="px-2 py-1.5 text-xs text-destructive">{input.error} Reopen to retry.</p>}
+    </>
+  );
+}
+
+/**
+ * The microphone as a submenu of another menu (the composer's options): its
+ * row names the saved input, and opening it reads the inputs again.
+ */
+export function TranscriptionInputSubmenu() {
+  const choice = useInputChoice();
+  const { busy, label, detail } = choice;
+  return (
+    <DropdownMenuSub onOpenChange={(next) => { if (next && !busy) void refreshTranscriptionInputs(); }}>
+      <DropdownMenuSubTrigger
+        disabled={busy}
+        aria-label={`Transcription audio input: ${label}`}
+        title={busy ? `${detail} Device changes are disabled until recording and saving finish.` : detail}
+      >
+        <Mic /> Microphone
+        <span className="ml-auto max-w-36 truncate pl-3 text-faint">{label}</span>
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent className="max-h-72 w-72 max-w-[calc(100vw-2rem)] overflow-y-auto">
+        <InputChoices choice={choice} onPicked={() => {}} />
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+export function TranscriptionInputPicker({ compact = false }: { compact?: boolean }) {
+  const choice = useInputChoice();
+  const { input, busy, label, detail } = choice;
+  // Opens on a click and an accessibility press too; the list is re-read each time it opens.
+  const menu = useRowMenu({ onOpenChange: (next) => { if (next && !busy) void refreshTranscriptionInputs(); } });
+  const { open, setOpen } = menu;
+  useEffect(() => { if (busy) setOpen(false); }, [busy]);
   return (
     <DropdownMenu open={open && !busy} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild {...menu.trigger}>
@@ -51,26 +113,7 @@ export function TranscriptionInputPicker({ compact = false }: { compact?: boolea
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="max-h-72 w-72 max-w-[calc(100vw-2rem)] overflow-y-auto">
-        <p className="px-2 py-1.5 text-xs text-muted-foreground">Audio input for the next recording</p>
-        <DropdownMenuRadioGroup value={input.loaded ? input.selected ?? "" : undefined} onValueChange={(value) => {
-          setOpen(false);
-          if (!busy) void selectTranscriptionInput(value || null);
-        }}>
-          <DropdownMenuRadioItem value="">System default</DropdownMenuRadioItem>
-          {missing && <DropdownMenuRadioItem value={input.selected!} disabled className="whitespace-normal break-words">
-            {input.selected} · unavailable
-          </DropdownMenuRadioItem>}
-          {input.inputs?.map((device) => (
-            <DropdownMenuRadioItem key={device.id} value={device.id} className="whitespace-normal break-words">
-              <span className="min-w-0 break-words">{device.name}{device.isDefault && <span className="text-faint"> · default</span>}</span>
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-        {input.loading && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">Looking for audio inputs…</p>}
-        {noInputs && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">No audio inputs available. Connect a microphone and reopen this picker.</p>}
-        {!missing && !noInputs && needsDefault && noDefault && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">{detail}</p>}
-        {missing && <p role="status" className="px-2 py-1.5 text-xs text-muted-foreground">{detail} Your saved preference is unchanged.</p>}
-        {input.error && <p role="alert" className="px-2 py-1.5 text-xs text-destructive">{input.error} Reopen to retry.</p>}
+        <InputChoices choice={choice} onPicked={() => setOpen(false)} />
       </DropdownMenuContent>
       {input.error && !open && <span role="alert" className="max-w-36 text-xs text-destructive" title={input.error}>Input error. Reopen to retry.</span>}
     </DropdownMenu>

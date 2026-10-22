@@ -8,7 +8,6 @@ import { useHeldShortcut, useShortcut, useShortcutKeys } from "@/lib/hotkeys";
 import { clearDictationError, dictationAvailable, startDictation, stopDictation, useDictation, type DictationState } from "@/lib/dictation";
 import { anchorAt, insertSpoken, spokenSince, type DictationAnchor } from "@/lib/dictationText";
 import { useTranscriptionInput } from "@/lib/transcriptionInput";
-import { TranscriptionInputPicker } from "./TranscriptionInputPicker";
 
 /**
  * The mic, shared by the two composers: the one inside a session and the one
@@ -300,8 +299,8 @@ export function MicButton({ dictation, disabled = false }: { dictation: Dictatio
   const keys = useShortcutKeys("composer.dictate");
   if (available === false) return null;
   return (
-    // In a narrow composer the input picker gives way first, down to its chevron (`min-w-14`: the mic and that chevron), and never past it.
-    <div className="flex min-w-14 shrink-[8] items-center">
+    // The input it records from is chosen in the composer's options menu (and in Settings), not beside it.
+    <div className="flex shrink-0 items-center">
       <WithTooltip label={dictating ? "Stop dictating" : `Dictate · ${state.engine}`} keys={keys}>
         <Button
           variant="ghost"
@@ -315,7 +314,6 @@ export function MicButton({ dictation, disabled = false }: { dictation: Dictatio
           <Mic className={cn(dictating && state.phase === "listening" && "animate-pulse-soft")} />
         </Button>
       </WithTooltip>
-      <TranscriptionInputPicker compact />
     </div>
   );
 }

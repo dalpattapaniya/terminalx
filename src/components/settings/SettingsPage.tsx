@@ -224,11 +224,6 @@ function GeneralTab() {
         control={<Switch checked={prefs.animations} onCheckedChange={(v) => setPrefs({ animations: v })} />}
       />
       <SettingRow
-        label="Tabs in the title bar"
-        description="A session's agents, terminals and browser pages as a row of tabs in the title bar, in the same order as the sidebar. Off leaves them in the sidebar only."
-        control={<Switch aria-label="Tabs in the title bar" checked={prefs.tabStrip} onCheckedChange={(v) => setPrefs({ tabStrip: v })} />}
-      />
-      <SettingRow
         label="Fold tool calls"
         description="Once an agent starts answering, the tool calls it made collapse under one line. Off keeps every call expanded."
         control={<Switch checked={prefs.foldToolCalls} onCheckedChange={(v) => setPrefs({ foldToolCalls: v })} />}
@@ -343,6 +338,27 @@ function AppearanceTab({ onOpenUsage }: { onOpenUsage?: () => void }) {
             options={[
               { value: "wide", label: "Wide" },
               { value: "chat", label: "Chat" },
+            ]}
+          />
+        }
+      />
+      <SettingRow
+        label="Tab bar"
+        description="A session's agents, terminals and browser pages as a row of tabs under the title bar, in the same order as the sidebar. Off leaves them in the sidebar only."
+        control={<Switch aria-label="Tab bar" checked={prefs.tabStrip} onCheckedChange={(v) => setPrefs({ tabStrip: v })} />}
+      />
+      <SettingRow
+        label="Sessions on a branch"
+        description="Several sessions on one branch: as tabs beside each other in the tab bar, with one row for the branch in the sidebar; or listed under the branch in the sidebar, with the tab bar holding only the open session's tabs. Without the tab bar they are in the sidebar."
+        control={
+          <Segmented<"tabs" | "sidebar">
+            aria-label="Sessions on a branch"
+            value={prefs.tabStrip ? prefs.branchSessions : "sidebar"}
+            disabled={!prefs.tabStrip}
+            onChange={(v) => setPrefs({ branchSessions: v })}
+            options={[
+              { value: "tabs", label: "Tabs" },
+              { value: "sidebar", label: "Sidebar" },
             ]}
           />
         }

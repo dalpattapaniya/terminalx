@@ -170,7 +170,9 @@ export function ToolGroupRow({ name, calls, cwd, linkContext }: { name: string; 
       ? `${toolVerb(name, done)} ${shortPath(targets[0], cwd)}`
       : `${toolVerb(name, done)} ${targets.length || calls.length} ${noun}${(targets.length || calls.length) === 1 ? "" : "s"}`;
   const Icon = iconFor(calls[0].toolType);
-  const anyFailed = calls.some((c) => c.result?.isError);
+  // Red only while the group ended on a failure: one the agent got past is marked on its own row inside, not on the whole group.
+  const endedFailed = !!calls[calls.length - 1]?.result?.isError;
+  const names = targets.map((t) => fileName(t)).filter(Boolean);
   return (
     <div>
       <div
@@ -180,16 +182,16 @@ export function ToolGroupRow({ name, calls, cwd, linkContext }: { name: string; 
         <button type="button" onClick={(event) => { event.stopPropagation(); setOpen((o) => !o); }} aria-label={`${open ? "Collapse" : "Expand"} ${label}`} className="rounded outline-none focus-visible:ring-2 focus-visible:ring-ring/40">
         {!done ? (
           <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-        ) : anyFailed ? (
+        ) : endedFailed ? (
           <CircleAlert className="size-3.5 shrink-0 text-destructive" />
         ) : (
           <Icon className="size-3.5 shrink-0 text-muted-foreground" />
         )}
         </button>
         <span className={cn("min-w-0 flex-1 truncate", !done ? "text-shimmer" : "text-muted-foreground")}><LinkedText text={label} context={linkContext} /></span>
-        {targets.length > 1 && (
+        {targets.length > 1 && names.length > 0 && (
           <span className="hidden max-w-[40%] truncate font-mono text-[11px] text-faint sm:inline">
-            {targets.map((t) => fileName(t)).slice(0, 4).join(", ")}
+            {names.slice(0, 4).join(", ")}
           </span>
         )}
         <button type="button" onClick={(event) => { event.stopPropagation(); setOpen((o) => !o); }} aria-label={open ? "Collapse tool group" : "Expand tool group"} className="rounded outline-none focus-visible:ring-2 focus-visible:ring-ring/40"><ChevronRight className={cn("size-3.5 shrink-0 text-faint transition-transform", open && "rotate-90")} /></button>

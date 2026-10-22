@@ -31,6 +31,8 @@
 
   /* Aliases: palettes set the --surface-* and --ink-* rungs, everything reads these. */
   --background: var(--surface-page);
+  /* Behind a tab's chat and terminal: the page itself, a shade darker in dark mode. */
+  --surface-chat: var(--surface-page);
   --foreground: var(--ink-strong);
   --card: var(--surface-card);
   --card-foreground: var(--ink-strong);
@@ -82,6 +84,7 @@
   --hairline-strong: oklch(1 0 0 / 8%);
   --border: oklch(1 0 0 / 10%);
   --surface-well: oklch(0 0 0 / 28%);
+  --surface-chat: color-mix(in oklab, var(--surface-page) 88%, black);
   --surface-thumb: color-mix(in oklab, var(--surface-card) 70%, white 30%);
   --shadow-surface: none;
   --shadow-card: none;

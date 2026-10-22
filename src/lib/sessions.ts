@@ -31,7 +31,7 @@ interface State {
   /** Explicit navigation also reveals a destination that was collapsed. */
   navigationVersion: number;
   /** What the workspace shows when no session is selected. */
-  view: "new" | "issues" | "agents" | "automations" | "skills" | "stats";
+  view: "new" | "issues" | "agents" | "automations" | "skills" | "stats" | "project";
   /** The issues browser opens its new-issue form when it next shows; it sets this back. */
   newIssueRequested: boolean;
   /** A cross-workspace navigation request can open one automation directly. */
@@ -280,6 +280,11 @@ export function openNewIssue() {
 /** The issues browser has opened the form it was asked for. */
 export function takeNewIssueRequest() {
   if (state.newIssueRequested) set({ newIssueRequested: false });
+}
+
+/** A project's overview page: its branches, contributors and latest work, from its name in the sidebar. */
+export function openProjectOverview(path: string) {
+  focusProject(path, { selectedSessionId: null, view: "project", selectedAutomationId: null, lastProject: path, navigationVersion: state.navigationVersion + 1 });
 }
 
 /** The agent dashboard, like the issues browser, replaces the whole workspace. */

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { ChevronDown, Globe, Lock, Terminal, TerminalSquare, X } from "@/icons";
 import { AgentMark } from "@/components/AgentMark";
 import { StatusStripe } from "@/components/layout/SidebarRows";
@@ -30,11 +30,8 @@ const DRAG_THRESHOLD = 5;
 
 /** The narrowest a tab gets before the row scrolls: its icon and a few characters. */
 const TAB_MIN_REM = 4.75;
-/** A width a tab's title still reads at. In the title bar the tabs narrow to this before the chips beside them give way. */
-const TAB_EASY_REM = 7.5;
-/** A tab's width when there is room for it. */
-const TAB_MAX_REM = 11;
-const PINNED_REM = 2;
+/** A tab's width when there is room for it: wide enough that most titles are read whole. */
+const TAB_MAX_REM = 14;
 
 const STATUS_DOT: Partial<Record<TabStatus, string>> = {
   waiting: "bg-warning",
@@ -68,10 +65,10 @@ interface Drag {
 }
 
 /**
- * The workspace's tabs as a browser-style row: one tab per agent, terminal
- * and browser page of the open workspace, whichever of its sessions each
- * belongs to. In the main window it sits in the title bar; a window with no
- * room there draws it as a row of its own.
+ * The workspace's tabs as a row of their own under the title bar: one tab
+ * per agent, terminal and browser page of the open workspace, whichever of
+ * its sessions each belongs to. A tab is its icon and title; the open one
+ * is underlined, the way a document's tabs are, and the others are quieter.
  *
  * It is one view of the list the sidebar draws (`@/lib/sessionTabs`): the
  * same tabs in the same order with the same selection. Tabs share the width
@@ -85,23 +82,19 @@ export function WorkspaceTabStrip({
   session,
   selected,
   readOnlyReason,
-  placement,
   hideSingle = false,
+  trailing,
   className,
 }: {
   session: SessionEntry;
-  /**
-   * `titlebar`: between the session's name and its actions, taking what room
-   * there is (see `STRIP_NARROW` in SessionView for what gives way to what).
-   * `row`: a row of its own, the window's whole width.
-   */
-  placement: "titlebar" | "row";
   /** The tab on screen in `session`. */
   selected: SelectedSessionTab | null;
   /** Why this person may not change the tabs (a viewer of a shared session); the tabs still show. */
   readOnlyReason?: string | null;
   /** Draw nothing for a single tab: there is nothing to switch between. */
   hideSingle?: boolean;
+  /** What ends the row of tabs: the "+" that opens one. */
+  trailing?: ReactNode;
   className?: string;
 }) {
   const row = useTabRow(session);
@@ -236,24 +229,9 @@ export function WorkspaceTabStrip({
     return { label, state, kind: peerKind(tab, harnessName), owner: several && tab.sessionId ? row.sessions.find((candidate) => candidate.id === tab.sessionId)?.title : undefined };
   };
   const fade = more.before || more.after ? `linear-gradient(to right, ${more.before ? "transparent, black 1.25rem" : "black"}, ${more.after ? "black calc(100% - 1.25rem), transparent" : "black"})` : null;
-  const pinned = tabs.filter((tab) => tab.pinned).length;
-  const free = tabs.length - pinned;
-  // Gaps between tabs and the row's own padding, in rem.
-  const chrome = (tabs.length + 1) * 0.125;
-  // In the title bar the row starts from its tabs at a width their titles still read at and grows into the
-  // room there is, up to their full width. So its neighbours give way before the tabs narrow further, and
-  // only then does it scroll. It never gives up its last `--tab-floor` tabs.
-  const sizing: CSSProperties =
-    placement === "titlebar"
-      ? {
-          flex: `1 1 ${free * TAB_EASY_REM + pinned * PINNED_REM + chrome}rem`,
-          maxWidth: `${free * TAB_MAX_REM + pinned * PINNED_REM + chrome}rem`,
-          minWidth: `calc(min(${free}, var(--tab-floor, 3)) * ${TAB_MIN_REM}rem + ${pinned * PINNED_REM}rem)`,
-        }
-      : {};
 
   return (
-    <div className={cn("flex min-w-0 items-center gap-0.5", placement === "row" && "w-full shrink-0", className)} style={sizing} data-testid="workspace-tab-strip">
+    <div className={cn("flex w-full shrink-0 items-stretch gap-1 border-b border-hairline px-2", className)} data-testid="workspace-tab-strip">
       <div
         ref={scroller}
         role="tablist"
@@ -264,7 +242,8 @@ export function WorkspaceTabStrip({
           // A wheel turned over the row scrolls it sideways.
           if (!event.deltaX && scroller.current) scroller.current.scrollLeft += event.deltaY;
         }}
-        className="scrollbar-none relative flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto overflow-y-hidden px-0.5 py-1"
+        // The list takes the width of its tabs and no more, so the + sits right after the last one; it shrinks before it scrolls.
+        className="scrollbar-none relative flex min-w-0 shrink items-stretch gap-1 overflow-x-auto overflow-y-hidden"
         style={fade ? { maskImage: fade, WebkitMaskImage: fade } : undefined}
       >
         {tabs.map((tab, index) => {
@@ -277,7 +256,6 @@ export function WorkspaceTabStrip({
               <ContextMenuTrigger asChild>
                 <div
                   data-tab-key={tab.key}
-                  data-tauri-drag-region="false"
                   data-pinned={tab.pinned || undefined}
                   data-dragging={drag?.key === tab.key || undefined}
                   onPointerDown={(event) => beginDrag(event, tab)}
@@ -287,9 +265,12 @@ export function WorkspaceTabStrip({
                     void closePeer(session.id, tab, tabs, selected);
                   }}
                   className={cn(
-                    "group/tab relative flex h-7 select-none items-center rounded-md",
+                    "group/tab relative flex h-9 select-none items-center",
                     tab.pinned ? "w-8 flex-none justify-center" : "shrink",
-                    isActive ? "bg-(--surface-thumb) text-foreground shadow-button" : "text-muted-foreground hover:bg-veil-raised hover:text-foreground",
+                    // The open tab is underlined along its whole width; the others brighten under the pointer.
+                    isActive
+                      ? "text-foreground after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-t-full after:bg-foreground"
+                      : "text-muted-foreground hover:text-foreground",
                     drag?.key === tab.key && "opacity-60",
                   )}
                   // The open tab's close button is always there, so it keeps that much more for its title.
@@ -311,8 +292,8 @@ export function WorkspaceTabStrip({
                           openPeer(session.id, tab);
                         }}
                         className={cn(
-                          "flex min-w-0 flex-1 items-center gap-1.5 self-stretch rounded-md text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
-                          tab.pinned ? "justify-center px-0" : "px-2",
+                          "flex min-w-0 flex-1 items-center gap-1.5 self-stretch rounded-md text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
+                          tab.pinned ? "justify-center px-0" : "pl-3 pr-1",
                         )}
                       >
                         {status ? <StatusStripe status={status} size="tab" /> : null}
@@ -339,7 +320,7 @@ export function WorkspaceTabStrip({
                       // The open tab always has it. Another tab takes no room for it until it is pointed at or has the
                       // focus, so a narrow tab shows its title instead.
                       className={cn(
-                        "mr-1 size-4 shrink-0 items-center justify-center rounded-sm opacity-70 outline-none hover:bg-veil-strong hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring/40",
+                        "mr-2 size-4 shrink-0 items-center justify-center rounded-sm opacity-70 outline-none hover:bg-veil-strong hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring/40",
                         isActive ? "flex" : "hidden group-focus-within/tab:flex group-hover/tab:flex",
                       )}
                     >
@@ -354,9 +335,14 @@ export function WorkspaceTabStrip({
             </ContextMenu>
           );
         })}
-        {drag?.x != null ? <span aria-hidden data-testid="tab-drop-indicator" className="pointer-events-none absolute bottom-1.5 top-1.5 w-0.5 -translate-x-1/2 rounded-full bg-ring" style={{ left: drag.x }} /> : null}
+        {drag?.x != null ? <span aria-hidden data-testid="tab-drop-indicator" className="pointer-events-none absolute bottom-2 top-2 w-0.5 -translate-x-1/2 rounded-full bg-ring" style={{ left: drag.x }} /> : null}
       </div>
-      {overflowing ? <AllTabsMenu row={row} active={activeKey} describe={describe} /> : null}
+      {trailing || overflowing ? (
+        <div className="flex shrink-0 items-center gap-0.5">
+          {trailing}
+          {overflowing ? <AllTabsMenu row={row} active={activeKey} describe={describe} /> : null}
+        </div>
+      ) : null}
     </div>
   );
 }
