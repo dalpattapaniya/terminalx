@@ -8,6 +8,7 @@
 #[cfg(feature = "desktop")]
 mod account;
 mod agent_data;
+mod project_overview;
 #[cfg(feature = "desktop")]
 mod desktop_links;
 #[cfg(feature = "desktop")]
@@ -647,6 +648,9 @@ pub fn run() {
             commands::list_workspaces,
             commands::preview_workspace_name,
             commands::rename_workspace,
+            commands::adopt_agent_title,
+            commands::project_overview,
+            commands::copy_text,
             commands::workspace_disposition,
             commands::remove_workspace,
             commands::workspace_size,

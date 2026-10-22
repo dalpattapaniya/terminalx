@@ -887,6 +887,36 @@ impl SessionPatch {
     }
 }
 
+/// Name a conversation after what it is about, as its agent titled it
+/// (Claude Code writes a title into its transcript), while the conversation
+/// still goes by the name it was given automatically: "New session", or the
+/// first line of its opening prompt. A title the reader chose is never
+/// replaced, nor one taken from the agent before. `None` when nothing changes.
+pub(crate) fn adopt_agent_title(session_id: &str) -> Result<Option<SessionEntry>> {
+    let Some(session) = index::load().map_err(err)?.into_iter().find(|s| s.id == session_id) else { return Ok(None) };
+    let Some(path) = session.tabs.iter()
+        .filter(|tab| tab.harness == "claude")
+        .filter_map(|tab| crate::harness::claude::transcript::locate(&session.cwd, tab.provider_session_id.as_deref()?))
+        .find(|path| path.is_file())
+    else { return Ok(None) };
+    let Some(title) = crate::harness::claude::transcript::ai_title(&path) else { return Ok(None) };
+    let first = crate::harness::claude::transcript::first_prompt(&path).unwrap_or_default();
+    if title == session.title || !automatic_title(&session.title, &first) {
+        return Ok(None);
+    }
+    update_session_meta(session_id, &SessionPatch { title: Some(title), ..Default::default() }).map(Some)
+}
+
+/// Whether `title` is one the app made up: the untitled default, or the
+/// opening prompt's first line (cut short).
+fn automatic_title(title: &str, first_prompt: &str) -> bool {
+    let title = title.trim();
+    title.is_empty()
+        || title == "New session"
+        || title == QUICK_CHAT_TITLE
+        || first_prompt.trim().lines().next().is_some_and(|line| line.trim().starts_with(title))
+}
+
 /// Apply a [`SessionPatch`] and return the updated entry.
 pub(crate) fn update_session_meta(session_id: &str, patch: &SessionPatch) -> Result<SessionEntry> {
     index::update_session(session_id, |s| {
@@ -1152,6 +1182,13 @@ mod tests {
             "projectPath": project, "title": title, "useWorktree": true,
             "tab": { "harness": "codex" },
         })).unwrap()
+    }
+
+    #[test]
+    fn only_a_made_up_title_gives_way_to_the_agents() {
+        assert!(super::automatic_title("New session", ""));
+        assert!(super::automatic_title("We can work on PRD", "We can work on PRD here\nand more"));
+        assert!(!super::automatic_title("Pricing notes", "We can work on PRD here"));
     }
 
     #[test]

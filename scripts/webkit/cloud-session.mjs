@@ -242,7 +242,7 @@ function toolbarChecks(measured) {
   measured.overlapping = overlapping;
   const names = controls.map((control) => control.name);
   return {
-    "the toolbar has its controls: attach, dictate, audio input, model, permission mode, stop and send": ["Attach", "Dictate", "Transcription audio input", "Stop", "Send"].every((name) => names.some((found) => found.startsWith(name))) && controls.length >= 7,
+    "the toolbar has its controls: attach, dictate, more options, model, permission mode, stop and send": ["Attach", "Dictate", "More options", "Stop", "Send"].every((name) => names.some((found) => found.startsWith(name))) && controls.length >= 7,
     "no two controls of the composer toolbar overlap": overlapping.length === 0,
     "every control is inside the toolbar, and the toolbar inside the composer and the window": controls.every((control) => control.left >= toolbar.left - SLACK && control.right <= toolbar.right + SLACK) && !!box && toolbar.left >= box.left - SLACK && toolbar.right <= box.right + SLACK && box.right <= viewport.width + SLACK && toolbar.bottom <= viewport.height + SLACK,
     "every control keeps its icons inside its own box, and is wide enough to press": controls.every((control) => control.iconsInside && control.width >= 20),
@@ -260,7 +260,7 @@ for (const viewport of [{ width: 1000, height: 520 }, { width: 1280, height: 760
     await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
     await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
     await page.locator("main [data-composer-toolbar]").waitFor();
-    await page.getByRole("button", { name: /^Transcription audio input: System default/ }).waitFor();
+    await page.getByRole("button", { name: "More options" }).waitFor();
     await page.waitForTimeout(300);
     let measured = await toolbarLayout(page);
     const wide = toolbarChecks(measured);

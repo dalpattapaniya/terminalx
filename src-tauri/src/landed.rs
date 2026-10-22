@@ -443,6 +443,13 @@ pub struct ListContext {
     stash_subjects: Option<String>,
 }
 
+impl ListContext {
+    /// The default branch every workspace is compared with, when known.
+    pub fn base(&self) -> Option<&str> {
+        self.base.as_deref()
+    }
+}
+
 pub fn list_context(project: &Path) -> ListContext {
     let (base, _, _) = base_for(project, Fetch::Skip);
     let base_commit = base.as_deref().and_then(|base| git::run(project, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]).ok()).map(|sha| sha.trim().to_string());

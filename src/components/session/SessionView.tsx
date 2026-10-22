@@ -1,10 +1,10 @@
 import { LocalShareButton } from "./ShareSessionDialog";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { CalendarClock, CircleDot, Cloud, FolderOpen, GitBranch, Globe, MessageSquare, MessageSquarePlus, PanelLeft, PanelRight, Terminal } from "@/icons";
+import { CalendarClock, ChevronRight, CircleDot, Cloud, Copy, Ellipsis, Folder, FolderOpen, GitBranch, Globe, MessageSquare, MessageSquarePlus, PanelLeft, PanelRight, Terminal } from "@/icons";
 import { describeGithubIdentity, refreshGithubIdentity, useGithubIdentity } from "@/lib/githubIdentity";
 import { toggleTabView, useTabViews } from "@/lib/tabViews";
 import { followedSelection, isTerminalTab, tabViewIn } from "@/lib/tabFront";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { WithTooltip } from "@/components/ui/tooltip";
 import { SessionIssueWork } from "@/components/issues/IssueWork";
@@ -12,6 +12,7 @@ import { linkText } from "@/lib/issueWork";
 import { TITLEBAR_INSET } from "@/components/layout/AppShell";
 import { useShortcut } from "@/lib/hotkeys";
 import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
+import { checkoutLabel, worktreeCheckout } from "@/lib/checkout";
 import { openAutomations, renameWorkspace, selectSession, useSessionStore } from "@/lib/sessions";
 import { cn } from "@/lib/cn";
 import type { SessionEntry } from "@/types/session";
@@ -55,6 +56,7 @@ import { WorkspaceTabStrip, stripTabId } from "./WorkspaceTabStrip";
 import { localRemovableWorkspace } from "@/lib/workspaceRemoval";
 import { PipelineStatus } from "@/components/issues/IssuePipelinePanel";
 import { pipelineForSession, useIssuePipelines } from "@/lib/issuePipeline";
+import { copyText } from "@/lib/clipboard";
 
 /** Why a quick chat's panel has no Changes, Repo or PR. */
 const NO_REPOSITORY = "No repository here: Changes, Repo and PR need one. Point this chat at a repository, or move it to a project, to use them.";
@@ -211,49 +213,12 @@ function GithubMark({ className }: { className?: string }) {
 }
 
 /**
- * A local session's header with the tab strip in it (the main window, unless
- * the strip is turned off in Settings). The title bar then holds, from the
- * left: the session's chips, the workspace's tabs, the "+", and the session's
- * actions pinned to the right edge. What is left between the "+" and the
- * actions is empty, and is where the window is dragged from.
- *
- * The session's name and its branch are not in the title bar (#477): the
- * sidebar's rows show both (and rename a worktree), and a tab's hover names
- * its session when the workspace has several.
- *
- * The chips and the tabs are laid out as one row (the breadcrumb has no box
- * of its own here), so each gives way in its turn and none runs under
- * another. The actions at the right never shrink and are never covered. As
- * the header narrows:
- *
- * 1. The tabs narrow evenly, to a width their titles still read at.
- * 2. The pipeline, automation and folder chips shrink to their icons (the
- *    pipeline's to the dot that says where it stands), the way a cloud
- *    header's do (`STRIP_CHIP_YIELDS`: a label with no room left for even
- *    an ellipsis is out of sight, never a stray letter). The issue chip
- *    keeps its place.
- * 3. The tabs narrow further, down to an icon and a few characters each.
- * 4. The row of tabs scrolls, with a menu at its end that lists every tab,
- *    until two tabs are left in view.
- *
- * Past that nothing can shrink, so what is drawn depends on the header's
- * width, least needed first:
- *
- * 5. Narrower than `STRIP_NARROW`: the folder and base chips are left out
- *    (the sidebar's workspace row shows them), and one tab stays in view
- *    beside the menu.
- * 6. Narrower than `STRIP_TIGHT`: Share keeps only its icon.
- * 7. Narrower than `STRIP_MENU`: the row of tabs is the menu alone, and the
- *    issue chip keeps only its icon.
+ * A local session's header in the main window: the title bar names the place
+ * (the GitHub account, the project and the branch) with the session's chips,
+ * and holds its actions at the right edge. The workspace's tabs are a row of
+ * their own under it, with the "+" that opens one at their end, unless the
+ * reader turned the row off in Settings (then the sidebar alone lists them).
  */
-const STRIP_CHIP_YIELDS = cn(HEADER_CHIP_YIELDS, "shrink-[10000] overflow-hidden");
-const STRIP_NARROW = "@max-[650px]/session-header:hidden";
-const STRIP_TIGHT = "@max-[540px]/session-header:hidden";
-const STRIP_MENU = "@max-[415px]/session-header:hidden";
-/** How many tabs the strip keeps in view at their narrowest, and its giving way to its menu in the narrowest header. */
-const STRIP_FLOOR =
-  "[--tab-floor:2] @max-[650px]/session-header:[--tab-floor:1] @max-[415px]/session-header:min-w-0! @max-[415px]/session-header:grow-0! @max-[415px]/session-header:basis-auto! @max-[415px]/session-header:[&>[role=tablist]]:hidden";
-
 /** What a presence tab id names in this session: an agent tab's title or a terminal. */
 function tabLabelOf(cloud: CloudSessionModel, tabId: string): string | null {
   const tab = cloud.session.tabs.find((candidate) => candidate.id === tabId);
@@ -410,12 +375,11 @@ export function SessionView({
   const store = useSessionStore();
   const backend = cloud?.backend ?? localSessionBackend(session.id);
   const local = backend.caps.local;
-  // The workspace's tabs in the title bar: the main window's local sessions, unless the reader turned the strip off.
-  const strip = local && !cloud && !compact && prefs.tabStrip;
-  // A window with no room in its title bar (the floating one) draws the same tabs in a row under it.
-  const stripRow = !!chrome?.tabStrip && !cloud && !strip;
-  // A tab's panel is named by the tab that shows it: the strip's while there is one, else the sidebar's row.
-  const labelledBy = strip || stripRow ? stripTabId : tabNodeId;
+  // The workspace's tabs as a row under the title bar: a local session's, unless the reader turned the row off
+  // (the floating window says for itself whether it has one).
+  const stripRow = local && !cloud && (chrome ? !!chrome.tabStrip : prefs.tabStrip);
+  // A tab's panel is named by the tab that shows it: the row's while there is one, else the sidebar's row.
+  const labelledBy = stripRow ? stripTabId : tabNodeId;
   // What the chat's Delete workspace acts on; a cloud session's is its runtime's.
   const localWorkspace = cloud ? undefined : localRemovableWorkspace(session);
   const project = store.projects.find((p) => p.path === session.projectPath);
@@ -474,8 +438,13 @@ export function SessionView({
   const workspaceTitle = session.removedWorkspace?.path ?? session.cwd;
   const baseNote = session.worktreeBase && !session.worktreeBase.warning ? `Base ${session.worktreeBase.commit.slice(0, 7)}${session.worktreeBase.fetched ? " · fetched at creation" : ""}` : null;
   const [continuationSource, setContinuationSource] = useState<TabEntry | null>(null);
+  // Carry the open tab's conversation into a new session: from the workspace menu, not a button of its own.
+  const continueTab = activeTab && local ? () => setContinuationSource(activeTab) : null;
   const [renameError, setRenameError] = useState<string | null>(null);
   const workspace = managedWorkspaceFor(session);
+  // The worktree's agent moved it off the branch it was made on: say where it is now.
+  const own = worktreeCheckout(session, store.workspaces);
+  const movedTo = own && own.branch !== session.branch ? checkoutLabel(own) : null;
   // One action for local and cloud tabs, so a remapped shortcut switches either.
   useShortcut("session.toggleTerminalView", () => {
     if (activeTab && terminalOffer?.available) void toggleTabView(session, activeTab, { remote: !local });
@@ -522,7 +491,7 @@ export function SessionView({
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
         <header
           data-tauri-drag-region="deep"
-          className={cn("flex h-(--titlebar-h) shrink-0 items-center gap-1 px-2", (cloud || strip) && "@container/session-header")}
+          className={cn("flex h-(--titlebar-h) shrink-0 items-center gap-1 px-2", cloud && "@container/session-header")}
           style={{ paddingLeft: sidebarOpen ? 8 : TITLEBAR_INSET }}
         >
           {!sidebarOpen && !compact && (
@@ -536,8 +505,7 @@ export function SessionView({
             <div className="flex min-w-0 flex-1 items-center gap-1 text-sm" data-testid="session-compact-leading">{chrome?.leading}</div>
           ) : (
           /* A cloud header in a narrow window gives way in order (see HEADER_CHIP_YIELDS), and clips rather than run under the buttons on the right. */
-          /* Beside the tabs its parts are items of the header's own row (it has no box), so each gives way in its turn and none runs under a tab. */
-          <div className={cn("text-sm", strip ? "contents" : "flex min-w-0 flex-1 items-center gap-1.5 px-1", cloud && "overflow-hidden")} data-testid="session-breadcrumb">
+          <div className={cn("flex min-w-0 flex-1 items-center gap-1.5 px-1 text-sm", cloud && "overflow-hidden")} data-testid="session-breadcrumb">
             {/* The GitHub account the folder is connected to, first: the mark alone, the account on hover; a click asks GitHub again. */}
             {githubIdentity?.login && (
               <WithTooltip label={`Connected to GitHub as ${githubIdentity.login}. ${describeGithubIdentity(githubIdentity)}`}>
@@ -553,25 +521,40 @@ export function SessionView({
               </WithTooltip>
             )}
             {/* A cloud session that goes by its project's name (untitled, or locked with nothing else to name) has one title, not the same one twice. */}
-            {/* With the tabs in the title bar the project is on the title's hover, not beside it. */}
-            {!strip && !(cloud && cloud.projectName === session.title) && (
+            {!(cloud && cloud.projectName === session.title) && (
               <>
                 <span className={cn("max-w-[30%] truncate text-muted-foreground", cloud && HEADER_PROJECT_YIELDS, cloud && HEADER_TIGHT)} title={cloud ? cloud.projectName : quick ? "A quick chat: it has no project" : project?.name} data-testid="session-project">
                   {cloud ? cloud.projectName : quick ? sessionProjectName(session, project) : (project?.name ?? "project")}
                 </span>
-                <span className={cn("text-faint", cloud && HEADER_TIGHT)}>/</span>
+                <ChevronRight aria-hidden className={cn("size-3.5 shrink-0 text-faint", cloud && HEADER_TIGHT)} />
               </>
             )}
-            {/* Beside the tabs neither the name nor the branch is drawn (#477): the sidebar's rows show both. */}
-            {strip ? null : local && workspaceLabel ? (
-              /* A local chat is placed by its branch, not named by its title (the sidebar names it): "terminalx / main". */
+            {local && workspaceLabel && own?.placeholder ? (
+              /* Its worktree's branch still has the name drawn for it: until somebody names a branch, the chat goes by its title. */
+              <>
+                <span className="truncate text-foreground" title={[`On ${own.branch}, a name drawn for the workspace`, workspaceTitle].join("\n")} data-testid="session-title">
+                  {session.title}
+                </span>
+                <BranchSize additions={own.branchAdditions ?? 0} deletions={own.branchDeletions ?? 0} />
+                <WorkspaceMenu session={session} branch={own.branch} folder={session.worktreeName ?? null} base={baseNote} onContinue={continueTab} />
+              </>
+            ) : local && workspaceLabel ? (
+              /* A local chat is placed by its branch, not named by its title (the sidebar names it): "terminalx › main". */
+              <>
               <span
                 className="flex min-w-0 items-center gap-1 text-foreground"
                 title={[session.title, workspaceTitle, baseNote].filter(Boolean).join("\n")}
                 data-testid="session-branch"
               >
                 <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
-                {session.worktreeName && !session.worktreeRemoved ? (
+                {movedTo ? (
+                  // Its agent moved the worktree to another branch (or a bare commit): that is where the session is now, and the folder keeps its own name beside it.
+                  <>
+                    <span className="truncate" title={`Checked out now. The worktree was made on ${session.branch ?? "its own branch"}.`} data-testid="session-checkout">
+                      {movedTo}
+                    </span>
+                  </>
+                ) : session.worktreeName && !session.worktreeRemoved ? (
                   <WorkspaceNameEditor
                     value={session.worktreeName}
                     onCommit={async (requested) => {
@@ -586,6 +569,9 @@ export function SessionView({
                 )}
                 {session.worktreeRemoved && <span className="shrink-0 text-[11px] text-faint">· workspace removed</span>}
               </span>
+              {own && <BranchSize additions={own.branchAdditions ?? 0} deletions={own.branchDeletions ?? 0} />}
+              <WorkspaceMenu session={session} branch={movedTo ?? session.branch} folder={session.worktreeName && !session.worktreeRemoved ? session.worktreeName : null} base={baseNote} onContinue={continueTab} />
+              </>
             ) : (
               <span className="truncate text-foreground" title={session.title} data-testid="session-title">
                 {session.title}
@@ -599,40 +585,23 @@ export function SessionView({
                   className="ml-1 flex shrink-0 items-center gap-1 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
                 >
                   <CircleDot className="size-3" />
-                  <span className={cn(strip && STRIP_MENU)}>{session.issue.identifier}</span>
+                  <span>{session.issue.identifier}</span>
                 </button>
               </WithTooltip>
             )}
             {/* Who else works on the issue now (#441). It is the first to go when the header narrows. */}
-            {session.issue && <SessionIssueWork session={session} sessions={store.sessions} className={cn("ml-1 max-w-48 shrink", strip && STRIP_NARROW)} />}
+            {session.issue && <SessionIssueWork session={session} sessions={store.sessions} className="ml-1 max-w-48 shrink" />}
             {pipelineRole && (
               // The issue pipeline this session is part of, as its author or its reviewer.
               <WithTooltip label={`${pipelineRole.role === "reviewer" ? "Reviewing" : "Working on"} ${pipelineRole.pipeline.issue.identifier} · ${pipelineRole.pipeline.note ?? pipelineRole.pipeline.issue.title}`}>
                 <button
                   type="button"
                   onClick={() => (pipelineRole.pipeline.pr ? void openUrl(pipelineRole.pipeline.pr.url) : void openUrl(pipelineRole.pipeline.issue.url))}
-                  className={cn(
-                    "ml-1 flex items-center rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground",
-                    // Beside the tabs it gives way like the other chips, down to the dot that says where the pipeline stands.
-                    strip ? cn("max-w-48", STRIP_CHIP_YIELDS, "gap-x-1.5") : "shrink-0 gap-1.5",
-                  )}
+                  className="ml-1 flex shrink-0 items-center gap-1.5 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
                   data-testid="session-pipeline"
                 >
-                  {strip ? (
-                    // The status laid out as the chip's own icon and label: the dot leads and stays, and the words are one label that is cut, then gone.
-                    <PipelineStatus
-                      pipeline={pipelineRole.pipeline}
-                      className="contents"
-                      dotClassName="my-[7px]"
-                      labelClassName={cn("truncate", HEADER_CHIP_LABEL)}
-                      lead={pipelineRole.role === "reviewer" ? <span className="font-normal text-muted-foreground">Reviewer · </span> : null}
-                    />
-                  ) : (
-                    <>
-                      {pipelineRole.role === "reviewer" && <span>Reviewer ·</span>}
-                      <PipelineStatus pipeline={pipelineRole.pipeline} />
-                    </>
-                  )}
+                  {pipelineRole.role === "reviewer" && <span>Reviewer ·</span>}
+                  <PipelineStatus pipeline={pipelineRole.pipeline} />
                 </button>
               </WithTooltip>
             )}
@@ -641,33 +610,32 @@ export function SessionView({
                 <button
                   type="button"
                   onClick={openAutomations}
-                  className={cn("ml-1 flex items-center gap-1 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground", strip ? cn("max-w-40", STRIP_CHIP_YIELDS) : "shrink-0")}
+                  className="ml-1 flex shrink-0 items-center gap-1 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
                   data-testid="session-automation"
                 >
-                  <CalendarClock className={strip ? HEADER_CHIP_ICON : "size-3 shrink-0"} />
-                  <span className={cn(strip && cn("truncate", HEADER_CHIP_LABEL))}>{session.automation.name} #{session.automation.runNumber}</span>
+                  <CalendarClock className="size-3 shrink-0" />
+                  <span>{session.automation.name} #{session.automation.runNumber}</span>
                 </button>
               </WithTooltip>
             )}
             {quick && (
               // Where a quick chat runs: it has no project to say so.
-              <span className={cn("ml-1 flex min-w-0 items-center gap-1 overflow-hidden rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground", strip ? cn("max-w-40", STRIP_CHIP_YIELDS, STRIP_NARROW) : "max-w-[35%]")} title={session.cwd} data-testid="session-quick-place">
-                <FolderOpen className={strip ? HEADER_CHIP_ICON : "size-3 shrink-0"} />
-                <span className={cn("truncate", strip && HEADER_CHIP_LABEL)}>{quickChatPlace(session)}</span>
+              <span className="ml-1 flex min-w-0 max-w-[35%] items-center gap-1 overflow-hidden rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground" title={session.cwd} data-testid="session-quick-place">
+                <FolderOpen className="size-3 shrink-0" />
+                <span className="truncate">{quickChatPlace(session)}</span>
               </span>
             )}
             {/* A cloud session's branch is a chip after its title; a local one's is the crumb above. */}
             {!local && workspaceLabel && (
               <span
                 className={cn(
-                  "ml-1 flex items-center overflow-hidden rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground",
-                  strip ? "max-w-48" : "max-w-[35%]",
-                  cloud ? cn(HEADER_CHIP_YIELDS, HEADER_TIGHT) : strip ? cn(STRIP_CHIP_YIELDS, STRIP_NARROW) : "min-w-0 gap-1",
+                  "ml-1 flex max-w-[35%] items-center overflow-hidden rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground",
+                  cloud ? cn(HEADER_CHIP_YIELDS, HEADER_TIGHT) : "min-w-0 gap-1",
                 )}
                 title={workspaceTitle}
                 data-testid="session-branch"
               >
-                <GitBranch className={cloud || strip ? HEADER_CHIP_ICON : "size-3 shrink-0"} />
+                <GitBranch className={cloud ? HEADER_CHIP_ICON : "size-3 shrink-0"} />
                 {local && session.worktreeName && !session.worktreeRemoved ? (
                   <WorkspaceNameEditor
                     value={session.worktreeName}
@@ -676,19 +644,19 @@ export function SessionView({
                       return renamed.name;
                     }}
                     onError={setRenameError}
-                    className={cn("text-muted-foreground hover:text-foreground", strip ? cn("truncate text-left", HEADER_CHIP_LABEL) : "max-w-52")}
+                    className="max-w-52 text-muted-foreground hover:text-foreground"
                   />
                 ) : (
-                  <span className={cn("truncate", (cloud || strip) && HEADER_CHIP_LABEL)}>{workspaceLabel}</span>
+                  <span className={cn("truncate", cloud && HEADER_CHIP_LABEL)}>{workspaceLabel}</span>
                 )}
                 {session.worktreeRemoved && <span className="text-faint">· workspace removed</span>}
               </span>
             )}
-            {/* Beside the tabs only a base that may be out of date is said aloud. */}
-            {session.worktreeBase && (!strip || session.worktreeBase.warning) && (
+            {/* The base commit is a detail (the branch's tooltip and the ··· menu have it); only a doubt about it stays on the bar. A cloud session has no menu, so it keeps the note. */}
+            {session.worktreeBase && (session.worktreeBase.warning || !local) && (
               <span
                 role={session.worktreeBase.warning ? "status" : undefined}
-                className={cn("truncate text-[11px] text-muted-foreground", strip && cn("min-w-0 shrink-[10000]", STRIP_NARROW))}
+                className={cn("truncate text-[11px]", session.worktreeBase.warning ? "text-warning" : "text-muted-foreground")}
                 title={session.worktreeBase.warning ?? `Base commit: ${session.worktreeBase.commit}`}
               >
                 {session.worktreeBase.warning
@@ -698,35 +666,19 @@ export function SessionView({
             )}
             {cloud && <CloudLocation cloud={cloud} yields={!!terminalOffer?.available} onShowPorts={showPorts} />}
             {renameError && (
-              <span role="alert" className={cn("ml-1 max-w-64 truncate text-[11px] text-destructive", strip && "min-w-0 shrink-[10000]")} title={renameError}>
+              <span role="alert" className="ml-1 max-w-64 truncate text-[11px] text-destructive" title={renameError}>
                 {renameError}
               </span>
             )}
           </div>
           )}
 
-          {strip && (
-            <>
-              <WorkspaceTabStrip session={session} selected={selected} placement="titlebar" readOnlyReason={backend.readOnlyReason} className={STRIP_FLOOR} />
-              {/* The "+" ends the row of tabs, as in a browser. Keyed by session: a menu left open never carries over to another session. */}
-              <TabActions key={session.id} session={session} selected={selected} />
-              {/* Empty title bar: what is left here is where the window is dragged from. */}
-              <div aria-hidden className="min-w-6 flex-[0.001_1_0%] self-stretch @max-[415px]/session-header:min-w-2" data-testid="session-header-handle" />
-            </>
-          )}
-          {/* At the right edge whatever the width: room the tabs leave unused goes before these, not after them (#477). */}
-          <div className={cn("ml-auto flex shrink-0 items-center gap-0.5", !compact && !strip && "max-w-[70%]")}>
+          {/* At the right edge whatever the width. */}
+          <div className={cn("ml-auto flex shrink-0 items-center gap-0.5", !compact && "max-w-[70%]")}>
             {/* The compact (floating) window has no share dialog to open. */}
-            {local && !compact && <LocalShareButton sessionId={session.id} labelClassName={strip ? STRIP_TIGHT : undefined} />}
-            {/* Keyed by session: a menu left open never carries over to another session. */}
-            {!strip && !cloud?.locked && <TabActions key={session.id} session={session} selected={selected} cloud={cloud} onShowPorts={showPorts} />}
-            {activeTab && local && (
-              <WithTooltip label="Continue in New Session…">
-                <Button variant="ghost" size="icon-sm" aria-label="Continue in New Session…" onClick={() => setContinuationSource(activeTab)}>
-                  <MessageSquarePlus />
-                </Button>
-              </WithTooltip>
-            )}
+            {local && !compact && <LocalShareButton sessionId={session.id} />}
+            {/* The "+" that opens a tab, where no row of tabs ends with it (the floating window's row comes and goes). Keyed by session: a menu left open never carries over to another session. */}
+            {(!stripRow || compact) && !cloud?.locked && <TabActions key={session.id} session={session} selected={selected} cloud={cloud} onShowPorts={showPorts} />}
             {activeTab && terminalOffer?.available && (!activeIsTerminal || terminalHasConversation) && (
               <WithTooltip label={activeInTerminal ? viewSwitch.toChat : viewSwitch.toTerminal} shortcut="session.toggleTerminalView">
                 <Button
@@ -774,7 +726,16 @@ export function SessionView({
             {chrome?.trailing}
           </div>
         </header>
-        {stripRow && <WorkspaceTabStrip session={session} selected={selected} placement="row" hideSingle className="border-b border-hairline px-1.5" />}
+        {/* The row of tabs, ended by the "+" that opens one (keyed by session, as above). The floating window leaves out a row that would only repeat its one tab, and keeps its + in the title bar. */}
+        {stripRow && (
+          <WorkspaceTabStrip
+            session={session}
+            selected={selected}
+            readOnlyReason={backend.readOnlyReason}
+            hideSingle={compact}
+            trailing={compact ? undefined : <TabActions key={session.id} session={session} selected={selected} />}
+          />
+        )}
         {cloud && !cloud.locked && <CloudResourceNotice workspaceKey={cloud.workspaceKey} turn={session.tabs.some((t) => t.status === "in_progress")} manage={cloud.manage} />}
 
         {continuationSource && <ContinuationDialog session={session} source={continuationSource} onClose={() => setContinuationSource(null)} />}
@@ -928,5 +889,58 @@ export function SessionView({
         </>
       )}
     </div>
+  );
+}
+
+/** What the branch changes against the default branch, as its pull request would count it. Nothing for a branch that changes nothing. */
+function BranchSize({ additions, deletions }: { additions: number; deletions: number }) {
+  if (!additions && !deletions) return null;
+  return (
+    <span className="ml-1 flex shrink-0 items-center gap-1 font-mono text-[12px] tabular-nums" title="Lines changed on this branch against the default branch, committed or not" data-testid="session-branch-size">
+      {additions > 0 && <span className="text-add">+{additions}</span>}
+      {deletions > 0 && <span className="text-destructive">−{deletions}</span>}
+    </span>
+  );
+}
+
+/** The workspace's details, out of the title bar: the folder it lives in, the commit it started from, and a way to it. */
+function WorkspaceMenu({ session, branch, folder, base, onContinue }: { session: SessionEntry; branch: string | null | undefined; folder: string | null; base: string | null; onContinue: (() => void) | null }) {
+  return (
+    <DropdownMenu>
+      <WithTooltip label="Workspace">
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="icon-xs" aria-label="Workspace details" className="ml-0.5 shrink-0 text-faint hover:text-foreground">
+            <Ellipsis />
+          </Button>
+        </DropdownMenuTrigger>
+      </WithTooltip>
+      <DropdownMenuContent align="start" className="min-w-[15rem]">
+        {(folder || base) && (
+          <>
+            <DropdownMenuLabel className="flex flex-col gap-0.5 font-normal">
+              {folder && <span className="flex items-center gap-1.5 text-foreground"><Folder className="size-3.5 text-faint" />{folder}</span>}
+              {base && <span className="text-[11px] text-muted-foreground">{base}</span>}
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        {branch && (
+          <DropdownMenuItem onSelect={() => void copyText(branch).catch(() => {})}>
+            <Copy /> Copy branch name
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem onSelect={() => void revealItemInDir(session.cwd)}>
+          <FolderOpen /> Reveal in Finder
+        </DropdownMenuItem>
+        {onContinue && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={onContinue}>
+              <MessageSquarePlus /> Continue in New Session…
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

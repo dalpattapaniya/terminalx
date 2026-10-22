@@ -1893,6 +1893,50 @@ pub fn rename_session(app: AppHandle, session_id: String, title: String) -> CmdR
     patch_session(&app, &session_id, crate::session_ops::SessionPatch { title: Some(title), ..Default::default() })
 }
 
+/// Put text on the system clipboard. The webview's own clipboard refuses a
+/// write it does not count as the reader's gesture (a choice in a context
+/// menu, say); the system's has no such rule.
+#[tauri::command]
+pub fn copy_text(text: String) -> CmdResult<()> {
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("pbcopy");
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("clip");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        std::process::Command::new("wl-copy")
+    } else {
+        let mut xclip = std::process::Command::new("xclip");
+        xclip.args(["-selection", "clipboard"]);
+        xclip
+    };
+    let mut child = command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(err)?;
+    child.stdin.take().ok_or("The clipboard could not be written.")?.write_all(text.as_bytes()).map_err(err)?;
+    let status = child.wait().map_err(err)?;
+    if !status.success() {
+        return Err("The clipboard could not be written.".into());
+    }
+    Ok(())
+}
+
+/// A project at a glance: branches, contributors, the newest commits and pull requests.
+#[tauri::command]
+pub async fn project_overview(project_path: String) -> CmdResult<crate::project_overview::ProjectOverview> {
+    tauri::async_runtime::spawn_blocking(move || crate::project_overview::overview(Path::new(&project_path)))
+        .await
+        .map_err(err)
+}
+
+/// Take the agent's title for a conversation that still has a made-up one.
+#[tauri::command]
+pub fn adopt_agent_title(app: AppHandle, session_id: String) -> CmdResult<()> {
+    if let Some(session) = crate::session_ops::adopt_agent_title(&session_id)? {
+        let _ = app.emit("session_updated", &session);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_session_archived(app: AppHandle, session_id: String, archived: bool) -> CmdResult<()> {
     patch_session(&app, &session_id, crate::session_ops::SessionPatch { archived: Some(archived), ..Default::default() })

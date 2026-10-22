@@ -16,8 +16,16 @@ export interface Prefs {
   sidebarOpen: boolean;
   sidebarWidth: number;
   panelOpen: boolean;
-  /** A session's tabs as a row in the title bar. Off leaves them to the sidebar alone. */
+  /** A session's tabs as a row under the title bar. Off leaves them to the sidebar alone. */
   tabStrip: boolean;
+  /**
+   * Where several sessions on one branch are kept: as tabs beside each other
+   * in the tab bar, with one row for the branch in the sidebar, or listed
+   * under the branch in the sidebar, with the tab bar holding only the open
+   * session's own tabs. One or the other, never both. With no tab bar it is
+   * the sidebar (see `branchSessionsAsTabs` in `@/lib/tabLayouts`).
+   */
+  branchSessions: "tabs" | "sidebar";
   panelWidth: number;
   editorPaneWidth: number;
   updateChannel: "stable" | "beta";
@@ -111,6 +119,7 @@ const DEFAULTS: Prefs = {
   sidebarWidth: 268,
   panelOpen: false,
   tabStrip: true,
+  branchSessions: "tabs",
   panelWidth: 400,
   editorPaneWidth: 520,
   updateChannel: "stable",

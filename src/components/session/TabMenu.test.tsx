@@ -219,9 +219,11 @@ describe("a tab's right-click menu", () => {
     expect(order().at(-2)).toBe("agent:a2");
 
     await choose("Tab title");
-    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith("Fix flaky test");
+    // Copied through the system clipboard: the webview's refuses a write from a menu.
+    const copied = () => backend.callsOf("copy_text").at(-1);
+    expect(copied()).toEqual({ text: "Fix flaky test" });
     await choose("Working directory");
-    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(FEATURE);
+    expect(copied()).toEqual({ text: FEATURE });
     await choose("Reveal working directory in the file manager");
     expect(native.reveal).toHaveBeenCalledWith(FEATURE);
 

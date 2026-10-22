@@ -9,6 +9,7 @@ import { cn } from "@/lib/cn";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/menu";
 import type { ChangeStatus } from "@/types/session";
 import { FileTypeIcon } from "./FileTypeIcon";
+import { copyText } from "@/lib/clipboard";
 
 interface Row {
   path: string;
@@ -267,7 +268,7 @@ function RootedFileTreeView({
   }, [focus]);
 
   const abs = (rel: string) => (rel ? `${root}/${rel}` : root);
-  const copy = (text: string) => void navigator.clipboard?.writeText(text).catch(() => {});
+  const copy = (text: string) => void copyText(text).catch(() => {});
   const mention = (rel: string) => {
     if (!mentionTabId) return;
     const cur = getDraft(mentionTabId);

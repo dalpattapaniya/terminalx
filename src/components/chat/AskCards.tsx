@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { ShieldAlert, MessageCircleQuestion } from "@/icons";
+import { forwardRef, useEffect, useRef, useState, type ReactNode } from "react";
+import { Check, ShieldAlert, MessageCircleQuestion } from "@/icons";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/tooltip";
 import { revealInOwnScroller } from "@/lib/shellScroll";
@@ -45,12 +45,38 @@ export function askDetail(ask: Pick<PendingAsk, "toolName" | "input" | "title">)
   return line.length > DETAIL_MAX ? `${line.slice(0, DETAIL_MAX)}…` : line;
 }
 
+/** The one look both requests share: a labelled card, its body, and a bar of actions. */
+const AskShell = forwardRef<HTMLDivElement, { icon: ReactNode; label: string; tone: "warning" | "info"; children: ReactNode; actions: ReactNode; aside?: ReactNode; note?: ReactNode }>(
+  function AskShell({ icon, label, tone, children, actions, aside, note }, ref) {
+    return (
+      <div ref={ref} className="animate-fade-in overflow-hidden rounded-xl border border-hairline-strong bg-card">
+        <div className={cn("flex items-center gap-1.5 px-4 pt-3 text-[11px] font-medium uppercase tracking-wide", tone === "warning" ? "text-warning" : "text-info")}>
+          {icon}
+          {label}
+        </div>
+        <div className="px-4 pb-3.5 pt-1.5">{children}</div>
+        <div className="flex flex-wrap items-center gap-1.5 border-t border-hairline bg-veil-card px-3 py-2">
+          {aside && <div className="mr-auto flex items-center gap-1.5">{aside}</div>}
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">{actions}</div>
+        </div>
+        {note && <p className="border-t border-hairline px-4 py-2 text-xs text-muted-foreground" data-testid="answer-blocked">{note}</p>}
+      </div>
+    );
+  },
+);
+
+/** The Return hint on a request's default action. */
+function EnterKey() {
+  return <Kbd className="ml-1.5 h-4 min-w-4 bg-black/15 text-[10px] text-current">⏎</Kbd>;
+}
+
 export function PermissionCard({
   ask,
   onAnswer,
   busy,
   blockedReason = null,
   showDetail = false,
+  aside,
 }: {
   ask: PendingAsk;
   onAnswer: (optionId: string) => void;
@@ -63,6 +89,8 @@ export function PermissionCard({
   blockedReason?: string | null;
   /** Quote what is asked for (the command, file or tool) under the heading. */
   showDetail?: boolean;
+  /** At the start of the action bar, such as stopping the session. */
+  aside?: ReactNode;
 }) {
   const detail = showDetail ? askDetail(ask) : null;
   const blocked = !!blockedReason;
@@ -74,48 +102,39 @@ export function PermissionCard({
     if (first) revealInOwnScroller(first);
   }, []);
   return (
-    <div
+    <AskShell
       ref={ref}
-      className="animate-fade-in rounded-xl border border-warning/30 bg-warning/[0.06] p-3.5"
-
+      icon={<ShieldAlert className="size-3.5" />}
+      label="Permission"
+      tone="warning"
+      aside={aside}
+      note={blocked ? blockedReason : null}
+      actions={ask.options?.map((o, i) => (
+        <Button
+          key={o.id}
+          size="sm"
+          // Blocked: the same quiet outline for every option, so Allow reads as off as Deny does.
+          variant={blocked || o.kind === "deny" ? "outline" : i === 0 ? "accent" : "secondary"}
+          disabled={busy || blocked}
+          title={blockedReason ?? undefined}
+          onClick={() => onAnswer(o.id)}
+          className={cn((blocked || o.kind === "deny") && "text-muted-foreground")}
+        >
+          {o.kind === "deny" ? "Deny" : o.kind === "allow_once" ? "Allow" : o.kind === "allow_always" ? "Always allow" : o.kind === "allow_session" ? "Allow for session" : "Change permission mode"}
+          {/* Return answers nothing for someone who may not answer. */}
+          {i === 0 && !blocked && <EnterKey />}
+        </Button>
+      ))}
     >
-      <div className="flex items-start gap-2.5">
-        <ShieldAlert className="mt-0.5 size-4 shrink-0 text-warning" />
-        <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium">
-            Waiting for permission to {verbFor(ask.toolName ?? "")}
-          </div>
-          {detail && (
-            <div className="mt-1.5 break-words rounded-md bg-well px-2 py-1 font-mono text-[11.5px] text-muted-foreground" data-testid="permission-detail" title={detail}>
-              <LinkedText text={detail} />
-            </div>
-          )}
-          <div className="mt-3 flex flex-wrap items-center gap-1.5">
-            {ask.options?.map((o, i) => (
-              <Button
-                key={o.id}
-                size="sm"
-                // Blocked: the same quiet outline for every option, so Allow reads as off as Deny does.
-                variant={blocked || o.kind === "deny" ? "outline" : i === 0 ? "accent" : "secondary"}
-                disabled={busy || blocked}
-                title={blockedReason ?? undefined}
-                onClick={() => onAnswer(o.id)}
-                className={cn((blocked || o.kind === "deny") && "text-muted-foreground", o.kind === "deny" && "ml-auto")}
-              >
-                {o.kind === "deny" ? "Deny" : o.kind === "allow_once" ? "Allow" : o.kind === "allow_always" ? "Always allow" : o.kind === "allow_session" ? "Allow for session" : "Change permission mode"}
-                {/* Return answers nothing for someone who may not answer. */}
-                {i === 0 && !blocked && <Kbd className="ml-1 bg-black/10">⏎</Kbd>}
-              </Button>
-            ))}
-          </div>
-          {blocked && (
-            <p className="mt-2 text-xs text-muted-foreground" data-testid="answer-blocked">
-              {blockedReason}
-            </p>
-          )}
-        </div>
+      <div className="text-[14px] font-medium leading-snug text-foreground">
+        Waiting for permission to {verbFor(ask.toolName ?? "")}
       </div>
-    </div>
+      {detail && (
+        <div className="mt-2 break-words rounded-md bg-well px-2.5 py-1.5 font-mono text-[12px] text-muted-foreground" data-testid="permission-detail" title={detail}>
+          <LinkedText text={detail} />
+        </div>
+      )}
+    </AskShell>
   );
 }
 
@@ -151,12 +170,15 @@ export function QuestionCard({
   onAnswer,
   busy,
   blockedReason = null,
+  aside,
 }: {
   ask: PendingAsk;
   onAnswer: (answers: Record<string, string>) => void;
   busy?: boolean;
   /** Why this reader may not answer (see PermissionCard): Answer and Skip are plainly off, with the reason. */
   blockedReason?: string | null;
+  /** At the start of the action bar, such as stopping the session. */
+  aside?: ReactNode;
 }) {
   const blocked = !!blockedReason;
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -191,76 +213,85 @@ export function QuestionCard({
   return (
     <form
       ref={ref}
-      className="animate-fade-in rounded-xl border border-info/30 bg-info/[0.06] p-3.5"
       onSubmit={(e) => {
         e.preventDefault();
         submit();
       }}
     >
-      <div className="flex items-start gap-2.5">
-        <MessageCircleQuestion className="mt-0.5 size-4 shrink-0 text-info" />
-        <div className="min-w-0 flex-1 space-y-4">
+      <AskShell
+        icon={<MessageCircleQuestion className="size-3.5" />}
+        label={questions.length > 1 ? `${questions.length} questions` : "Question"}
+        tone="info"
+        aside={aside}
+        note={blocked ? blockedReason : null}
+        actions={
+          <>
+            <Button size="sm" variant="ghost" type="button" disabled={busy || blocked} title={blockedReason ?? undefined} onClick={() => onAnswer({})} className="text-muted-foreground">
+              Skip
+            </Button>
+            <Button size="sm" variant={blocked ? "outline" : "accent"} type="submit" disabled={busy || blocked} title={blockedReason ?? undefined} className={cn(blocked && "text-muted-foreground")}>
+              Answer {!blocked && <EnterKey />}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-5">
           {questions.map((q) => {
             const picked = answers[q.question] ?? "";
             const pickedSet = new Set(picked.split(", ").filter(Boolean));
             return (
               <div key={q.question}>
-                <div className="text-[13px] font-medium"><LinkedText text={q.question} /></div>
-                <div className="mt-2 flex flex-col gap-1">
-                  {q.options.map((o) => (
-                    <div
-                      key={o.label}
-                      onClick={() => toggle(q.question, o.label, q.multiSelect)}
-                      className={cn(
-                        "flex items-start gap-2 rounded-md border px-2.5 py-1.5 text-left text-[13px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
-                        pickedSet.has(o.label) ? "border-ring bg-veil-raised" : "border-hairline hover:bg-veil-raised",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        data-choice
-                        aria-label={o.label}
-                        aria-pressed={pickedSet.has(o.label)}
-                        onClick={(event) => { event.stopPropagation(); toggle(q.question, o.label, q.multiSelect); }}
+                <div className="text-[14px] font-medium leading-snug text-foreground"><LinkedText text={q.question} /></div>
+                {q.multiSelect && <div className="mt-0.5 text-[12px] text-faint">Choose any that apply</div>}
+                <div className="mt-3 flex flex-col gap-1.5">
+                  {q.options.map((o) => {
+                    const on = pickedSet.has(o.label);
+                    return (
+                      <div
+                        key={o.label}
+                        onClick={() => toggle(q.question, o.label, q.multiSelect)}
                         className={cn(
-                          "mt-1 size-2.5 shrink-0 rounded-full border outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
-                          pickedSet.has(o.label) ? "border-accent bg-accent" : "border-faint",
+                          "group flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors",
+                          on ? "border-accent/50 bg-accent/[0.07]" : "border-hairline hover:border-hairline-strong hover:bg-veil-card",
                         )}
-                      />
-                      <span>
-                        <span><LinkedText text={o.label} /></span>
-                        {o.description && <span className="block text-xs text-muted-foreground"><LinkedText text={o.description} /></span>}
-                      </span>
-                    </div>
-                  ))}
+                      >
+                        {/* The choice itself: a radio, or a checkbox where several may be picked. Links in the text stay outside it. */}
+                        <button
+                          type="button"
+                          data-choice
+                          aria-label={o.label}
+                          aria-pressed={on}
+                          onClick={(event) => { event.stopPropagation(); toggle(q.question, o.label, q.multiSelect); }}
+                          className={cn(
+                            "mt-0.5 flex size-4 shrink-0 items-center justify-center border transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
+                            q.multiSelect ? "rounded-[4px]" : "rounded-full",
+                            on ? "border-accent bg-accent" : "border-muted-foreground/50 group-hover:border-muted-foreground",
+                          )}
+                        >
+                          {on && (q.multiSelect ? <Check className="size-3 text-accent-foreground" strokeWidth={3} /> : <span className="size-1.5 rounded-full bg-accent-foreground" />)}
+                        </button>
+                        <span className="min-w-0">
+                          <span className="block text-[13px] font-medium leading-5 text-foreground"><LinkedText text={o.label} /></span>
+                          {o.description && <span className="mt-0.5 block text-[12px] leading-relaxed text-muted-foreground"><LinkedText text={o.description} /></span>}
+                        </span>
+                      </div>
+                    );
+                  })}
                   {q.freeText && (
                     <input
                       {...textProps}
                       value={free[q.question] ?? ""}
                       onChange={(e) => setFree((f) => ({ ...f, [q.question]: e.target.value }))}
                       placeholder="Or type your own answer"
-                      className="mt-0.5 h-8 rounded-md border border-hairline bg-transparent px-2.5 text-[13px] outline-none placeholder:text-faint focus:border-ring"
+                      className="mt-1 h-9 rounded-lg border border-hairline bg-well px-3 text-[13px] outline-none placeholder:text-faint focus:border-ring/60"
                     />
                   )}
                 </div>
               </div>
             );
           })}
-          <div className="flex items-center gap-2">
-            <Button size="sm" variant={blocked ? "outline" : "accent"} type="submit" disabled={busy || blocked} title={blockedReason ?? undefined} className={cn(blocked && "text-muted-foreground")}>
-              Answer {!blocked && <Kbd className="ml-1 bg-black/10">⏎</Kbd>}
-            </Button>
-            <Button size="sm" variant="ghost" type="button" disabled={busy || blocked} title={blockedReason ?? undefined} onClick={() => onAnswer({})}>
-              Skip
-            </Button>
-          </div>
-          {blocked && (
-            <p className="text-xs text-muted-foreground" data-testid="answer-blocked">
-              {blockedReason}
-            </p>
-          )}
         </div>
-      </div>
+      </AskShell>
     </form>
   );
 }

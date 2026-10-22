@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { agent, api } from "@/lib/api";
-import { getSessions, patchTab } from "@/lib/sessions";
+import { getSessions, patchTab, refreshWorkspaces } from "@/lib/sessions";
 import { noteStatusChange } from "@/lib/notify";
 import { onAppResume } from "@/lib/appResume";
 import type { AgentEvent, BlockRef } from "@/types/events";
@@ -220,6 +220,13 @@ export function setTabStatus(sessionId: string, tabId: string, status: TabStatus
   patchTab(sessionId, tabId, { status });
   touch(k, true);
   if (session && tab && prev !== status) noteStatusChange(session, { ...tab, status }, prev, status);
+  // Once a turn ends the agent may have titled the conversation: it takes that name while it has a made-up one.
+  if (session && prev === "in_progress" && status !== "in_progress") void Promise.resolve().then(() => api.adoptAgentTitle(session.id)).catch(() => {});
+  // A turn may have switched branches or committed: the checkouts are read again once it ends.
+  if (session && prev === "in_progress" && status !== "in_progress" && session.kind !== "quick") {
+    void refreshWorkspaces(session.projectPath);
+    if (session.link && session.link.path !== session.projectPath) void refreshWorkspaces(session.link.path);
+  }
 }
 
 export function useTabLog(sessionId: string, tabId: string): TabLog {

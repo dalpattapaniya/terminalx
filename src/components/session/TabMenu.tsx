@@ -49,10 +49,11 @@ import { useTabState } from "@/lib/tabLayouts";
 import { toggleTabView, useTabViews } from "@/lib/tabViews";
 import type { SelectedSessionTab } from "@/lib/terminal";
 import { IssueLinkContextItems } from "@/components/session/IssueLinkMenuItems";
+import { copyText } from "@/lib/clipboard";
 
 const BULK: BulkClose[] = ["others", "right", "left", "idle", "all"];
 
-const copy = (text: string) => void navigator.clipboard?.writeText(text).catch(() => {});
+const copy = (text: string) => void copyText(text).catch(() => {});
 
 const failed = (what: string) => (error: unknown) => console.error(`${what} failed`, error);
 

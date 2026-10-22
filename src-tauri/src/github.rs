@@ -135,6 +135,14 @@ pub(crate) fn parse_pr(v: &Value) -> PullRequest {
     }
 }
 
+/// `gh pr list` with the given flags (a `--json` among them), as its records.
+pub fn list_prs(cwd: &Path, flags: &[&str]) -> Result<Vec<Value>> {
+    let mut args = vec!["pr", "list"];
+    args.extend_from_slice(flags);
+    let out = run(cwd, &args)?;
+    Ok(serde_json::from_str::<Value>(&out)?.as_array().cloned().unwrap_or_default())
+}
+
 /// Every PR whose head is `branch`, open first then newest.
 pub fn prs_for_branch(cwd: &Path, branch: &str) -> Result<Vec<PullRequest>> {
     prs_for_branch_with(cwd, branch, run)
