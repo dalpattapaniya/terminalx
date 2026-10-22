@@ -1,5 +1,6 @@
 //! Argument parsing and output for the `terminalx` thin client.
 
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -149,61 +150,99 @@ pub fn run_cli() -> Option<i32> {
     } else {
         return None;
     };
-    Some(run(&all[offset..]))
+    Some(run(&all[offset..], &mut Output { stdout: &mut io::stdout().lock(), stderr: &mut io::stderr().lock() }))
 }
 
-fn run(args: &[String]) -> i32 {
+/// Where a CLI run writes: standard output and error, or stand-ins in tests.
+///
+/// Nothing here prints with `println!`: it panics when a write fails, and the
+/// release profile's `panic = "abort"` turned `terminalx --help | head -1`
+/// into SIGABRT and a macOS crash report for TerminalX (PRO-108).
+struct Output<'a> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+/// Writes `text` as one line and flushes it, so a failed write is seen here
+/// rather than when the process exits.
+fn emit(to: &mut dyn Write, text: &str) -> io::Result<()> {
+    writeln!(to, "{text}")?;
+    to.flush()
+}
+
+/// The exit status once the command's output is written. A reader that
+/// stopped early (`| head`, a pager quit) closed the pipe: that ends the
+/// output, not the command, so the status stays the command's own, as with
+/// git or rg. The command has run by then (an RPC was carried out in the
+/// app); only its output is lost. Any other failed write is an error.
+fn exit_status(status: i32, written: io::Result<()>, stderr: &mut dyn Write) -> i32 {
+    match written {
+        Ok(()) => status,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => status,
+        Err(error) => {
+            let _ = emit(stderr, &format!("terminalx: could not write the output: {error}"));
+            if status == 0 { 1 } else { status }
+        }
+    }
+}
+
+fn run(args: &[String], out: &mut Output) -> i32 {
+    let (status, written) = execute(args, out);
+    exit_status(status, written, out.stderr)
+}
+
+/// Runs the command and writes its output: the exit status, and whether the
+/// output got written.
+fn execute(args: &[String], out: &mut Output) -> (i32, io::Result<()>) {
     let wants_json = args.iter().any(|arg| arg == "--json");
     let parsed = match parse(args) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            print_error(error, wants_json);
-            return 2;
-        }
+        Err(error) => return (2, print_error(out, error, wants_json)),
     };
     match parsed.action {
         Action::Help => {
             let help = help_text();
-            if parsed.json {
+            let written = if parsed.json {
                 print_response(
+                    out,
                     &ControlResponse::success("local", json!({"help": help})),
                     true,
-                );
+                )
             } else {
-                println!("{help}");
-            }
-            0
+                emit(out.stdout, &help)
+            };
+            (0, written)
         }
         Action::Version => {
-            if parsed.json {
+            let written = if parsed.json {
                 print_response(
+                    out,
                     &ControlResponse::success(
                         "local",
                         json!({"version": env!("CARGO_PKG_VERSION")}),
                     ),
                     true,
-                );
+                )
             } else {
-                println!("{}", env!("CARGO_PKG_VERSION"));
-            }
-            0
+                emit(out.stdout, env!("CARGO_PKG_VERSION"))
+            };
+            (0, written)
         }
         Action::Guide { name, guide } => {
-            if parsed.json {
+            let written = if parsed.json {
                 print_response(
+                    out,
                     &ControlResponse::success(
                         "local",
                         json!({"name": name, "version": env!("CARGO_PKG_VERSION"), "guide": guide}),
                     ),
                     true,
-                );
+                )
             } else {
-                print!("{guide}");
-                if !guide.ends_with('\n') {
-                    println!();
-                }
-            }
-            0
+                // The guide ends in its own newline, which `emit` supplies.
+                emit(out.stdout, guide.strip_suffix('\n').unwrap_or(guide))
+            };
+            (0, written)
         }
         Action::Rpc {
             command,
@@ -220,20 +259,13 @@ fn run(args: &[String]) -> i32 {
                         })
                     })
                     .flatten();
-                match readable {
-                    Some(text) => println!("{text}"),
-                    None => print_response(&response, parsed.json),
-                }
-                if ok {
-                    0
-                } else {
-                    1
-                }
+                let written = match readable {
+                    Some(text) => emit(out.stdout, &text),
+                    None => print_response(out, &response, parsed.json),
+                };
+                (if ok { 0 } else { 1 }, written)
             }
-            Err(error) => {
-                print_error(error, parsed.json);
-                1
-            }
+            Err(error) => (1, print_error(out, error, parsed.json)),
         },
     }
 }
@@ -261,31 +293,34 @@ fn cloud_wait(
     }
 }
 
-fn print_response(response: &ControlResponse, json_output: bool) {
+fn print_response(out: &mut Output, response: &ControlResponse, json_output: bool) -> io::Result<()> {
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(response).unwrap_or_else(|_| "{\"ok\":false}".into())
-        );
+        emit(
+            out.stdout,
+            &serde_json::to_string_pretty(response).unwrap_or_else(|_| "{\"ok\":false}".into()),
+        )
     } else if response.ok {
         let result = response.result.as_ref().unwrap_or(&Value::Null);
         match result {
-            Value::String(text) => println!("{text}"),
-            _ => println!(
-                "{}",
-                serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into())
+            Value::String(text) => emit(out.stdout, text),
+            _ => emit(
+                out.stdout,
+                &serde_json::to_string_pretty(result).unwrap_or_else(|_| "null".into()),
             ),
         }
     } else if let Some(error) = &response.error {
-        eprintln!("{}: {}", error.code, error.message);
-        if let Some(recovery) = &error.recovery {
-            eprintln!("Recovery: {recovery}");
+        emit(out.stderr, &format!("{}: {}", error.code, error.message))?;
+        match &error.recovery {
+            Some(recovery) => emit(out.stderr, &format!("Recovery: {recovery}")),
+            None => Ok(()),
         }
+    } else {
+        Ok(())
     }
 }
 
-fn print_error(error: ControlError, json_output: bool) {
-    print_response(&ControlResponse::failure("local", error), json_output);
+fn print_error(out: &mut Output, error: ControlError, json_output: bool) -> io::Result<()> {
+    print_response(out, &ControlResponse::failure("local", error), json_output)
 }
 
 fn parse(args: &[String]) -> Result<Parsed, ControlError> {
@@ -1574,6 +1609,87 @@ mod tests {
             panic!("expected rpc")
         };
         assert_eq!(params["value"], "hunter2");
+    }
+
+    /// A stream that refuses every write: a broken pipe when the reader has
+    /// gone, or some other failure.
+    struct Failing(io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(self.0.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_into(values: &[&str], stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+        run(&args(values), &mut Output { stdout, stderr })
+    }
+
+    #[test]
+    fn a_closed_pipe_ends_the_output_and_keeps_the_status() {
+        let closed = || Failing(io::ErrorKind::BrokenPipe);
+        let mut stderr = Vec::new();
+        assert_eq!(run_into(&["--help"], &mut closed(), &mut stderr), 0);
+        assert_eq!(run_into(&["--version", "--json"], &mut closed(), &mut stderr), 0);
+        assert_eq!(run_into(&["skills", "get", "terminalx-cli", "--full"], &mut closed(), &mut stderr), 0);
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        // A usage error keeps its 2 on either stream.
+        assert_eq!(run_into(&["invented"], &mut Vec::new(), &mut closed()), 2);
+        assert_eq!(run_into(&["invented", "--json"], &mut closed(), &mut Vec::new()), 2);
+        // A call carried out in the app keeps its own status.
+        assert_eq!(exit_status(0, Err(io::ErrorKind::BrokenPipe.into()), &mut stderr), 0);
+        assert_eq!(exit_status(1, Err(io::ErrorKind::BrokenPipe.into()), &mut stderr), 1);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn any_other_failed_write_is_an_error() {
+        let mut stderr = Vec::new();
+        assert_eq!(run_into(&["--version"], &mut Failing(io::ErrorKind::StorageFull), &mut stderr), 1);
+        let said = String::from_utf8(stderr).unwrap();
+        assert!(said.starts_with("terminalx: could not write the output: "), "{said}");
+        assert_eq!(exit_status(2, Err(io::ErrorKind::Other.into()), &mut Vec::new()), 2);
+    }
+
+    #[test]
+    fn output_is_written_as_println_wrote_it() {
+        let mut stdout = Vec::new();
+        assert_eq!(run_into(&["--version"], &mut stdout, &mut Vec::new()), 0);
+        assert_eq!(String::from_utf8(stdout).unwrap(), format!("{}\n", env!("CARGO_PKG_VERSION")));
+
+        let mut stdout = Vec::new();
+        assert_eq!(run_into(&["--help"], &mut stdout, &mut Vec::new()), 0);
+        assert_eq!(String::from_utf8(stdout).unwrap(), format!("{}\n", help_text()));
+
+        // The guide keeps its own final newline and gains no second one.
+        let mut stdout = Vec::new();
+        assert_eq!(run_into(&["skills", "get", "terminalx-cli"], &mut stdout, &mut Vec::new()), 0);
+        assert!(GUIDE.ends_with('\n') && !GUIDE.ends_with("\n\n"));
+        assert_eq!(String::from_utf8(stdout).unwrap(), GUIDE);
+
+        let mut stdout = Vec::new();
+        assert_eq!(run_into(&["skills", "get", "computer-use", "--json"], &mut stdout, &mut Vec::new()), 0);
+        let reply: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(reply["result"]["guide"], COMPUTER_GUIDE);
+
+        // An error goes to standard error with its recovery, or whole to
+        // standard output with --json.
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        assert_eq!(run_into(&["invented"], &mut stdout, &mut stderr), 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "invalid_arguments: Unknown command group invented.\nRecovery: Run terminalx --help and correct the named argument.\n"
+        );
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        assert_eq!(run_into(&["invented", "--json"], &mut stdout, &mut stderr), 2);
+        assert!(stderr.is_empty());
+        let reply: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(reply["error"]["code"], "invalid_arguments");
     }
 
     #[test]
