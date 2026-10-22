@@ -363,7 +363,14 @@ resume a stopped workspace. Lists come from what the app already holds. `read` r
 transcript kept on this computer, caught up from the workspace's saved checkpoint. `wait`
 follows a running workspace and only polls a stopped one. Session titles and transcripts are
 end-to-end encrypted: a workspace this computer has never opened appears under
-`workspacesNotLoaded` until someone opens it once in the app.
+`workspacesNotLoaded` until someone opens it once in the app. `read`, `send` and `wait` on a
+session this computer holds nothing of yet, such as the first session of a workspace
+`sessions create` just made, look it up the way opening it in the app does: a running
+workspace's runtime is asked for its tabs (this connects but never resumes), and a stopped one's
+saved checkpoints are listed and read. While the workspace, or the first prompt that starts the
+session's agent, is still starting they answer `cloud_workspace_starting`; when the workspace
+does not answer in time, `cloud_workspace_unreachable`. They answer `not_found` only when the
+session has no tab there, or its first prompt failed to start one (the message says why).
 
 **Only these start or stop compute, and each says so:**
 
@@ -542,6 +549,8 @@ JSON failures have this shape:
   Do not retry.
 - `cloud_workspace_stopped`, `spend_confirmation_required`: the command would start billed
   compute. Repeat it with `--wake` or `--confirm-spend` only when that is intended.
+- `cloud_workspace_starting`, `cloud_workspace_unreachable`: the session's agent has not started
+  yet, or its workspace did not answer. Nothing was sent; run the command again in a moment.
 - `cloud_control_disabled`: the person has not allowed cloud commands from the command line. Tell
   them the setting named in `recovery`; do not retry.
 - `declined`: the person refused the request in the app window. Do not retry.

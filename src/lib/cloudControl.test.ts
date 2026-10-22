@@ -26,6 +26,8 @@ const mocks = vi.hoisted(() => ({
   },
   workspaceConnection: vi.fn(),
   ask: vi.fn(),
+  /** The runtime a lease connects to: who it says this person is, and its own tab list. */
+  runtime: { you: undefined as unknown, listAgentTabs: vi.fn() },
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: mocks.ask, open: vi.fn() }));
@@ -56,7 +58,15 @@ vi.mock("@/lib/cloudConnections", async (importOriginal) => {
   return {
     ...original,
     wakeCloudConnection: vi.fn(async () => ({ release: vi.fn() })),
-    retainCloudConnection: vi.fn(async () => ({ release: vi.fn() })),
+    retainCloudConnection: vi.fn(async () => {
+      const client = {
+        get connection() {
+          return { state: "connected", runtimeGeneration: 1, runtimeVersion: "1", capabilities: [], authority: "manage", you: mocks.runtime.you };
+        },
+        listAgentTabs: mocks.runtime.listAgentTabs,
+      };
+      return { release: vi.fn(), client, current: () => ({ client }), state: () => client.connection, ended: () => false };
+    }),
     connectedCloudClient: vi.fn(() => null),
   };
 });
@@ -76,6 +86,8 @@ const {
   cloudControlEnabled,
   CLOUD_CONTROL_POLICY,
   LIFECYCLE_SETTLE_MS,
+  LOOKUP_WITHIN_MS,
+  SEND_LOOKUP_WITHIN_MS,
   WAIT_CHUNK_SECONDS,
 } = await import("./cloudControl");
 // The lifecycle refusal is the app's own sentence, whatever it currently says (PRO-73 rewords it).
@@ -192,6 +204,8 @@ beforeEach(async () => {
   });
   for (const fn of Object.values(mocks.api)) fn.mockReset();
   mocks.workspaceConnection.mockReset();
+  mocks.runtime.you = undefined;
+  mocks.runtime.listAgentTabs.mockReset().mockResolvedValue([]);
   for (const fn of [connections.wakeCloudConnection, connections.retainCloudConnection, connections.connectedCloudClient, newSession.startInWorkspace, newSession.prepareCloudCreate, newSession.confirmCloudCreate]) vi.mocked(fn).mockClear();
   // A refresh after an action reads back what the catalog holds.
   // As the real one answers when nothing needs waking.
@@ -588,6 +602,192 @@ describe("creating a session", () => {
   it("does not know a project in an organization the person is not in", async () => {
     expect(await refusal("sessions.create", { project: "cloud:org-nope:github.com/acme/api", prompt: "go" })).toMatchObject({ code: "not_found" });
     expect(await refusal("sessions.create", { project: "/Users/me/code/api", prompt: "go" })).toMatchObject({ code: "invalid_arguments" });
+  });
+});
+
+describe("a session this desktop holds no tab of yet (PRO-109)", () => {
+  const launch = (sessionId: string, phase: string, state = "pending", fields: Record<string, unknown> = {}) => ({
+    launchId: "launch-1",
+    phase,
+    state,
+    workBranch: "main",
+    agent: "claude",
+    model: null,
+    effort: null,
+    mode: null,
+    hasPrompt: true,
+    category: null,
+    sessionId,
+    tabId: `${sessionId}-tab`,
+    timings: { requestedAt: Date.now(), bootingAt: null, authenticatingAt: null, syncingAt: null, startingAgentAt: null, runningAt: null, failedAt: null },
+    ...fields,
+  });
+  const said = (sessionId: string, texts: string[]) =>
+    texts.map((text, index) => ({ id: `${sessionId}-e${index + 1}`, sessionId, tabId: `${sessionId}-tab`, seq: index + 1, ts: index + 1, payload: { type: index % 2 ? "assistant_message" : "user_message", text } }));
+  const checkpointOf = (sessionId: string, texts: string[]) => ({
+    epoch: 1,
+    version: 1,
+    projection: { v: 1, sessionId, tabId: `${sessionId}-tab`, title: null, harness: "claude", model: "opus", effort: null, permissionMode: "default", status: "idle", process: "running", events: said(sessionId, texts), truncated: false, followUps: [], updatedAt: 5 },
+  });
+  /** Every lease taken was given back. */
+  const leasesReleased = async () => {
+    for (const result of vi.mocked(connections.retainCloudConnection).mock.results) expect((await result.value).release).toHaveBeenCalledTimes(1);
+  };
+
+  it("follows a session the CLI just created with send, wait and read, the window untouched and the tab cache empty", async () => {
+    await list(ORG, []);
+    catalog.setCloudRepositories(ORG, [{ fullName: "acme/api", cloneUrl: acmeApi.cloneUrl, defaultBranch: "main", private: true, state: "accessible", reason: null } as never]);
+    const { setPrefs, getPrefs } = await import("@/lib/prefs");
+    setPrefs({ cloudProjects: { ...getPrefs().cloudProjects, [ORG]: ["github.com/acme/api"] } });
+    vi.mocked(newSession.prepareCloudCreate).mockResolvedValue({ orgId: ORG, providerLabel: "Boat", quote: { currency: "USD", activeHourlyMicros: 120_000 }, pending: { idempotencyKey: "k", createdAt: 1, request: { idempotencyKey: "k" } } } as never);
+    vi.mocked(newSession.confirmCloudCreate).mockResolvedValue({ workspace: { id: "ws-new", orgId: ORG, state: "provisioning" }, operation: { id: "op-1" } } as never);
+    // The mailbox hands the runtime each message; its checkpoint then holds the turn.
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
+      if (args.workspaceId !== "ws-new") return base(command, args);
+      if (command === "cloud_agent_outbox_sync") return enqueued.map((_, index) => ({ clientCommandId: `cmd-${index + 1}`, tabId: "s-new-tab", kind: "send", state: "applied", createdAt: 1, updatedAt: 2 }));
+      if (command === "cloud_agent_checkpoint") return checkpointOf("s-new", ["fix the login", "fixed", "now run the tests", "they pass"]);
+      return base(command, args);
+    });
+    try {
+      expect(await handleCloudControl("sessions.create", { project: PROJECT, prompt: "fix the login", confirmSpend: true })).toMatchObject({ created: "workspace", workspace: `cloud:${ORG}:ws-new` });
+      // What the window holds right after: the new workspace, still booting, its first session named by the launch.
+      await list(ORG, [item("ws-new", ORG, { state: "provisioning", launch: launch("s-new", "booting") })]);
+      const target = `cloud:${ORG}:ws-new:s-new`;
+      const { sessions: listed } = (await handleCloudControl("sessions.list", { org: ORG })) as { sessions: { key: string; tabs: { id: string }[] }[] };
+      expect(listed.find((entry) => entry.key === target)?.tabs).toEqual([expect.objectContaining({ id: "s-new-tab" })]);
+      // Still booting: starting, not missing, and nothing attached to or woken.
+      expect(await refusal("read", { target })).toMatchObject({ code: "cloud_workspace_starting", message: expect.stringContaining("(booting)") });
+      expectNoWake();
+      // Listed as ready before its runtime has started the agent: its runtime has no tab yet, and that too is starting.
+      mocks.api.cloudWorkspaces.mockImplementation(async () => ({ workspaces: [item("ws-new", ORG, { launch: launch("s-new", "starting-agent") })] }));
+      for (const action of ["read", "send", "wait"]) {
+        expect(await refusal(action, { target, text: "hello", timeoutSeconds: 1 })).toMatchObject({ code: "cloud_workspace_starting", message: expect.stringContaining("(starting agent)") });
+      }
+      expect(await refusal("read", { target, tab: "s-new-tab" })).toMatchObject({ code: "cloud_workspace_starting" });
+      expect(enqueued).toEqual([]);
+
+      // The agent has started. Its runtime has the tab; this desktop's cache still has nothing.
+      await list(ORG, [item("ws-new", ORG, { launch: launch("s-new", "running", "running") })]);
+      mocks.runtime.listAgentTabs.mockResolvedValue([tabInfo("s-new")]);
+      vi.useFakeTimers();
+      const sent = await handleCloudControl("send", { target, text: "now run the tests" });
+      expect(sent).toMatchObject({ session: target, tabId: "s-new-tab", state: "queued" });
+      expect(enqueued).toEqual([expect.objectContaining({ workspaceId: "ws-new", tabId: "s-new-tab", kind: "send", payload: expect.objectContaining({ text: "now run the tests" }) })]);
+      // The runtime was asked over `connect`, which attaches and never resumes.
+      expect(connections.retainCloudConnection).toHaveBeenCalledWith({ orgId: ORG, workspaceId: "ws-new" }, "connect");
+
+      const waited = await waitForCloudTab({ target, timeoutSeconds: 30 }, (ms) => vi.advanceTimersByTimeAsync(ms).then(() => undefined), () => Date.now());
+      expect(waited).toMatchObject({ session: target, tabId: "s-new-tab", reason: "stopped", status: "idle" });
+
+      const read = (await handleCloudControl("read", { target, tail: 2 })) as { tabId: string; events: { payload: { text: string } }[] };
+      expect(read.tabId).toBe("s-new-tab");
+      expect(read.events.map((event) => event.payload.text)).toEqual(["now run the tests", "they pass"]);
+      expect(connections.wakeCloudConnection).not.toHaveBeenCalled();
+      expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+      expect(sessions.getSessionStore().selectedSessionId).toBeNull();
+      await leasesReleased();
+    } finally {
+      vi.useRealTimers();
+      setPrefs({ cloudProjects: {} });
+    }
+  });
+
+  it("says why a launch started no agent, rather than that its session does not exist", async () => {
+    const target = `cloud:${ORG}:ws-1:s-new`;
+    await list(ORG, [item("ws-1", ORG, { launch: launch("s-new", "failed", "failed", { category: "agent-start-failed" }) })]);
+    expect(await refusal("read", { target })).toMatchObject({ code: "not_found", message: expect.stringContaining("The agent could not be started.") });
+    // Ready for long with its launch never claimed: the runtime cannot start it.
+    await list(ORG, [item("ws-1", ORG, { launch: launch("s-new", "authenticating-runtime", "pending", { timings: { ...launch("s-new", "x").timings, requestedAt: 1, authenticatingAt: 1 } }) })]);
+    expect(await refusal("read", { target })).toMatchObject({ code: "not_found", message: expect.stringContaining("has not picked up the first task") });
+    expect(connections.wakeCloudConnection).not.toHaveBeenCalled();
+    expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+  });
+
+  it("still answers not_found for a session the workspace's runtime does not have, and gives the connection back", async () => {
+    mocks.runtime.listAgentTabs.mockResolvedValue([tabInfo("s1")]);
+    for (const action of ["read", "send", "wait"]) {
+      expect(await refusal(action, { target: `cloud:${ORG}:ws-1:no-such-session`, text: "hello", timeoutSeconds: 1 })).toMatchObject({ code: "not_found" });
+    }
+    expect(await refusal("read", { target: `cloud:${ORG}:ws-1:s1`, tab: "no-such-tab" })).toMatchObject({ code: "not_found" });
+    expect(connections.retainCloudConnection).toHaveBeenCalledWith({ orgId: ORG, workspaceId: "ws-1" }, "connect");
+    await leasesReleased();
+    expect(enqueued).toEqual([]);
+    expect(connections.wakeCloudConnection).not.toHaveBeenCalled();
+    expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+    // The session the runtime does have reads as before.
+    expect(((await handleCloudControl("read", { target: `cloud:${ORG}:ws-1:s1` })) as { tabId: string }).tabId).toBe("s1-tab");
+  });
+
+  it("reads a stopped workspace's session from a checkpoint saved after this desktop listed them, and connects to nothing", async () => {
+    let saved: { tabId: string; epoch: number; version: number }[] = [];
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown> = {}) => {
+      if (args.workspaceId === "ws-stopped" && command === "cloud_agent_checkpoints") return saved;
+      if (args.workspaceId === "ws-stopped" && command === "cloud_agent_checkpoint" && args.tabId === "s3-tab") return checkpointOf("s3", ["deploy it", "deployed"]);
+      return base(command, args);
+    });
+    // Listing sessions loads every workspace's tabs here, its checkpoint list included: none names s3 yet.
+    await handleCloudControl("sessions.list", { org: ORG });
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("cloud_agent_checkpoints", expect.objectContaining({ workspaceId: "ws-stopped" })));
+    // The session ran its first prompt and the workspace stopped before the CLI looked.
+    saved = [{ tabId: "s3-tab", epoch: 1, version: 1 }];
+    const read = (await handleCloudControl("read", { target: `cloud:${ORG}:ws-stopped:s3` })) as { tabId: string; source: string; events: unknown[] };
+    expect(read).toMatchObject({ tabId: "s3-tab", source: "checkpoint" });
+    expect(read.events).toHaveLength(2);
+    expect(await refusal("read", { target: `cloud:${ORG}:ws-stopped:no-such-session` })).toMatchObject({ code: "not_found", message: expect.stringContaining("not running") });
+    expectNoWake();
+  });
+
+  it("keeps the whole lookup inside its time, and gives back a connection that comes too late", async () => {
+    vi.useFakeTimers();
+    try {
+      // The runtime never answers its tab list.
+      mocks.runtime.listAgentTabs.mockReturnValue(new Promise(() => undefined));
+      for (const [action, within] of [["read", LOOKUP_WITHIN_MS], ["send", SEND_LOOKUP_WITHIN_MS]] as const) {
+        let answer: unknown = null;
+        const pending = answerCloudControl(action, { target: `cloud:${ORG}:ws-1:s-new`, text: "hello" }).then((result) => (answer = result));
+        await vi.advanceTimersByTimeAsync(within - 1);
+        expect(answer).toBeNull();
+        await vi.advanceTimersByTimeAsync(1);
+        await pending;
+        expect(answer).toMatchObject({ ok: false, error: { code: "cloud_workspace_unreachable" } });
+      }
+      expect(enqueued).toEqual([]);
+      await leasesReleased();
+      // The connection itself takes longer than the lookup may.
+      let connect: (lease: unknown) => void = () => undefined;
+      const late = { release: vi.fn(), client: {}, current: () => null, state: () => ({ state: "opening" }), ended: () => false };
+      vi.mocked(connections.retainCloudConnection).mockImplementationOnce(() => new Promise((resolve) => (connect = resolve)) as never);
+      const pending = answerCloudControl("read", { target: `cloud:${ORG}:ws-1:s-new` });
+      await vi.advanceTimersByTimeAsync(LOOKUP_WITHIN_MS);
+      expect(await pending).toMatchObject({ ok: false, error: { code: "cloud_workspace_unreachable" } });
+      connect(late);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(late.release).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses a workspace this person has no role in before its own lookup asks for any tab, by the list's word or the runtime's", async () => {
+    await list(OTHER, [item("ws-b", OTHER, { authority: "participate", you: { role: "none", canApprove: false, canManageShares: false } })]);
+    for (const action of ["read", "send", "wait"]) {
+      expect(await refusal(action, { target: `cloud:${OTHER}:ws-b:s-other`, text: "hello", timeoutSeconds: 1 })).toMatchObject({ code: "forbidden" });
+    }
+    // By the list's word: not even connected.
+    expect(connections.retainCloudConnection).not.toHaveBeenCalled();
+    // The list still says manager; the runtime says this person has no role now. The lookup asks it for no tab list. (What
+    // the app's own connected listeners ask of a connection, the runtime refuses to someone with no role.)
+    mocks.runtime.you = { userId: "u-1", role: "none", canApprove: false };
+    mocks.runtime.listAgentTabs.mockResolvedValue([tabInfo("s-new")]);
+    for (const action of ["read", "send"]) {
+      const refused = await refusal(action, { target: `cloud:${ORG}:ws-1:s-new`, text: "hello" });
+      expect(refused).toMatchObject({ code: "forbidden", message: expect.stringContaining("has not been shared with you") });
+    }
+    expect(mocks.runtime.listAgentTabs).not.toHaveBeenCalled();
+    await leasesReleased();
+    expect(enqueued).toEqual([]);
   });
 });
 

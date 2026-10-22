@@ -30,7 +30,8 @@ vi.mock("@/lib/account", () => ({
 
 const catalog = await import("@/lib/cloudCatalog");
 const { bootCloudSessions, liveCloudSessionList, resetCloudSessions } = await import("@/lib/cloudSessions");
-const { retainCloudConnection, resetCloudConnections } = await import("@/lib/cloudConnections");
+const { closeCloudConnection, retainCloudConnection, resetCloudConnections } = await import("@/lib/cloudConnections");
+const { getCloudAgents, resetCloudAgents } = await import("@/lib/cloudAgents");
 const { applyCollabEvent, clearCollabAccess, resetCollab, startCollab } = await import("@/lib/cloudCollab");
 const cloudTerminals = await import("@/lib/cloudTerminals");
 const terminalStore = await import("@/lib/terminal");
@@ -109,6 +110,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   resetCloudSessions();
+  resetCloudAgents();
   resetCloudConnections();
   resetCollab();
   cloudTerminals.resetCloudTerminals();
@@ -226,5 +228,23 @@ describe("a tab added to a session (live test: two rows named after the session)
     // A first tab with no title yet goes by the session's.
     const first = buildCloudSessions({ item: item({ role: "manager", canApprove: true }), live: [{ ...live[0], tabs: [tab("t1", null)] }] as never, agentTabs: [info("t1", title)] as never });
     expect(first[0].tabs.map((row) => row.title)).toEqual([title]);
+  });
+});
+
+describe("a connection going away", () => {
+  it("leaves what its runtime said of each tab as only the last known state, so a newer checkpoint may say more (PRO-109)", async () => {
+    const held = runtime(driver);
+    const tab = { sessionId: "s1", tabId: "s1-tab", title: null, harness: "claude", model: "opus", effort: null, permissionMode: "default", status: "in_progress", process: "running", pendingPermissions: [], followUps: [], lastSeq: 3, created: "", modified: "" };
+    held.client.listAgentTabs.mockResolvedValue([tab] as never);
+    mocks.workspaceConnection.mockResolvedValue(held.connection);
+    bootCloudSessions();
+    // The CLI's lookup: a lease held only for the read, nothing selected and no session view open.
+    const lease = await retainCloudConnection({ orgId: ORG, workspaceId: WS }, "connect");
+    await settle();
+    const scope = { organizationId: ORG, workspaceId: WS };
+    expect(getCloudAgents(scope).tabs.map((known) => [known.tabId, known.source])).toEqual([["s1-tab", "live"]]);
+    lease.release();
+    closeCloudConnection({ orgId: ORG, workspaceId: WS });
+    expect(getCloudAgents(scope).tabs.map((known) => [known.tabId, known.source])).toEqual([["s1-tab", "cache"]]);
   });
 });

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type { RuntimeSession, RuntimeSessionPatch, WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import type { CloudWorkspaceListItem } from "@/lib/api";
-import { applyLiveTabs, getCloudAgents, loadCloudAgents, useCloudAgents, watchLiveTabs, type CloudAgentTab } from "@/lib/cloudAgents";
+import { applyLiveTabs, getCloudAgents, loadCloudAgents, markCloudAgentsOffline, useCloudAgents, watchLiveTabs, type CloudAgentTab } from "@/lib/cloudAgents";
 import { cacheCloudSessions, dropCachedCloudSessions, getCloudCatalog, useCloudCatalog, type CachedWorkspaceSessions } from "@/lib/cloudCatalog";
 import { onWorkspaceAccess } from "@/lib/cloudCollab";
 import { cloudTabTitle } from "@/lib/cloudRowState";
@@ -161,6 +161,9 @@ function onConnected(target: CloudTarget, client: WorkspaceRpcClient): () => voi
     stopTabs();
     stopSessions();
     if (connected.get(key)?.client === client) connected.delete(key);
+    // What the runtime said of each tab is the last known state from here on: a newer checkpoint may say a turn
+    // finished. Without the window open on the workspace (the CLI's `read` and `wait`, PRO-109), nothing else says so.
+    markCloudAgentsOffline(scope);
     // The cached copy (the same list) takes over.
     if (live.delete(key)) publish();
   };
