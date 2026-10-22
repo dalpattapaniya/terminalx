@@ -372,7 +372,13 @@ end-to-end encrypted: a workspace this computer has never opened appears under
   runtime takes it. Pass `--idempotency-key` so that repeating the command after a timeout
   returns the first answer instead of sending again (the key is remembered while the app runs);
   without one, `read` the session before resending.
-- `cloud resume` and `cloud stop --yes` are the workspace menu's Resume and Stop.
+- `cloud resume` and `cloud stop --yes` are the workspace menu's Resume and Stop. Each reads
+  the workspace's state from the server first, not from the list the app last read, and waits
+  up to 5 seconds for the other one, if it is still running, to finish. Its `state` is what
+  the action leads to: `stopping`, then `stopped`, for a stop; `resuming`, then `running`, for a
+  resume. `changed` is `false` when the workspace was already there or on its way, and nothing
+  was sent. `projects list --cloud` shows how far it has got (`status`). A workspace that is
+  doing something else answers `cloud_workspace_not_running` or `cloud_workspace_not_stopped`.
 - `sessions create` runs in the project's running workspace. If its workspace is stopped, or
   turns out to have stopped by itself, it answers `cloud_workspace_stopped` and wakes nothing
   unless `--wake` is passed. If the project has no workspace

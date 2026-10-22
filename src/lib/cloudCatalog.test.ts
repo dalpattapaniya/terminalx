@@ -63,6 +63,7 @@ import {
   refreshCloudCatalog,
   refreshCloudFeed,
   refreshCloudWorkspaces,
+  relistCloudCatalog,
   rememberCreatedWorkspace,
   resetCloudCatalog,
   serializeCatalog,
@@ -419,6 +420,23 @@ describe("merging and tombstones", () => {
     const catalog = getCloudCatalog().orgs[ORG];
     expect(catalog.workspaces.map((w) => w.workspace.id)).toEqual(["w1"]);
     expect(catalog.error).toBe("cloud_workspace_network_unavailable");
+  });
+
+  it("a list asked for now lets one already on its way land, then reads again (PRO-113)", async () => {
+    signIn();
+    mocks.api.cloudWorkspaces.mockResolvedValueOnce({ workspaces: [item("w1")] });
+    bootCloudCatalog();
+    await refreshCloudCatalog(ORG);
+    // Asked for while the stop still ran, answered after it finished.
+    let answer!: (list: CloudWorkspaceList) => void;
+    mocks.api.cloudWorkspaces.mockReturnValueOnce(new Promise((resolve) => (answer = resolve)));
+    const earlier = refreshCloudCatalog(ORG);
+    mocks.api.cloudWorkspaces.mockResolvedValueOnce({ workspaces: [item("w1", { state: "suspended" }, { id: "op", action: "suspend", state: "succeeded" })] });
+    const relisted = relistCloudCatalog(ORG);
+    answer({ workspaces: [item("w1", { state: "provisioning" }, { id: "op", action: "suspend", state: "running" })] });
+    await Promise.all([earlier, relisted]);
+    expect(mocks.api.cloudWorkspaces).toHaveBeenCalledTimes(3);
+    expect(getCloudCatalog().orgs[ORG].workspaces[0].workspace.state).toBe("suspended");
   });
 
   it("replaces one row from a snapshot, and ignores a list for another organization", async () => {

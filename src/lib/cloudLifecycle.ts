@@ -44,6 +44,11 @@ export function stopping(item: Pick<CloudWorkspaceListItem, "latestOperation">):
   return isOpen(item.latestOperation) && item.latestOperation?.action === "suspend";
 }
 
+/** A resume still running: the machine is on its way up, whoever asked. */
+export function resuming(item: Pick<CloudWorkspaceListItem, "latestOperation">): boolean {
+  return isOpen(item.latestOperation) && item.latestOperation?.action === "resume";
+}
+
 /** The machine runs as far as the list knows: ready, with no stop, archive or delete taking it down. */
 export function machineRunning(item: CloudWorkspaceListItem): boolean {
   const operation = item.latestOperation;

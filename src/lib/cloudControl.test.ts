@@ -65,7 +65,19 @@ vi.mock("@/lib/cloudNewSession", async (importOriginal) => {
   return { ...original, startInWorkspace: vi.fn(async (plan: { node: { key: string } }) => `${plan.node.key}:new-session`), prepareCloudCreate: vi.fn(), confirmCloudCreate: vi.fn() };
 });
 
-const { answerCloudControl, handleCloudControl, waitForCloudTab, CloudControlError, setCloudControlPolicy, setCloudControlEnabled, cloudControlEnabled, CLOUD_CONTROL_POLICY, WAIT_CHUNK_SECONDS } = await import("./cloudControl");
+const {
+  answerCloudControl,
+  handleCloudControl,
+  waitForCloudTab,
+  cloudLifecycleCommands,
+  CloudControlError,
+  setCloudControlPolicy,
+  setCloudControlEnabled,
+  cloudControlEnabled,
+  CLOUD_CONTROL_POLICY,
+  LIFECYCLE_SETTLE_MS,
+  WAIT_CHUNK_SECONDS,
+} = await import("./cloudControl");
 // The lifecycle refusal is the app's own sentence, whatever it currently says (PRO-73 rewords it).
 const { LIFECYCLE_ADMIN_REASON, NEW_SESSION_ADMIN_REASON } = await import("@/lib/cloudCollab");
 const catalog = await import("@/lib/cloudCatalog");
@@ -580,31 +592,114 @@ describe("creating a session", () => {
 });
 
 describe("stop and resume", () => {
-  const snapshot = (id: string, state: string) => ({ workspace: item(id, ORG, { state }).workspace, operation: { id: "op-9", workspaceId: id, action: state === "suspended" ? "suspend" : "resume", state: "queued" } });
+  // As the server answers both: "provisioning" while the operation runs, whichever it is.
+  const snapshot = (id: string, action: "suspend" | "resume") => ({ workspace: item(id, ORG, { state: "provisioning" }).workspace, operation: { id: "op-9", workspaceId: id, action, state: "queued" } });
+  const underway = (id: string, action: "suspend" | "resume", fields: Record<string, unknown> = {}) =>
+    ({ ...item(id, ORG, { state: "provisioning", ...fields }), latestOperation: { id: `op-${action}`, workspaceId: id, action, state: "running" } }) as CloudWorkspaceListItem;
+  const finished = (id: string, action: "suspend" | "resume", fields: Record<string, unknown> = {}) =>
+    ({ ...item(id, ORG, { state: action === "suspend" ? "suspended" : "ready", ...fields }), latestOperation: { id: `op-${action}`, workspaceId: id, action, state: "succeeded" } }) as CloudWorkspaceListItem;
+  /** What the server lists from now on, whatever this window last held. */
+  const serverSays = (...workspaces: CloudWorkspaceListItem[]) => mocks.api.cloudWorkspaces.mockImplementation(async () => ({ workspaces }));
+  /** A clock that only the sleeps move. */
+  const clock = (onSleep: () => void = () => undefined) => {
+    let at = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      at += ms;
+      onSleep();
+    });
+    return { sleep, now: () => at };
+  };
 
-  it("stops a running workspace only after --yes, and says what stopping does first", async () => {
+  it("stops a running workspace only after --yes, and answers stopping, never the server's provisioning", async () => {
     const target = `cloud:${ORG}:ws-1`;
     const asked = await refusal("stop", { workspace: target });
     expect(asked.code).toBe("confirmation_required");
     expect(asked.recovery).toContain("--yes");
     expect(mocks.api.cloudWorkspaceSuspend).not.toHaveBeenCalled();
-    mocks.api.cloudWorkspaceSuspend.mockResolvedValue(snapshot("ws-1", "suspended"));
-    expect(await handleCloudControl("stop", { workspace: target, confirmed: true })).toEqual({ workspace: target, state: "suspended", operationId: "op-9", changed: true });
+    mocks.api.cloudWorkspaceSuspend.mockResolvedValue(snapshot("ws-1", "suspend"));
+    expect(await handleCloudControl("stop", { workspace: target, confirmed: true })).toEqual({ workspace: target, state: "stopping", operationId: "op-9", changed: true });
     expect(mocks.api.cloudWorkspaceSuspend).toHaveBeenCalledWith("ws-1", ORG);
     // Already stopped: nothing is sent.
     mocks.api.cloudWorkspaceSuspend.mockClear();
-    expect(await handleCloudControl("stop", { workspace: `cloud:${ORG}:ws-stopped`, confirmed: true })).toEqual({ workspace: `cloud:${ORG}:ws-stopped`, state: "suspended", changed: false });
+    expect(await handleCloudControl("stop", { workspace: `cloud:${ORG}:ws-stopped`, confirmed: true })).toEqual({ workspace: `cloud:${ORG}:ws-stopped`, state: "stopped", changed: false });
     expect(mocks.api.cloudWorkspaceSuspend).not.toHaveBeenCalled();
   });
 
-  it("resumes a stopped workspace with the menu's Resume, once", async () => {
-    mocks.api.cloudWorkspaceResume.mockResolvedValue(snapshot("ws-stopped", "provisioning"));
+  it("resumes a stopped workspace with the menu's Resume, once, and answers resuming", async () => {
+    mocks.api.cloudWorkspaceResume.mockResolvedValue(snapshot("ws-stopped", "resume"));
     const resumed = (await handleCloudControl("resume", { workspace: `cloud:${ORG}:ws-stopped` })) as { changed: boolean; state: string };
-    expect(resumed).toMatchObject({ changed: true, state: "provisioning" });
+    expect(resumed).toEqual({ workspace: `cloud:${ORG}:ws-stopped`, state: "resuming", operationId: "op-9", changed: true });
     expect(mocks.api.cloudWorkspaceResume).toHaveBeenCalledTimes(1);
     expect(mocks.api.cloudWorkspaceResume).toHaveBeenCalledWith("ws-stopped", ORG);
     mocks.api.cloudWorkspaceResume.mockClear();
-    expect(await handleCloudControl("resume", { workspace: `cloud:${ORG}:ws-1` })).toMatchObject({ changed: false, state: "ready" });
+    expect(await handleCloudControl("resume", { workspace: `cloud:${ORG}:ws-1` })).toEqual({ workspace: `cloud:${ORG}:ws-1`, state: "running", changed: false });
+    expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+  });
+
+  it("resumes straight after a stop: the server's word, not the stop this window last saw running (PRO-113)", async () => {
+    // This window still holds the stop's own answer; the server has finished it.
+    mocks.api.cloudWorkspaceSuspend.mockResolvedValue(snapshot("ws-1", "suspend"));
+    await handleCloudControl("stop", { workspace: `cloud:${ORG}:ws-1`, confirmed: true });
+    expect(catalog.findCloudWorkspace(catalog.getCloudCatalog(), ORG, "ws-1")?.workspace.state).toBe("provisioning");
+    serverSays(finished("ws-1", "suspend"), item("ws-stopped", ORG, { state: "suspended" }));
+    mocks.api.cloudWorkspaces.mockClear();
+    mocks.api.cloudWorkspaceResume.mockResolvedValue(snapshot("ws-1", "resume"));
+    const { sleep, now } = clock();
+    expect(await cloudLifecycleCommands.resume({ workspace: `cloud:${ORG}:ws-1` }, sleep, now)).toMatchObject({ state: "resuming", changed: true });
+    expect(mocks.api.cloudWorkspaces).toHaveBeenCalledWith(ORG);
+    expect(mocks.api.cloudWorkspaceResume).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("stops straight after a resume, as the server has it", async () => {
+    await list(ORG, [underway("ws-1", "resume")]);
+    serverSays(finished("ws-1", "resume"));
+    mocks.api.cloudWorkspaceSuspend.mockResolvedValue(snapshot("ws-1", "suspend"));
+    expect(await handleCloudControl("stop", { workspace: `cloud:${ORG}:ws-1`, confirmed: true })).toMatchObject({ state: "stopping", changed: true });
+    expect(mocks.api.cloudWorkspaceSuspend).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits a moment for a stop that is still running, then resumes", async () => {
+    serverSays(underway("ws-1", "suspend"));
+    const { sleep, now } = clock(() => sleep.mock.calls.length === 2 && serverSays(finished("ws-1", "suspend")));
+    mocks.api.cloudWorkspaceResume.mockResolvedValue(snapshot("ws-1", "resume"));
+    expect(await cloudLifecycleCommands.resume({ workspace: `cloud:${ORG}:ws-1` }, sleep, now)).toMatchObject({ state: "resuming", changed: true });
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(mocks.api.cloudWorkspaceResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a stop still running after the wait, says when to try again, and resumes nothing", async () => {
+    serverSays(underway("ws-1", "suspend"));
+    const { sleep, now } = clock();
+    mocks.ask.mockClear();
+    const refused = await cloudLifecycleCommands.resume({ workspace: `cloud:${ORG}:ws-1` }, sleep, now).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(CloudControlError);
+    expect(refused).toMatchObject({ code: "cloud_workspace_not_stopped", message: expect.stringContaining("stopping"), recovery: expect.stringContaining("once it has stopped") });
+    expect(now()).toBe(LIFECYCLE_SETTLE_MS);
+    expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+    expect(mocks.ask).not.toHaveBeenCalled();
+  });
+
+  it("answers what is already on its way, and sends nothing again", async () => {
+    serverSays(underway("ws-1", "suspend"), underway("ws-stopped", "resume"));
+    const { sleep, now } = clock();
+    expect(await cloudLifecycleCommands.stop({ workspace: `cloud:${ORG}:ws-1`, confirmed: true }, sleep, now)).toEqual({ workspace: `cloud:${ORG}:ws-1`, state: "stopping", operationId: "op-suspend", changed: false });
+    expect(await cloudLifecycleCommands.resume({ workspace: `cloud:${ORG}:ws-stopped` }, sleep, now)).toEqual({ workspace: `cloud:${ORG}:ws-stopped`, state: "resuming", operationId: "op-resume", changed: false });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(mocks.api.cloudWorkspaceSuspend).not.toHaveBeenCalled();
+    expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
+  });
+
+  it("goes by the row it holds when the list cannot be read: the server still has the last word", async () => {
+    mocks.api.cloudWorkspaces.mockRejectedValue({ code: "cloud_workspace_unavailable" });
+    mocks.api.cloudWorkspaceResume.mockRejectedValue({ code: "cloud_workspace_operation_in_progress" });
+    expect(await refusal("resume", { workspace: `cloud:${ORG}:ws-stopped` })).toMatchObject({ code: "cloud_workspace_operation_in_progress" });
+    expect(mocks.api.cloudWorkspaceResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not act on a workspace the server no longer lists", async () => {
+    serverSays(item("ws-1", ORG));
+    expect(await refusal("resume", { workspace: `cloud:${ORG}:ws-stopped` })).toMatchObject({ code: "not_found" });
     expect(mocks.api.cloudWorkspaceResume).not.toHaveBeenCalled();
   });
 

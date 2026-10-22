@@ -14,12 +14,13 @@ import {
   liveCloudOrgIds,
   placeCloudProjects,
   refreshCloudCatalog,
+  relistCloudCatalog,
   resumeCloudWorkspace,
 } from "@/lib/cloudCatalog";
 import { LIFECYCLE_ADMIN_REASON, NEW_SESSION_ADMIN_REASON, NOT_SHARED_REASON, effectiveYou, getCollab, listedYou, tabGate, workspaceAuthority } from "@/lib/cloudCollab";
 import { cloudConnectionInfo, connectedCloudClient, retainCloudConnection, wakeCloudConnection, type CloudLease } from "@/lib/cloudConnections";
 import { getCloudDashboard, type CloudDashboardSession } from "@/lib/cloudDashboard";
-import { archiving, deletion, isArchived, lifecycleErrorMessage, stopping } from "@/lib/cloudLifecycle";
+import { archiving, deletion, isArchived, isOpen, lifecycleErrorMessage, machineRunning, resuming, stopping } from "@/lib/cloudLifecycle";
 import { confirmCloudCreate, planCloudStart, prepareCloudCreate, startInWorkspace, type CloudIssueOutcome, type CloudSessionRequest } from "@/lib/cloudNewSession";
 import { cloudPipelineSettings } from "@/lib/issuePipeline";
 import { issueWorktreeName } from "@/lib/issueSession";
@@ -709,33 +710,98 @@ function assertLifecycle(item: CloudWorkspaceListItem) {
   if (archiving(item) || isArchived(item.workspace)) throw new CloudControlError("cloud_workspace_archived", "This workspace is archived.", "Unarchive it in TerminalX first.");
 }
 
-async function stop(params: Params) {
+/**
+ * How long stop and resume follow the other one, still running, before they
+ * answer that the workspace is not where they start from. It comes before the
+ * person is asked (up to 40 s), inside the 50 s the socket waits.
+ */
+export const LIFECYCLE_SETTLE_MS = 5_000;
+const LIFECYCLE_POLL_MS = 1_000;
+
+type Sleep = (ms: number) => Promise<void>;
+const pause: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The workspace as the server lists it now. When the list cannot be read, the
+ * row held is used: the server still refuses what the workspace's own state
+ * does not allow.
+ */
+async function listedNow(target: { orgId: string; workspaceId: string; key: string }): Promise<CloudWorkspaceListItem> {
+  await relistCloudCatalog(target.orgId).catch(() => undefined);
+  const item = findCloudWorkspace(getCloudCatalog(), target.orgId, target.workspaceId);
+  if (!item) throw notFound(`No cloud workspace ${target.key}.`, "List them with terminalx projects list --cloud.");
+  return item;
+}
+
+/**
+ * The workspace a stop or resume acts on, by the server's word and not the
+ * list this window last read, which can be seconds old: a resume straight
+ * after a stop was refused as "stopping" when the stop had already finished
+ * (PRO-113). The opposite action, still running (`settling`), is followed for
+ * a moment before the caller decides.
+ */
+async function lifecycleTarget(params: Params, settling: (item: CloudWorkspaceListItem) => boolean, sleep: Sleep, now: () => number) {
   const target = resolveWorkspace(required(params, "workspace"));
-  assertLifecycle(target.item);
-  if (target.item.workspace.state === "suspended") return { workspace: target.key, state: "suspended", changed: false };
-  if (target.item.workspace.state !== "ready") throw new CloudControlError("cloud_workspace_not_running", `This workspace is ${deriveCloudActivity(target.item).label.toLowerCase()}; only a running one can be stopped.`);
+  let item = await listedNow(target);
+  assertLifecycle(item);
+  const deadline = now() + LIFECYCLE_SETTLE_MS;
+  while (settling(item) && now() < deadline) {
+    await sleep(LIFECYCLE_POLL_MS);
+    item = await listedNow(target);
+  }
+  return { ...target, item };
+}
+
+/**
+ * Where a stop or resume has got to, in the words `cloud stop` and `cloud
+ * resume` answer with. The server says "provisioning" while either runs, so
+ * its state is not passed on.
+ */
+function lifecycleState(item: CloudWorkspaceListItem | null, action: "suspend" | "resume"): "stopping" | "stopped" | "resuming" | "running" {
+  if (action === "suspend") return item?.workspace.state === "suspended" && !stopping(item) ? "stopped" : "stopping";
+  return item?.workspace.state === "ready" && !resuming(item) ? "running" : "resuming";
+}
+
+async function stop(params: Params, sleep: Sleep = pause, now: () => number = Date.now) {
+  const target = await lifecycleTarget(params, resuming, sleep, now);
+  const { item } = target;
+  // Already stopped, or on its way: nothing more to ask for.
+  if (stopping(item)) return { workspace: target.key, state: lifecycleState(item, "suspend"), operationId: item.latestOperation?.id ?? null, changed: false };
+  if (item.workspace.state === "suspended") return { workspace: target.key, state: lifecycleState(item, "suspend"), changed: false };
+  if (item.workspace.state !== "ready") {
+    const activity = deriveCloudActivity(item);
+    throw new CloudControlError("cloud_workspace_not_running", `This workspace is ${activity.label.toLowerCase()}; only a running one can be stopped.`, activity.tone === "changing" ? "Run the command again once it is running." : null);
+  }
   // The app asks before stopping: running agent turns end with the machine.
-  if (params.confirmed !== true) throw new CloudControlError("confirmation_required", `Stopping ${target.item.workspace.name} ends any agent turn running in it. Everything is kept, and it can be resumed.`, "Pass --yes to stop it.");
-  await confirmInWindow(`stop the cloud workspace ${target.item.workspace.name}. Any agent turn running in it ends.`, "Stop workspace");
+  if (params.confirmed !== true) throw new CloudControlError("confirmation_required", `Stopping ${item.workspace.name} ends any agent turn running in it. Everything is kept, and it can be resumed.`, "Pass --yes to stop it.");
+  await confirmInWindow(`stop the cloud workspace ${item.workspace.name}. Any agent turn running in it ends.`, "Stop workspace");
   const requestedAt = Date.now();
   const snapshot = await api.cloudWorkspaceSuspend(target.workspaceId, cloudOrgArg(target.orgId));
   if (snapshot?.workspace) applyCloudSnapshot(snapshot, requestedAt);
   void refreshCloudCatalog(target.orgId);
-  return { workspace: target.key, state: snapshot?.workspace.state ?? null, operationId: snapshot?.operation.id ?? null, changed: true };
+  const after = snapshot?.workspace ? { workspace: snapshot.workspace, latestOperation: snapshot.operation } : null;
+  return { workspace: target.key, state: lifecycleState(after, "suspend"), operationId: snapshot?.operation.id ?? null, changed: true };
 }
 
-async function resume(params: Params) {
-  const target = resolveWorkspace(required(params, "workspace"));
-  assertLifecycle(target.item);
-  if (target.item.workspace.state === "ready") return { workspace: target.key, state: "ready", changed: false };
-  if (target.item.workspace.state !== "suspended") throw new CloudControlError("cloud_workspace_not_stopped", `This workspace is ${deriveCloudActivity(target.item).label.toLowerCase()}; only a stopped one can be resumed.`);
-  await confirmInWindow(`resume the cloud workspace ${target.item.workspace.name}, which starts billing its compute.`, "Resume workspace");
+async function resume(params: Params, sleep: Sleep = pause, now: () => number = Date.now) {
+  const target = await lifecycleTarget(params, stopping, sleep, now);
+  const { item } = target;
+  // Already running, or on its way: nothing is resumed twice.
+  if (resuming(item)) return { workspace: target.key, state: lifecycleState(item, "resume"), operationId: item.latestOperation?.id ?? null, changed: false };
+  if (machineRunning(item)) return { workspace: target.key, state: lifecycleState(item, "resume"), changed: false };
+  if (item.workspace.state !== "suspended" || isOpen(item.latestOperation)) {
+    throw new CloudControlError("cloud_workspace_not_stopped", `This workspace is ${deriveCloudActivity(item).label.toLowerCase()}; only a stopped one can be resumed.`, stopping(item) ? "Run the command again once it has stopped." : null);
+  }
+  await confirmInWindow(`resume the cloud workspace ${item.workspace.name}, which starts billing its compute.`, "Resume workspace");
   // The one explicit wake: the same call as the menu's Resume.
-  await resumeCloudWorkspace(target.item);
+  await resumeCloudWorkspace(item);
   void refreshCloudCatalog(target.orgId);
   const after = findCloudWorkspace(getCloudCatalog(), target.orgId, target.workspaceId);
-  return { workspace: target.key, state: after?.workspace.state ?? null, operationId: after?.latestOperation?.id ?? null, changed: true };
+  return { workspace: target.key, state: lifecycleState(after, "resume"), operationId: after?.latestOperation?.id ?? null, changed: true };
 }
+
+/** For tests: `stop` and `resume` with their clock and sleep replaced. */
+export const cloudLifecycleCommands = { stop, resume };
 
 /** Run one `cloud.*` control command. Throws `CloudControlError` for a refusal. */
 export async function handleCloudControl(action: string, params: Params = {}): Promise<unknown> {
