@@ -50,6 +50,16 @@ impl CloudWorkspaceProviderId {
             Self::LocalDocker => "local-docker",
         }
     }
+
+    /// What the provider is called when the service does not say.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Machine0 => "Machine0",
+            Self::Box => "Boat",
+            Self::Hetzner => "Hetzner",
+            Self::LocalDocker => "Local Docker",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1940,6 +1950,16 @@ impl CloudWorkspaceService {
             return Err(CloudWorkspaceClientError::local("organization_admin_required", false));
         }
         Ok(ProviderConnectAuthorization { context, provider })
+    }
+
+    /// The provider's name in the organization's provider list, as Settings
+    /// shows it; `None` when the list cannot be read or does not name it.
+    pub(crate) fn provider_display_name(&self, authorization: &ProviderConnectAuthorization) -> Option<String> {
+        let list = self
+            .client
+            .request::<CloudProviderSummaryResponse>(&authorization.context, &["cloud-providers"], None, None, None, RequestRisk::Read)
+            .ok()?;
+        list.providers.into_iter().find(|summary| summary.id == authorization.provider).map(|summary| summary.display_name)
     }
 
     pub(crate) fn connect_authorized(
@@ -3900,6 +3920,31 @@ mod tests {
         assert!(captured
             .text
             .starts_with("GET /v1/desktop/orgs/org-1/cloud-providers/box HTTP/1.1"));
+    }
+
+    // PRO-111: the key dialog names the provider as the organization's list does.
+    #[test]
+    fn provider_display_name_comes_from_the_organization_list() {
+        let summary = |id: &str, name: &str| json!({ "id": id, "displayName": name, "availability": "available", "canManage": true, "connection": null, "capabilities": { "suspend": true, "resume": true, "releaseDisposition": "destroyed", "locationSelection": "automatic", "sourceSelection": "optional", "pricing": "provider-rate" } });
+        let body = json!({ "providers": [summary("box", "Boat"), summary("local-docker", "Local Docker (development)")] }).to_string();
+        let (base, _, request) = serve_once(response("200 OK", &body, ""), Duration::ZERO);
+        let (_, service) = test_service(&base);
+        let authorization = ProviderConnectAuthorization { context: context(), provider: CloudWorkspaceProviderId::LocalDocker };
+        assert_eq!(service.provider_display_name(&authorization).as_deref(), Some("Local Docker (development)"));
+        let captured = request.join().unwrap();
+        assert!(captured.text.starts_with("GET /v1/desktop/orgs/org-1/cloud-providers HTTP/1.1"));
+        assert!(!captured.extra_request);
+
+        // Not listed, or no list: no name, and the dialog falls back to the provider's own label.
+        let (base, _, request) = serve_once(response("200 OK", &body, ""), Duration::ZERO);
+        let (_, service) = test_service(&base);
+        let authorization = ProviderConnectAuthorization { context: context(), provider: CloudWorkspaceProviderId::Hetzner };
+        assert_eq!(service.provider_display_name(&authorization), None);
+        request.join().unwrap();
+        let (base, _, request) = serve_once(response("503 Service Unavailable", "{}", ""), Duration::ZERO);
+        let (_, service) = test_service(&base);
+        assert_eq!(service.provider_display_name(&authorization), None);
+        request.join().unwrap();
     }
 
     #[test]
