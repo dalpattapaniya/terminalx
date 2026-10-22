@@ -126,6 +126,7 @@ import { LocalPathLeakError, cloudSessionKey } from "@/types/target";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { resetPanelTabs } from "@/lib/panelTab";
 import { resetPurged } from "@/lib/cloudLifecycle";
+import { takeOrganizationRequest } from "@/lib/settingsLinks";
 
 mocks.guard = guardedApi();
 // jsdom lays nothing out; the file tree scrolls its focused row into view.
@@ -1240,6 +1241,52 @@ describe("a turn that finished while this desktop was away", () => {
     expect(await screen.findByText("chunk 150 of 150")).toBeTruthy();
     await waitFor(() => expect(within(composer()).queryByRole("button", { name: "Queue" })).toBeNull());
     expect(mocks.workspaceConnection).toHaveBeenCalledTimes(1);
+    expect(guard.violations).toEqual([]);
+  });
+});
+
+// PRO-110: the notice lived only in the old workspace view, so a tab of a session never showed it.
+describe("a cloud tab whose agent has no way to sign in", () => {
+  const SIGN_IN = { provider: "claude", state: "not-connected", reason: null };
+  /** The notice over a tab, in that tab's own panel (the others stay mounted, hidden). */
+  const noticeOver = (tabId: string) => document.getElementById(`session-agent-panel-${tabId}`)?.querySelector<HTMLElement>('[data-testid="cloud-agent-sign-in"]') ?? null;
+
+  /** The organization's login was removed; then a second Claude Code tab is added to the session. */
+  async function addTabAfterTheLoginWasRemoved() {
+    await openConnected();
+    expect(noticeOver("t-1")).toBeNull();
+    const added = tabInfo({ tabId: "t-2", title: null, signIn: SIGN_IN });
+    runtime.tabs = [tabInfo(), added];
+    runtime.sessions = [{ ...runtimeSession(), tabs: [...runtimeSession().tabs, { id: "t-2", harness: "claude", model: "", permissionMode: "bypassPermissions", status: "idle", created: "", modified: "" }] }];
+    await act(async () => runtime.notify("session.tabs", { tabs: runtime.tabs }));
+    act(() => selectSessionTab(KEY, { kind: "agent", id: "t-2" }));
+  }
+
+  it("says so over the new tab, with the way to the organization's Agent logins for an admin", async () => {
+    mocks.role = "admin";
+    await addTabAfterTheLoginWasRemoved();
+    const shown = await waitFor(() => noticeOver("t-2")!);
+    expect(shown.textContent).toContain("Needs sign-in: Claude Code isn't connected for this organization");
+    fireEvent.click(within(shown).getByRole("button", { name: "Open Agent logins" }));
+    expect(takeOrganizationRequest()).toBe(ORG);
+
+    // The tab that started signed in is not held to the removed login.
+    act(() => selectSessionTab(KEY, { kind: "agent", id: "t-1" }));
+    await waitFor(() => expect(document.getElementById("session-agent-panel-t-1")?.getAttribute("aria-hidden")).toBe("false"));
+    expect(noticeOver("t-1")).toBeNull();
+    expect(guard.violations).toEqual([]);
+  });
+
+  it("tells a member to ask an owner or admin, and goes once the runtime says the agent can sign in", async () => {
+    await addTabAfterTheLoginWasRemoved();
+    const shown = await waitFor(() => noticeOver("t-2")!);
+    expect(shown.textContent).toContain("Ask an owner or admin to connect it");
+    expect(within(shown).queryByRole("button", { name: "Open Agent logins" })).toBeNull();
+
+    // A login connected again: the runtime's next tab list has no sign-in for it.
+    runtime.tabs = runtime.tabs.map((tab) => ({ ...tab, signIn: undefined }));
+    await act(async () => runtime.notify("session.tabs", { tabs: runtime.tabs }));
+    await waitFor(() => expect(noticeOver("t-2")).toBeNull());
     expect(guard.violations).toEqual([]);
   });
 });

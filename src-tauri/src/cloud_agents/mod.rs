@@ -268,7 +268,7 @@ impl AgentOps for ManagerOps {
                         .collect(),
                     follow_ups: Vec::new(),
                     lease: None,
-                    sign_in: crate::cloud_grants::sign_in_required_for_launch(&tab.harness, &format!("{}/{}", entry.id, tab.id)),
+                    sign_in: self.manager.sign_in_required(&entry.id, &tab.id, &tab.harness),
                     last_seq,
                     created: tab.created.clone(),
                     modified: tab.modified.clone(),

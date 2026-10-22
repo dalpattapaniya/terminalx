@@ -616,6 +616,8 @@ export function useCloudSession(key: string): CloudSessionModel | null {
   // PRO-86: whether the runtime serves agent terminals; its last word outlives the connection.
   const agentPty = agentPtyServed(workspaceKey, connected && client ? client.hasCapability("agent-pty/1") : null);
   const agentProcess = useCallback((tabId: string) => agents.tabs.find((tab) => tab.tabId === tabId)?.info.process ?? null, [agents.tabs]);
+  // PRO-110: what the runtime says of the tab's agent's sign-in, for the notice over the tab.
+  const signIn = useCallback((tabId: string) => agents.tabs.find((tab) => tab.tabId === tabId)?.info.signIn ?? null, [agents.tabs]);
   const backend = useMemo(
     () =>
       cloudSessionBackend({
@@ -637,8 +639,9 @@ export function useCloudSession(key: string): CloudSessionModel | null {
         agentPty,
         terminalBase,
         agentProcess,
+        signIn,
       }),
-    [key, workspaceKey, scope, runtimeSessionId, state, client, workspaceState, authority, agents.outbox, followUps, wake, you, collabLive, settingsNotice, connects, agentPty, terminalBase, agentProcess],
+    [key, workspaceKey, scope, runtimeSessionId, state, client, workspaceState, authority, agents.outbox, followUps, wake, you, collabLive, settingsNotice, connects, agentPty, terminalBase, agentProcess, signIn],
   );
 
   const ownTabs = useMemo(() => {

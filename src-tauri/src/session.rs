@@ -528,6 +528,15 @@ impl TabRuntime {
     fn key(&self) -> String {
         format!("{}/{}", self.session_id, self.tab_id)
     }
+
+    /// What the agent's launch is recorded under in `cloud_grants` and
+    /// `cloud_config`: a CLI's pane, else the tab.
+    fn launch_key(&self) -> String {
+        match &self.engine {
+            Engine::Cli(cli) => cli.pane_id.clone(),
+            _ => self.key(),
+        }
+    }
 }
 
 /// No child survives a restart: a tab persisted mid-turn or waiting is idle
@@ -1159,6 +1168,14 @@ impl SessionManager {
         Ok(self.publish(&mut rt, payload, None))
     }
 
+    /// Whether the tab's agent has no way to sign in in this cloud workspace
+    /// (PRO-78). One running on a credential it started with keeps it.
+    pub fn sign_in_required(&self, session_id: &str, tab_id: &str, harness: &str) -> Option<crate::cloud_grants::SignInRequired> {
+        let runtime = self.tabs.lock().unwrap().get(&key_of(session_id, tab_id)).cloned();
+        let launch = runtime.map_or_else(|| key_of(session_id, tab_id), |runtime| runtime.lock().unwrap().launch_key());
+        crate::cloud_grants::sign_in_required_for_launch(harness, &launch)
+    }
+
     pub fn is_running(&self, session_id: &str, tab_id: &str) -> bool {
         let runtime = self.tabs.lock().unwrap().get(&key_of(session_id, tab_id)).cloned();
         runtime.is_some_and(|runtime| {
@@ -1216,7 +1233,7 @@ impl SessionManager {
             let turn = running
                 && (runtime.status == TabStatus::InProgress || silence_warning)
                 && now.saturating_duration_since(last_activity) < crate::cloud_activity::MAX_TURN_SILENCE
-                && crate::cloud_grants::sign_in_required_for_launch(&runtime.harness, &runtime.key()).is_none();
+                && crate::cloud_grants::sign_in_required_for_launch(&runtime.harness, &runtime.launch_key()).is_none();
             (active + usize::from(turn), pending + runtime.pending.len())
         })
     }

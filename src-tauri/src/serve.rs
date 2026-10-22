@@ -464,6 +464,13 @@ fn start_cloud_agents(
     start_issue_pipelines(runtime, &agents);
     if let Some((cloud, _)) = cloud {
         watch_access(agents.clone(), cloud.clone());
+        // A login brought or taken away changes what the tabs say (PRO-110).
+        let weak = Arc::downgrade(&agents);
+        crate::cloud_grants::on_sign_in_change(move || {
+            if let Some(agents) = weak.upgrade() {
+                agents.changed(None, false);
+            }
+        });
     }
     if let Some(http) = http {
         start_launch(runtime, root, data_dir, http.clone(), &agents);
