@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { CloudWorkspaceListItem } from "@/lib/api";
+import type { CloudProviderSummary, CloudWorkspaceListItem } from "@/lib/api";
 import { forgetSetups, loadSetups, newSetup, reconcileSetup, resendable, saveSetup, setupFor, unfinishedCreation, unsettledRequest, type OrganizationSetupRecord, type SetupFacts } from "./organizationSetup";
 
 const USER = "owner@example.test";
 const record = (patch: Partial<OrganizationSetupRecord> = {}): OrganizationSetupRecord => ({ ...newSetup("Team", "request-1", 1), organizationId: "org-1", step: "compute", logins: "connected", ...patch });
-const facts = (patch: Partial<SetupFacts> = {}): SetupFacts => ({ activeOrganizationId: "org-1", compute: true, logins: ["claude"], repository: true, workspaces: [], ...patch });
+const facts = (patch: Partial<SetupFacts> = {}): SetupFacts => ({ activeOrganizationId: "org-1", compute: true, paused: [], logins: ["claude"], repository: true, workspaces: [], ...patch });
 const workspace = (patch: Record<string, unknown> = {}): CloudWorkspaceListItem =>
   ({ workspace: { id: "ws-1", state: "ready", runtimeActivity: { online: true, reportedAt: 1, activeTurns: 0, pendingApprovals: 0 }, launch: { category: null, sessionId: "s-1" }, ...patch }, latestOperation: null }) as unknown as CloudWorkspaceListItem;
 const withWorkspace = (patch: Partial<OrganizationSetupRecord> = {}) => record({ step: "runtime", workspace: { pending: null, id: "ws-1" }, ...patch });
@@ -70,6 +70,19 @@ describe("reconciling against the server", () => {
     expect(step(record({ logins: "later" }), facts({ logins: [] }))).toBe("workspace");
     // Still after the compute connection: no cloud, no logins step yet.
     expect(step(fresh, facts({ compute: false }))).toBe("compute");
+  });
+
+  // PRO-112: a new organization's Boat connection starts with new machines paused.
+  it("holds a new setup at the compute step while the connected provider's new machines are paused, and goes on once they are allowed", () => {
+    const boat = { id: "box", displayName: "Boat", availability: "disabled-for-create", canManage: true } as CloudProviderSummary;
+    const fresh = record({ logins: undefined });
+    expect(step(fresh, facts({ compute: false, paused: [boat] }))).toBe("compute");
+    // Allowed: straight on to the agent logins.
+    expect(step(fresh, facts({ compute: true, paused: [] }))).toBe("logins");
+    // Paused later in the setup: no workspace can be created, so the setup is back at the compute step.
+    expect(step(record({ step: "workspace" }), facts({ compute: false, paused: [boat] }))).toBe("compute");
+    // Not known: held where it was.
+    expect(step(record({ step: "workspace" }), facts({ compute: null, paused: null }))).toBe("workspace");
   });
 
   it("puts a record from before the step back on it only when no agent has a login", () => {

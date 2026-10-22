@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, type AgentLogin } from "@/lib/api";
+import { api, type AgentLogin, type CloudProviderSummary } from "@/lib/api";
 import { takeAgentLoginsRequest, takeOrganizationRequest } from "@/lib/settingsLinks";
 import { organizationGithubApp } from "@/lib/organizationGithubApp";
 import { ENVIRONMENT_CHECK_PROMPT, newSetup, type OrganizationSetupRecord } from "@/lib/organizationSetup";
@@ -9,6 +9,7 @@ import { OrganizationSetupSteps } from "./OrganizationSetupSteps";
 vi.mock("@/lib/api", () => ({
   api: {
     cloudProviders: vi.fn(),
+    cloudProviderSetCreationEnabled: vi.fn(),
     cloudWorkspaces: vi.fn(),
     cloudWorkspaceSetup: vi.fn(),
     cloudWorkspaceQuote: vi.fn(),
@@ -31,7 +32,7 @@ const creates = () => {
 let record: OrganizationSetupRecord;
 let stored: AgentLogin[];
 const history: OrganizationSetupRecord[] = [];
-const view = () => (
+const view = (props: { providersChanged?: number; onProvidersChange?: () => void } = {}) => (
   <OrganizationSetupSteps
     record={record}
     organizationId="org-1"
@@ -41,6 +42,7 @@ const view = () => (
       record = next;
       history.push(next);
     }}
+    {...props}
   />
 );
 
@@ -329,5 +331,79 @@ describe("the agent logins step", () => {
     render(view());
     expect((await screen.findByTestId("organization-setup-missing-logins")).textContent).toContain("No agent login yet for Codex and Cursor in Team");
     expect(screen.getByTestId("organization-setup-done").textContent).toContain("Cloud setup is complete");
+  });
+});
+
+// PRO-112: a new organization's Boat connection starts with new machines paused.
+describe("a connected provider with new machines paused", () => {
+  let availability: CloudProviderSummary["availability"];
+  let canManage: boolean;
+
+  beforeEach(() => {
+    record = { ...record, logins: undefined };
+    availability = "disabled-for-create";
+    canManage = true;
+    vi.mocked(api.cloudProviders).mockImplementation(async () => ({ providers: [{ id: "box", displayName: "Boat", availability, canManage }] }) as never);
+    vi.mocked(api.cloudProviderSetCreationEnabled).mockImplementation(async (_provider, _revision, enabled) => {
+      availability = enabled ? "available" : "disabled-for-create";
+      return {} as CloudProviderSummary;
+    });
+  });
+
+  it("says so on the compute step, and goes on to the agent logins once they are allowed, without a Check again", async () => {
+    const changed = vi.fn();
+    const shown = render(view({ onProvidersChange: changed }));
+    const paused = await screen.findByTestId("organization-setup-compute-paused");
+    expect(record.step).toBe("compute");
+    expect(paused.textContent).toContain("New machines are paused for Team on Boat.");
+    expect(paused.textContent).toContain("setup goes on once new machines are allowed");
+    // The step list says it too: the connection is done, and new machines are what it waits on.
+    expect(screen.getByRole("listitem", { current: "step" }).textContent).toContain("Compute provider connected, new machines paused");
+    expect(screen.queryByText("Connect a compute provider above.")).toBeNull();
+
+    fireEvent.click(within(paused).getByRole("button", { name: "Allow new machines" }));
+    await waitFor(() => expect(record.step).toBe("logins"));
+    expect(api.cloudProviderSetCreationEnabled).toHaveBeenCalledWith("box", "rev-1", true);
+    // The compute controls above read their provider again.
+    expect(changed).toHaveBeenCalledOnce();
+    shown.rerender(view({ onProvidersChange: changed }));
+    expect(screen.getByTestId("organization-setup-logins")).toBeTruthy();
+    expect(screen.queryByTestId("organization-setup-compute-paused")).toBeNull();
+    expect(screen.getByRole("listitem", { current: "step" }).textContent).toContain("Connect agent logins");
+  });
+
+  it("tells someone who can't allow them who can", async () => {
+    canManage = false;
+    render(view());
+    const paused = await screen.findByTestId("organization-setup-compute-paused");
+    expect(paused.textContent).toContain("An organization owner or administrator can allow them.");
+    expect(within(paused).queryByRole("button")).toBeNull();
+  });
+
+  it("says why it stays when the provider is still not offered after allowing", async () => {
+    vi.mocked(api.cloudProviderSetCreationEnabled).mockResolvedValue({} as CloudProviderSummary);
+    render(view());
+    fireEvent.click(within(await screen.findByTestId("organization-setup-compute-paused")).getByRole("button", { name: "Allow new machines" }));
+    expect(await screen.findByText(/New machines are allowed for Team, but Boat isn't offered for new workspaces right now/)).toBeTruthy();
+    expect(record.step).toBe("compute");
+  });
+
+  it("says why when the service refuses", async () => {
+    vi.mocked(api.cloudProviderSetCreationEnabled).mockRejectedValue({ code: "organization_admin_required" });
+    const changed = vi.fn();
+    render(view({ onProvidersChange: changed }));
+    fireEvent.click(within(await screen.findByTestId("organization-setup-compute-paused")).getByRole("button", { name: "Allow new machines" }));
+    expect(await screen.findByText(/Only an organization owner or administrator/)).toBeTruthy();
+    expect(changed).not.toHaveBeenCalled();
+    expect(record.step).toBe("compute");
+  });
+
+  it("reads the setup again when new machines were allowed in the compute controls above", async () => {
+    const shown = render(view({ providersChanged: 0 }));
+    await screen.findByTestId("organization-setup-compute-paused");
+    availability = "available";
+    shown.rerender(view({ providersChanged: 1 }));
+    await waitFor(() => expect(record.step).toBe("logins"));
+    expect(api.cloudProviders).toHaveBeenCalledTimes(2);
   });
 });

@@ -367,6 +367,29 @@ describe("organization provider controls", () => {
       expect(screen.getByRole("button", { name: "Pause new machines" })).toBeTruthy();
     });
 
+    // PRO-112: the organization setup steps below read what changed here, and the other way round.
+    it("tells the page when a change went through, and reads its provider again when the page changed it", async () => {
+      vi.mocked(api.cloudProviderSetCreationEnabled).mockImplementation(async (_provider, _revision, enabled) => {
+        availability = enabled ? "available" : "disabled-for-create";
+        return {} as CloudProviderSummary;
+      });
+      const changed = vi.fn();
+      const shown = render(<ProviderControls contextRevision="org-revision" providersChanged={0} onChange={changed} />);
+      fireEvent.click(await screen.findByRole("button", { name: "Pause new machines" }));
+      await screen.findByTestId("provider-creation-paused");
+      expect(changed).toHaveBeenCalledOnce();
+
+      // New machines allowed elsewhere on the page: no Refresh needed here.
+      availability = "available";
+      const reads = vi.mocked(api.cloudProviders).mock.calls.length;
+      shown.rerender(<ProviderControls contextRevision="org-revision" providersChanged={1} onChange={changed} />);
+      await waitFor(() => expect(screen.queryByTestId("provider-creation-paused")).toBeNull());
+      await screen.findByRole("button", { name: "Pause new machines" });
+      expect(api.cloudProviders).toHaveBeenCalledTimes(reads + 1);
+      // Reading it is not a change made here.
+      expect(changed).toHaveBeenCalledOnce();
+    });
+
     it("shows a member that new machines are paused, with no switch", async () => {
       detail.canManage = false;
       availability = "disabled-for-create";
