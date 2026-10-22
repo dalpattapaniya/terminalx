@@ -1,28 +1,33 @@
 #!/usr/bin/env node
-// WebKit layout check for the tab strip in the title bar (#438):
+// WebKit layout check for the workspace tab strip (#438), which since #584 is
+// its own row under the title bar, ended by the + and the row's actions:
 //
-// - every tab of the open workspace is in the strip, in one row, in the
-//   sidebar's order, and no tab of another workspace is;
+// - every tab of the open workspace is in the strip, in one row under the
+//   title bar, in the sidebar's order, and no tab of another workspace is;
 // - tabs share the width evenly, long titles are cut with an ellipsis, and
 //   the full title is on hover and on keyboard focus;
 // - with more tabs than fit, the row scrolls, a menu lists every tab by its
 //   full title, and the tab on screen is in view;
-// - the strip never covers the window controls' inset or the header's
-//   actions, with the sidebar open and hidden, down to a narrow window with
-//   the side panel open; the issue and automation chips stay reachable;
-// - the session's name and branch are not in the title bar, and Share and the
-//   other actions sit at its right edge at every width, with the empty room
-//   between the + and them (#477);
-// - the empty part of the title bar still drags the window and a tab does not;
+// - neither the title bar nor the row overflows the window, with the sidebar
+//   open and hidden, down to a narrow window with the side panel open; the
+//   window controls' inset is left clear, and the issue, automation and
+//   pipeline chips stay reachable down to a 360 px title bar, which leaves
+//   them out below that;
+// - the title bar names the workspace (its project, and its branch or the
+//   conversation's title, #584) and Share and the other actions sit at its
+//   right edge at every width;
+// - the empty part of the title bar drags the window and a tab does not;
 // - a tab dragged to a new place lands there, shows where it will land on
 //   the way, and Escape puts it back;
 // - the tab shortcuts and the arrow keys work, and a right-click opens the menu.
 //
 // Not checked since the chat-first sidebar (#484): that the sidebar lists the
 // session's tabs in the strip's order (the sidebar has no tab rows; the strip
-// is the one list of a workspace's tabs), the branch chip beside the crumb
-// giving way below 650 px, and the project on the crumb's hover: since #477
-// the title bar has neither a crumb nor a branch chip.
+// is the one list of a workspace's tabs). Not checked since the strip left the
+// title bar (#584): the room between the + and the title bar's actions, the
+// crumb's chips giving way to their icons under many tabs, the row folding to
+// its menu alone below 415 px, and Share keeping only its icon below 540 px;
+// the row has the window's whole width now, and the title bar its own room.
 //
 //   pnpm build && npx playwright install webkit && node scripts/webkit/tab-strip.mjs
 //   Set TAB_STRIP_SHOTS to a directory to also save screenshots.
@@ -56,6 +61,7 @@ const setup = ({ tabs, prefs }) => {
     list_harnesses: [{ id: "claude", name: "Claude Code", available: true }, { id: "codex", name: "Codex", available: true }],
     list_sessions: [
       session("s-a", "Tab strip in the title bar", WORKTREE, first, {
+        modified: at(2),
         worktreeName: "tab-strip",
         branch: "raccoon/438-browser-style-tab-strip",
         issue: { provider: "github", id: "438", identifier: "#438", title: "Browser-style tab strip in the title bar", url: "https://example.test/438" },
@@ -116,13 +122,12 @@ async function app(fixture, viewport) {
   const page = await browser.newPage({ viewport });
   await page.addInitScript(`window.__PW_FIXTURE__ = { cloud: false, localProjects: 1 };\n${stub}\n(${setup})(${JSON.stringify(fixture)});`);
   await page.goto(server.url);
-  // The two sessions share a branch, so the sidebar folds them under its row. A
-  // conversation goes by its open tab's title (the first session's is its first
-  // tab's), which is also its row's hover; the other session's first tab is
-  // that title and a number, so the row is picked by its hover, not by a prefix.
+  // The two sessions share a branch and sit beside each other as tabs, so the
+  // sidebar gives the branch one row that stands for both (#584). The row opens
+  // the branch's latest session: the first one, whose tabs the checks count and
+  // whose issue, automation and pipeline chips the header shows.
   const list = (await sidebar(page)).locator('[data-testid="conversation-list"]');
-  await list.getByRole("button", { name: /^raccoon\/438-browser-style-tab-strip/, expanded: false }).click();
-  await list.locator('[title="Refactor the authentication middleware to use the new token service everywhere"]').getByRole("button").first().click();
+  await list.getByRole("button", { name: /^raccoon\/438-browser-style-tab-strip, 2 sessions$/ }).click();
   // Attached, not visible: the narrowest header draws the row as its menu alone.
   await page.locator('[data-testid="workspace-tab-strip"] [role="tab"]').first().waitFor({ state: "attached" });
   await page.waitForTimeout(250);
@@ -147,6 +152,7 @@ const measure = (page) =>
     const list = strip.querySelector('[role="tablist"]');
     const tabs = [...list.querySelectorAll("[data-tab-key]")];
     const actions = header.lastElementChild;
+    const trailing = strip.lastElementChild !== list ? strip.lastElementChild : null;
     // What Tauri's own script decides for a press at a point of the title bar.
     const clickable = (el) => ["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "LABEL", "SUMMARY"].includes(el.tagName) || (el.hasAttribute("tabindex") && el.getAttribute("tabindex") !== "-1") || ["button", "link", "menuitem", "tab", "checkbox", "radio", "switch", "option"].includes(el.getAttribute("role"));
     const drags = (element) => {
@@ -160,12 +166,17 @@ const measure = (page) =>
       }
       return false;
     };
-    const handle = document.querySelector('[data-testid="session-header-handle"]');
-    const handleBox = handle.getBoundingClientRect();
+    // The title bar's empty stretch, just before its actions: where the window is dragged from.
+    const headerBox = header.getBoundingClientRect();
+    const actionsBox = actions.getBoundingClientRect();
+    const emptyAt = document.elementFromPoint(actionsBox.left - 12, (headerBox.top + headerBox.bottom) / 2);
     return {
       window: innerWidth,
       header: rect(header),
       headerOverflows: header.scrollWidth > header.clientWidth + 1,
+      row: rect(strip),
+      rowOverflows: strip.scrollWidth > strip.clientWidth + 1,
+      rowTrailing: rect(trailing),
       first: rect(header.firstElementChild),
       breadcrumbParts: [...header.querySelector('[data-testid="session-breadcrumb"]').children].filter(visible).map(rect),
       strip: rect(strip),
@@ -176,47 +187,54 @@ const measure = (page) =>
         const label = tab.querySelector('[role="tab"] span.truncate');
         return { key: tab.dataset.tabKey, ...rect(tab), name: tab.querySelector('[role="tab"]').getAttribute("aria-label"), selected: tab.querySelector('[role="tab"]').getAttribute("aria-selected") === "true", cut: label ? label.scrollWidth > label.clientWidth : false, hasIcon: !!tab.querySelector('[role="tab"] svg, [role="tab"] img, [role="tab"] [data-agent-mark]'), pinned: tab.dataset.pinned === "true" };
       }),
-      plus: rect(header.querySelector('[aria-label="New tab"]')),
-      allTabs: rect(header.querySelector('[data-testid="all-tabs"]')),
-      allTabsText: header.querySelector('[data-testid="all-tabs"]')?.textContent.trim() ?? null,
+      plus: rect(strip.querySelector('[aria-label="New tab"]')),
+      allTabs: rect(strip.querySelector('[data-testid="all-tabs"]')),
+      allTabsText: strip.querySelector('[data-testid="all-tabs"]')?.textContent.trim() ?? null,
       actions: rect(actions),
       actionButtons: [...actions.querySelectorAll("button")].map((button) => ({ name: button.getAttribute("aria-label"), ...rect(button) })),
-      handle: rect(handle),
-      handleDrags: handleBox.width > 0 ? drags(document.elementFromPoint(handleBox.left + handleBox.width / 2, handleBox.top + handleBox.height / 2)) : null,
+      headerDrags: emptyAt ? drags(emptyAt) : null,
       tabDrags: tabs.length ? drags(tabs[0].querySelector('[role="tab"]')) : null,
-      // #477: nothing in the title bar names the session or its branch.
+      // #584: the title bar names the workspace again, by its branch or the conversation's title.
       named: ['[data-testid="session-branch"]', '[data-testid="session-title"]', '[data-testid="session-project"]'].some((selector) => visible(header.querySelector(selector))),
       paddingRight: Math.round(parseFloat(getComputedStyle(header).paddingRight)),
       issue: visible([...header.querySelectorAll("button")].find((button) => button.textContent.trim() === "#438")),
       automation: visible(header.querySelector('[data-testid="session-automation"]')),
       pipeline: (() => {
         const chip = header.querySelector('[data-testid="session-pipeline"]');
-        if (!chip) return null;
+        if (!visible(chip)) return null;
         const box = chip.getBoundingClientRect();
         const shown = (part) => !!part && part.width > 0 && part.top < box.bottom - 1 && part.right <= box.right + 1;
-        const dot = chip.querySelector("span.rounded-full").getBoundingClientRect();
-        const label = chip.querySelector("span.truncate").getBoundingClientRect();
+        // The chip is "Reviewer ·", then the pipeline's dot and its words (`PipelineStatus`).
+        const dotNode = chip.querySelector("span.rounded-full");
+        const dot = dotNode.getBoundingClientRect();
+        const label = dotNode.nextElementSibling.getBoundingClientRect();
         // Its words are a label that is in view (whole, or cut with an ellipsis) or out of it; `slack` is what is left empty at the chip's end.
-        return { ...rect(chip), text: chip.textContent.trim(), dot: shown(dot), label: shown(label) ? Math.round(label.width) : 0, slack: Math.round(box.right - (shown(label) ? label.right : dot.right)) };
+        return { ...rect(chip), text: chip.textContent.replace(/\s*·\s*/, " · ").trim(), dot: shown(dot), label: shown(label) ? Math.round(label.width) : 0, slack: Math.round(box.right - (shown(label) ? label.right : dot.right)) };
       })(),
     };
   });
 
-/** The header is in one piece: nothing over the window controls, nothing over the actions, nothing off the edge. */
+/** The title bar and the row of tabs are each in one piece: nothing over the window controls, nothing off the edge, the row under the title bar. */
 function fits(layout, { sidebarHidden = false } = {}) {
   const lastTab = layout.tabs.at(-1);
-  const rightOfStrip = Math.max(layout.strip.right, layout.plus.right, layout.allTabs?.right ?? 0);
   return {
     "the header does not overflow the window": !layout.headerOverflows && layout.actions.right <= layout.window + SLACK,
-    "every action is inside the header, uncovered by the tabs": layout.actionButtons.length >= 3 && layout.actionButtons.every((button) => button.left >= rightOfStrip - SLACK && button.right <= layout.header.right + SLACK),
-    "the tabs are in one row, inside the title bar": layout.tabs.every((tab) => tab.top === layout.tabs[0].top && tab.top >= layout.header.top && tab.bottom <= layout.header.bottom + SLACK),
-    "the + follows the row of tabs": layout.plus.left >= layout.strip.right - SLACK && (!lastTab || layout.plus.left >= Math.min(lastTab.right, layout.list.right) - SLACK),
+    "the row of tabs does not overflow the window": !layout.rowOverflows && layout.row.right <= layout.window + SLACK && (!layout.rowTrailing || layout.rowTrailing.right <= layout.row.right + SLACK),
+    "every action is inside the header": layout.actionButtons.length >= 2 && layout.actionButtons.every((button) => button.left >= layout.header.left - SLACK && button.right <= layout.header.right + SLACK),
+    "the tabs are in one row, under the title bar": layout.tabs.every((tab) => tab.top === layout.tabs[0].top && tab.top >= layout.header.bottom - SLACK && tab.bottom <= layout.row.bottom + SLACK),
+    "the + follows the row of tabs": layout.plus.left >= layout.list.left - SLACK && (!lastTab || layout.plus.left >= Math.min(lastTab.right, layout.list.right) - SLACK),
     ...(sidebarHidden ? { "the window controls' inset is left clear": layout.first.left >= 78 - SLACK } : {}),
-    "the issue and automation chips are still there": layout.issue && layout.automation,
-    "the pipeline chip is still there, with the dot that says where it stands": !!layout.pipeline && layout.pipeline.dot,
-    "it is that dot alone, or the dot and its words up to the chip's edge": !!layout.pipeline && (layout.pipeline.label ? layout.pipeline.slack <= 7 : layout.pipeline.width <= 38),
+    // The chips give way to their icons, and a title bar under 360 px leaves them out, as it does the cloud header's chips.
+    ...(layout.header.width >= 360
+      ? {
+          "the issue and automation chips are still there": layout.issue && layout.automation,
+          "the pipeline chip is still there, with the dot that says where it stands": !!layout.pipeline && layout.pipeline.dot,
+          "it is that dot alone, or the dot and its words up to the chip's edge": !!layout.pipeline && (layout.pipeline.label ? layout.pipeline.slack <= 7 : layout.pipeline.width <= 38),
+        }
+      : { "a title bar under 360 px leaves the issue, automation and pipeline chips out": !layout.issue && !layout.automation && !layout.pipeline }),
     "a tab does not drag the window": layout.tabDrags === false,
-    "neither the session's name nor its branch is in the title bar": !layout.named,
+    // The crumb gives way to the chips and the actions when the title bar is tight.
+    ...(layout.content >= 600 ? { "with room, the title bar names the workspace, by its branch or the conversation's title": layout.named } : {}),
     "Share and the other actions are at the right edge": layout.actions.right >= layout.header.right - layout.paddingRight - SLACK && layout.actionButtons[0]?.name === "Share session…",
   };
 }
@@ -225,8 +243,7 @@ function fits(layout, { sidebarHidden = false } = {}) {
 function tier(layout) {
   const width = layout.content;
   return {
-    [`at ${width}px Share ${width < 540 ? "keeps only its icon" : "has its label"}`]: !!layout.share === width >= 540,
-    [`at ${width}px the row of tabs is ${width < 415 ? "its menu alone" : "drawn"}`]: layout.list.hidden === width < 415,
+    [`at ${width}px the row of tabs is drawn`]: !layout.list.hidden,
   };
 }
 
@@ -247,8 +264,8 @@ function tier(layout) {
       "the tabs are the same width": Math.max(...widths) - Math.min(...widths) <= SLACK,
       "a long title is cut and a short one is not": layout.tabs[0].cut && !layout.tabs[3].cut,
       "the open tab is marked": layout.tabs.filter((tab) => tab.selected).length === 1 && layout.tabs[0].selected,
-      "the empty title bar after the + drags the window": layout.handle.width >= 24 && layout.handleDrags === true,
-      "the room the tabs leave is between the + and the actions": layout.actions.left - layout.plus.right >= 24 && layout.actions.right >= layout.header.right - layout.paddingRight - SLACK,
+      "the empty title bar drags the window": layout.headerDrags === true,
+      "the + follows the last tab closely": layout.plus.left >= layout.tabs.at(-1).right - SLACK && layout.plus.left - layout.tabs.at(-1).right <= 12,
       "the row does not scroll": layout.list.scrollWidth <= layout.list.clientWidth + SLACK && !layout.allTabs,
     },
     layout,
@@ -387,9 +404,7 @@ function tier(layout) {
     ...fits(layout),
     "the tabs are at their narrowest, all the same width": Math.max(...widths) - Math.min(...widths) <= SLACK && widths[0] <= 80 && open.width >= widths[0] && open.width <= 96,
     "the row scrolls": layout.list.scrollWidth > layout.list.clientWidth + SLACK,
-    "a menu at the end of the row lists the tabs, and says how many": !!layout.allTabs && layout.allTabs.left >= layout.list.right - SLACK && layout.allTabs.right <= layout.plus.left + SLACK && layout.allTabsText === "23",
-    "the session's name and chips are not under the tabs": layout.breadcrumbParts.every((part) => part.right <= layout.strip.left + SLACK),
-    "the chips before the tabs are down to their icons": layout.breadcrumbParts.slice(1).every((part) => part.width <= 26),
+    "a menu at the end of the row lists the tabs, and says how many": !!layout.allTabs && layout.allTabs.left >= layout.list.right - SLACK && layout.allTabs.left >= layout.plus.right - SLACK && layout.allTabsText === "23",
   };
   // The last tab, opened from the menu, is scrolled into view.
   await page.locator('[data-testid="all-tabs"]').click();
@@ -433,8 +448,7 @@ for (const [name, viewport, prefs, tabs] of [
       {
         ...fits(layout, { sidebarHidden }),
         "a tab is in view, or the menu that lists them is": layout.list.hidden ? !!layout.allTabs : layout.list.clientWidth >= 70,
-        "the + is right of the tabs and left of the actions": layout.plus.right <= layout.actions.left + SLACK,
-        "the session's name and chips are not under the tabs, nor under each other": layout.breadcrumbParts.every((part, index, parts) => part.right <= layout.strip.left + SLACK && (index === 0 || part.left >= parts[index - 1].right - SLACK)),
+        "the crumb and its chips are inside the title bar, before the actions, not under each other": layout.breadcrumbParts.every((part, index, parts) => part.right <= layout.actions.left + SLACK && (index === 0 || part.left >= parts[index - 1].right - SLACK)),
         ...tier(layout),
       },
       layout,

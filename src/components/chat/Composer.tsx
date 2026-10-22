@@ -736,7 +736,7 @@ function PermissionSubmenu({ permissions: p }: { permissions: PermissionChoice }
       <DropdownMenuSubTrigger disabled={!!p.lock} title={p.lock ?? `Permission mode: ${p.label}`} aria-label={`Permission mode: ${p.lock ?? p.label}`} data-testid="permission-mode">
         <span className={cn("size-2 shrink-0 rounded-full", p.tone ? TONE_DOT[p.tone] : "bg-add")} />
         Permissions
-        <span className="ml-auto max-w-32 truncate pl-3 text-faint" data-testid="permission-mode-label">
+        <span className="ml-auto max-w-48 truncate pl-3 text-faint" data-testid="permission-mode-label">
           {p.label}
         </span>
       </DropdownMenuSubTrigger>
