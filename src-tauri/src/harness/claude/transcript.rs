@@ -54,6 +54,41 @@ pub fn locate(cwd: &str, session_id: &str) -> Option<PathBuf> {
     Some(locate_in(&projects_root()?, cwd, session_id))
 }
 
+/// The title the CLI gave the conversation from what it is about (an
+/// `ai-title` record, which it writes again as the talk moves on): the last
+/// one in the file's final stretch, where a recent one always is.
+pub fn ai_title(path: &Path) -> Option<String> {
+    let text = tail_text(path, 2 * 1024 * 1024)?;
+    text.lines()
+        .filter(|line| line.contains("\"ai-title\""))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["type"] == "ai-title")
+        .filter_map(|v| v["aiTitle"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(String::from))
+        .last()
+}
+
+/// The first thing the reader typed in the conversation, as it was written.
+pub fn first_prompt(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(512 * 1024).read_to_end(&mut head).ok()?;
+    String::from_utf8_lossy(&head)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v["type"] == "user" && !v["isMeta"].as_bool().unwrap_or(false) && v["isSidechain"].as_bool() != Some(true) && !text_of(&v["message"]["content"]).trim().is_empty())
+        .map(|v| text_of(&v["message"]["content"]))
+}
+
+fn tail_text(path: &Path, limit: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(limit))).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// [`locate`] within a given projects folder.
 pub fn locate_in(projects: &Path, cwd: &str, session_id: &str) -> PathBuf {
     let derived = transcript_in(projects, cwd, session_id);
@@ -597,6 +632,13 @@ fn decode_assistant(v: &Value, out: &mut Vec<Payload>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_conversations_title_and_opening_prompt_are_read_from_its_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/harness/claude/fixtures/manual_compact.jsonl");
+        assert_eq!(ai_title(&path).as_deref(), Some("Pong reply"));
+        assert!(first_prompt(&path).is_some_and(|prompt| !prompt.trim().is_empty()));
+    }
     use crate::harness::tui::Streamer;
 
     const FIXTURE: &str = r#"{"type":"queue-operation","timestamp":"2026-09-02T02:41:16.631Z","sessionId":"s"}

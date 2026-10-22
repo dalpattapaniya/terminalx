@@ -592,7 +592,7 @@ export function TabView({
   // The body sits in a flex column: the chat (`flex-1`) takes the height left
   // under the bars above and scrolls inside it. In a plain block it grew as
   // tall as its transcript and pushed the composer out of the window.
-  const wrap = (body: React.ReactNode) => <div className="flex h-full min-h-0 flex-col">
+  const wrap = (body: React.ReactNode) => <div className="flex h-full min-h-0 flex-col bg-chat">
     {collabLive && shared?.client && (
       <LeaseBar
         collabKey={shared.key}
@@ -673,7 +673,7 @@ export function TabView({
         <div className={cn("absolute inset-0 flex min-h-0 flex-col", !terminalMode && "invisible")} aria-hidden={!terminalMode}>
           {terminal}
         </div>
-        {!terminalMode && <div className="absolute inset-0 z-10 flex min-h-0 flex-col bg-background">{chat}</div>}
+        {!terminalMode && <div className="absolute inset-0 z-10 flex min-h-0 flex-col bg-chat">{chat}</div>}
       </div>
     );
   }

@@ -84,7 +84,7 @@ describe("status bar usage", () => {
     statusState.usage.claude = { retryAt: Date.now() + 60_000, revalidateAt: Date.now() + 60_000, error: "Rate limited" };
     render(<StatusBar />);
     fireEvent.click(screen.getByRole("button", { name: /Claude 5h/ }));
-    expect(screen.getByRole("status").textContent).toContain("Claude refresh paused; retry in 1m");
+    expect(screen.getByRole("status").textContent).toBe("Claude refresh paused · retry in 1mRate limited");
     expect(screen.getByRole("button", { name: "Refresh usage" })).toBeTruthy();
   });
 
@@ -99,7 +99,9 @@ describe("status bar usage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Claude 5h/ }));
     const popover = document.querySelector("[data-usage-popover]") as HTMLElement;
     // Only the provider that is failing is called out beside Refresh.
-    expect(screen.getByRole("status").textContent).toBe("Codex refresh paused; retry in 4m. read Codex rate limits: timed out");
+    expect(screen.getByRole("status").textContent).toBe("Codex refresh paused · retry in 4mTimed out");
+    // The raw error stays on the notice, for whoever needs it.
+    expect(within(screen.getByRole("status")).getByTitle("read Codex rate limits: timed out")).toBeTruthy();
 
     fireEvent.click(within(popover).getByRole("button", { name: /^Claude, / }));
     const freshness = () => document.querySelector("[data-usage-freshness]") as HTMLElement;

@@ -47,6 +47,20 @@ export function RecoveryBanner({ placement = "top", kind, limit = null, waiting,
   if (!kind && !waiting) return null;
   const reset = kind === "usage_limit" && limit ? usageLimitText(limit, now) : null;
   const offerModels = (kind === "capacity" || kind === "usage_limit") && !asks.length;
+  // Only a request to answer: the request's own card says it all, with stopping in its action bar.
+  if (!kind && asks.length) {
+    const stop = <Button size="sm" variant="ghost" className="text-muted-foreground" disabled={busy} onClick={onStop}>Stop session</Button>;
+    return <section aria-label="Session recovery" role="status" className={placement === "composer"
+      ? "mx-auto mb-2 flex max-h-[60vh] w-[calc(100%-2rem)] max-w-3xl shrink-0 flex-col gap-2 overflow-auto"
+      : "flex max-h-[50vh] shrink-0 flex-col gap-2 overflow-auto border-b border-hairline p-3"}>
+      {asks.map((ask, i) => {
+        const aside = i === asks.length - 1 ? stop : null;
+        return <div key={ask.requestId}>{ask.kind === "permission"
+          ? <PermissionCard ask={ask} busy={busy || answering} blockedReason={answerBlockedReason} showDetail={askDetail} aside={aside} onAnswer={option => onPermission(ask.requestId, option)} />
+          : <QuestionCard ask={ask} busy={busy || answering} blockedReason={answerBlockedReason} aside={aside} onAnswer={answers => onQuestions(ask.requestId, answers)} />}</div>;
+      })}
+    </section>;
+  }
   return <section aria-label="Session recovery" role="status" className={placement === "composer"
     ? "mx-auto mb-2 max-h-[50vh] w-[calc(100%-2rem)] max-w-3xl shrink-0 overflow-auto rounded-xl border border-warning/30 bg-warning/10 p-3 text-xs"
     : "max-h-[50vh] shrink-0 overflow-auto border-b border-warning/30 bg-warning/10 p-3 text-xs"}>

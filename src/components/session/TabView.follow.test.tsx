@@ -42,6 +42,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { applyEvent } from "@/lib/agentEvents";
 import { bootSessions, upsertSession, useSessionStore } from "@/lib/sessions";
 import { mouseClick } from "@/test/press";
+import { permissionEntry } from "@/test/permissionMenu";
 
 let seq = 0;
 let session: SessionEntry;
@@ -158,14 +159,15 @@ describe("a tab whose agent was started by hand", () => {
   it("has a live chat, with the permission mode locked and the reason said", async () => {
     mocks.views.views = { [`tab${seq}`]: "chat" };
     open({ front: "by_hand", permissionMode: "terminal" });
-    const mode = await screen.findByTestId("permission-mode");
-    expect((mode as HTMLButtonElement).disabled).toBe(true);
+    await screen.findByTestId("model-picker");
+    const mode = await permissionEntry();
+    expect(mode.hasAttribute("data-disabled")).toBe(true);
     expect(mode.getAttribute("title")).toMatch(/Claude Code was started by hand in this tab's terminal.*permission mode/);
     expect(screen.getByTestId("permission-mode-label").textContent).toBe("Set in the terminal");
     // Claude Code takes a model while it runs, so that picker is left to use.
     expect((screen.getByTestId("model-picker") as HTMLButtonElement).disabled).toBe(false);
     expect(screen.getByTestId("composer-settings-note").textContent).toBe("Claude Code was started by hand in this tab's terminal. Its permission mode is changed there: TerminalX only restarts an agent it launched.");
-    expect(screen.getByRole("textbox")).toBeTruthy();
+    expect(screen.getByRole("textbox", { hidden: true })).toBeTruthy();
   });
 
   it("locks the model too for an agent that only takes one when it starts", async () => {
@@ -174,7 +176,7 @@ describe("a tab whose agent was started by hand", () => {
     const model = await screen.findByTestId("model-picker");
     expect((model as HTMLButtonElement).disabled).toBe(true);
     expect(model.getAttribute("title")).toMatch(/Codex was started by hand.*model or effort/);
-    expect((screen.getByTestId("permission-mode") as HTMLButtonElement).disabled).toBe(true);
+    expect((await permissionEntry()).hasAttribute("data-disabled")).toBe(true);
     expect(screen.getByTestId("composer-settings-note").textContent).toContain("Its model, effort and permission mode are changed there");
   });
 
@@ -194,7 +196,8 @@ describe("a tab whose agent was started by hand", () => {
 
   it("locks nothing for an agent the app runs", async () => {
     open({});
-    expect(((await screen.findByTestId("permission-mode")) as HTMLButtonElement).disabled).toBe(false);
+    await screen.findByTestId("model-picker");
+    expect((await permissionEntry()).hasAttribute("data-disabled")).toBe(false);
     expect((screen.getByTestId("model-picker") as HTMLButtonElement).disabled).toBe(false);
     expect(screen.queryByTestId("composer-settings-note")).toBeNull();
   });

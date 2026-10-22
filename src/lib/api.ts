@@ -564,6 +564,10 @@ export const api = {
   /** Save one workspace's tab order, pins, mutes and titles for every window and device. */
   setTabLayout: (workspace: string, layout: TabLayout) => invoke<void>("set_tab_layout", { workspace, layout }),
   renameSession: (sessionId: string, title: string) => invoke<void>("rename_session", { sessionId, title }),
+  /** Take the agent's title for a conversation still named automatically; the change arrives as `session_updated`. */
+  adoptAgentTitle: (sessionId: string) => invoke<void>("adopt_agent_title", { sessionId }),
+  /** A project at a glance: branches, contributors, the newest commits and pull requests. */
+  projectOverview: (projectPath: string) => invoke<ProjectOverview>("project_overview", { projectPath }),
   setSessionArchived: (sessionId: string, archived: boolean) =>
     invoke<void>("set_session_archived", { sessionId, archived }),
   setSessionPinned: (sessionId: string, pinned: boolean) => invoke<void>("set_session_pinned", { sessionId, pinned }),
@@ -2126,6 +2130,18 @@ export const workStatus = {
   unlinkIssue: (sessionId: string) => invoke<SessionEntry>("session_unlink_issue", { sessionId }),
   setPrivate: (sessionId: string, isPrivate: boolean) => invoke<SessionEntry>("session_set_work_private", { sessionId, private: isPrivate }),
 };
+
+export interface ProjectOverview {
+  defaultBranch: string | null;
+  /** Commits on the default branch in the last 30 days. */
+  recentCommits: number;
+  branches: { name: string; committedAt: string; author: string; subject: string; ahead: number; behind: number }[];
+  /** Busiest first; `days` is commits a day over the last 14, today last. */
+  contributors: { name: string; email: string; login: string | null; commits: number; days: number[] }[];
+  latest: { sha: string; author: string; email: string; at: string; subject: string }[];
+  pullRequests: { open: number; merged: number; recent: { number: number; title: string; url: string; state: "OPEN" | "MERGED" | "CLOSED"; isDraft: boolean; author: string; at: string }[] } | null;
+  pullRequestNote: string | null;
+}
 
 export interface GithubIdentity {
   login: string | null;

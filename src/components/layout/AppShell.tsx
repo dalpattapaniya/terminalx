@@ -9,6 +9,8 @@ import { NewSessionView } from "@/components/session/NewSessionView";
 import { StartScreen } from "@/components/start/StartScreen";
 import { ProjectStartDialogHost } from "@/components/start/ProjectStartDialogs";
 import { IssuesView } from "@/components/issues/IssuesView";
+import { ProjectOverview } from "@/components/project/ProjectOverview";
+import { cn } from "@/lib/cn";
 import { AgentDashboard } from "@/components/dashboard/AgentDashboard";
 import { SkillsView } from "@/components/skills/SkillsView";
 import { SessionView } from "@/components/session/SessionView";
@@ -326,7 +328,8 @@ function UnselectedWorkspace({
 
   return (
     <>
-      <main className={MAIN}>
+      {/* The project overview is one dark surface, top bar included, like the chat. */}
+      <main className={cn(MAIN, store.view === "project" && "bg-chat")}>
         <header
           data-tauri-drag-region="deep"
           className="flex h-(--titlebar-h) shrink-0 items-center gap-1 px-2"
@@ -343,7 +346,7 @@ function UnselectedWorkspace({
           <span className="min-w-0 flex-1 truncate px-1 text-sm text-muted-foreground">
             {store.view === "issues"
               ? "Issues"
-              : store.view === "agents" || store.view === "skills" || store.view === "stats"
+              : store.view === "agents" || store.view === "skills" || store.view === "stats" || store.view === "project"
                 ? ""
                 : store.view === "automations"
                   ? "Automations"
@@ -368,6 +371,8 @@ function UnselectedWorkspace({
                 onUseWorktreeChange={setUseWorktree}
                 onTargetProjectChange={setIssueProjectPath}
               />
+            ) : store.view === "project" && store.selectedProject ? (
+              <ProjectOverview key={store.selectedProject} path={store.selectedProject} />
             ) : store.view === "agents" ? (
               <AgentDashboard />
             ) : store.view === "stats" ? (

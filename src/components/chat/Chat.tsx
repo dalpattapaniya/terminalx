@@ -255,25 +255,28 @@ export function Chat({
           ))}
         </div>
       </div>
-      <div
-        className={cn(
-          "pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 transition-opacity",
-          atBottom ? "opacity-0" : "opacity-100",
-        )}
-      >
-        <Button
-          size="sm"
-          variant="secondary"
-          className="pointer-events-auto gap-1 rounded-full shadow-surface"
-          onClick={() => {
-            follow(true);
-            pinToBottom(!live);
-          }}
-        >
-          <ArrowDown /> Latest
-        </Button>
-      </div>
       <div className="relative shrink-0">
+        {/* Above the composer, never behind it: the composer is see-through. */}
+        <div
+          className={cn(
+            "pointer-events-none absolute bottom-full left-1/2 z-10 mb-3 -translate-x-1/2 transition-[opacity,visibility]",
+            atBottom ? "invisible opacity-0" : "opacity-100",
+          )}
+        >
+          <Button
+            size="sm"
+            variant="secondary"
+            // Solid, on the chat's own colour: it floats over the transcript, and text must not show through it.
+            className="pointer-events-auto gap-1 rounded-full bg-chat text-muted-foreground shadow-surface hairline hover:bg-chat hover:text-foreground"
+            tabIndex={atBottom ? -1 : undefined}
+            onClick={() => {
+              follow(true);
+              pinToBottom(!live);
+            }}
+          >
+            <ArrowDown /> Latest
+          </Button>
+        </div>
         <RaccoonRunner active={progressing} obstacle={!atBottom} />
         {footer}
       </div>

@@ -32,6 +32,22 @@ describe("a workspace's tabs", () => {
     expect(workspaceSessions(all, session("new", { cwd: "/repo/wt" })).map((s) => s.id)).toEqual(["new", "a", "b"]);
     expect(workspaceSessions(all, all[4]).map((s) => s.id)).toEqual(["q"]);
   });
+
+  it("list a chat with the checkout it is linked to, and a chat with no link on its own, never every chat together", () => {
+    const chats = "/home/me/Chats";
+    const chat = (id: string, link: SessionEntry["link"]) => session(id, { projectPath: chats, cwd: chats, link });
+    const linked = chat("hi", { path: "/repo/", branch: "main" });
+    const other = chat("other", { path: "/elsewhere" });
+    const unlinked = chat("loose", null);
+    expect(workspaceKey(linked, chats)).toBe("/repo");
+    expect(workspaceKey(unlinked, chats)).toBe("chat:loose");
+    const all = [session("main"), linked, chat("again", { path: "/repo" }), other, unlinked, chat("loose2", null)];
+    expect(workspaceSessions(all, linked, chats).map((s) => s.id)).toEqual(["main", "hi", "again"]);
+    expect(workspaceSessions(all, session("main"), chats).map((s) => s.id)).toEqual(["main", "hi", "again"]);
+    expect(workspaceSessions(all, unlinked, chats).map((s) => s.id)).toEqual(["loose"]);
+    // Without the chats folder known, the chats share their folder as any sessions do.
+    expect(workspaceSessions(all, linked).map((s) => s.id)).toEqual(["hi", "again", "other", "loose", "loose2"]);
+  });
 });
 
 describe("the order of a workspace's tabs", () => {

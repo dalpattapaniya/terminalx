@@ -12,7 +12,7 @@ import { resolveSessionTab, setVisibleSessionTab } from "@/lib/visibleTab";
 
 /**
  * The open session's tabs as the main window shows them, without the rest of
- * the session view: the title bar strip and the tab shortcuts, the sidebar's
+ * the session view: the row of tabs with its + and the tab shortcuts, the sidebar's
  * rows for the workspace's sessions, the tab dialogs, and a composer and a
  * terminal to type in. The tab on screen is worked out the way the session
  * view does it, from the same stores.
@@ -43,12 +43,9 @@ export function TabsHarness({ readOnlyReason, hideSingle }: { readOnlyReason?: s
   const harnessNames = new Map(store.harnesses.map((harness) => [harness.id, harness.name]));
   return (
     <TooltipProvider>
-      <header>
-        <WorkspaceTabStrip session={session} selected={selected} placement="titlebar" readOnlyReason={readOnlyReason} hideSingle={hideSingle} />
-        <TabActions key={session.id} session={session} selected={selected} />
-      </header>
+      <WorkspaceTabStrip session={session} selected={selected} readOnlyReason={readOnlyReason} hideSingle={hideSingle} trailing={<TabActions key={session.id} session={session} selected={selected} />} />
       <div role="tree" aria-label="Sidebar">
-        {workspaceSessions(store.sessions, session).map((member) => (
+        {workspaceSessions(store.sessions, session, store.chatsPath).map((member) => (
           <SessionNode key={member.id} session={member} selected={member.id === session.id} expanded onToggle={() => undefined} tabViews={{}} mobileDriven={new Set()} harnessNames={harnessNames} />
         ))}
       </div>
