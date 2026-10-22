@@ -491,7 +491,7 @@ export function SessionView({
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
         <header
           data-tauri-drag-region="deep"
-          className={cn("flex h-(--titlebar-h) shrink-0 items-center gap-1 px-2", cloud && "@container/session-header")}
+          className="@container/session-header flex h-(--titlebar-h) shrink-0 items-center gap-1 px-2"
           style={{ paddingLeft: sidebarOpen ? 8 : TITLEBAR_INSET }}
         >
           {!sidebarOpen && !compact && (
@@ -582,7 +582,7 @@ export function SessionView({
                 <button
                   type="button"
                   onClick={() => void openUrl(session.issue!.url)}
-                  className="ml-1 flex shrink-0 items-center gap-1 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+                  className={cn("ml-1 flex shrink-0 items-center gap-1 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground", HEADER_TIGHT)}
                 >
                   <CircleDot className="size-3" />
                   <span>{session.issue.identifier}</span>
@@ -590,18 +590,25 @@ export function SessionView({
               </WithTooltip>
             )}
             {/* Who else works on the issue now (#441). It is the first to go when the header narrows. */}
-            {session.issue && <SessionIssueWork session={session} sessions={store.sessions} className="ml-1 max-w-48 shrink" />}
+            {session.issue && <SessionIssueWork session={session} sessions={store.sessions} className={cn("ml-1 max-w-48 shrink", HEADER_TIGHT)} />}
             {pipelineRole && (
               // The issue pipeline this session is part of, as its author or its reviewer.
               <WithTooltip label={`${pipelineRole.role === "reviewer" ? "Reviewing" : "Working on"} ${pipelineRole.pipeline.issue.identifier} · ${pipelineRole.pipeline.note ?? pipelineRole.pipeline.issue.title}`}>
                 <button
                   type="button"
                   onClick={() => (pipelineRole.pipeline.pr ? void openUrl(pipelineRole.pipeline.pr.url) : void openUrl(pipelineRole.pipeline.issue.url))}
-                  className="ml-1 flex shrink-0 items-center gap-1.5 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+                  // It gives way like the other chips, down to the dot that says where the pipeline stands (#584 left it rigid, and it ran under the actions).
+                  className={cn("ml-1 flex max-w-48 items-center overflow-hidden rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground", HEADER_CHIP_YIELDS, HEADER_TIGHT, "gap-x-1.5")}
                   data-testid="session-pipeline"
                 >
-                  {pipelineRole.role === "reviewer" && <span>Reviewer ·</span>}
-                  <PipelineStatus pipeline={pipelineRole.pipeline} />
+                  {/* The status laid out as the chip's own icon and label: the dot leads and stays, and the words are one label that is cut, then gone. */}
+                  <PipelineStatus
+                    pipeline={pipelineRole.pipeline}
+                    className="contents"
+                    dotClassName="my-[7px]"
+                    labelClassName={cn("truncate", HEADER_CHIP_LABEL)}
+                    lead={pipelineRole.role === "reviewer" ? <span className="font-normal text-muted-foreground">Reviewer · </span> : null}
+                  />
                 </button>
               </WithTooltip>
             )}
@@ -610,11 +617,11 @@ export function SessionView({
                 <button
                   type="button"
                   onClick={openAutomations}
-                  className="ml-1 flex shrink-0 items-center gap-1 rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+                  className={cn("ml-1 flex max-w-40 items-center gap-1 overflow-hidden rounded-md bg-veil-raised px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground", HEADER_CHIP_YIELDS, HEADER_TIGHT)}
                   data-testid="session-automation"
                 >
-                  <CalendarClock className="size-3 shrink-0" />
-                  <span>{session.automation.name} #{session.automation.runNumber}</span>
+                  <CalendarClock className={HEADER_CHIP_ICON} />
+                  <span className={cn("truncate", HEADER_CHIP_LABEL)}>{session.automation.name} #{session.automation.runNumber}</span>
                 </button>
               </WithTooltip>
             )}

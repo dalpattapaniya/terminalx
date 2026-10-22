@@ -200,7 +200,8 @@ for (const width of [1100, 760]) {
     const card = box(document.querySelector("[data-cleanup-indicator]"));
     const shown = document.querySelector('[role="tabpanel"]:not([aria-hidden="true"]) [data-composer-box]');
     const composer = box(shown);
-    const send = box(shown.querySelector('button[aria-label="Send"]'));
+    // One button is Send, or Stop while the agent works (#584).
+    const send = box(shown.querySelector('button[aria-label="Send"], button[aria-label="Stop"], button[aria-label="Stop session"]'));
     return {
       card,
       composer,

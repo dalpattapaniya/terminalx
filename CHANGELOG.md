@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.16
+
 ### Issues
 
 - A session started from an issue in a cloud workspace is now carried on
@@ -38,6 +40,48 @@
   its Linear workspaces. Needs the account service's work-claims routes
   (terminalx-saas `raccoon/441-work-claims`); without them, or signed out,
   the list shows this Mac only. (#441)
+
+### Chats and composer
+
+- A new chat keeps its conversation title, taken from Claude Code's own
+  title for it, until the agent creates a real branch; placeholder worktree
+  names are no longer shown as the title. The header shows the whole
+  branch's added and removed line counts and follows a branch switch. Tool
+  groups show an error only when their last call failed. **Continue in New
+  Session** moved into the workspace menu, and copy actions in menus use the
+  native clipboard, which WebKit refused before. (#584)
+- The row of tabs is its own row under the title bar, ended by its **+**,
+  with the window's whole width; the title bar names the project and the
+  branch, or the chat's title, with the branch's line counts, and keeps
+  Share and the other actions at its right edge. Its pipeline and automation
+  chips give way to their icons when it is tight, and under 360 px the title
+  bar leaves its issue, work, pipeline and automation chips out, as the cloud
+  header's chips are. (#584)
+- The composer puts the permission mode in its options menu, the mic and
+  options on the right, and one button that is **Send** or **Stop**, with
+  concentric corner radii. **Latest** sits above the composer and is opaque.
+  The usage popover is redesigned. (#584)
+
+### Projects
+
+- A project overview page: stats, contributors with their activity, pull
+  requests, branches with ahead/behind counts, the latest commits, and
+  actions to start a new chat or a new branch. Projects without chats are
+  listed in the sidebar, and only the chevron folds a project, so clicking
+  its name opens the overview. (#584)
+
+### Cloud
+
+- The compute provider key dialog names the organization by its name, with
+  the id only as a fallback, and the provider by the name Settings shows,
+  for example "Local Docker (development)". (PRO-111)
+
+### Command line
+
+- `terminalx` output goes through a writer that reports errors instead of
+  panicking, so a reader that closes the pipe early (`| head`) ends the
+  output, the command keeps its own exit status, and a release build no
+  longer aborts or leaves a macOS crash report. (PRO-108)
 
 ## 0.2.15
 
