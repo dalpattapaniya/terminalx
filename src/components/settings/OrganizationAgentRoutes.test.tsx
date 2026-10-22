@@ -94,6 +94,8 @@ describe("your model access in Settings (PRO-18)", () => {
     await show();
     expect(api.cloudAgentRoutes).toHaveBeenCalledWith("org-2");
     expect(screen.getByText("Your model access in Acme Robotics")).toBeTruthy();
+    expect(screen.getByTestId("agent-routes").textContent).toMatch(/a\s+credential helper also runs for everyone who drives a workspace you share/);
+    expect(screen.getByTestId("agent-routes").textContent).not.toMatch(/never .* run on it/);
     expect(within(row("claude")).getByTestId("agent-route-status").textContent).toBe("Organization login, managed by TerminalX.");
     expect(within(row("cursor")).getByTestId("agent-route-status").textContent).toMatch(/supports no custom endpoint or credential helper/);
     expect(within(row("cursor")).queryByRole("button")).toBeNull();
@@ -144,7 +146,7 @@ describe("your model access in Settings (PRO-18)", () => {
     fireEvent.click(within(row("codex")).getByTestId("agent-route-save"));
     await waitFor(() => expect(screen.getByTestId("agent-route-notice").textContent).toBe("Checked from this Mac: the endpoint refused the credential (401). Nothing was saved."));
     expect(screen.getByTestId("agent-route-edit")).toBeTruthy();
-    fireEvent.click(within(row("codex")).getByRole("checkbox", { name: /Save even if this Mac can't reach the endpoint/ }));
+    fireEvent.click(within(row("codex")).getByRole("checkbox", { name: /Save even if this Mac's check fails/ }));
     vi.mocked(api.cloudAgentRouteSave).mockResolvedValueOnce({ saved: true, check: { outcome: "failed", code: "unreachable" }, routes: view() });
     fireEvent.click(within(row("codex")).getByTestId("agent-route-save"));
     await waitFor(() => expect(screen.queryByTestId("agent-route-edit")).toBeNull());
@@ -175,6 +177,8 @@ describe("your model access in Settings (PRO-18)", () => {
     fireEvent.click(within(row("claude")).getByRole("button", { name: "Use your own endpoint or helper…" }));
     fireEvent.click(within(within(row("claude")).getAllByTestId("agent-route-template")[1]!).getByRole("radio"));
     expect(within(row("claude")).getByTestId("agent-route-user-managed").textContent).toMatch(/TerminalX never sees what it prints/);
+    // It is not private to its creator in a shared workspace, and says so.
+    expect(within(row("claude")).getByTestId("agent-route-user-managed").textContent).toMatch(/everyone who\s+drives it runs through your helper too/);
     fill("claude", "helperPath", "./scripts/llm-key");
     vi.mocked(api.cloudAgentRouteSave).mockImplementation(async () => {
       routes = [gatewayRoute({ mode: "user-managed", templateId: "claude-key-helper", settings: { helperPath: "./scripts/llm-key" }, credentialStored: false, version: 1 })];

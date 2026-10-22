@@ -16,6 +16,7 @@
 //! `GET /models` under an OpenAI-format provider's base URL. No model id is
 //! known here: the endpoint's own answer is the list.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -26,7 +27,11 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const RESPONSE_LIMIT_BYTES: u64 = 1024 * 1024;
+/// A model list is read up to this much. Large gateways' lists (hundreds of
+/// models with descriptions and prices) run to a few MiB.
+const RESPONSE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+/// At most this many ids are reported; the route's model is checked
+/// against the whole list.
 const MAX_MODELS: usize = 200;
 const HELPER_OUTPUT_LIMIT: u64 = 16 * 1024;
 pub const HELPER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -129,10 +134,10 @@ fn agent() -> ureq::Agent {
 
 /// Read an endpoint's model list with the credential.
 pub fn probe(probe: &Probe<'_>) -> Checked {
-    probe_with(&agent(), probe)
+    probe_with(&agent(), probe, RESPONSE_LIMIT_BYTES)
 }
 
-fn probe_with(agent: &ureq::Agent, probe: &Probe<'_>) -> Checked {
+fn probe_with(agent: &ureq::Agent, probe: &Probe<'_>, limit: u64) -> Checked {
     if !valid_base_url(probe.base_url) {
         return Checked::failed("unreachable");
     }
@@ -157,14 +162,20 @@ fn probe_with(agent: &ureq::Agent, probe: &Probe<'_>) -> Checked {
         Ok(response) => {
             let status = response.status();
             let mut body = Vec::new();
-            let read = response.into_reader().take(RESPONSE_LIMIT_BYTES + 1).read_to_end(&mut body);
-            let models = read.ok().filter(|_| body.len() as u64 <= RESPONSE_LIMIT_BYTES).and_then(|_| models_in(&body));
-            match models {
+            if response.into_reader().take(limit + 1).read_to_end(&mut body).is_err() {
+                return Checked::status("failed", Some("bad-response"), status);
+            }
+            // The endpoint answered with the credential, with more than is
+            // read: the credential works, the model is not judged.
+            if body.len() as u64 > limit {
+                return Checked::status("ok", None, status);
+            }
+            match models_in(&body) {
                 None => Checked::status("failed", Some("bad-response"), status),
                 Some(models) => {
-                    let unlisted = probe.model.is_some_and(|model| !models.is_empty() && !models.iter().any(|listed| listed == model));
+                    let unlisted = probe.model.is_some_and(|model| !models.is_empty() && !models.contains(model));
                     let mut checked = if unlisted { Checked::status("failed", Some("model-unsupported"), status) } else { Checked::status("ok", None, status) };
-                    checked.models = models;
+                    checked.models = models.iter().filter(|id| valid_model_id(id)).take(MAX_MODELS).cloned().collect();
                     checked
                 }
             }
@@ -197,19 +208,41 @@ fn transport_code(transport: &ureq::Transport) -> &'static str {
     }
 }
 
-/// The ids in a model list answer: `{"data":[{"id":…}]}`, the shape both
+/// The ids an endpoint listed, in order, each once.
+#[derive(Default)]
+struct ListedIds {
+    order: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl ListedIds {
+    fn push(&mut self, id: &str) {
+        if self.seen.insert(id.to_string()) {
+            self.order.push(id.to_string());
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.order.iter()
+    }
+}
+
+/// Every id in a model list answer: `{"data":[{"id":…}]}`, the shape both
 /// formats share. None when the answer is not that shape at all.
-fn models_in(body: &[u8]) -> Option<Vec<String>> {
+fn models_in(body: &[u8]) -> Option<ListedIds> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let data = value.get("data")?.as_array()?;
-    let mut models: Vec<String> = Vec::new();
+    let mut models = ListedIds::default();
     for id in data.iter().filter_map(|entry| entry.get("id").and_then(Value::as_str)) {
-        if valid_model_id(id) && !models.iter().any(|seen| seen == id) {
-            models.push(id.to_string());
-            if models.len() == MAX_MODELS {
-                break;
-            }
-        }
+        models.push(id);
     }
     Some(models)
 }
@@ -339,6 +372,31 @@ mod tests {
         assert!(server.join().unwrap().contains("x-api-key: sk-gw-secret-1"));
         assert_eq!((checked.outcome, checked.code), ("failed", Some("model-unsupported")));
         assert_eq!(checked.models, vec!["gw-sonnet".to_string()]);
+    }
+
+    #[test]
+    fn judges_the_model_on_the_whole_list_and_reports_only_the_first_ids() {
+        // A large gateway: the route's model is far past the ids reported.
+        let ids: Vec<Value> = (0..250).map(|index| serde_json::json!({ "id": format!("gw-model-{index}") })).collect();
+        let body = serde_json::json!({ "data": ids }).to_string();
+        let (base, server) = serve_once("200 OK", "", &body);
+        let checked = probe(&anthropic(&base, CredentialHeader::Bearer, Some("gw-model-240")));
+        server.join().unwrap();
+        assert!(checked.passed(), "{:?}", (checked.outcome, checked.code));
+        assert_eq!(checked.models.len(), 200);
+        let (base, server) = serve_once("200 OK", "", &body);
+        let checked = probe(&anthropic(&base, CredentialHeader::Bearer, Some("gw-model-999")));
+        server.join().unwrap();
+        assert_eq!((checked.outcome, checked.code, checked.models.len()), ("failed", Some("model-unsupported"), 200));
+    }
+
+    #[test]
+    fn a_list_too_large_to_read_passes_the_credential_without_judging_the_model() {
+        let body = serde_json::json!({ "data": [{ "id": "gw-sonnet" }, { "id": "gw-haiku" }] }).to_string();
+        let (base, server) = serve_once("200 OK", "", &body);
+        let checked = probe_with(&agent(), &anthropic(&base, CredentialHeader::Bearer, Some("gw-opus")), 16);
+        server.join().unwrap();
+        assert_eq!(checked, Checked { outcome: "ok", code: None, http_status: Some(200), models: Vec::new() });
     }
 
     #[test]

@@ -2420,16 +2420,17 @@ impl SessionManager {
         // this tab (#202).
         env.push((crate::hooks::SOCKET_ENV.to_string(), self.control.socket.to_string_lossy().into_owned()));
         env.push((crate::hooks::TOKEN_ENV.to_string(), token.clone()));
-        // The workspace creator's own route for this agent (PRO-18), in a
-        // cloud workspace that runs one: its model and what its CLI takes on
-        // the command line. The tab is told what keeps it from working.
-        let route = crate::cloud_grants::route_launch(&tab.harness, Path::new(&entry.cwd));
-        if let Some(text) = route.as_ref().and_then(|route| route.notice.clone()) {
+        // A cloud workspace's agent credentials (`cloud_grants`), from one
+        // snapshot: the variables, the creator's own route for this agent
+        // (PRO-18: its model, what its CLI takes on the command line) and
+        // Codex's auth file. The tab is told what keeps a route from working.
+        let grant = crate::cloud_grants::launch_grant(&tab.harness, Path::new(&entry.cwd));
+        if let Some(text) = grant.route.as_ref().and_then(|route| route.notice.clone()) {
             self.publish(rt, Payload::Status { text }, None);
         }
         let launch = match kind {
-            CliKind::Claude => self.claude_launch(entry, tab, &exe, route.as_ref())?,
-            CliKind::Codex => self.codex_launch(rt, entry, tab, &exe, &mut env, route.as_ref())?,
+            CliKind::Claude => self.claude_launch(entry, tab, &exe, grant.route.as_ref())?,
+            CliKind::Codex => self.codex_launch(rt, entry, tab, &exe, &mut env, &grant)?,
         };
         // The reader has been told about a substitution already.
         let launched_for = launched_for.map(|asked| Settings { model: launch.model.clone().unwrap_or(asked.model), ..asked });
@@ -2439,10 +2440,11 @@ impl SessionManager {
         // agent credential always wins.
         let config = crate::cloud_config::launch_config(&tab.harness, &pane);
         env.extend(config.env);
-        // A cloud workspace's agent credentials (`cloud_grants`); names to
-        // unset are dropped after the login shell's profile has run.
+        // The agent credentials read above; names to unset are dropped after
+        // the login shell's profile has run.
+        crate::cloud_grants::record_launch(&pane, &grant);
         let mut unset = Vec::new();
-        for (name, value) in crate::cloud_grants::agent_env_for_launch(&tab.harness, &pane) {
+        for (name, value) in grant.env {
             match value {
                 Some(value) => env.push((name, value)),
                 None => unset.push(name),
@@ -2513,6 +2515,10 @@ impl SessionManager {
         if let Some(helper) = route.and_then(|route| route.api_key_helper.clone()) {
             settings["apiKeyHelper"] = serde_json::Value::String(helper);
         }
+        // A route's endpoint, at the level above the checkout's own settings.
+        if let Some(env) = route.map(|route| &route.claude_settings_env).filter(|env| !env.is_empty()) {
+            settings["env"] = env.iter().map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone()))).collect::<serde_json::Map<_, _>>().into();
+        }
         // A route that names its model runs on it: the endpoint may serve no
         // model of the tab's name.
         let route_model = route.and_then(|route| route.model.clone());
@@ -2577,8 +2583,9 @@ impl SessionManager {
         tab: &TabEntry,
         exe: &Path,
         env: &mut Vec<(String, String)>,
-        route: Option<&crate::cloud_grants::RouteLaunch>,
+        grant: &crate::cloud_grants::LaunchGrant,
     ) -> Result<CliLaunch> {
+        let route = grant.route.as_ref();
         // A route's provider serves the model the route names (PRO-18), not
         // the account's list, so neither the tab's model nor a substitute
         // from that list is sent to it.
@@ -2599,7 +2606,7 @@ impl SessionManager {
             (None, None) => tab.model.clone(),
         };
 
-        let codex::home::Prepared { home, hooks_live } = codex::home::prepare(&entry.cwd, exe).context("prepare the Codex home")?;
+        let codex::home::Prepared { home, hooks_live } = codex::home::prepare(&entry.cwd, exe, grant.codex_auth.clone()).context("prepare the Codex home")?;
         env.push(("CODEX_HOME".to_string(), home.to_string_lossy().into_owned()));
         if !hooks_live {
             // The hooks are what say a turn began, needs a decision, or ended.

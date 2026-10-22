@@ -15,9 +15,10 @@
 //! Mac against the endpoint's model list (`agent_route_check`: codes and
 //! model ids come back, never a response body), sent once to the service in
 //! one zeroized buffer and never returned to the webview. A failed check
-//! keeps it from being saved unless the member chose to save anyway (an
-//! endpoint may be reachable only from the cloud). The check that labels a
-//! route working is the workspace's own (`cloud_grants`).
+//! keeps it from being saved unless the member chose to save anyway, which
+//! the page offers for any failure (an endpoint may answer only the cloud,
+//! or serve a model it does not list). The check that labels a route
+//! working is the workspace's own (`cloud_grants`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -63,7 +64,10 @@ pub struct AgentRouteSave {
     pub settings: Map<String, Value>,
     pub expected_version: u64,
     pub enter_credential: bool,
-    /// Save even when this Mac's check of the endpoint fails.
+    /// Save even when this Mac's check fails, whatever the reason: an
+    /// endpoint may answer only the cloud (unreachable, or 403 to other
+    /// addresses), or serve a model it does not list. The workspace's own
+    /// check labels the route either way.
     pub save_unchecked: bool,
 }
 

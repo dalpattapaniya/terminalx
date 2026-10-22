@@ -85,11 +85,16 @@ header the CLI would use, and no redirect followed. The page is told the
 outcome, an HTTP status and the model ids it listed, never the answer body.
 
 - Passed, or reachable with no model list (`unverified`): saved.
-- Failed: nothing is saved and the form stays, unless **Save even if this Mac
-  can't reach the endpoint** was ticked (an endpoint may be reachable only
-  from the cloud).
+- Failed: nothing is saved and the form stays, unless **Save even if this
+  Mac's check fails** was ticked. That applies to any failure, a refused
+  credential or an unlisted model included: an endpoint may answer only the
+  cloud (unreachable, or 403 to other addresses), or serve a model it does
+  not list. The workspace's own check labels the route either way.
 - A model the endpoint does not list fails as `model-unsupported`, and the
-  page lists what it does serve.
+  page lists what it does serve. The model is looked for in the whole list
+  (read up to 16 MiB); only the first 200 ids are reported. A list too
+  large to read still shows the credential works, and the model is then not
+  judged.
 
 The credential leaves Rust once, to the account service, in one zeroized
 buffer, and is never returned. Changing only the model or header choice of a
@@ -109,7 +114,11 @@ login for that agent beside it. The runtime says it can apply routes
 neither the route nor the organization's login, and the tab says it needs
 updating.
 
-For a new session the runtime (`cloud_grants::route_env`, `route_launch`):
+For a new session the runtime (`cloud_grants::launch_grant`) reads the
+variables, the route's additions and Codex's auth file from one snapshot,
+after waiting briefly for the first grant sync when the runtime has just
+started (a prompt that woke the workspace), so a launch never gets half of a
+route. It:
 
 - sets the template's variables and unsets every other variable that could
   sign the agent in or send it elsewhere (`ANTHROPIC_API_KEY`,
@@ -117,8 +126,21 @@ For a new session the runtime (`cloud_grants::route_env`, `route_launch`):
   `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`, `OPENAI_API_KEY`,
   `CODEX_API_KEY`), after the login shell's profile, so nothing app-managed,
   configured or exported overrides what the member chose;
+- for Claude Code, also pins the route's address (`ANTHROPIC_BASE_URL`, Claude
+  Code's own for a helper route that names none) and those provider switches
+  (`0`) in the `env` of the launch's `--settings`. A checkout's
+  `.claude/settings.json` `env` beats the process environment, and without
+  this it could send the route's credential to an address or provider of its
+  own (checked live with Claude Code 2.1.308 against two stand-in gateways:
+  both a project `ANTHROPIC_BASE_URL` and a project Bedrock switch took the
+  route's token elsewhere; with the pins, every request went to the route).
+  The credential itself never goes on the command line;
 - removes Codex's `auth.json` from the managed home;
 - adds the helper or provider overrides and the route's model.
+
+What this does not change: code the checkout runs (its hooks, its tools) runs
+with the agent's environment, where the credential is, as for any agent
+credential.
 
 A route whose template version this runtime does not apply, or whose
 settings do not fit it, sets nothing (and still unsets the rest): the tab
@@ -130,7 +152,9 @@ Each route version is checked from the workspace (`agent_route_check.rs`,
 reported to `POST /v1/cloud-workspace-bootstrap/agent-route-check`): a helper
 is run the way the agent would run it (no stdin, its folder, at most 15 s;
 exit 0 and one header-safe line), then the endpoint's model list is read with
-the credential. Only codes, an HTTP status and model ids are reported. A
+the credential. Only codes, an HTTP status and model ids are reported, and a
+report that does not get through is sent again on the next turns of the grant
+loop until the server has it (or says the route has moved on). A
 route is checked once per version, a failed or unverified one again after
 five minutes (one minute when an agent starts), and a `./relative` helper only
 from the folder an agent starts in.
@@ -159,7 +183,10 @@ Claude Code endpoint did not list the model … It lists …").
   cannot be opened to the organization or shared with Can send
   (`cloud_workspace_share_personal_route`): stopping delivery would not take
   back what a running agent already holds. A helper route carries no
-  credential and is delivered to shared workspaces too.
+  credential and is delivered to shared workspaces too: everyone who drives
+  such a workspace runs through the creator's helper and gets what it prints.
+  The page says so, so a member does not point a helper at a credential only
+  they should use.
 - Organization owners and admins can drive any workspace of the organization,
   so they could read a credential an agent of it holds; the page says
   "reaches only workspaces you create that nobody else can drive" and makes no

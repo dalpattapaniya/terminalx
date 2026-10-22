@@ -143,7 +143,8 @@ export function OrganizationAgentRoutes({
       <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
         How the agents in cloud workspaces you create in {organization} reach their model. By default they use the organization's agent logins,
         managed by TerminalX. You can instead use your own endpoint with a credential you store, or a credential helper you manage in the
-        workspace. This is yours alone: other members never see it or run on it.
+        workspace. Other members never see your setup. A stored credential reaches only workspaces you create that nobody else drives; a
+        credential helper also runs for everyone who drives a workspace you share, and their sessions get whatever it prints.
       </p>
 
       {loading && !data ? (
@@ -383,14 +384,15 @@ function RouteEditor({
           {entering && (
             <label className="flex items-start gap-2">
               <input type="checkbox" checked={edit.saveUnchecked} disabled={busy} onChange={(event) => onChange({ ...edit, saveUnchecked: event.target.checked })} />
-              <span>Save even if this Mac can't reach the endpoint (it may be reachable only from the cloud)</span>
+              <span>Save even if this Mac's check fails: an endpoint may answer only the cloud, or serve a model it doesn't list. The workspace checks it again.</span>
             </label>
           )}
         </div>
       ) : (
         <p className="text-muted-foreground" data-testid="agent-route-user-managed">
-          User managed: the helper must be in the workspace, and TerminalX never sees what it prints. It stays labeled user managed until a workspace
-          runs it and the endpoint accepts its credential.
+          User managed: the helper must be in the workspace, and TerminalX never sees what it prints. In a workspace you share, everyone who
+          drives it runs through your helper too and gets what it prints, so don't point it at a credential only you should use. It stays
+          labeled user managed until a workspace runs it and the endpoint accepts its credential.
         </p>
       )}
       <div className="flex gap-1.5">
