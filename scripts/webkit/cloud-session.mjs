@@ -17,10 +17,10 @@
 //   composer, and each keeps its icons;
 // - a modal dialog (the bypass-permissions confirmation) dims the whole
 //   window, the Notes drawer included;
-// - the permission-mode picker at 960 px with the side panel open, and at
-//   every width from 960 to 1400 px: its label shows at least about a first
-//   word or not at all (never a single letter), and the mode's dot, the
-//   chevron and the tooltip stay.
+// - the permission mode at 960 px with the side panel open, and at every
+//   width from 960 to 1400 px: the More options button that holds it stays in
+//   the toolbar and wide enough to press, carries the mode's dot for an
+//   unguarded or plan mode, and its menu names the mode whole.
 //
 // A cloud session is reached through the command palette ("Go to cloud
 // session…", then its title): the chat-first sidebar lists no cloud sessions.
@@ -200,10 +200,13 @@ for (const role of ["manager", "viewer"]) {
 }
 
 // The composer's toolbar at the two window sizes of the live test, with the
-// Notes drawer open and a permission request up (Stop next to Send): the worst
-// case for room. At 1000x520 the audio input picker used to collapse to a
-// chevron drawn over the model picker's icon. No control may overlap another,
-// leave the toolbar, or lose an icon; and a modal dialog dims the drawer too.
+// Notes drawer open and a turn running (Stop in Send's place): the worst case
+// for room. At 1000x520 the audio input picker used to collapse to a chevron
+// drawn over the model picker's icon. Since #584 the permission mode lives in
+// the More options menu and Stop and Send share one button, so the toolbar is
+// attach, model, dictate, more options and Stop or Send. No control may
+// overlap another, leave the toolbar, or lose an icon; and a modal dialog dims
+// the drawer too.
 const toolbarLayout = (page) =>
   page.evaluate(() => {
     const toolbar = document.querySelector("main [data-composer-toolbar]");
@@ -242,7 +245,7 @@ function toolbarChecks(measured) {
   measured.overlapping = overlapping;
   const names = controls.map((control) => control.name);
   return {
-    "the toolbar has its controls: attach, dictate, more options, model, permission mode, stop and send": ["Attach", "Dictate", "More options", "Stop", "Send"].every((name) => names.some((found) => found.startsWith(name))) && controls.length >= 7,
+    "the toolbar has its controls: attach, model, dictate, more options, and Stop or Send": ["Attach", "Dictate", "More options"].every((name) => names.some((found) => found.startsWith(name))) && names.some((found) => found === "Stop" || found === "Send") && controls.length >= 5,
     "no two controls of the composer toolbar overlap": overlapping.length === 0,
     "every control is inside the toolbar, and the toolbar inside the composer and the window": controls.every((control) => control.left >= toolbar.left - SLACK && control.right <= toolbar.right + SLACK) && !!box && toolbar.left >= box.left - SLACK && toolbar.right <= box.right + SLACK && box.right <= viewport.width + SLACK && toolbar.bottom <= viewport.height + SLACK,
     "every control keeps its icons inside its own box, and is wide enough to press": controls.every((control) => control.iconsInside && control.width >= 20),
@@ -264,7 +267,6 @@ for (const viewport of [{ width: 1000, height: 520 }, { width: 1280, height: 760
     await page.waitForTimeout(300);
     let measured = await toolbarLayout(page);
     const wide = toolbarChecks(measured);
-    delete wide["the toolbar has its controls: attach, dictate, audio input, model, permission mode, stop and send"];
     failed += report(`${name}, idle`, wide, measured);
 
     // The tightest it gets: the Notes drawer takes 18rem, and a running turn adds Stop.
@@ -281,7 +283,8 @@ for (const viewport of [{ width: 1000, height: 520 }, { width: 1280, height: 760
 
     // The bypass confirmation is modal: its overlay covers the whole window, the Notes drawer included.
     if (session.permissionMode !== "bypassPermissions") {
-      await page.locator("main [data-composer-toolbar]").getByRole("button", { name: /Accept edits/ }).click();
+      await page.locator("main [data-composer-toolbar]").getByRole("button", { name: "More options" }).click();
+      await page.getByTestId("permission-mode").click();
       await page.getByRole("menuitemradio", { name: /Bypass permissions/ }).click();
       const dialog = page.getByRole("dialog");
       const opened = await dialog.waitFor({ timeout: 5_000 }).then(() => true, () => false);
@@ -491,88 +494,93 @@ for (const { viewport, collapsed, terminalSwitch = false } of [
   await page.close();
 }
 
-// The permission-mode picker in a narrow composer (the live check at 960 px
-// with the side panel open read "B"): its label is cut no shorter than about
-// a first word ("Bypas…"), and with no room for that it is not shown at all.
-// The mode's dot, the chevron and the tooltip naming the mode always stay.
-const permissionPicker = (page) =>
+// The permission mode in a narrow composer. It used to be a picker in the
+// toolbar whose label was cut to "B" at 960 px with the side panel open; since
+// #584 it is a submenu of More options, so what must hold at every width is
+// that the button stays in the toolbar and pressable, shows the mode's dot for
+// an unguarded or plan mode, and that its menu names the mode in full.
+const permissionButton = (page) =>
   page.evaluate(() => {
-    const button = document.querySelector('main [data-composer-toolbar] [data-testid="permission-mode"]');
-    const label = button?.querySelector('[data-testid="permission-mode-label"]');
-    if (!button || !label) return null;
+    const button = document.querySelector('main [data-composer-toolbar] [data-testid="composer-options"]');
+    if (!button) return null;
     const rect = button.getBoundingClientRect();
-    const text = label.getBoundingClientRect();
-    const clip = label.parentElement.getBoundingClientRect();
-    // The least that still reads as a label: five letters and the ellipsis, or the whole of a shorter one.
-    const probe = document.createElement("span");
-    probe.textContent = label.textContent.length > 6 ? `${label.textContent.slice(0, 5)}…` : label.textContent;
-    probe.style.cssText = `position:fixed;left:-9999px;top:0;white-space:pre;font:${getComputedStyle(label).font}`;
-    document.body.append(probe);
-    const needed = probe.getBoundingClientRect().width;
-    probe.remove();
-    // A label that does not fit wraps below the button's one line, where it is clipped.
-    const onLine = text.top < clip.top + clip.height / 2;
-    const inside = (part) => !!part && part.width > 0 && part.left >= rect.left - 0.5 && part.right <= rect.right + 0.5 && part.top >= rect.top - 0.5 && part.bottom <= rect.bottom + 0.5;
     const toolbar = button.closest("[data-composer-toolbar]").getBoundingClientRect();
+    const dot = button.querySelector('[data-testid="permission-mode-dot"]')?.getBoundingClientRect();
+    const icon = button.querySelector("svg")?.getBoundingClientRect();
+    const inside = (part) => !!part && part.width > 0 && part.left >= rect.left - 0.5 && part.right <= rect.right + 0.5 && part.top >= rect.top - 0.5 && part.bottom <= rect.bottom + 0.5;
     return {
       viewport: innerWidth,
       panel: !!document.querySelector("main aside"),
-      label: label.textContent,
-      shown: onLine ? Math.round(Math.max(0, Math.min(text.right, clip.right) - Math.max(text.left, clip.left)) * 10) / 10 : 0,
-      whole: onLine && label.scrollWidth <= label.clientWidth + 1,
-      needed: Math.round(needed * 10) / 10,
       width: Math.round(rect.width * 10) / 10,
-      tooltip: button.title,
-      dot: inside(button.querySelector("span.rounded-full")?.getBoundingClientRect()),
-      chevron: inside(button.querySelector("svg")?.getBoundingClientRect()),
-      inToolbar: rect.left >= toolbar.left - 1 && rect.right <= toolbar.right + 1,
+      icon: inside(icon),
+      dot: dot ? inside(dot) : null,
+      inToolbar: rect.left >= toolbar.left - 1 && rect.right <= toolbar.right + 1 && rect.top >= toolbar.top - 1 && rect.bottom <= toolbar.bottom + 1,
     };
   });
 
-function permissionChecks(measured) {
-  if (!measured) return { "the permission-mode picker is there": false };
+const permissionMenuItem = (page) =>
+  page.evaluate(() => {
+    const item = document.querySelector('[role="menu"] [data-testid="permission-mode"]');
+    const label = item?.querySelector('[data-testid="permission-mode-label"]');
+    if (!item || !label) return null;
+    return { name: item.getAttribute("aria-label"), label: label.textContent, whole: label.scrollWidth <= label.clientWidth + 1 };
+  });
+
+function permissionChecks(measured, mode) {
+  if (!measured) return { "the More options button is there": false };
+  const marked = mode !== "manual";
   return {
-    "its label shows at least about a first word, or not at all: never a single letter": measured.shown === 0 || measured.shown >= measured.needed - 0.5,
-    "the mode's dot and the chevron are inside the picker, which is wide enough to press": measured.dot && measured.chevron && measured.width >= 20,
-    "its tooltip names the mode": measured.tooltip === `Permission mode: ${measured.label}`,
-    "the picker is inside the composer toolbar": measured.inToolbar,
+    "the More options button is inside the composer toolbar": measured.inToolbar,
+    "it keeps its icon and is wide enough to press": measured.icon && measured.width >= 20,
+    [marked ? "it carries the mode's dot" : "a guarded mode shows no dot"]: marked ? measured.dot === true : measured.dot === null,
   };
 }
 
+const MODE_LABEL = { bypassPermissions: "Bypass permissions", manual: "Ask every time", plan: "Plan" };
 for (const permissionMode of ["bypassPermissions", "manual", "plan"]) {
   const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "manager", lines: 4, permissionMode } }, { width: 960, height: 700 });
   await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
   await page.locator('[data-testid="cloud-agent-lease"]').waitFor();
   if (!(await page.locator("main aside").count())) await page.getByRole("button", { name: "Toggle panel" }).click();
   await page.locator("main aside").first().waitFor();
-  await page.locator('main [data-composer-toolbar] [data-testid="permission-mode"]').waitFor();
+  await page.locator('main [data-composer-toolbar] [data-testid="composer-options"]').waitFor();
   await page.waitForTimeout(300);
-  let measured = await permissionPicker(page);
-  failed += report(`permission-mode picker (960x700, side panel open, ${permissionMode})`, { "the side panel is open": !!measured?.panel, ...permissionChecks(measured) }, measured);
+  let measured = await permissionButton(page);
+  await page.locator('main [data-composer-toolbar] [data-testid="composer-options"]').click();
+  await page.locator('[role="menu"] [data-testid="permission-mode"]').waitFor();
+  const item = await permissionMenuItem(page);
+  await page.keyboard.press("Escape");
+  failed += report(
+    `permission mode (960x700, side panel open, ${permissionMode})`,
+    {
+      "the side panel is open": !!measured?.panel,
+      ...permissionChecks(measured, permissionMode),
+      "the More options menu names the mode, whole": !!item && item.label === MODE_LABEL[permissionMode] && item.whole,
+      "the menu item's accessible name says which mode is in force": !!item && item.name === `Permission mode: ${MODE_LABEL[permissionMode]}`,
+    },
+    { button: measured, item },
+  );
   if (process.env.WEBKIT_LAYOUT_SCREENSHOTS) await page.screenshot({ path: `${process.env.WEBKIT_LAYOUT_SCREENSHOTS}/permission-mode-960-${permissionMode}.png` });
 
-  // Every width on the way: the label goes from whole, to cut, to gone, and is never a stub in between.
-  const stubs = [];
-  const states = new Set();
+  // Every width on the way: the button never leaves the toolbar, loses its icon or dot, or gets too narrow to press.
+  const failures = [];
   for (let width = 960; width <= 1400; width += 10) {
     await page.setViewportSize({ width, height: 700 });
     await page.waitForTimeout(40);
-    measured = await permissionPicker(page);
-    const checks = permissionChecks(measured);
-    if (Object.values(checks).some((ok) => !ok)) stubs.push(measured);
-    states.add(!measured ? "missing" : measured.shown === 0 ? "gone" : measured.whole ? "whole" : "cut");
+    measured = await permissionButton(page);
+    const checks = permissionChecks(measured, permissionMode);
+    if (Object.values(checks).some((ok) => !ok)) failures.push(measured ?? { viewport: width, missing: true });
   }
   await page.setViewportSize({ width: 1680, height: 800 });
   await page.waitForTimeout(200);
-  measured = await permissionPicker(page);
+  measured = await permissionButton(page);
   failed += report(
-    `permission-mode picker (960 to 1400 px, side panel open, ${permissionMode})`,
+    `permission mode (960 to 1400 px, side panel open, ${permissionMode})`,
     {
-      "at no width is the label a stub, and the dot, chevron and tooltip stay": stubs.length === 0,
-      "the narrowest composer shows the dot alone, a wide one the whole label": states.has("gone") && states.has("whole") && !states.has("missing"),
-      "with room (1680 px) the whole label shows": !!measured?.whole,
+      "at every width the button stays in the toolbar, pressable, with its icon and the mode's dot": failures.length === 0,
+      "with room (1680 px) the same holds": Object.values(permissionChecks(measured, permissionMode)).every(Boolean),
     },
-    { stubs, states: [...states], wide: measured },
+    { failures, wide: measured },
   );
   await page.close();
 }

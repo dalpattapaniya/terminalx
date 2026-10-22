@@ -64,7 +64,7 @@ pub fn ai_title(path: &Path) -> Option<String> {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|v| v["type"] == "ai-title")
         .filter_map(|v| v["aiTitle"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(String::from))
-        .last()
+        .next_back()
 }
 
 /// The first thing the reader typed in the conversation, as it was written.

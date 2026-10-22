@@ -91,7 +91,9 @@ try {
   await page.clock.runFor(2 * MINUTE);
   await bar.getByRole("button", { name: /Claude 5h/ }).click();
   const popover = page.locator("[data-usage-popover]");
-  await popover.getByRole("status").getByText(/Codex refresh paused; retry in \dm\. read Codex rate limits: synthetic timeout/).waitFor();
+  // The notice is a title and the error's cause on its own line (#584): "Codex refresh paused · retry in 4m" over "Synthetic timeout".
+  await popover.getByRole("status").getByText(/^Codex refresh paused · retry in \dm$/).waitFor();
+  await popover.getByRole("status").getByText("Synthetic timeout", { exact: true }).waitFor();
   await popover.getByRole("button", { name: /^Codex, / }).click();
   const detail = page.locator('[data-usage-detail="codex"]');
   const freshness = detail.locator("[data-usage-freshness]");
