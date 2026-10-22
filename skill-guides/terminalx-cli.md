@@ -363,7 +363,12 @@ resume a stopped workspace. Lists come from what the app already holds. `read` r
 transcript kept on this computer, caught up from the workspace's saved checkpoint. `wait`
 follows a running workspace and only polls a stopped one. Session titles and transcripts are
 end-to-end encrypted: a workspace this computer has never opened appears under
-`workspacesNotLoaded` until someone opens it once in the app.
+`workspacesNotLoaded` until someone opens it once in the app. `read`, `send` and `wait` on a
+session this computer holds nothing of yet, such as the first session of a workspace
+`sessions create` just made, look it up the way opening it in the app does: a running
+workspace's runtime is asked for its tabs (this connects but never resumes), and a stopped one's
+saved checkpoints are read. They answer `not_found` only when the session really has no tab
+there; the message says when its workspace is still starting.
 
 **Only these start or stop compute, and each says so:**
 
