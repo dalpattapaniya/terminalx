@@ -454,7 +454,7 @@ function ShareSessionDialog({ sessionId }: { sessionId: string }) {
     </Dialog>
   );
 }
-export function LocalShareButton({ sessionId, labelClassName }: { sessionId: string; /** On the word beside the icon, for a header that drops it when it runs out of room. */ labelClassName?: string }) {
+export function LocalShareButton({ sessionId }: { sessionId: string }) {
   const share = useLocalShare(sessionId);
   useEffect(() => {
     void refreshShare(sessionId).catch(() => undefined);
@@ -473,7 +473,7 @@ export function LocalShareButton({ sessionId, labelClassName }: { sessionId: str
       onClick={() => openSessionShare(sessionId)}
     >
       <Share2 />
-      <span className={labelClassName}>{share.active ? `${people.length} guests` : "Share"}</span>
+      <span>{share.active ? `${people.length} guests` : "Share"}</span>
     </Button>
   );
 }

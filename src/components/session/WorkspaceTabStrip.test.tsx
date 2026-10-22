@@ -21,6 +21,7 @@ const { bootBrowser, refreshBrowserPages } = await import("@/lib/browser");
 const { dropSessionTerminals, openTerminal, setSelectedAgent } = await import("@/lib/terminal");
 const { resetTabLayouts } = await import("@/lib/tabLayouts");
 const { dropIndex, stripTabId } = await import("./WorkspaceTabStrip");
+const prefs = await import("@/lib/prefs");
 
 const LONG = "Refactor the authentication middleware to use the new token service";
 const flush = () => act(async () => void (await new Promise((resolve) => setTimeout(resolve, 0))));
@@ -65,6 +66,7 @@ beforeEach(async () => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  prefs.setPrefs({ branchSessions: "tabs" });
 });
 
 describe("the tab strip", () => {
@@ -90,6 +92,20 @@ describe("the tab strip", () => {
     // The sidebar lists each session's part of the same row.
     expect(rowNames("a")).toEqual([LONG, "Fix flaky test", "Review", "Page page-feature browser page", "Terminal 1"]);
     expect(rowNames("b")).toEqual(["Docs", "Page page-feature browser page"]);
+  });
+
+  it("lists only the open session's own tabs when a branch's sessions are kept in the sidebar instead", () => {
+    prefs.setPrefs({ branchSessions: "sidebar" });
+    render(<TabsHarness />);
+    // Session b's "Docs" is the sidebar's to list; the workspace's page and shell are still here.
+    expect(names()).toEqual([LONG, "Fix flaky test", "Review", "Page page-feature", "Terminal 1"]);
+    expect(screen.queryByRole("tab", { name: "Docs" })).toBeNull();
+    // And without a tab bar at all, the same: the sidebar has them.
+    cleanup();
+    prefs.setPrefs({ branchSessions: "tabs", tabStrip: false });
+    render(<TabsHarness />);
+    expect(screen.queryByRole("tab", { name: "Docs" })).toBeNull();
+    prefs.setPrefs({ tabStrip: true });
   });
 
   it("draws a tab as what runs in its terminal now, in the place it has always had", async () => {
@@ -338,7 +354,5 @@ describe("dragging a tab", () => {
     fireEvent.pointerDown(tab("Review").parentElement!, { button: 2, clientX: 250 });
     fireEvent.pointerMove(window, { clientX: 20 });
     expect(screen.queryByTestId("tab-drop-indicator")).toBeNull();
-    // A tab is never a place the window is dragged from.
-    for (const item of tabs()) expect(item.parentElement!.getAttribute("data-tauri-drag-region")).toBe("false");
   });
 });

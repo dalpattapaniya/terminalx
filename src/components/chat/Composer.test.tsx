@@ -6,6 +6,7 @@ import { WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import { FakeAgentRuntime } from "@/test/fakeAgentRuntime";
 import type { TabEntry } from "@/types/session";
 import { accessibilityPress, mouseClick } from "@/test/press";
+import { openPermissionModes, permissionEntry } from "@/test/permissionMenu";
 
 const { dragDropListener, invoke, openDialog } = vi.hoisted(() => ({ dragDropListener: vi.fn(), invoke: vi.fn(), openDialog: vi.fn() }));
 
@@ -271,10 +272,10 @@ describe("composer pickers", () => {
   // hidden: an open modal menu hides the rest of the page from the accessibility tree.
   const picker = (name: RegExp) => screen.getByRole("button", { name, hidden: true });
 
-  it("the model and permission pickers open on a real mouse click and close on a second one", async () => {
+  it("the model picker opens on a real mouse click and closes on a second one", async () => {
     const models = await import("@/lib/models");
     render(<TestComposer onSend={vi.fn()} />);
-    for (const [name, label] of [[/Default/, "Model"], [/Auto/, "Permissions"]] as const) {
+    for (const [name, label] of [[/Default/, "Model"]] as const) {
       mouseClick(picker(name));
       const menu = await screen.findByRole("menu");
       expect(menu.textContent).toContain(label);
@@ -288,7 +289,7 @@ describe("composer pickers", () => {
 
   it("open on an accessibility press (a click with no pointerdown)", async () => {
     render(<TestComposer onSend={vi.fn()} />);
-    for (const name of [/Default/, /Auto/]) {
+    for (const name of [/Default/, /More options/]) {
       accessibilityPress(picker(name));
       await screen.findByRole("menu");
       fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
@@ -465,11 +466,12 @@ describe("the pickers show what the agent is running (#404)", () => {
 
   it("keeps showing the mode the agent is in while another waits for the restart (#417)", async () => {
     show({ ...onSol, permissionMode: "plan", requestedPermissionMode: "auto" }, { busy: true });
-    const button = screen.getByTitle("Permission mode: Plan");
-    expect(screen.getByTestId("permission-mode-label").textContent).toBe("Plan");
     expect(pending()).toBe("Switching to Auto after this turn");
-    mouseClick(button);
-    const menu = await screen.findByRole("menu");
+    // Plan mode marks the options button, so it is seen without opening the menu.
+    expect(screen.getByTestId("permission-mode-dot").className).toContain("bg-info");
+    expect((await permissionEntry()).getAttribute("title")).toBe("Permission mode: Plan");
+    expect(screen.getByTestId("permission-mode-label").textContent).toBe("Plan");
+    const menu = await openPermissionModes();
     expect(ticked(menu)).toEqual([]);
     expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["Autoswitching…"]);
   });
@@ -481,10 +483,9 @@ describe("the pickers show what the agent is running (#404)", () => {
 
   it("shows a mode set in the terminal that the picker does not offer as reported (#417)", async () => {
     show({ ...onSol, permissionMode: "never, workspace-write" });
-    const button = screen.getByTitle("Permission mode: never, workspace-write");
+    expect((await permissionEntry()).getAttribute("title")).toBe("Permission mode: never, workspace-write");
     expect(screen.getByTestId("permission-mode-label").textContent).toBe("never, workspace-write");
-    mouseClick(button);
-    const menu = await screen.findByRole("menu");
+    const menu = await openPermissionModes();
     // It is the one ticked, and what the picker does offer is still there to choose.
     expect(ticked(menu)).toEqual(["never, workspace-writeSet in the terminal."]);
     expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent)).toEqual(["never, workspace-writeSet in the terminal.", "Auto"]);
@@ -493,8 +494,7 @@ describe("the pickers show what the agent is running (#404)", () => {
   it("ticks the picker's entry for a mode stored under an older spelling", async () => {
     listed.models = [];
     show({ ...tab, permissionMode: "auto" });
-    mouseClick(screen.getByTitle("Permission mode: Auto"));
-    const menu = await screen.findByRole("menu");
+    const menu = await openPermissionModes();
     expect(ticked(menu)).toEqual(["Auto"]);
     expect(screen.queryByTestId("permission-mode-reported")).toBeNull();
   });
@@ -513,7 +513,7 @@ describe("the pickers show what the agent is running (#404)", () => {
 });
 
 describe("a shared cloud tab's limits (PRO-30 review)", () => {
-  it("disables the model and mode pickers with the reason, and hides Stop when this reader may not stop", () => {
+  it("disables the model and mode pickers with the reason, and hides Stop when this reader may not stop", async () => {
     const onSetMode = vi.fn();
     render(
       <Composer
@@ -531,8 +531,10 @@ describe("a shared cloud tab's limits (PRO-30 review)", () => {
       />,
     );
     const model = screen.getByRole("button", { name: /^Model: Only a workspace admin/ }) as HTMLButtonElement;
-    const mode = screen.getByRole("button", { name: /^Permission mode: Only a workspace admin/ }) as HTMLButtonElement;
-    expect(model.disabled && mode.disabled).toBe(true);
+    expect(model.disabled).toBe(true);
+    const mode = await permissionEntry();
+    expect(mode.getAttribute("aria-label")).toMatch(/^Permission mode: Only a workspace admin/);
+    expect(mode.hasAttribute("data-disabled")).toBe(true);
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
   });
 
@@ -907,7 +909,8 @@ describe("composer history (PRO-85)", () => {
     const view = render(<CloudComposer connected />);
     const box = screen.getByRole("textbox") as HTMLTextAreaElement;
     // The button opens the list on the shallowest files, as a bare `@` does locally.
-    fireEvent.click(screen.getByRole("button", { name: "Mention a file" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "More options" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Mention a file/ }));
     expect((await screen.findByRole("option")).textContent).toContain("README.md");
     fireEvent.change(box, { target: { value: "read @log", selectionStart: 9 } });
     await waitFor(() => expect(screen.getByRole("option").textContent).toContain("src/auth/login.rs"));
@@ -918,7 +921,6 @@ describe("composer history (PRO-85)", () => {
     // Not connected: no list and no button, and nothing is asked.
     view.rerender(<CloudComposer connected={false} />);
     search.mockClear();
-    expect(screen.queryByRole("button", { name: "Mention a file" })).toBeNull();
     fireEvent.change(box, { target: { value: "read @", selectionStart: 6 } });
     expect(screen.queryByRole("listbox")).toBeNull();
     expect(search).not.toHaveBeenCalled();
@@ -978,9 +980,9 @@ describe("composer history (PRO-85)", () => {
     expect(field().value).toBe("earlier");
   });
 
-  it("the model and permission menus take the arrows while open", async () => {
+  it("the model and options menus take the arrows while open", async () => {
     render(<HistoryComposer />);
-    for (const name of [/Default/, /Auto/]) {
+    for (const name of [/Default/, /More options/]) {
       mouseClick(screen.getByRole("button", { name, hidden: true }));
       await screen.findByRole("menu");
       expect(press("ArrowUp")).toBe(false);

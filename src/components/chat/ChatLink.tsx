@@ -17,6 +17,7 @@ import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
 import type { LocalPathInfo } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "@/components/ui/menu";
+import { copyText } from "@/lib/clipboard";
 
 type Props = AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps & { context?: ChatLinkContext };
 const EXTERNAL_CONTEXT: ChatLinkContext = { sessionId: "", cwd: "" };
@@ -86,7 +87,7 @@ export function ChatLink({ context = EXTERNAL_CONTEXT, href = "", children, clas
   }, [context, destination, identity]);
 
   const copy = useCallback(() => {
-    run(async () => navigator.clipboard.writeText(chatLinkCopyValue(destination, info ?? undefined)));
+    run(() => copyText(chatLinkCopyValue(destination, info ?? undefined)));
   }, [destination, info, run]);
 
   const activate = (alternate = false) => {

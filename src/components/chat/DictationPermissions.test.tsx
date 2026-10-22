@@ -12,6 +12,18 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 const { useDictationInto, MicButton } = await import("./Dictation");
 const { TranscriptionTab } = await import("@/components/settings/TranscriptionTab");
+const { TranscriptionInputSubmenu } = await import("./TranscriptionInputPicker");
+const { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } = await import("@/components/ui/menu");
+
+/** The composer's options menu, open, with the microphone in it. */
+function ComposerOptions() {
+  return (
+    <DropdownMenu open modal={false}>
+      <DropdownMenuTrigger>More options</DropdownMenuTrigger>
+      <DropdownMenuContent><TranscriptionInputSubmenu /></DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 /**
  * Commands behind this boundary can make macOS consult the microphone or
@@ -48,7 +60,7 @@ describe("passive dictation surfaces", () => {
 
     render(<TooltipProvider><ComposerDictation /><ComposerDictation target="new-session" /></TooltipProvider>);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("dictation_available"));
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "Transcription audio input: System default" })).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Dictate" })).toHaveLength(2));
 
     expect(permissionCalls()).toEqual([]);
   });
@@ -80,27 +92,31 @@ describe("passive dictation surfaces", () => {
     await saving;
   });
 
-  it("synchronizes both composer controls with Transcription settings in both directions", async () => {
+  it("synchronizes the composer's microphone choice with Transcription settings in both directions", async () => {
     let selected: string | null = "Studio Microphone";
     invoke.mockImplementation(async (command: string, args?: { device: string | null }) => {
-      if (command === "dictation_available") return true;
       if (command === "transcription_preferences") return { model: "apple", inputDevice: selected, muteWhileRecording: false };
       if (command === "transcription_models") return [];
       if (command === "transcription_inputs") return [{ id: "Studio Microphone", name: "Studio Microphone", isDefault: true }];
       if (command === "transcription_set_input") selected = args!.device;
     });
-    render(<TooltipProvider><ComposerDictation /><ComposerDictation target="new-session" /><TranscriptionTab /></TooltipProvider>);
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "Transcription audio input: Studio Microphone" })).toHaveLength(3));
+    render(<TooltipProvider><ComposerOptions /><TranscriptionTab /></TooltipProvider>);
+    const composer = () => screen.getByRole("menuitem", { name: /^Transcription audio input:/ });
+    const settings = () => screen.getByRole("button", { name: /^Transcription audio input:/ });
+    await waitFor(() => expect(composer().getAttribute("aria-label")).toBe("Transcription audio input: Studio Microphone"));
+    expect(settings().getAttribute("aria-label")).toBe("Transcription audio input: Studio Microphone");
     expect(permissionCalls()).toEqual([]);
 
-    fireEvent.keyDown(screen.getAllByRole("button", { name: "Transcription audio input: Studio Microphone" })[0], { key: "Enter" });
+    // Chosen in Settings: the composer's row follows.
+    fireEvent.keyDown(settings(), { key: "Enter" });
     fireEvent.click(await screen.findByRole("menuitemradio", { name: "System default" }));
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "Transcription audio input: System default" })).toHaveLength(3));
+    await waitFor(() => expect(composer().getAttribute("aria-label")).toBe("Transcription audio input: System default"));
     expect(selected).toBeNull();
 
-    fireEvent.keyDown(screen.getAllByRole("button", { name: "Transcription audio input: System default" })[2], { key: "Enter" });
+    // Chosen in the composer's submenu: Settings follows.
+    fireEvent.keyDown(composer(), { key: "ArrowRight" });
     fireEvent.click(await screen.findByRole("menuitemradio", { name: /Studio Microphone/ }));
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "Transcription audio input: Studio Microphone" })).toHaveLength(3));
+    await waitFor(() => expect(settings().getAttribute("aria-label")).toBe("Transcription audio input: Studio Microphone"));
     expect(selected).toBe("Studio Microphone");
     expect(invoke).not.toHaveBeenCalledWith("dictation_start");
   });

@@ -1,10 +1,11 @@
 import { useMemo } from "react";
 import { activateBrowserPage, closeBrowserPage, getBrowserState, pagesFor, useBrowser } from "@/lib/browser";
-import type { BrowserPage, TabLayout } from "@/lib/api";
+import type { BrowserPage, TabLayout, TabState } from "@/lib/api";
+import { getPrefs, usePrefs } from "@/lib/prefs";
 import { getSessionStore, removeTab, selectSession, setActiveTab, useSessionStore } from "@/lib/sessions";
 import { followedSelection, isTerminalTab, tabLabel, tabPaneId } from "@/lib/tabFront";
 import { closeTerminal, getTerminalState, setActiveTerminal, useTerminals, type SelectedSessionTab, type TerminalPane } from "@/lib/terminal";
-import { NO_LAYOUT, followedLayout, getTabState, layoutOf, rememberClosed, saveTabLayout, settleLayout, sortByLayout, tabKey, useTabState, workspaceKey, workspaceSessions } from "@/lib/tabLayouts";
+import { NO_LAYOUT, branchSessionsAsTabs, followedLayout, getTabState, layoutOf, rememberClosed, saveTabLayout, settleLayout, sortByLayout, tabKey, useTabState, workspaceKey, workspaceSessions } from "@/lib/tabLayouts";
 import type { SessionEntry, TabEntry, TabStatus } from "@/types/session";
 
 interface PeerBase {
@@ -88,26 +89,34 @@ export interface TabRow {
   tabs: PeerTab[];
 }
 
-function rowOf(session: SessionEntry, all: readonly SessionEntry[], saved: TabLayout, panes: readonly TerminalPane[], agents: Readonly<Record<string, string>>, pages: BrowserPage[]): TabRow {
-  const sessions = workspaceSessions(all, session);
-  const layout = followedLayout(saved, sessions);
-  return { session, sessions, workspace: workspaceKey(session), layout, tabs: workspaceTabs(sessions, panes, pagesFor(pages, session.cwd), layout, agents) };
+/**
+ * `shared`: the row holds every session of the workspace (the reader keeps a
+ * branch's sessions as tabs); otherwise only the open session's own tabs,
+ * and the sidebar lists the others.
+ */
+function rowOf(session: SessionEntry, all: readonly SessionEntry[], chatsPath: string | null, shared: boolean, saved: TabState, panes: readonly TerminalPane[], agents: Readonly<Record<string, string>>, pages: BrowserPage[]): TabRow {
+  const workspace = workspaceKey(session, chatsPath);
+  const sessions = shared ? workspaceSessions(all, session, chatsPath) : [session];
+  const layout = followedLayout(layoutOf(saved, workspace), sessions);
+  return { session, sessions, workspace, layout, tabs: workspaceTabs(sessions, panes, pagesFor(pages, session.cwd), layout, agents) };
 }
 
 /** A session's workspace row as the stores have it now, outside React. */
 export function workspaceRow(session: SessionEntry): TabRow {
   const { panes, agents } = getTerminalState();
-  return rowOf(session, getSessionStore().sessions, layoutOf(getTabState(), workspaceKey(session)), panes, agents, getBrowserState().pages);
+  const { sessions, chatsPath } = getSessionStore();
+  return rowOf(session, sessions, chatsPath, branchSessionsAsTabs(getPrefs()), getTabState(), panes, agents, getBrowserState().pages);
 }
 
 /** A session's workspace row, kept up to date: what the strip, the tab shortcuts and the tab menus all act on. */
 export function useTabRow(session: SessionEntry): TabRow {
-  const sessions = useSessionStore().sessions;
+  const { sessions, chatsPath } = useSessionStore();
   const { panes, agents } = useTerminals();
   // The store's state, not its list of pages: a new state is what says the pages changed.
   const browser = useBrowser();
   const saved = useTabState();
-  return useMemo(() => rowOf(session, sessions, layoutOf(saved, workspaceKey(session)), panes, agents, browser.pages), [session, sessions, panes, agents, browser, saved]);
+  const shared = branchSessionsAsTabs(usePrefs());
+  return useMemo(() => rowOf(session, sessions, chatsPath, shared, saved, panes, agents, browser.pages), [session, sessions, chatsPath, shared, panes, agents, browser, saved]);
 }
 
 /** One session's tabs, in the order its workspace's layout gives them. */

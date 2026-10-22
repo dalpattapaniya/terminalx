@@ -558,13 +558,10 @@ impl ProviderPromptError {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn secure_provider_prompt(provider: crate::cloud_workspaces::CloudWorkspaceProviderId, organization_id: &str) -> Result<zeroize::Zeroizing<String>, ProviderPromptError> {
-    secure_prompt(
-        "Provider connection",
-        &format!("Enter the {} provider key for organization {}. The key is sent to the account service only for validation and secure storage.", provider.as_str(), organization_id),
-        "Provider key",
-    )
+/// What the native dialog for a provider key says: the provider and the
+/// organization by the names Settings shows.
+fn provider_key_prompt(provider: &str, organization: &str) -> String {
+    format!("Enter the {provider} provider key for organization {organization}. The key is sent to the account service only for validation and secure storage.")
 }
 
 /// A key typed into a native secure field: it never passes through the
@@ -594,11 +591,6 @@ fn secure_prompt(title: &str, text: &str, placeholder: &str) -> Result<zeroize::
     Ok(value)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn secure_provider_prompt(_provider: crate::cloud_workspaces::CloudWorkspaceProviderId, _organization_id: &str) -> Result<zeroize::Zeroizing<String>, ProviderPromptError> {
-    Err(ProviderPromptError::Unavailable)
-}
-
 #[tauri::command]
 pub async fn cloud_provider_connect(
     app: AppHandle,
@@ -610,12 +602,19 @@ pub async fn cloud_provider_connect(
     static PROMPT_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _prompt_guard = PROMPT_GUARD.try_lock().map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_provider_operation_in_progress", true))?;
     let service = state.cloud_workspaces.clone();
-    let authorization = tauri::async_runtime::spawn_blocking(move || service.authorize_connect(provider))
-        .await
-        .map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::task_failed(crate::cloud_workspaces::RequestRisk::Read))??;
+    let (authorization, provider_name) = tauri::async_runtime::spawn_blocking(move || {
+        let authorization = service.authorize_connect(provider)?;
+        let provider_name = service.provider_display_name(&authorization);
+        Ok::<_, crate::cloud_workspaces::CloudWorkspaceClientError>((authorization, provider_name))
+    })
+    .await
+    .map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::task_failed(crate::cloud_workspaces::RequestRisk::Read))??;
+    let text = provider_key_prompt(
+        &dialog_name(provider_name, provider.label()),
+        &dialog_name(state.account.organization_name(authorization.organization_id()), authorization.organization_id()),
+    );
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let org_id = authorization.organization_id().to_owned();
-    app.run_on_main_thread(move || { let _ = sender.send(secure_provider_prompt(provider, &org_id)); })
+    app.run_on_main_thread(move || { let _ = sender.send(secure_prompt("Provider connection", &text, "Provider key")); })
         .map_err(|_| crate::cloud_workspaces::CloudWorkspaceClientError::local("cloud_provider_secure_input_unavailable", false))?;
     let prompt_result = tauri::async_runtime::spawn_blocking(move || receiver.recv())
         .await
@@ -696,13 +695,7 @@ pub async fn cloud_agent_login_connect(
         .await
         .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Read))??;
     // The organization by name, the active one or another the person belongs to; its id when no name is known.
-    // It is put into a native dialog: text from the account service, cleaned like any other.
-    let organization = state
-        .account
-        .organization_name(authorization.organization_id())
-        .map(|name| dialog_text(&name))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| authorization.organization_id().to_owned());
+    let organization = dialog_name(state.account.organization_name(authorization.organization_id()), authorization.organization_id());
     let replaces = authorization.replaces();
     let unavailable = || CloudWorkspaceClientError::local("cloud_provider_secure_input_unavailable", false);
     let (kind, secret, identity) = match source {
@@ -784,6 +777,12 @@ fn replacement_notice(agent: &str, organization: &str, replaces: Option<crate::c
         Some(AgentLoginKind::LoginDocument) => format!("THIS REPLACES the login now stored for {agent} in {organization}.\n\n"),
         None => String::new(),
     }
+}
+
+/// A name from the account service for a native dialog, cleaned like any
+/// other text there; `fallback` when there is none.
+fn dialog_name(name: Option<String>, fallback: &str) -> String {
+    name.map(|name| dialog_text(&name)).filter(|name| !name.is_empty()).unwrap_or_else(|| fallback.to_owned())
 }
 
 /// Text for a native dialog: no control or direction-changing characters, bounded.
@@ -946,12 +945,7 @@ pub async fn cloud_agent_claude_login_complete(
     let authorization = tauri::async_runtime::spawn_blocking(move || service.authorize_agent_login(AgentLoginProvider::Claude, &consent))
         .await
         .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Read))??;
-    let organization = state
-        .account
-        .organization_name(authorization.organization_id())
-        .map(|name| dialog_text(&name))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| authorization.organization_id().to_owned());
+    let organization = dialog_name(state.account.organization_name(authorization.organization_id()), authorization.organization_id());
     let unavailable = || CloudWorkspaceClientError::local("cloud_provider_secure_input_unavailable", false);
     let text = claude_code_prompt(&organization, authorization.replaces(), &authorization.reach(AgentLoginKind::LoginDocument));
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -1897,6 +1891,50 @@ fn patch_session(app: &AppHandle, session_id: &str, patch: crate::session_ops::S
 #[tauri::command]
 pub fn rename_session(app: AppHandle, session_id: String, title: String) -> CmdResult<()> {
     patch_session(&app, &session_id, crate::session_ops::SessionPatch { title: Some(title), ..Default::default() })
+}
+
+/// Put text on the system clipboard. The webview's own clipboard refuses a
+/// write it does not count as the reader's gesture (a choice in a context
+/// menu, say); the system's has no such rule.
+#[tauri::command]
+pub fn copy_text(text: String) -> CmdResult<()> {
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("pbcopy");
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("clip");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        std::process::Command::new("wl-copy")
+    } else {
+        let mut xclip = std::process::Command::new("xclip");
+        xclip.args(["-selection", "clipboard"]);
+        xclip
+    };
+    let mut child = command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map_err(err)?;
+    child.stdin.take().ok_or("The clipboard could not be written.")?.write_all(text.as_bytes()).map_err(err)?;
+    let status = child.wait().map_err(err)?;
+    if !status.success() {
+        return Err("The clipboard could not be written.".into());
+    }
+    Ok(())
+}
+
+/// A project at a glance: branches, contributors, the newest commits and pull requests.
+#[tauri::command]
+pub async fn project_overview(project_path: String) -> CmdResult<crate::project_overview::ProjectOverview> {
+    tauri::async_runtime::spawn_blocking(move || crate::project_overview::overview(Path::new(&project_path)))
+        .await
+        .map_err(err)
+}
+
+/// Take the agent's title for a conversation that still has a made-up one.
+#[tauri::command]
+pub fn adopt_agent_title(app: AppHandle, session_id: String) -> CmdResult<()> {
+    if let Some(session) = crate::session_ops::adopt_agent_title(&session_id)? {
+        let _ = app.emit("session_updated", &session);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3541,6 +3579,22 @@ mod command_tests {
         let same = |text: &str| text.replace("Claude Code", "AGENT").replace("Codex", "AGENT").replace("Claude subscription", "SUB subscription").replace("ChatGPT subscription", "SUB subscription").replace(", with its ID token (which names the account and plan),", "");
         assert_eq!(same(&claude), same(&codex));
         assert_eq!(super::lent_identity(AgentLoginProvider::Codex, None, 1_790_000_000_000), "Codex on a Mac · lent until 2026-09-21T14:13:20Z");
+    }
+
+    // PRO-111: the provider key dialog names the provider and the organization, not their ids.
+    #[test]
+    fn the_provider_key_prompt_names_the_provider_and_the_organization() {
+        use crate::cloud_workspaces::CloudWorkspaceProviderId;
+        assert_eq!(
+            super::provider_key_prompt("Local Docker (development)", "Org B"),
+            "Enter the Local Docker (development) provider key for organization Org B. The key is sent to the account service only for validation and secure storage."
+        );
+        // Names from the account service are cleaned; the id or the provider's own label stands in for none.
+        assert_eq!(super::dialog_name(Some(" Org\u{202E} B\n".into()), "08c6afb1"), "Org B");
+        assert_eq!(super::dialog_name(Some("\u{200B} ".into()), "08c6afb1"), "08c6afb1");
+        assert_eq!(super::dialog_name(None, "08c6afb1"), "08c6afb1");
+        assert_eq!(super::dialog_name(None, CloudWorkspaceProviderId::Box.label()), "Boat");
+        assert_eq!(CloudWorkspaceProviderId::LocalDocker.label(), "Local Docker");
     }
     use crate::session_ops::{
         create_session_entry, new_tab_entry, notify_workspace_deleted,

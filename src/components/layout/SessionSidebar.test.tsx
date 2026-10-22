@@ -28,7 +28,7 @@ let sessions: SessionEntry[];
 
 beforeEach(async () => {
   // Folds are remembered; each test starts from the defaults.
-  prefs.setPrefs({ sidebarLayout: "simple", sidebarSections: {} });
+  prefs.setPrefs({ sidebarLayout: "simple", sidebarSections: {}, branchSessions: "sidebar" });
   mocks.invoke.mockReset().mockImplementation(async (command: string) => {
     if (command === "list_projects") return { projects, lastSelected: null };
     if (command === "list_sessions") return sessions;
@@ -155,6 +155,109 @@ describe("the conversation list", () => {
     expect(mocks.invoke.mock.calls.filter(([command]) => command === "create_session").at(-1)?.[1]).toMatchObject({ req: { projectPath: "/repos/web", cwd: "/repos/web/.worktrees/fix-login", useWorktree: false } });
   });
 
+  it("ticks the branch icon of a branch whose commits are in the default branch", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    const base = mocks.invoke.getMockImplementation()!;
+    const checkout = (branch: string, state: string) => ({ path: `/repos/web/.worktrees/${branch}`, name: branch, branch, head: "abc", isMain: false, managed: true, uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0, state });
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "list_workspaces") return [...(await base(command, args)), checkout("done", "merged"), checkout("open", "unmerged")];
+      return base(command, args);
+    });
+    await boot([
+      session("done", "/repos/web", at(1), { branch: "done", worktreeName: "done", cwd: "/repos/web/.worktrees/done" }),
+      session("open", "/repos/web", at(2), { branch: "open", worktreeName: "open", cwd: "/repos/web/.worktrees/open" }),
+    ]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getAllByRole("button", { name: /, Talk/ }).map((row) => row.getAttribute("aria-label"))).toEqual(["open, Talk open", "done (merged), Talk done"]);
+  });
+
+  it("ticks a branch merged with a merge commit too, but not a new one that has nothing of its own yet", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    const base = mocks.invoke.getMockImplementation()!;
+    const tree = (name: string, head: string) => ({ path: `/repos/web/.worktrees/${name}`, name, branch: name, head, isMain: false, managed: true, uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0, state: "clean" });
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "list_workspaces") return [...(await base(command, args)), tree("landed", "bbb"), tree("fresh", "aaa")];
+      return base(command, args);
+    });
+    const made = { fetched: true, warning: null, commit: "aaa" };
+    await boot([
+      session("landed", "/repos/web", at(2), { branch: "landed", worktreeName: "landed", cwd: "/repos/web/.worktrees/landed", worktreeBase: made }),
+      session("fresh", "/repos/web", at(1), { branch: "fresh", worktreeName: "fresh", cwd: "/repos/web/.worktrees/fresh", worktreeBase: made }),
+    ]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getAllByRole("button", { name: /, Talk/ }).map((row) => row.getAttribute("aria-label"))).toEqual(["landed (merged), Talk landed", "fresh, Talk fresh"]);
+  });
+
+  it("adds a project from the Projects header: a folder, a GitHub clone, or a new empty one", async () => {
+    await boot([session("a", "/repos/web", new Date(Date.UTC(2026, 9, 1)).toISOString())]);
+    mount();
+    const trigger = screen.getByRole("button", { name: "Add a project" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    expect((await screen.findAllByRole("menuitem")).map((item) => item.textContent?.trim())).toEqual(["Open local project", "Open GitHub project", "Quick start"]);
+  });
+
+  it("names a worktree by what its agent has checked out there now, a bare commit included", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    const base = mocks.invoke.getMockImplementation()!;
+    const tree = (name: string, branch: string | null, head: string) => ({ path: `/repos/web/.worktrees/${name}`, name, branch, head, isMain: false, managed: true, uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0 });
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "list_workspaces") return [...(await base(command, args)), tree("panda", null, "3657040abcdef"), tree("crane", "feat/other", "abc1234")];
+      return base(command, args);
+    });
+    await boot([
+      session("panda", "/repos/web", at(2), { branch: "raccoon/panda", worktreeName: "panda", cwd: "/repos/web/.worktrees/panda" }),
+      session("crane", "/repos/web", at(1), { branch: "raccoon/crane", worktreeName: "crane", cwd: "/repos/web/.worktrees/crane" }),
+    ]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getAllByRole("button", { name: /, Talk/ }).map((row) => row.getAttribute("aria-label"))).toEqual(["detached at 3657040, Talk panda", "feat/other, Talk crane"]);
+  });
+
+  it("calls a worktree by its conversation's title until its branch has a name somebody gave it", async () => {
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    const base = mocks.invoke.getMockImplementation()!;
+    const tree = (name: string, branch: string, placeholder: boolean) => ({ path: `/repos/web/.worktrees/${name}`, name, branch, head: "abc1234", isMain: false, managed: true, placeholder, uncommitted: 0, additions: 0, deletions: 0, unpushed: 0, ahead: 0, behind: 0 });
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "list_workspaces") return [...(await base(command, args)), tree("calm-ember-panda", "dc/calm-ember-panda", true), tree("crane", "dc/prd", false)];
+      return base(command, args);
+    });
+    await boot([
+      session("panda", "/repos/web", at(2), { branch: "dc/calm-ember-panda", worktreeName: "calm-ember-panda", cwd: "/repos/web/.worktrees/calm-ember-panda" }),
+      session("crane", "/repos/web", at(1), { branch: "dc/crane", worktreeName: "crane", cwd: "/repos/web/.worktrees/crane" }),
+    ]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    expect(within(web).getByRole("button", { name: "dc/prd, Talk crane" })).toBeTruthy();
+    expect(within(web).queryByText("dc/calm-ember-panda")).toBeNull();
+    expect(within(web).getByRole("button", { name: /^Talk panda/ })).toBeTruthy();
+  });
+
+  it("lists a project just added before it has any chat, newest first, and says it has none yet", async () => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "list_projects") return { projects: [...projects, { path: "/repos/june", name: "june", kind: "git", lastOpened: "2026-10-21T07:00:00Z" }], lastSelected: null };
+      return base(command, args);
+    });
+    await boot([session("a", "/repos/web", new Date(Date.UTC(2026, 9, 1)).toISOString())]);
+    mount();
+    expect(screen.getAllByRole("group").map((group) => group.getAttribute("aria-label")).filter((name) => name === "web" || name === "june")).toEqual(["june", "web"]);
+    expect(within(screen.getByRole("group", { name: "june" })).getByText("No chats yet")).toBeTruthy();
+  });
+
+  it("opens the project's overview from its name, and folds it only from its picture", async () => {
+    await boot([session("a", "/repos/web", new Date(Date.UTC(2026, 9, 1)).toISOString())]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    await act(async () => { fireEvent.click(within(web).getByRole("button", { name: "web overview" })); });
+    expect(store.getSessions().view).toBe("project");
+    expect(store.getSessions().selectedProject).toBe("/repos/web");
+    expect(within(web).getByRole("button", { name: "web overview" }).getAttribute("aria-current")).toBe("page");
+    // Opening it left the project as it was folded.
+    expect(within(web).getByRole("button", { name: "Collapse web" }).getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("removes a project from its menu after asking, archiving its conversations rather than deleting them", async () => {
     const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
     await boot([session("here", "/repos/web", at(1)), session("there", "/repos/web", at(2), { branch: "old" }), session("done", "/repos/web", at(3), { archived: true })]);
@@ -204,7 +307,26 @@ describe("the conversation list", () => {
     expect(within(web).getByRole("button", { name: "b1, Talk w1" })).toBeTruthy();
   });
 
-  it("invites a first chat when there is none", async () => {
+  it("keeps a branch to one row, for whichever of its sessions is open, when its sessions are tabs in the tab bar", async () => {
+    prefs.setPrefs({ branchSessions: "tabs" });
+    const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+    await boot([session("m1", "/repos/web", at(9)), session("m2", "/repos/web", at(8), { tabs: [{ id: "m2-tab", title: "Talk m2", harness: "claude", model: "", permissionMode: "auto", status: "waiting", created: "", modified: "" }] })]);
+    mount();
+    const web = screen.getByRole("group", { name: "web" });
+    // Not a count with the sessions under it: one row, named by the branch, that opens its latest session.
+    const main = within(web).getByRole("button", { name: "main, 2 sessions" });
+    expect(within(web).queryByText("Talk m1")).toBeNull();
+    expect(within(web).queryByText("Talk m2")).toBeNull();
+    // The row's state is the most pressing among them.
+    expect(within(main).getByRole("img", { name: "Needs you" })).toBeTruthy();
+    fireEvent.click(main);
+    expect(within(web).getByRole("button", { name: "main, 2 sessions" }).getAttribute("aria-current")).toBe("true");
+    expect(within(web).queryByText("Talk m1")).toBeNull();
+  });
+
+  it("invites a first chat when there is none, and no project to show", async () => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args?: unknown) => (command === "list_projects" ? { projects: [], lastSelected: null } : base(command, args)));
     await boot([]);
     mount();
     expect(within(screen.getByTestId("conversation-list")).getByRole("button", { name: /Start a chat/ })).toBeTruthy();

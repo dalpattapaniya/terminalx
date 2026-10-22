@@ -1,5 +1,5 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
-import { Archive, ChevronDown, Ellipsis, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, GitPullRequest, Palette, Pin, Plus, Settings, SquarePen, Trash2 } from "@/icons";
+import { Archive, ChevronDown, Ellipsis, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, GitPullRequest, Github, Palette, Pin, Plus, Settings, SquarePen, Trash2 } from "@/icons";
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
@@ -12,12 +12,15 @@ import { IssuePipelineSettingsDialog } from "@/components/issues/IssuePipelineSe
 import { cn } from "@/lib/cn";
 import { errorMessage } from "@/lib/api";
 import { usePrefs } from "@/lib/prefs";
-import { addProject, archiveSession, pinSession, removeProject, selectSession, startChat, startSessionIn, updateProject, useSessionStore } from "@/lib/sessions";
+import { branchSessionsAsTabs } from "@/lib/tabLayouts";
+import { branchMerged, checkoutLabel, worktreeCheckout } from "@/lib/checkout";
+import { START_ACTIONS, type StartAction } from "@/lib/projectStart";
+import { addProject, archiveSession, openProjectOverview, pinSession, removeProject, selectSession, startChat, startSessionIn, updateProject, useSessionStore } from "@/lib/sessions";
 import { ContinuationDialog } from "@/components/session/ContinuationDialog";
 import { confirmDeleteSession } from "@/lib/deleteSessionFlow";
 import { setSidebarFilter, useSidebarFilter } from "@/lib/sidebarFilter";
 import type { Project, TabEntry, Workspace } from "@/types/session";
-import { sessionStatus, type SessionEntry } from "@/types/session";
+import { sessionStatus, type SessionEntry, type TabStatus } from "@/types/session";
 import { RowTime } from "./SidebarRows";
 import { useFold } from "./useFold";
 import { StatusMark } from "@/components/ui/StatusMark";
@@ -63,11 +66,14 @@ export function conversationLink(
   const path = canon(session.projectPath);
   const project = projects.find((entry) => canon(entry.path) === path) ?? null;
   const checkout = (workspaces[session.projectPath] ?? []).find((workspace) => canon(workspace.path) === canon(session.cwd));
-  // A worktree has its branch to itself. A conversation in the project's own
-  // checkout shares it, so it names the branch its agent last worked on (or
-  // started on), not wherever another conversation has since switched it.
+  // A worktree has its branch to itself, so it names what is checked out there
+  // now (its agent may have switched it, or left it on a bare commit). A
+  // conversation in the project's own checkout shares it, so it names the
+  // branch its agent last worked on (or started on), not wherever another
+  // conversation has since switched it.
+  const own = worktreeCheckout(session, workspaces);
   const branch = session.worktreeName && !session.worktreeRemoved
-    ? (session.branch ?? session.worktreeName)
+    ? ((own && checkoutLabel(own)) ?? session.branch ?? session.worktreeName)
     : (session.link?.branch ?? session.branch ?? checkout?.branch ?? null);
   return { path: session.projectPath, project, name: project?.name ?? (path.split("/").pop() || path), branch };
 }
@@ -93,6 +99,8 @@ export function groupConversations(
   chatsPath: string | null,
   workspaces: Record<string, Workspace[]>,
   selectedId: string | null,
+  /** List every open project, one with no conversations yet too: one just added is there at once (off while a filter narrows the list). */
+  everyProject = false,
 ): { groups: ConversationGroup[]; chats: SessionEntry[] } {
   const groups = new Map<string, ConversationGroup>();
   const chats: SessionEntry[] = [];
@@ -108,7 +116,15 @@ export function groupConversations(
     group.branches[session.id] = link.branch;
     groups.set(key, group);
   }
-  const latest = (group: ConversationGroup) => group.sessions.reduce((max, session) => (session.modified > max ? session.modified : max), "");
+  if (everyProject) {
+    for (const project of projects) {
+      const key = canon(project.path);
+      if (project.archived || key === chatsPath || groups.has(key)) continue;
+      groups.set(key, { path: project.path, name: project.name, project, sessions: [], branches: {} });
+    }
+  }
+  // Newest activity first: a conversation's, or the project's being opened (a new project has only that).
+  const latest = (group: ConversationGroup) => group.sessions.reduce((max, session) => (session.modified > max ? session.modified : max), group.project?.lastOpened ?? "");
   const ordered = [...groups.values()].sort((a, b) => Number(!!b.project?.pinned) - Number(!!a.project?.pinned) || latest(b).localeCompare(latest(a)));
   return { groups: ordered, chats };
 }
@@ -170,8 +186,8 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
   // Unread or Needs you: only the conversations that pass (and the open one), and so only their projects.
   const listed = useMemo(() => (filter.active ? store.sessions.filter((session) => filter.shows(session.id)) : store.sessions), [filter, store.sessions]);
   const { groups, chats } = useMemo(
-    () => groupConversations(listed, store.projects, chatsPath, store.workspaces, store.selectedSessionId),
-    [listed, store.projects, chatsPath, store.workspaces, store.selectedSessionId],
+    () => groupConversations(listed, store.projects, chatsPath, store.workspaces, store.selectedSessionId, !filter.active),
+    [listed, store.projects, chatsPath, store.workspaces, store.selectedSessionId, filter.active],
   );
 
   const run = (action: () => Promise<unknown>) => () => {
@@ -216,7 +232,7 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
         ) : (
           <>
             {groups.length > 0 && (
-              <ListSection id="projects" label={sectioned ? "Local" : "Projects"}>
+              <ListSection id="projects" label={sectioned ? "Local" : "Projects"} actions={<AddProjectMenu run={(action) => run(async () => action.run())()} />}>
                 {groups.map((group) => (
                   <ProjectGroup
                     key={group.path}
@@ -383,12 +399,21 @@ function ProjectGroup({
     if (!branch) return null;
     return { label: `New workspace from ${branch}`, run: () => onNewSession({ fromBranch: branch }) };
   };
+  // Branches whose checkout has its commits in the default branch, as git knows it here without a fetch.
+  const merged = useMemo(() => new Set(workspaces.flatMap((workspace) => (branchMerged(workspace, group.sessions) ? [workspace.branch!] : []))), [workspaces, group.sessions]);
+  // Branches still on the name drawn for their worktree: nobody named them, so their row goes by its conversation's title.
+  const placeholders = useMemo(() => new Set(workspaces.flatMap((workspace) => (workspace.placeholder && workspace.branch ? [workspace.branch] : []))), [workspaces]);
+  const nav = useSessionStore();
+  const overviewOpen = nav.view === "project" && !!nav.selectedProject && canon(nav.selectedProject) === canon(group.path);
   const [all, toggleAll] = useFold(`project-all:${canon(group.path)}`, false);
   // The project folds its branches away: its picture turns into a chevron on hover, and stays one while folded.
   const [expanded, toggle] = useFold(`project:${canon(group.path)}`, true);
   const open = expanded || filtered;
   const [pipelineOpen, setPipelineOpen] = useState(false);
-  const { animations } = usePrefs();
+  const prefs = usePrefs();
+  const { animations } = prefs;
+  // A branch's sessions are tabs or sidebar rows, never both: as tabs, the branch is one row here whatever their number.
+  const asTabs = branchSessionsAsTabs(prefs);
   // One row per branch, newest work first; the conversations come in that order already.
   const branches = useMemo(() => {
     const byBranch = new Map<string, SessionEntry[]>();
@@ -403,13 +428,14 @@ function ProjectGroup({
   return (
     <div role="group" aria-label={group.name} className="mb-1">
       <DropdownMenu>
-        <div className={cn(actionRow, "relative flex h-8 items-center gap-2 rounded-md px-2 hover:bg-selected/50")} title={group.path}>
+        <div className={cn(actionRow, "relative flex h-8 items-center gap-2 rounded-md px-2 hover:bg-selected/50", overviewOpen && "bg-selected")} title={group.path}>
+          {/* Only the picture (a chevron on hover) folds the project; its name opens the project's overview. */}
           <button
             type="button"
             onClick={toggle}
             aria-expanded={open}
             aria-label={open ? `Collapse ${group.name}` : `Expand ${group.name}`}
-            className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+            className="flex h-full shrink-0 items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           >
             <span className="relative size-4 shrink-0">
               <span className={cn("absolute inset-0 transition-opacity duration-150", open ? "group-hover/row:opacity-0 group-focus-within/row:opacity-0" : "opacity-0")} aria-hidden>
@@ -423,6 +449,14 @@ function ProjectGroup({
                 data-testid="project-fold"
               />
             </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => (group.project ? openProjectOverview(group.path) : toggle())}
+            aria-current={overviewOpen ? "page" : undefined}
+            aria-label={group.project ? `${group.name} overview` : undefined}
+            className="flex h-full min-w-0 flex-1 items-center rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          >
             <span className="min-w-0 flex-1 truncate text-[13px]">{group.name}</span>
           </button>
           <RowActions>
@@ -481,22 +515,26 @@ function ProjectGroup({
         data-testid="project-branches"
       >
         <div className="min-h-0 overflow-hidden">
-      <ul className="ml-[15px] flex flex-col gap-px border-l border-hairline pl-1.5">
+      <ul className="ml-[15px] flex flex-col gap-px pl-1.5">
         {shown.map(({ branch, sessions }) =>
-          sessions.length === 1 ? (
+          sessions.length === 1 || asTabs ? (
             <ConversationRow
               key={branch}
-              session={sessions[0]}
-              selected={selectedId === sessions[0].id}
-              branch={branch || null}
-              named="branch"
+              // The branch's row opens the session that is open on it, else its latest.
+              session={sessions.find((session) => session.id === selectedId) ?? sessions[0]}
+              peers={sessions}
+              selected={sessions.some((session) => session.id === selectedId)}
+              branch={placeholders.has(branch) ? null : branch || null}
+              named={placeholders.has(branch) ? "title" : "branch"}
+              merged={merged.has(branch)}
               onNewSession={newSessionOn(branch, sessions)}
               linkTo={null}
             />
           ) : (
-            <BranchRow key={branch} path={group.path} branch={branch} sessions={sessions} selectedId={selectedId} opened={filtered} onNewSession={newSessionOn(branch, sessions)} />
+            <BranchRow key={branch} path={group.path} branch={branch} sessions={sessions} selectedId={selectedId} opened={filtered} merged={merged.has(branch)} onNewSession={newSessionOn(branch, sessions)} />
           ),
         )}
+        {branches.length === 0 && <li className="flex h-7 items-center px-2 text-[12px] text-faint">No chats yet</li>}
         {more && (
           <li>
             <button
@@ -522,6 +560,7 @@ function BranchRow({
   sessions,
   selectedId,
   opened,
+  merged,
   onNewSession,
 }: {
   path: string;
@@ -530,6 +569,8 @@ function BranchRow({
   selectedId: string | null;
   /** Open whatever its fold: the sidebar's filter is on. */
   opened: boolean;
+  /** Its commits are in the default branch. */
+  merged: boolean;
   onNewSession: NewSessionAction | null;
 }) {
   const holdsSelected = sessions.some((session) => session.id === selectedId);
@@ -546,7 +587,7 @@ function BranchRow({
           title={label}
           className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-md pl-2 pr-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
         >
-          <GitBranch className="size-3.5 shrink-0 text-faint" />
+          <BranchGlyph merged={merged} />
           <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{label}</span>
           <span className={cn("shrink-0 text-[11px] tabular-nums text-faint", yieldsToRowActions)}>{sessions.length}</span>
           <ChevronDown className={cn("size-3 shrink-0 text-faint transition-transform", !expanded && "-rotate-90")} />
@@ -558,13 +599,53 @@ function BranchRow({
         )}
       </div>
       {expanded && (
-        <ul className="ml-[13px] flex flex-col gap-px border-l border-hairline pl-1.5">
+        <ul className="ml-[13px] flex flex-col gap-px pl-1.5">
           {sessions.map((session) => (
             <ConversationRow key={session.id} session={session} selected={selectedId === session.id} branch={null} linkTo={null} />
           ))}
         </ul>
       )}
     </li>
+  );
+}
+
+/** A branch row's icon; a merged branch has a tick drawn into its empty corner, in the icon's own stroke. */
+function BranchGlyph({ merged }: { merged: boolean }) {
+  if (!merged) return <GitBranch className="size-3.5 shrink-0 text-faint" />;
+  return (
+    <span className="flex shrink-0" title="Merged: its commits are in the default branch">
+      <GitBranch className="size-3.5 text-faint">
+        <path d="M9.25 12.25l1.75 1.75 3.5-3.75" className="text-info" />
+      </GitBranch>
+      <span className="sr-only">merged</span>
+    </span>
+  );
+}
+
+const START_ICON: Record<StartAction["id"], typeof FolderOpen> = { local: FolderOpen, github: Github, quick: FolderPlus };
+
+/** The Projects header's +: open a folder, clone from GitHub, or start a new empty project. */
+function AddProjectMenu({ run }: { run: (action: StartAction) => void }) {
+  return (
+    <DropdownMenu>
+      <WithTooltip label="Add a project">
+        <DropdownMenuTrigger asChild>
+          <Button variant="ghost" size="icon-xs" aria-label="Add a project" className="text-faint hover:text-foreground">
+            <Plus />
+          </Button>
+        </DropdownMenuTrigger>
+      </WithTooltip>
+      <DropdownMenuContent align="end">
+        {START_ACTIONS.map((action) => {
+          const Icon = START_ICON[action.id];
+          return (
+            <DropdownMenuItem key={action.id} onSelect={() => run(action)}>
+              <Icon /> {action.label}
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -584,18 +665,30 @@ function NewSessionButton({ action }: { action: NewSessionAction }) {
   );
 }
 
+/** The state that matters most among several: a question waiting, then work in progress, then work done. */
+function pressingStatus(statuses: TabStatus[]): TabStatus {
+  const order: TabStatus[] = ["waiting", "in_progress", "completed", "idle"];
+  return order.find((status) => statuses.includes(status)) ?? "idle";
+}
+
 function ConversationRow({
   session,
+  peers = [session],
   selected,
   branch,
   named = "title",
+  merged = false,
   onNewSession = null,
   linkTo,
 }: {
   session: SessionEntry;
+  /** A branch row's sessions (as tabs, the row stands for all of them): the row shows the most pressing state among them. */
+  peers?: SessionEntry[];
   selected: boolean;
   /** What the row is called: the conversation's title, or (alone on its branch in a project) the branch. */
   named?: "title" | "branch";
+  /** The branch's commits are in the default branch. */
+  merged?: boolean;
   /** Start another session on the row's branch, where it is checked out (or a workspace from it). */
   onNewSession?: NewSessionAction | null;
   /** The branch it works on, named at the row's end; without one the row shows when it was last active. */
@@ -603,8 +696,8 @@ function ConversationRow({
   /** For a chat linked to nothing: the projects it may be linked to. */
   linkTo: { projects: Project[]; onMove: (project: Project, worktree: boolean) => void; onAddProject: (worktree: boolean) => void } | null;
 }) {
-  const title = conversationTitle(session);
-  const status = sessionStatus(session);
+  const title = named === "branch" && peers.length > 1 ? `${peers.length} sessions` : conversationTitle(session);
+  const status = pressingStatus(peers.map(sessionStatus));
   const agent = useContext(ShowAgents) ? conversationAgent(session) : null;
   const mark = agent && <AgentMark id={agent} className={cn("size-3 text-faint", yieldsToRowActions)} />;
   return (
@@ -618,13 +711,13 @@ function ConversationRow({
             type="button"
             onClick={() => selectSession(session.id)}
             aria-current={selected ? "true" : undefined}
-            aria-label={named === "branch" ? `${branch ?? "No branch"}, ${title}` : undefined}
+            aria-label={named === "branch" ? `${branch ?? "No branch"}${merged ? " (merged)" : ""}, ${title}` : undefined}
             className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           >
             {session.pinned && <Pin className="size-3 shrink-0 text-faint" />}
             {named === "branch" ? (
               <>
-                <GitBranch className="size-3.5 shrink-0 text-faint" />
+                <BranchGlyph merged={merged} />
                 <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{branch ?? "No branch"}</span>
                 {mark}
                 {/* The row's state sits where the time does, at the end, so the row's own icon keeps its place; while working, the sign stands in for the time. */}

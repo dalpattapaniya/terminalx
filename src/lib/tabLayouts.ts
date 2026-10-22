@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, type ClosedTab, type TabLayout, type TabState } from "@/lib/api";
+import type { Prefs } from "@/lib/prefs";
 import type { SessionEntry } from "@/types/session";
 
 /**
@@ -22,13 +23,19 @@ export function tabKey(kind: TabKind, id: string): string {
 const canon = (path: string) => path.replace(/\/+$/, "");
 
 /**
- * The workspace a session's tabs are listed with: its checkout, shared by
- * every session that runs there. A quick chat has no checkout of its own to
- * share, and a session whose worktree was removed is listed apart from the
- * sessions of the checkout it fell back to, as in the sidebar.
+ * Where a session's tabs are listed: with the other sessions' in the same
+ * checkout. A quick chat and a session whose worktree was removed each stand
+ * apart. A chat (a session in the chats folder, `chatsPath`) is placed by its
+ * link, the repo its agent last worked in, so its tabs are listed with that
+ * checkout's and not with every other chat's; a chat with no link is a
+ * workspace of its own.
  */
-export function workspaceKey(session: Pick<SessionEntry, "id" | "kind" | "cwd" | "worktreeRemoved" | "removedWorkspace">): string {
+export function workspaceKey(
+  session: Pick<SessionEntry, "id" | "kind" | "cwd" | "projectPath" | "link" | "worktreeRemoved" | "removedWorkspace">,
+  chatsPath: string | null = null,
+): string {
   if (session.kind === "quick") return `quick:${session.id}`;
+  if (chatsPath != null && canon(session.projectPath) === canon(chatsPath)) return session.link ? canon(session.link.path) : `chat:${session.id}`;
   if (session.worktreeRemoved) return `removed:${canon(session.removedWorkspace?.path ?? session.cwd)}`;
   return canon(session.cwd);
 }
@@ -36,12 +43,21 @@ export function workspaceKey(session: Pick<SessionEntry, "id" | "kind" | "cwd" |
 /**
  * The sessions whose tabs are listed with `session`'s: the ones open in the
  * same workspace. `session` is always one of them, known to `sessions` or not:
- * a row never lacks the tabs of the session it is shown for.
+ * a row never lacks its own session's tabs.
  */
-export function workspaceSessions(sessions: readonly SessionEntry[], session: SessionEntry): SessionEntry[] {
-  const key = workspaceKey(session);
-  const members = sessions.filter((other) => other.id === session.id || (!other.archived && workspaceKey(other) === key));
+export function workspaceSessions(sessions: readonly SessionEntry[], session: SessionEntry, chatsPath: string | null = null): SessionEntry[] {
+  const key = workspaceKey(session, chatsPath);
+  const members = sessions.filter((other) => other.id === session.id || (!other.archived && workspaceKey(other, chatsPath) === key));
   return members.some((member) => member.id === session.id) ? members : [session, ...members];
+}
+
+/**
+ * Whether a branch's sessions sit beside each other as tabs: the tab bar is
+ * on and the reader keeps them there (`branchSessions`). Otherwise the
+ * sidebar lists them and a row holds the open session's own tabs only.
+ */
+export function branchSessionsAsTabs(prefs: Partial<Pick<Prefs, "tabStrip" | "branchSessions">>): boolean {
+  return !!prefs.tabStrip && prefs.branchSessions !== "sidebar";
 }
 
 export const NO_LAYOUT: TabLayout = { order: [], pinned: [], muted: [], titles: {} };
@@ -220,8 +236,8 @@ export function settleLayout(layout: TabLayout, visible: readonly string[], gone
 }
 
 /** True when this agent tab raises nothing: the reader muted it. */
-export function isTabMuted(session: SessionEntry, tabId: string): boolean {
-  return followedLayout(layoutOf(state, workspaceKey(session)), [session]).muted.includes(tabKey("agent", tabId));
+export function isTabMuted(session: SessionEntry, tabId: string, chatsPath: string | null = null): boolean {
+  return followedLayout(layoutOf(state, workspaceKey(session, chatsPath)), [session]).muted.includes(tabKey("agent", tabId));
 }
 
 // ---------------------------------------------------------------- closed tabs
