@@ -570,6 +570,21 @@ fn cloud_counts_distinguish_silence_from_errors_and_unconfirmed_delivery() {
     }
 }
 
+/// `start_cli` records the agent's cloud credential under the pane it spawns
+/// (`cloud_grants::agent_env_for_launch`), so that is what a running CLI
+/// tab is asked about (PRO-110): asked as `session/tab`, a Claude tab that
+/// started signed in read as needing a sign-in once the login was removed.
+#[test]
+fn a_cli_tab_is_asked_about_its_launch_under_its_pane() {
+    let rig = Rig::new();
+    assert_eq!(rig.rt.lock().unwrap().launch_key(), rig.pane);
+    // A headless agent's process is recorded under the tab.
+    rig.rt.lock().unwrap().engine = Engine::None;
+    assert_eq!(rig.rt.lock().unwrap().launch_key(), key_of(SESSION, TAB));
+    // Outside a cloud workspace no agent is ever said to need one.
+    assert_eq!(rig.manager.sign_in_required(SESSION, TAB, "claude"), None);
+}
+
 #[test]
 fn a_silent_turn_waiting_for_approval_is_counted_separately() {
     let rig = Rig::with_live_pane();

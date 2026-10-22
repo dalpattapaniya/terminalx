@@ -85,9 +85,6 @@ export function CloudAgentsView({
   active?: boolean;
 }) {
   const snapshot = useCloudAgents(scope);
-  const { status: account } = useAccount();
-  // Who connects a login is an owner or admin, which is not who may start a session (any member, PRO-73).
-  const mayManage = managesOrganization(account, scope.organizationId);
   const [selected, setSelected] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -193,11 +190,7 @@ export function CloudAgentsView({
         />
       )}
       {error && <p className="px-4 py-1 text-xs text-red-500">Agent: {error}</p>}
-      {active?.info.signIn && (
-        <p className="border-b border-hairline px-4 py-1.5 text-xs text-amber-600 dark:text-amber-400" role="status" data-testid="cloud-agent-sign-in">
-          {signInMessage(active.info, mayManage)} <AgentLoginsLink message={signInMessage(active.info, mayManage)} organizationId={scope.organizationId} className="ml-1 align-baseline" />
-        </p>
-      )}
+      {active && <SignInNotice info={active.info} organizationId={scope.organizationId} />}
       {active ? (
         <CloudAgentPane
           key={active.tabId}
@@ -350,6 +343,23 @@ export function signInMessage(info: Pick<AgentTabInfo, "harness" | "signIn">, ma
         ? `Connect it in ${AGENT_LOGIN_PLACE}, then send again.`
         : "Ask an owner or admin to connect it, then send again.";
   return `Needs sign-in: ${what}, so it can't take prompts here. ${fix}`;
+}
+
+/**
+ * The notice over a cloud agent tab whose agent has no way to sign in
+ * (PRO-78), with the way to `organizationId`'s Agent logins for someone who
+ * may connect one. Nothing for a tab whose agent can sign in.
+ */
+export function SignInNotice({ info, organizationId }: { info: Pick<AgentTabInfo, "harness" | "signIn">; organizationId: string }) {
+  const { status: account } = useAccount();
+  // Who connects a login is an owner or admin, which is not who may start a session (any member, PRO-73).
+  const message = signInMessage(info, managesOrganization(account, organizationId));
+  if (!message) return null;
+  return (
+    <p className="border-b border-hairline px-4 py-1.5 text-xs text-amber-600 dark:text-amber-400" role="status" data-testid="cloud-agent-sign-in">
+      {message} <AgentLoginsLink message={message} organizationId={organizationId} className="ml-1 align-baseline" />
+    </p>
+  );
 }
 
 export function turnLabel(tab: CloudAgentTab): string {

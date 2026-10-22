@@ -299,6 +299,14 @@ impl ConfigStore {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The names of the variables a new agent session is given, bound
+    /// secrets included.
+    fn env_names(&self) -> Vec<String> {
+        let state = self.state();
+        let Some(config) = state.config.as_ref() else { return Vec::new() };
+        config.env.keys().cloned().chain(config.secret_env.iter().map(|(name, _)| name.clone())).collect()
+    }
+
     /// Stop injecting anything: the runtime was fenced or its key refused.
     pub fn drop_all(&self, reason: &str) {
         let mut state = self.state();
@@ -690,7 +698,12 @@ pub fn spawn_sync_loop(store: Arc<ConfigStore>, api: Arc<HttpGrantApi>, rejected
     let spawned = std::thread::Builder::new().name("cloud-workspace-config".into()).spawn(move || {
         let mut backoff = BACKOFF_START;
         loop {
+            let before = store.env_names();
             let wait = step(&store, api.as_ref(), api.as_ref(), rejected(), &mut backoff);
+            // A key set or removed may sign an agent in, or no longer.
+            if store.env_names() != before {
+                crate::cloud_grants::sign_in_may_have_changed();
+            }
             std::thread::sleep(wait);
         }
     });
@@ -717,10 +730,7 @@ pub fn launch_config(harness: &str, launch: &str) -> LaunchConfig {
 /// The names of the variables the workspace configuration gives a new agent
 /// session, bound secrets included; empty outside a cloud workspace.
 pub fn configured_env_names() -> Vec<String> {
-    let Some(store) = STORE.get() else { return Vec::new() };
-    let state = store.state();
-    let Some(config) = state.config.as_ref() else { return Vec::new() };
-    config.env.keys().cloned().chain(config.secret_env.iter().map(|(name, _)| name.clone())).collect()
+    STORE.get().map(|store| store.env_names()).unwrap_or_default()
 }
 
 pub fn forget_launch(launch: &str) {

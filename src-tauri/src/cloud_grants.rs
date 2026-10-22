@@ -1268,6 +1268,13 @@ impl GrantStore {
         }
     }
 
+    /// What [`Self::sign_in_required`] says of each provider, the
+    /// configuration aside. A sync that changes it is worth telling the
+    /// tabs about.
+    fn sign_in_answers(&self, now: Instant) -> Vec<Option<SignInRequired>> {
+        [Provider::Claude, Provider::Codex, Provider::Cursor].into_iter().map(|provider| self.sign_in_required(provider, &[], now)).collect()
+    }
+
     /// Whether the session under `launch` started with a cloud credential.
     fn launched_with_credential(&self, launch: &str) -> bool {
         self.state().launches.contains_key(launch)
@@ -1361,7 +1368,11 @@ pub fn spawn_sync_loop(store: Arc<GrantStore>, api: Arc<dyn GrantApi + Send + Sy
     let spawned = std::thread::Builder::new().name("cloud-agent-grants".into()).spawn(move || {
         let mut backoff = BACKOFF_START;
         loop {
+            let before = store.sign_in_answers(Instant::now());
             let wait = step(&store, api.as_ref(), rejected(), &mut backoff);
+            if store.sign_in_answers(Instant::now()) != before {
+                sign_in_may_have_changed();
+            }
             std::thread::sleep(wait);
         }
     });
@@ -1384,6 +1395,24 @@ pub fn install(store: Arc<GrantStore>) {
 
 pub(crate) fn installed() -> Option<&'static Arc<GrantStore>> {
     STORE.get()
+}
+
+static SIGN_IN_CHANGED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Call `changed` when [`sign_in_required`] may answer differently with no
+/// tab having changed: a sync brought an agent's login or took it away, or
+/// the workspace configuration changed. A tab list read before the first
+/// sync after a resume would otherwise keep its answer.
+pub fn on_sign_in_change(changed: impl Fn() + Send + Sync + 'static) {
+    if SIGN_IN_CHANGED.set(Box::new(changed)).is_err() {
+        log::warn!("the sign-in change hook is already set");
+    }
+}
+
+pub(crate) fn sign_in_may_have_changed() {
+    if let Some(changed) = SIGN_IN_CHANGED.get() {
+        changed();
+    }
 }
 
 /// The environment to apply to a new agent process for `harness`, recorded
@@ -2268,6 +2297,32 @@ mod tests {
         assert!(store.sign_in_required(Provider::Claude, &[], t0).is_some());
         assert!(store.launched_with_credential("s/t"));
         assert!(!store.launched_with_credential("s/other"));
+    }
+
+    #[test]
+    fn a_sync_is_news_for_the_tabs_only_when_it_changes_what_sign_in_says() {
+        let server = FakeServer::new();
+        server.credential("claude", "cred_c", "connected", 1, 1);
+        server.grant("claude", "cred_c", 1, claude_oauth("fake-oauth-1", 1));
+        let store = store(None);
+        let t0 = Instant::now();
+        // A tab list read before the first sync claimed nothing; the sync knows.
+        let unknown = store.sign_in_answers(t0);
+        assert!(unknown.iter().all(Option::is_none));
+        store.sync(&server, t0, NOW).unwrap();
+        let signed_in = store.sign_in_answers(t0);
+        assert_ne!(signed_in, unknown);
+        assert_eq!(signed_in[0], None, "Claude has a grant");
+        // A fresh grant for the same login says the same: nothing to tell.
+        store.sync(&server, t0, NOW).unwrap();
+        assert_eq!(store.sign_in_answers(t0), signed_in);
+        // The login removed: Claude needs a sign-in from here on.
+        server.credentials.borrow_mut().clear();
+        server.grants.borrow_mut().clear();
+        store.sync(&server, t0, NOW).unwrap();
+        let removed = store.sign_in_answers(t0);
+        assert_ne!(removed, signed_in);
+        assert_eq!(removed[0], Some(SignInRequired { provider: "claude", state: "not-connected".into(), reason: None }));
     }
 
     #[test]

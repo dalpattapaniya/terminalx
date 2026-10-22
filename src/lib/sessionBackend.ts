@@ -1,4 +1,4 @@
-import type { AgentProcessState, WorkspaceConnectionState, WorkspaceRpcClient, WorkspaceYou } from "@terminalx/portable/workspace";
+import type { AgentProcessState, AgentTabInfo, WorkspaceConnectionState, WorkspaceRpcClient, WorkspaceYou } from "@terminalx/portable/workspace";
 import { agent, type ImageInput } from "@/lib/api";
 import { loadTab, setTabStatus } from "@/lib/agentEvents";
 import { patchTab } from "@/lib/sessions";
@@ -137,6 +137,12 @@ export interface SessionBackend {
    * person may no longer change settings (the receipt's `settingsIgnored`).
    */
   settingsNotice?(tabId: string): "pending" | "ignored" | null;
+  /**
+   * Cloud only (PRO-78): why the tab's agent has no way to sign in in its
+   * workspace, as the runtime last said, and the organization whose Agent
+   * logins fix it. Null when it can sign in.
+   */
+  signIn?(tabId: string): { signIn: NonNullable<AgentTabInfo["signIn"]>; organizationId: string } | null;
   /** Why this person may not answer permission requests (a shared workspace's non-approver), or null. */
   approveBlockedReason?: string | null;
   /** The workspace client for model discovery, independent of collaboration capabilities. */
@@ -322,6 +328,8 @@ export interface CloudSessionContext {
   terminalBase?: () => TerminalInstance;
   /** Whether a tab's CLI runs, as the runtime last said. */
   agentProcess?: (tabId: string) => AgentProcessState | null;
+  /** Why a tab's agent cannot sign in, as the runtime last said (see `SessionBackend.signIn`). */
+  signIn?: (tabId: string) => AgentTabInfo["signIn"];
 }
 
 /** Whether a cloud workspace's compute is asleep as far as this client knows. */
@@ -440,6 +448,10 @@ export function cloudSessionBackend(ctx: CloudSessionContext): SessionBackend {
       const notice = ctx.settingsNotice?.(tabId) ?? null;
       // Someone who may no longer configure is not told their change "applies with the next message".
       return notice === "pending" && !mayConfigure(you) ? null : notice;
+    },
+    signIn: (tabId) => {
+      const signIn = ctx.signIn?.(tabId);
+      return signIn ? { signIn, organizationId: scope.organizationId } : null;
     },
     markRead: (tabId) => markCloudAgentRead(scope, tabId, client),
     patchTab: () => undefined,

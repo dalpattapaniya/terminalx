@@ -203,6 +203,20 @@ idle suspend, and the desktop shows it as "Needs sign-in", not "Working". A
 first prompt for such an agent fails with the launch category
 `agent-sign-in-required` instead of being typed into a sign-in screen.
 
+A grant or configuration sync that changes this answer for any provider (the
+first sync after a start or resume, a login removed or connected again, a key
+set or removed) broadcasts `session.tabs` again, so a desktop that read the
+list earlier is not left with the old answer (PRO-110). "Started with a
+credential" is judged by the launch the agent's process runs under: a Claude
+Code or Codex tab's pane (`tab:<tabId>`), a headless agent's tab. The desktop
+shows the notice, with the way to the organization's Agent logins for an owner
+or admin, over the tab in a session as in the workspace's agent view.
+
+On the local stack (local-docker, fake Claude Code) the notice shows like
+anywhere else: the image writes no `~/.claude/.credentials.json` and sets no
+Claude variable. The fake agent needs no login, so it still answers prompts
+sent to such a tab.
+
 Subscribers of `session.subscribe` also get `session.status` notifications:
 `{ subscriptionId, sessionId, tabId, status }` (the process state comes with
 `session.tabs`). Cursors are `<generation>:<process epoch>:<seq>`: a restarted

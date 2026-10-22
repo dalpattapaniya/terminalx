@@ -20,7 +20,9 @@
 // - the permission mode at 960 px with the side panel open, and at every
 //   width from 960 to 1400 px: the More options button that holds it stays in
 //   the toolbar and wide enough to press, carries the mode's dot for an
-//   unguarded or plan mode, and its menu names the mode whole.
+//   unguarded or plan mode, and its menu names the mode whole;
+// - a tab whose agent cannot sign in (PRO-110): its notice and the Agent
+//   logins button sit above the transcript, inside the window.
 //
 // A cloud session is reached through the command palette ("Go to cloud
 // session…", then its title): the chat-first sidebar lists no cloud sessions.
@@ -347,6 +349,41 @@ for (const viewport of [{ width: 1000, height: 520 }, { width: 1280, height: 760
   // Well past the terminal poll (3 s): a session terminal would have arrived by now.
   const putUnderSession = await page.locator('[role="tabpanel"][id^="session-terminal-panel"]').waitFor({ timeout: 8_000, state: "attached" }).then(() => true, () => false);
   failed += report(name, { "no terminal with no session is put among the session's tabs": !putUnderSession });
+  await page.close();
+}
+
+// PRO-110: a session's tab whose agent has no way to sign in says so over its
+// chat, with the way to the organization's Agent logins. The notice is one
+// more bar above the transcript: it, the header and the composer stay inside
+// the window, and the transcript still scrolls in its own container.
+for (const viewport of [{ width: 1000, height: 520 }, VIEWPORT]) {
+  const name = `cloud session (${viewport.width}x${viewport.height}, needs sign-in)`;
+  const signIn = { provider: "claude", state: "not-connected", reason: null };
+  const page = await open(browser, server.url, { cloud: true, localProjects: 0, session: { role: "manager", lines: 25, signIn } }, viewport);
+  await openCloudSession(page, await page.evaluate(() => window.__PW_RUNTIME__.sessionTitle));
+  const shown = await page.locator('main [data-testid="cloud-agent-sign-in"]').waitFor({ timeout: 8_000 }).then(() => true, () => false);
+  await page.getByText("chunk 25 of 25", { exact: true }).waitFor();
+  await page.waitForTimeout(300);
+  const layout = await measure(page);
+  const bar = await page.evaluate(() => {
+    const box = (element) => {
+      const rect = element?.getBoundingClientRect();
+      return rect ? { top: Math.round(rect.top), bottom: Math.round(rect.bottom), left: Math.round(rect.left), right: Math.round(rect.right) } : null;
+    };
+    const notice = document.querySelector('main [data-testid="cloud-agent-sign-in"]');
+    return { notice: box(notice), link: box(notice?.querySelector('[data-testid="open-agent-logins"]')), scroller: box(document.querySelector("[data-chat-scroller]")), width: innerWidth };
+  });
+  const { notice, link, scroller } = bar;
+  failed += report(
+    name,
+    inPlace(layout, {
+      "the notice shows over the tab": shown && !!notice,
+      "the notice is inside the window, above the transcript": !!notice && !!scroller && notice.top >= -SLACK && notice.right <= bar.width + SLACK && notice.bottom <= scroller.top + SLACK,
+      "its Open Agent logins button is inside the notice": !!notice && !!link && link.left >= notice.left - SLACK && link.right <= notice.right + SLACK && link.top >= notice.top - SLACK && link.bottom <= notice.bottom + SLACK,
+    }),
+    { ...layout, bar },
+  );
+  if (process.env.WEBKIT_LAYOUT_SCREENSHOTS) await page.screenshot({ path: `${process.env.WEBKIT_LAYOUT_SCREENSHOTS}/cloud-session-sign-in-${viewport.width}.png` });
   await page.close();
 }
 

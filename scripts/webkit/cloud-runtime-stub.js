@@ -45,7 +45,8 @@
   const outbox = (f.outbox ?? []).map((entry, i) => ({ clientCommandId: `c${i + 1}`, tabId: TAB, kind: "send", state: "rejected", createdAt: now - 1000 + i, updatedAt: now - 1000 + i, ...entry }));
   let status = "idle";
   // `model` and `permissionMode`: what the composer's pickers read (their labels decide how wide its toolbar wants to be).
-  const tabInfo = () => ({ sessionId: SESSION, tabId: TAB, title: tab.title, harness: "claude", model: f.model ?? "", effort: null, permissionMode: f.permissionMode ?? "default", status, process: "running", pendingPermissions: [], followUps: [], lastSeq: seq, created: at, modified: at });
+  // `signIn`: the tab's agent has no way to sign in (PRO-78), and the tab says so.
+  const tabInfo = () => ({ sessionId: SESSION, tabId: TAB, title: tab.title, harness: "claude", model: f.model ?? "", effort: null, permissionMode: f.permissionMode ?? "default", status, process: "running", pendingPermissions: [], followUps: [], lastSeq: seq, created: at, modified: at, ...(f.signIn ? { signIn: f.signIn } : {}) });
   const terminals = [];
   const terminal = (sessionId) => ({ ptyId: `p${terminals.length + 1}`, number: terminals.length + 1, epoch: "e1", pid: 100 + terminals.length, cwd: "/w", cols: 80, rows: 24, createdAt: now, offset: 0, exited: false, exitCode: null, control: "none", controllerId: null, ...(sessionId ? { sessionId } : {}) });
   const notes = [];

@@ -8,7 +8,7 @@ import { hasEscapeOverlay, useShortcut } from "@/lib/hotkeys";
 import { changeRange, useChanges } from "@/lib/changes";
 import { localGitSource, type GitSource } from "@/lib/gitSource";
 import { localSessionBackend, terminalViewOf, type SessionBackend } from "@/lib/sessionBackend";
-import { CloudOutbox, commandError as cloudCommandError } from "@/components/cloud/CloudAgents";
+import { CloudOutbox, SignInNotice, commandError as cloudCommandError } from "@/components/cloud/CloudAgents";
 import { CloudAgentTerminal } from "@/components/cloud/CloudAgentTerminal";
 import { LeaseBar, NotesPanel, useNowUntil } from "@/components/cloud/CloudCollab";
 import { SETTINGS_IGNORED_REASON, SETTINGS_LOCKED_REASON, SETTINGS_WITH_NEXT_MESSAGE, TERMINAL_APPROVAL_REASON, presenceTyping, tabGate, useCollab } from "@/lib/cloudCollab";
@@ -390,6 +390,8 @@ export function TabView({
   const outbox = backend.outbox;
   // What became of the last model, effort or mode chosen here (a cloud tab).
   const settingsNotice = backend.settingsNotice?.(tab.id) ?? null;
+  // A cloud tab's agent with no way to sign in in its workspace (PRO-78).
+  const signIn = backend.signIn?.(tab.id) ?? null;
   // What Up and Down recall in the composer: this tab's own messages, plus a cloud tab's commands still on their way.
   const history = useMemo(
     () => sentMessages(transcript, outbox && { entries: outbox.entries(tab.id), followUps: outbox.followUps(tab.id) }),
@@ -607,6 +609,7 @@ export function TabView({
         unreadNotes={collab.unreadNotes[tab.id] ?? 0}
       />
     )}
+    {signIn && <SignInNotice info={{ harness: tab.harness, signIn: signIn.signIn }} organizationId={signIn.organizationId} />}
     {outbox && <CloudOutbox entries={outbox.entries(tab.id)} followUps={outbox.followUps(tab.id)} nameOf={nameOf} onSendAgain={(entry) => void outbox.sendAgain(entry).catch((e) => setError(commandError(e)))} />}
     {earlier.length > 0 && (
       // The tab held other conversations before this one: another agent was run in its terminal, or the same one on something else.
