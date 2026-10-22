@@ -297,20 +297,23 @@ pub struct Prepared {
 /// Asking Codex for the hook hashes costs a short-lived child, so it only
 /// happens when `hooks.json` has actually changed — which is when Raccoon
 /// moves, or is upgraded, and not on every tab.
-pub fn prepare(cwd: &str, exe: &Path) -> Result<Prepared> {
+///
+/// `cloud_auth` is the launch's own (`cloud_grants::launch_grant`): `None`
+/// outside a cloud workspace, where the reader's `auth.json` is linked as
+/// usual; inside one the grant's auth file, or `Some(None)` for none at all.
+pub fn prepare(cwd: &str, exe: &Path, cloud_auth: Option<Option<PathBuf>>) -> Result<Prepared> {
     let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
     let managed = managed_root()?;
-    let hooks_live = prepare_in(&managed, user_root(), cwd, exe)?;
+    let hooks_live = prepare_in(&managed, user_root(), cwd, exe, cloud_auth)?;
     Ok(Prepared { home: managed, hooks_live })
 }
 
 /// The body of `prepare`, with both homes named so it can be exercised
 /// against a real `codex` without touching either of the real ones.
-fn prepare_in(managed: &Path, user: Option<PathBuf>, cwd: &str, exe: &Path) -> Result<bool> {
+fn prepare_in(managed: &Path, user: Option<PathBuf>, cwd: &str, exe: &Path, cloud_auth: Option<Option<PathBuf>>) -> Result<bool> {
     let user = user.filter(|u| u.is_dir());
     // In a cloud workspace the account is the workspace's, from a grant on
     // tmpfs (`cloud_grants`), never the reader's own `auth.json`.
-    let cloud_auth = crate::cloud_grants::codex_auth_source();
     if let Some(user) = &user {
         for name in LINKED {
             if *name == "auth.json" && cloud_auth.is_some() {
@@ -505,7 +508,7 @@ url = "https://example.test/mcp"
         std::fs::write(user.path().join("config.toml"), "model = \"gpt-5.6-sol\"\n\n[features]\nsteer = true\n").unwrap();
         // A real account is not needed to list hooks, and none is linked in.
         let cwd = work.path().to_string_lossy().into_owned();
-        assert!(prepare_in(managed.path(), Some(user.path().to_path_buf()), &cwd, Path::new("/opt/raccoon")).unwrap());
+        assert!(prepare_in(managed.path(), Some(user.path().to_path_buf()), &cwd, Path::new("/opt/raccoon"), None).unwrap());
 
         let config = std::fs::read_to_string(managed.path().join("config.toml")).unwrap();
         let t: toml::Table = toml::from_str(&config).unwrap();
@@ -523,7 +526,7 @@ url = "https://example.test/mcp"
         // The second build asks Codex nothing: the answer is cached against
         // the hooks file it was computed for.
         std::fs::remove_file(managed.path().join("config.toml")).unwrap();
-        assert!(prepare_in(managed.path(), Some(user.path().to_path_buf()), &cwd, Path::new("/opt/raccoon")).unwrap());
+        assert!(prepare_in(managed.path(), Some(user.path().to_path_buf()), &cwd, Path::new("/opt/raccoon"), None).unwrap());
         let again: toml::Table = toml::from_str(&std::fs::read_to_string(managed.path().join("config.toml")).unwrap()).unwrap();
         assert_eq!(again["hooks"]["state"].as_table().unwrap().len(), state.len());
     }

@@ -361,6 +361,13 @@ export const api = {
     invoke<AgentLogin>("cloud_agent_login_connect", { provider, source, consent }),
   cloudAgentLoginRemove: (provider: AgentLoginProvider, contextRevision: string, orgId?: string | null) =>
     invoke<void>("cloud_agent_login_remove", { provider, contextRevision, orgId: orgId ?? null }),
+  // A member's own model routes (PRO-18): how agents in the cloud workspaces they create reach their model
+  // instead of the organization's login. Personal and per organization, any member organization by `orgId`.
+  // A route's credential is entered in a native secure dialog and checked from this Mac in Rust, never here.
+  cloudAgentRoutes: (orgId?: string | null) => invoke<AgentRoutes>("cloud_agent_routes", { orgId: orgId ?? null }),
+  cloudAgentRouteSave: (save: AgentRouteSave) => invoke<AgentRouteSaved>("cloud_agent_route_save", { save }),
+  cloudAgentRouteRemove: (agent: AgentRouteAgent, contextRevision: string, orgId?: string | null) =>
+    invoke<AgentRoutes>("cloud_agent_route_remove", { agent, contextRevision, orgId: orgId ?? null }),
   // "Log in with Claude" (PRO-82): the account service runs the sign-in and keeps a login it can renew.
   // The page opens in the browser; the code it shows is entered in a native dialog, never here.
   cloudAgentClaudeLoginStart: (consent: AgentLoginConsent) => invoke<ClaudeLoginStarted>("cloud_agent_claude_login_start", { consent }),
@@ -791,6 +798,102 @@ export interface CloudProviderSummary {
 }
 
 export type AgentLoginProvider = "codex" | "claude" | "cursor";
+
+// ---- personal agent model routes (PRO-18)
+
+/** The agents a route can be for: Cursor's CLI supports neither a custom endpoint nor a credential helper. */
+export type AgentRouteAgent = "claude" | "codex";
+export type AgentRouteMode = "custom-endpoint" | "user-managed";
+export type AgentRouteFieldKey = "baseUrl" | "authScheme" | "model" | "helperPath";
+
+export interface AgentRouteField {
+  key: AgentRouteFieldKey;
+  kind: "url" | "choice" | "model" | "path";
+  required: boolean;
+  label: string;
+  help: string;
+  choices?: { value: string; label: string }[];
+  default?: string;
+}
+
+/** One provider template of the service's catalog, which is versioned on its own. */
+export interface AgentRouteTemplate {
+  id: string;
+  version: number;
+  provider: AgentRouteAgent;
+  mode: AgentRouteMode;
+  label: string;
+  description: string;
+  fields: AgentRouteField[];
+  /** What a custom endpoint stores; null for a helper, whose credential never reaches the app. */
+  credential: { label: string; help: string } | null;
+  capabilities: { modelList: "anthropic" | "openai"; defaultBaseUrl?: string; modelPicker: boolean };
+  docs: string;
+}
+
+export type AgentRouteSettings = Partial<Record<AgentRouteFieldKey, string>>;
+
+/** A check of a route: codes and model ids only, never what the endpoint or helper said. */
+export interface AgentRouteCheckResult {
+  outcome: "ok" | "unverified" | "failed";
+  code?: string;
+  httpStatus?: number;
+  models?: string[];
+}
+
+/** A workspace's check of a route version. */
+export interface AgentRouteCheck extends AgentRouteCheckResult {
+  workspaceId: string;
+  version: number;
+  checkedAt: number;
+}
+
+export interface AgentRoute {
+  id: string;
+  provider: AgentRouteAgent;
+  mode: AgentRouteMode;
+  templateId: string;
+  templateVersion: number;
+  /** False when the catalog no longer offers this template version: it still works as saved. */
+  templateCurrent: boolean;
+  settings: AgentRouteSettings;
+  credentialStored: boolean;
+  credentialUpdatedAt?: number;
+  version: number;
+  updatedAt: number;
+  /** The newest workspace check of this version. */
+  status: "not-checked" | "connected" | "unverified" | "failed";
+  lastCheck?: AgentRouteCheck;
+}
+
+export interface AgentRoutes {
+  catalogVersion: number;
+  agents: string[];
+  templates: AgentRouteTemplate[];
+  routes: AgentRoute[];
+}
+
+export interface AgentRouteSave {
+  /** The organization the page names; null is the active one. */
+  organizationId: string | null;
+  contextRevision: string;
+  agent: AgentRouteAgent;
+  templateId: string;
+  settings: AgentRouteSettings;
+  /** 0 when no route is stored. */
+  expectedVersion: number;
+  /** Ask for a credential in the app's secure dialog; otherwise the stored one is kept where it may be. */
+  enterCredential: boolean;
+  /** Save even when this Mac's check of the endpoint fails. */
+  saveUnchecked: boolean;
+}
+
+export interface AgentRouteSaved {
+  saved: boolean;
+  /** This Mac's check of the endpoint, when a credential was entered. */
+  check: AgentRouteCheckResult | null;
+  routes: AgentRoutes | null;
+}
 /** `api-key`: typed into a native secure dialog. `local-login`: the agent's own login on this computer. */
 export type AgentLoginSource = "api-key" | "local-login";
 

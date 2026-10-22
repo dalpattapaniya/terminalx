@@ -38,6 +38,8 @@ vi.mock("./OrganizationGithubApp", () => ({ OrganizationGithubApp: () => <div da
 vi.mock("./OrganizationWorkspaceConfig", () => ({ OrganizationWorkspaceConfig: () => <div data-testid="section-config" /> }));
 vi.mock("./OrganizationEnvironment", () => ({ OrganizationEnvironment: () => <div data-testid="section-environment" /> }));
 vi.mock("./OrganizationCloudTeardown", () => ({ OrganizationCloudTeardown: () => <div data-testid="section-teardown" /> }));
+// The person's own model access (PRO-18) has tests of its own; here it shows which organization it is for.
+vi.mock("./OrganizationAgentRoutes", () => ({ OrganizationAgentRoutes: ({ organizationId }: { organizationId: string }) => <div data-testid="section-routes" data-organization={organizationId} /> }));
 
 const { OrganizationSettings } = await import("./OrganizationSettings");
 const { OrganizationsTab } = await import("./OrganizationsTab");
@@ -135,7 +137,7 @@ describe("an organization's settings page (PRO-107)", () => {
   it("holds every section of the active organization, agent logins among them", async () => {
     render(<OrganizationSettings organization={acme} onBack={vi.fn()} />);
     expect(screen.getByTestId("organization-settings").textContent).toContain("You are an owner of Acme. It is your default organization.");
-    for (const section of ["members", "compute", "github", "config", "environment", "teardown"]) expect(screen.getByTestId(`section-${section}`)).toBeTruthy();
+    for (const section of ["members", "compute", "github", "config", "environment", "teardown", "routes"]) expect(screen.getByTestId(`section-${section}`)).toBeTruthy();
     expect(screen.queryByTestId("organization-settings-inactive")).toBeNull();
     await screen.findAllByTestId("agent-login");
     expect(screen.getByTestId("agent-logins-title").textContent).toBe("Agent logins for Acme");
@@ -150,6 +152,9 @@ describe("an organization's settings page (PRO-107)", () => {
     const share = await screen.findByRole("switch", { name: "Share work status in Beta" });
     expect(mocks.workStatus.organization).toHaveBeenCalledWith("b");
     expect(screen.getByTestId("organization-settings-inactive").textContent).toContain("Its agent logins and work status above are changed as it is.");
+    // Personal and per organization, so it is on the page of any organization, active or not.
+    expect(screen.getByTestId("section-routes").dataset.organization).toBe("b");
+    expect(screen.getByTestId("organization-settings-inactive").textContent).toContain("So is your own model access in it.");
     fireEvent.click(share);
     await waitFor(() => expect(mocks.workStatus.setOrganization).toHaveBeenCalledWith("b", { shareWorkStatus: false }));
     expect(mocks.api.organizationSelect).not.toHaveBeenCalled();
@@ -166,6 +171,8 @@ describe("an organization's settings page (PRO-107)", () => {
     expect(screen.queryByTestId("organization-work-status")).toBeNull();
     expect(mocks.workStatus.organization).not.toHaveBeenCalled();
     expect(screen.getByTestId("organization-settings-inactive").textContent).toContain("Its agent logins above are changed as it is.");
+    // A member sets their own model access too.
+    expect(screen.getByTestId("section-routes").dataset.organization).toBe("b");
   });
 
   it("asks a member of the active organization for no diagnostics", async () => {

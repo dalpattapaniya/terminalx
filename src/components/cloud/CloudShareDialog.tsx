@@ -59,6 +59,8 @@ export function shareErrorMessage(error: unknown, who?: string): string {
       return `${who ?? "This person"} already has access as owner/admin/creator.`;
     case "cloud_workspace_share_credential_restricted":
       return "Can send is not available here while the organization has an agent login that only owners and admins may use. Share as view only, or share that login with the whole organization first (Settings → Organizations → Agent logins).";
+    case "cloud_workspace_share_personal_route":
+      return "This workspace was handed its creator's own model credential (Settings → Organizations → Your model access) since it last started, and its sessions may still hold it, so it can't be opened to the organization or shared with Can send yet. Share as view only, or the creator switches that agent to the organization login or a credential helper and then stops and resumes the workspace.";
     case "cloud_workspace_share_requires_organization_access":
       return "Make the workspace visible to the organization first.";
     case "cloud_workspace_share_limit":

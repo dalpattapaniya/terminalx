@@ -8,6 +8,12 @@ page is about the desktop side: each organization's page in Settings →
 Organizations → **Agent logins**, and the Agent logins step of organization
 setup.
 
+A member may instead route an agent through their own endpoint or a
+credential helper they manage (PRO-18): that is personal, and in the same
+organization page under **Your model access**. An agent a member routed never
+gets the organization's login in their workspaces. See
+`docs/CLOUD-AGENT-ROUTES.md`.
+
 ## Where they are set (PRO-107)
 
 Agent logins are a setting of each organization, not of the account.

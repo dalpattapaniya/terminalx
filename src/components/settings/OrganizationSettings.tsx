@@ -7,6 +7,7 @@ import { defaultOrgId } from "@/lib/cloudCatalog";
 import { isMultiOrg } from "@/lib/multiOrg";
 import { organizationName } from "@/lib/organizationVisibility";
 import { OrganizationAgentLogins } from "./OrganizationAgentLogins";
+import { OrganizationAgentRoutes } from "./OrganizationAgentRoutes";
 import { OrganizationCloudTeardown } from "./OrganizationCloudTeardown";
 import { OrganizationCompute } from "./OrganizationCompute";
 import { OrganizationDiagnostics } from "./OrganizationDiagnostics";
@@ -26,7 +27,8 @@ const ROLE: Record<string, string> = { owner: "an owner", admin: "an administrat
  * changes everywhere.
  *
  * Agent logins and work status (#441) belong to each organization and are
- * changed here for any one the person belongs to, whichever is active. The
+ * changed here for any one the person belongs to, whichever is active, and
+ * so is the person's own model access there (PRO-18). The
  * other sections still act on the active organization only (the service
  * keeps them there), so another organization's page offers to make it the
  * active one for them.
@@ -57,6 +59,7 @@ export function OrganizationSettings({ organization, onBack }: { organization: O
   };
 
   const logins = <OrganizationAgentLogins key={organization.id} contextRevision={contextRevision} organizationId={organization.id} organizationName={name} />;
+  const routes = <OrganizationAgentRoutes key={`routes-${organization.id}`} contextRevision={contextRevision} organizationId={organization.id} organizationName={name} />;
   const workStatus = <OrganizationWorkStatusSettings key={organization.id} organization={organization} />;
 
   return (
@@ -78,6 +81,7 @@ export function OrganizationSettings({ organization, onBack }: { organization: O
           <OrganizationMembers accountEmail={accountEmail} contextRevision={contextRevision} />
           <OrganizationCompute contextRevision={contextRevision} />
           {logins}
+          {routes}
           <OrganizationGithubApp contextRevision={contextRevision} />
           {workStatus}
           <OrganizationWorkspaceConfig contextRevision={contextRevision} />
@@ -88,12 +92,13 @@ export function OrganizationSettings({ organization, onBack }: { organization: O
       ) : (
         <>
           {logins}
+          {routes}
           {workStatus}
           <div className="rounded-lg border border-hairline p-3" data-testid="organization-settings-inactive">
             <div className="text-sm font-medium">Other settings of {name}</div>
             <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
               Members, compute, GitHub, workspace settings, environment, diagnostics and teardown of {name} are changed while it is your {activeLabel}.
-              Its agent logins{managesWorkStatus(organization) ? " and work status" : ""} above are changed as it is.
+              Its agent logins{managesWorkStatus(organization) ? " and work status" : ""} above are changed as it is. So is your own model access in it.
             </p>
             <Button className="mt-2" size="sm" variant="outline" disabled={switching || !contextRevision} onClick={() => void makeActive()}>
               {switching && <Loader2 className="animate-spin" />}

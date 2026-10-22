@@ -41,6 +41,8 @@ const CODES: Record<string, string> = {
   cloud_workspace_share_redundant: "This person already has access as owner, admin or creator.",
   // The server refuses a driver while a managers-only agent login could reach the workspace.
   cloud_workspace_share_credential_restricted: "Can send is not available here while the organization has an agent login that only owners and admins may use. Share as view only, or an admin can share that login with the whole organization first.",
+  // PRO-18: the creator stores their own model credential, which reaches only workspaces nobody else can drive.
+  cloud_workspace_share_personal_route: "This workspace was handed its creator's own model credential since it last started, so it can't be opened to the organization or shared with Can send yet. Share as view only, or the creator switches that agent to the organization login or a helper and then stops and resumes the workspace.",
   cloud_workspace_share_requires_organization_access: "Make the workspace visible to the organization first.",
   cloud_workspace_share_limit: "This workspace is already shared with the maximum number of people (64). Remove someone first.",
   cloud_workspace_share_forbidden: "Only organization admins and the workspace's creator can change who it is shared with.",

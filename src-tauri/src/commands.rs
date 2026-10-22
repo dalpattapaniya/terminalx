@@ -1210,6 +1210,92 @@ pub async fn cloud_agent_login_remove(
     cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.remove_agent_login(provider, context_revision, org_id.as_deref()))
 }
 
+// ------------------------------------------- personal model routes (PRO-18)
+
+/// The caller's own model routes in an organization, with the template
+/// catalog the service offers.
+#[tauri::command]
+pub async fn cloud_agent_routes(
+    state: tauri::State<'_, crate::AppState>,
+    org_id: Option<String>,
+) -> Result<serde_json::Value, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Read, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.agent_routes(org_id.as_deref()))
+}
+
+/// Save one of the caller's routes. In order: the request is checked
+/// against the account, organization and catalog the page knew; only then
+/// is a credential asked for, in a native secure dialog, and checked from
+/// this Mac; it is saved when the check passed, could not reach the
+/// endpoint's model list, or the member chose to save anyway.
+#[tauri::command]
+pub async fn cloud_agent_route_save(
+    app: AppHandle,
+    save: crate::cloud_workspaces::AgentRouteSave,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<crate::cloud_workspaces::AgentRouteSaved, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    use crate::cloud_workspaces::{AgentRouteSaved, CloudWorkspaceClientError, RequestRisk};
+    static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = GUARD.try_lock().map_err(|_| CloudWorkspaceClientError::local("cloud_provider_operation_in_progress", true))?;
+    let save = std::sync::Arc::new(save);
+    let service = state.cloud_workspaces.clone();
+    let prepared = save.clone();
+    let change = tauri::async_runtime::spawn_blocking(move || service.prepare_route_change(&prepared))
+        .await
+        .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Read))??;
+    let change = std::sync::Arc::new(change);
+    let mut check = None;
+    let credential = if save.enter_credential {
+        let organization = dialog_name(state.account.organization_name(&change.organization_id), &change.organization_id);
+        let agent = save.agent.label();
+        let host = change.host().map(|host| dialog_text(&host)).unwrap_or_else(|| "your endpoint".into());
+        let title = format!("{agent} endpoint credential");
+        let text = format!(
+            "Enter the credential for {host} ({}). It is checked from this Mac, then sent to the account service, which encrypts it and hands it only to the cloud workspaces you create in organization {organization}, never to other members. It is not shown again.",
+            dialog_text(&change.template.label)
+        );
+        let unavailable = || CloudWorkspaceClientError::local("cloud_provider_secure_input_unavailable", false);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        app.run_on_main_thread(move || {
+            let _ = sender.send(secure_prompt(&title, &text, "Credential"));
+        })
+        .map_err(|_| unavailable())?;
+        let entered = tauri::async_runtime::spawn_blocking(move || receiver.recv()).await.map_err(|_| unavailable())?.map_err(|_| unavailable())?;
+        let credential = entered.map_err(ProviderPromptError::client_error)?;
+        let checking = change.clone();
+        let (credential, checked) = tauri::async_runtime::spawn_blocking(move || {
+            let checked = checking.check(&credential);
+            (credential, checked)
+        })
+        .await
+        .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Read))?;
+        // Unverified is an endpoint without a model list: the workspace's own check decides.
+        let blocks = checked.outcome == "failed" && !save.save_unchecked;
+        check = Some(checked);
+        if blocks {
+            return Ok(AgentRouteSaved { saved: false, check, routes: None });
+        }
+        Some(credential)
+    } else {
+        None
+    };
+    let service = state.cloud_workspaces.clone();
+    let routes = tauri::async_runtime::spawn_blocking(move || service.save_route(&change, &save, credential))
+        .await
+        .map_err(|_| CloudWorkspaceClientError::task_failed(RequestRisk::Mutation))??;
+    Ok(AgentRouteSaved { saved: true, check, routes: Some(routes) })
+}
+
+/// Switch an agent back to the organization's login.
+#[tauri::command]
+pub async fn cloud_agent_route_remove(
+    agent: crate::cloud_workspaces::AgentRouteAgent,
+    context_revision: String,
+    org_id: Option<String>,
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<serde_json::Value, crate::cloud_workspaces::CloudWorkspaceClientError> {
+    cloud_command!(state, crate::cloud_workspaces::RequestRisk::Mutation, move |service: std::sync::Arc<crate::cloud_workspaces::CloudWorkspaceService>| service.remove_agent_route(org_id.as_deref(), &context_revision, agent))
+}
+
 #[tauri::command]
 pub async fn cloud_provider_disconnect(
     provider: crate::cloud_workspaces::CloudWorkspaceProviderId,

@@ -322,10 +322,22 @@ const SIGN_IN_STATES: Record<string, string> = {
   unavailable: "is not available",
 };
 
+/** Why a creator's own route (PRO-18) gives this tab's agent nothing: never replaced by the organization's login. */
+const ROUTE_REASONS: Record<string, string> = {
+  "route-shared-workspace":
+    "its route's stored credential is personal and is never sent to a workspace others can drive. The workspace's creator can switch it to a credential helper or back to the organization login",
+  "route-runtime-unsupported": "this workspace's TerminalX is too old for its route. Restart the workspace to update it",
+  "route-template-unsupported": "this workspace's TerminalX does not apply its route's endpoint type. Restart the workspace to update it, or set the route up again",
+  "route-unavailable": "its route's stored credential could not be read. Its creator can enter it again",
+  "route-creator-left": "its route belongs to someone who is no longer a member",
+};
+
 export function signInMessage(info: Pick<AgentTabInfo, "harness" | "signIn">, mayManage: boolean | null): string | null {
   const signIn = info.signIn;
   if (!signIn) return null;
   const agent = cloudAgentLabel(info.harness);
+  const route = signIn.reason ? ROUTE_REASONS[signIn.reason] : undefined;
+  if (route) return `Needs sign-in: ${agent} uses its own route in this workspace, and ${route} (Settings → Organizations → Your model access).`;
   const what =
     signIn.reason === "token-expired"
       ? `The organization's ${agent} login has expired`
