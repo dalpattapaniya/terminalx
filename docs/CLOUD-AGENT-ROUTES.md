@@ -179,10 +179,17 @@ Claude Code endpoint did not list the model … It lists …").
   login and never receive the route.
 - **A stored credential only where nobody else drives.** It is delivered only
   to private workspaces with no driver shares (`route-shared-workspace`
-  otherwise, never a fallback). While a member stores one, their workspaces
+  otherwise, never a fallback), and the server records which runtime
+  generation it was handed to. A workspace whose current runtime received one
   cannot be opened to the organization or shared with Can send
   (`cloud_workspace_share_personal_route`): stopping delivery would not take
-  back what a running agent already holds. A helper route carries no
+  back what a running agent already holds. Switching back does not lift
+  that; a restart (stop and resume, a new runtime generation) does. A
+  workspace that never received one is not restricted, and from the moment
+  it is shared the credential is withheld there. The create and schedule
+  checks judge the same way (the workspace creator's route, and whether the
+  workspace is shared), so a schedule or a shared create never starts a
+  machine for an agent that would get nothing. A helper route carries no
   credential and is delivered to shared workspaces too: everyone who drives
   such a workspace runs through the creator's helper and gets what it prints.
   The page says so, so a member does not point a helper at a credential only

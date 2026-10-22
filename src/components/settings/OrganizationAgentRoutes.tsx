@@ -194,8 +194,8 @@ export function OrganizationAgentRoutes({
                       )}
                       {route.mode === "custom-endpoint" && (
                         <div className="text-muted-foreground">
-                          Your stored credential reaches only workspaces you create that nobody else can drive. While it is stored, those workspaces can't be
-                          opened to the organization or shared with Can send.
+                          Your stored credential reaches only workspaces you create that nobody else can drive. A workspace that received it can't be
+                          opened to the organization or shared with Can send until it restarts.
                         </div>
                       )}
                     </>
@@ -227,7 +227,8 @@ export function OrganizationAgentRoutes({
                     <div className="mt-2 space-y-1.5 rounded-md border border-hairline bg-background p-2" data-testid="agent-route-confirm-remove">
                       <p>
                         Switch {name} back to {organization}'s login? Your route{route.credentialStored ? " and its stored credential are" : " is"} deleted.
-                        New sessions in your workspaces use the organization's login; running sessions keep what they started with until restarted.
+                        New sessions in your workspaces use the organization's login; running sessions keep what they started with until restarted
+                        {route.credentialStored ? ", and a workspace that received the credential stays unshareable until it restarts" : ""}.
                       </p>
                       <div className="flex gap-1.5">
                         <Button size="xs" disabled={busy} onClick={() => void remove(agent as AgentRouteAgent)}>
