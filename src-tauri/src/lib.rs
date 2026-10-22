@@ -28,6 +28,7 @@ mod cloud_resources;
 mod cloud_environment;
 pub mod cloud_agents;
 mod cloud_github;
+mod agent_route_check;
 mod cloud_config;
 mod cloud_grants;
 #[cfg(feature = "desktop")]
@@ -428,6 +429,9 @@ pub fn run() {
             commands::cloud_agent_logins,
             commands::cloud_agent_login_connect,
             commands::cloud_agent_login_remove,
+            commands::cloud_agent_routes,
+            commands::cloud_agent_route_save,
+            commands::cloud_agent_route_remove,
             commands::cloud_agent_claude_login_start,
             commands::cloud_agent_claude_login_open,
             commands::cloud_agent_claude_login_complete,

@@ -2420,9 +2420,16 @@ impl SessionManager {
         // this tab (#202).
         env.push((crate::hooks::SOCKET_ENV.to_string(), self.control.socket.to_string_lossy().into_owned()));
         env.push((crate::hooks::TOKEN_ENV.to_string(), token.clone()));
+        // The workspace creator's own route for this agent (PRO-18), in a
+        // cloud workspace that runs one: its model and what its CLI takes on
+        // the command line. The tab is told what keeps it from working.
+        let route = crate::cloud_grants::route_launch(&tab.harness, Path::new(&entry.cwd));
+        if let Some(text) = route.as_ref().and_then(|route| route.notice.clone()) {
+            self.publish(rt, Payload::Status { text }, None);
+        }
         let launch = match kind {
-            CliKind::Claude => self.claude_launch(entry, tab, &exe)?,
-            CliKind::Codex => self.codex_launch(rt, entry, tab, &exe, &mut env)?,
+            CliKind::Claude => self.claude_launch(entry, tab, &exe, route.as_ref())?,
+            CliKind::Codex => self.codex_launch(rt, entry, tab, &exe, &mut env, route.as_ref())?,
         };
         // The reader has been told about a substitution already.
         let launched_for = launched_for.map(|asked| Settings { model: launch.model.clone().unwrap_or(asked.model), ..asked });
@@ -2496,16 +2503,24 @@ impl SessionManager {
 
     /// Claude Code: the app mints the conversation id, so the transcript's
     /// path is known before the CLI has written a byte.
-    fn claude_launch(&self, entry: &index::SessionEntry, tab: &TabEntry, exe: &Path) -> Result<CliLaunch> {
+    fn claude_launch(&self, entry: &index::SessionEntry, tab: &TabEntry, exe: &Path, route: Option<&crate::cloud_grants::RouteLaunch>) -> Result<CliLaunch> {
         let provider_id = tab.provider_session_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let resume = tab.provider_session_id.is_some();
         let fork_from = if resume { None } else { tab.fork_from.clone() };
-        let settings = claude::pty::settings_json(exe);
+        let mut settings = claude::pty::settings_json(exe);
+        // A user-managed route's credential helper, for this session only:
+        // `--settings` sits above the user's and the checkout's files.
+        if let Some(helper) = route.and_then(|route| route.api_key_helper.clone()) {
+            settings["apiKeyHelper"] = serde_json::Value::String(helper);
+        }
+        // A route that names its model runs on it: the endpoint may serve no
+        // model of the tab's name.
+        let route_model = route.and_then(|route| route.model.clone());
         let command = claude::pty::launch_command(claude::pty::LaunchOptions {
             provider_session_id: &provider_id,
             resume,
             fork_from: fork_from.as_deref(),
-            model: &tab.model,
+            model: route_model.as_deref().unwrap_or(&tab.model),
             effort: tab.effort.as_deref(),
             permission_mode: &tab.permission_mode,
             title: tab.title.as_deref(),
@@ -2543,7 +2558,7 @@ impl SessionManager {
         let carried = fork_from.as_deref().and_then(|parent| claude::transcript::record_uuids(&entry.cwd, parent)).unwrap_or_default();
         Ok(CliLaunch {
             command,
-            model: None,
+            model: route_model.filter(|model| *model != tab.model),
             tail: tui::Tail::opening(path, claude::transcript::decode_line, carried).marking(claude::transcript::decode_marked),
             minted: (!resume).then_some(provider_id),
             transcript_root,
@@ -2555,11 +2570,25 @@ impl SessionManager {
     /// after it, so a new tab has nothing to follow until its `SessionStart`
     /// hook says which file it opened. A tab that already holds an id follows
     /// that rollout from wherever it stands.
-    fn codex_launch(&self, rt: &mut TabRuntime, entry: &index::SessionEntry, tab: &TabEntry, exe: &Path, env: &mut Vec<(String, String)>) -> Result<CliLaunch> {
+    fn codex_launch(
+        &self,
+        rt: &mut TabRuntime,
+        entry: &index::SessionEntry,
+        tab: &TabEntry,
+        exe: &Path,
+        env: &mut Vec<(String, String)>,
+        route: Option<&crate::cloud_grants::RouteLaunch>,
+    ) -> Result<CliLaunch> {
+        // A route's provider serves the model the route names (PRO-18), not
+        // the account's list, so neither the tab's model nor a substitute
+        // from that list is sent to it.
+        let route_model = route.and_then(|route| route.model.clone());
         // A tab stored before the account's list was known can name a model
         // this account cannot run; sending it would fail the turn with a 400.
-        let model = match self.codex_models.substitute_for(&tab.model) {
-            Some(sub) => {
+        let substitute = if route_model.is_some() { None } else { self.codex_models.substitute_for(&tab.model) };
+        let model = match (route_model, substitute) {
+            (Some(model), _) => model,
+            (None, Some(sub)) => {
                 let text = format!("{} is not available on this account; using {}.", tab.model, sub.label);
                 self.publish(rt, Payload::Status { text }, None);
                 if let Err(error) = self.update_settings(rt, |s| s.model = sub.id.clone()) {
@@ -2567,7 +2596,7 @@ impl SessionManager {
                 }
                 sub.id
             }
-            None => tab.model.clone(),
+            (None, None) => tab.model.clone(),
         };
 
         let codex::home::Prepared { home, hooks_live } = codex::home::prepare(&entry.cwd, exe).context("prepare the Codex home")?;
@@ -2605,6 +2634,8 @@ impl SessionManager {
             permission_mode: &tab.permission_mode,
         })
         .ok_or_else(|| anyhow!("Codex is not installed. Install it and log in, then try again."))?;
+        // The route's model provider, as user-level overrides.
+        let command = format!("{command}{}", route.map(|route| route.codex_args.as_str()).unwrap_or_default());
         Ok(CliLaunch {
             command,
             model: (model != tab.model).then_some(model),

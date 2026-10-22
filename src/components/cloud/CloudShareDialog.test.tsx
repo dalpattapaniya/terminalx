@@ -210,6 +210,8 @@ describe("share dialog", () => {
     await waitFor(() => expect(within(screen.getByLabelText("Add person")).queryByText(/Erin/)).toBeTruthy());
     expect(within(screen.getByLabelText("Add person")).queryByText(/Bob/)).toBeNull();
     expect(shareErrorMessage({ code: "cloud_workspace_share_credential_restricted" })).toMatch(/agent login that only owners and admins may use/);
+    // A creator's personal route credential (PRO-18) keeps the workspace theirs alone, for sharing and for organization access.
+    expect(shareErrorMessage({ code: "cloud_workspace_share_personal_route" })).toMatch(/creator stores their own model credential.*can't be opened to the organization or shared with Can send/);
   });
 
   it("tells the organization's owner they are the Owner, and an admin that they are an Admin", async () => {

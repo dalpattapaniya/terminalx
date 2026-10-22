@@ -3187,7 +3187,16 @@ fn known_error_code(code: &str) -> bool {
             | "cloud_workspace_share_limit"
             | "cloud_workspace_share_forbidden"
             | "cloud_workspace_share_credential_restricted"
+            | "cloud_workspace_share_personal_route"
             | "cloud_workspace_collaboration_forbidden"
+            | "cloud_agent_route_invalid"
+            | "cloud_agent_route_template_unknown"
+            | "cloud_agent_route_base_url_invalid"
+            | "cloud_agent_route_model_invalid"
+            | "cloud_agent_route_helper_invalid"
+            | "cloud_agent_route_credential_invalid"
+            | "cloud_agent_route_credential_required"
+            | "cloud_agent_route_conflict"
     )
 }
 
@@ -3448,6 +3457,9 @@ fn ensure_list(
     }
     Ok(value)
 }
+
+mod agent_model_routes;
+pub use agent_model_routes::{AgentRouteAgent, AgentRouteSave, AgentRouteSaved};
 
 #[cfg(test)]
 mod tests {
@@ -4013,6 +4025,87 @@ mod tests {
             assert_eq!(call(&service, "old-context".into()).unwrap().code, "account_context_changed");
             assert!(!request.join().unwrap().extra_request);
         }
+    }
+
+    // ---- personal model routes (PRO-18)
+
+    const ROUTES: &str = r#"{"catalogVersion":1,"agents":["claude","codex","cursor"],"templates":[{"id":"claude-gateway","version":1,"provider":"claude","mode":"custom-endpoint","label":"LLM gateway","capabilities":{"modelList":"anthropic"}},{"id":"claude-key-helper","version":1,"provider":"claude","mode":"user-managed","label":"Helper","capabilities":{"modelList":"anthropic"}}],"routes":[]}"#;
+
+    fn route_save(revision: &str, template: &str, settings: Value, enter_credential: bool) -> AgentRouteSave {
+        AgentRouteSave {
+            organization_id: None,
+            context_revision: revision.into(),
+            agent: AgentRouteAgent::Claude,
+            template_id: template.into(),
+            settings: settings.as_object().unwrap().clone(),
+            expected_version: 0,
+            enter_credential,
+            save_unchecked: false,
+        }
+    }
+
+    #[test]
+    fn a_route_is_saved_with_its_credential_sent_once_and_never_returned() {
+        let revision = AccountManager::context_revision(&context());
+        let (base, requests) = serve_each(vec![response("200 OK", ROUTES, ""), response("200 OK", ROUTES, "")]);
+        let (_, service) = test_service(&base);
+        let save = route_save(&revision, "claude-gateway", json!({ "baseUrl": " https://llm.example.com ", "authScheme": "bearer", "model": "" }), true);
+        let change = service.prepare_route_change(&save).unwrap();
+        assert_eq!(change.host().as_deref(), Some("llm.example.com"));
+        let routes = service.save_route(&change, &save, Some(zeroize::Zeroizing::new("sk-gw-native-1".into()))).unwrap();
+        let requests = requests.join().unwrap();
+        assert!(requests[0].starts_with("GET /v1/desktop/orgs/org-1/agent-model-routes "), "{}", requests[0]);
+        assert!(requests[1].starts_with("PUT /v1/desktop/orgs/org-1/agent-model-routes/claude "), "{}", requests[1]);
+        let body: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, json!({ "templateId": "claude-gateway", "settings": { "baseUrl": "https://llm.example.com", "authScheme": "bearer" }, "expectedVersion": 0, "credential": "sk-gw-native-1" }));
+        assert!(!routes.to_string().contains("sk-gw-native-1"));
+    }
+
+    #[test]
+    fn a_route_change_without_a_credential_keeps_the_stored_one_and_sends_none() {
+        let revision = AccountManager::context_revision(&context());
+        let (base, requests) = serve_each(vec![response("200 OK", ROUTES, ""), response("200 OK", ROUTES, "")]);
+        let (_, service) = test_service(&base);
+        let save = route_save(&revision, "claude-key-helper", json!({ "helperPath": "./scripts/llm-key" }), false);
+        let change = service.prepare_route_change(&save).unwrap();
+        service.save_route(&change, &save, None).unwrap();
+        let requests = requests.join().unwrap();
+        let body: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, json!({ "templateId": "claude-key-helper", "settings": { "helperPath": "./scripts/llm-key" }, "expectedVersion": 0 }));
+    }
+
+    #[test]
+    fn a_route_change_is_refused_before_anything_is_asked_for() {
+        let revision = AccountManager::context_revision(&context());
+        // Nothing is sent for a stale page or settings that are not a template's fields.
+        let (_, service) = test_service("http://127.0.0.1:9");
+        assert_eq!(service.prepare_route_change(&route_save("stale", "claude-gateway", json!({}), true)).err().unwrap().code, "account_context_changed");
+        assert_eq!(service.prepare_route_change(&route_save(&revision, "claude-gateway", json!({ "credential": "sk-x" }), true)).err().unwrap().code, "cloud_agent_route_invalid");
+        assert_eq!(service.prepare_route_change(&route_save(&revision, "../x", json!({}), true)).err().unwrap().code, "cloud_agent_route_template_unknown");
+        // A template the service does not offer for the agent, and a credential for a helper.
+        for (template, enter, code) in [("codex-provider", true, "cloud_agent_route_template_unknown"), ("claude-key-helper", true, "cloud_agent_route_invalid")] {
+            let (base, request) = serve_each(vec![response("200 OK", ROUTES, "")]);
+            let (_, service) = test_service(&base);
+            assert_eq!(service.prepare_route_change(&route_save(&revision, template, json!({}), enter)).err().unwrap().code, code);
+            request.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn route_refusals_keep_their_codes_and_switching_back_deletes_the_route() {
+        let revision = AccountManager::context_revision(&context());
+        for code in ["cloud_agent_route_conflict", "cloud_agent_route_credential_required", "cloud_agent_route_base_url_invalid"] {
+            let (base, requests) = serve_each(vec![response("200 OK", ROUTES, ""), response("422 Unprocessable Entity", &json!({ "error": code }).to_string(), "")]);
+            let (_, service) = test_service(&base);
+            let save = route_save(&revision, "claude-gateway", json!({ "baseUrl": "https://llm.example.com", "authScheme": "bearer" }), false);
+            let change = service.prepare_route_change(&save).unwrap();
+            assert_eq!(service.save_route(&change, &save, None).unwrap_err().code, code);
+            requests.join().unwrap();
+        }
+        let (base, requests) = serve_each(vec![response("200 OK", ROUTES, "")]);
+        let (_, service) = test_service(&base);
+        service.remove_agent_route(None, &revision, AgentRouteAgent::Codex).unwrap();
+        assert!(requests.join().unwrap()[0].starts_with("DELETE /v1/desktop/orgs/org-1/agent-model-routes/codex "));
     }
 
     // ---- agent logins (PRO-79)
@@ -5657,6 +5750,7 @@ mod tests {
             ("429 Too Many Requests", "cloud_workspace_share_limit"),
             ("403 Forbidden", "cloud_workspace_share_forbidden"),
             ("409 Conflict", "cloud_workspace_share_credential_restricted"),
+            ("409 Conflict", "cloud_workspace_share_personal_route"),
             ("404 Not Found", "organization_member_not_found"),
             ("404 Not Found", "cloud_workspace_share_not_found"),
         ] {

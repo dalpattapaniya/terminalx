@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Cloud workspaces
+
+- Your own model access: in Settings → Organizations, each organization's
+  page has **Your model access**, where any member can route Claude Code or
+  Codex in the cloud workspaces they create through their own LLM gateway or
+  model provider (with a credential they store) or through a credential
+  helper they manage in the workspace, instead of the organization's login.
+  Only what each CLI supports is offered, from the account service's
+  versioned template catalog; the credential is entered in a native secure
+  dialog, checked from this Mac against the endpoint's model list and never
+  shown again. The workspace checks the route too: a helper route is labeled
+  user managed until that check passes, a model the endpoint does not list
+  is called out with the models it does, and the organization's login is
+  never injected beside a route. A stored credential reaches only the
+  member's own workspaces that nobody else drives, so those can't be shared
+  with Can send while it is stored. **Switch back to the organization
+  login** removes the route. Cursor's CLI supports neither, so it always uses
+  the organization's login. Needs the account service's agent model routes
+  (terminalx-saas, PRO-18). (PRO-18)
+
 ## 0.2.16
 
 ### Issues

@@ -443,6 +443,18 @@ describe("cloud agent tabs", () => {
     expect(unknown).not.toContain("quarantined");
   });
 
+  it("says why a creator's own route gives the agent nothing, without sending anyone to the organization's logins (PRO-18)", () => {
+    const info = (reason: string) => ({ harness: "claude", signIn: { provider: "claude", state: "unavailable", reason } });
+    const shared = signInMessage(info("route-shared-workspace"), true)!;
+    expect(shared).toBe(
+      "Needs sign-in: Claude Code uses its own route in this workspace, and its route's stored credential is personal and is never sent to a workspace others can drive. The workspace's creator can switch it to a credential helper or back to the organization login (Settings → Organizations → Your model access).",
+    );
+    expect(shared).not.toContain("Agent logins");
+    expect(signInMessage(info("route-runtime-unsupported"), false)).toContain("too old for its route");
+    expect(signInMessage(info("route-template-unsupported"), false)).toContain("does not apply its route's endpoint type");
+    expect(signInMessage(info("route-unavailable"), false)).toContain("could not be read");
+  });
+
   it("wakes a sleeping workspace only after an interactive command, and reports the wake", async () => {
     cache["t-1"] = { tab: tabInfo(), events: [], cursor: null, checkpoint: null, unread: false, completed: false, updatedAt: 1 };
     const wake = vi.fn();

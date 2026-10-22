@@ -75,6 +75,24 @@
 //! sessions started with the old one keep it and are counted in
 //! [`status_json`] as needing a restart. The count follows PTY tabs exactly
 //! and ACP (Cursor) tabs until they are relaunched.
+//!
+//! **Personal routes** (PRO-18). A workspace creator may route an agent
+//! through their own endpoint (a gateway or model provider with a
+//! credential they stored) or through a credential helper they manage in
+//! the workspace, instead of the organization's login. The server then sends
+//! that route as the provider's only grant (`mode: route`), never the
+//! organization's login beside it, and this runtime says it can apply one
+//! (`agent-routes-v1` on the fetch). A route sets the CLI's endpoint
+//! variables, unsets every other credential variable so nothing
+//! app-managed can override it, and adds what the CLI takes on its command
+//! line ([`route_launch`]: Claude Code's `apiKeyHelper` in `--settings`,
+//! Codex's `model_providers` overrides, the route's model). A template
+//! version this runtime does not know is never guessed at: the agent then
+//! gets no credential and its tab says why. Each route version is checked
+//! from the workspace (`agent_route_check`): its model list read with the
+//! credential, or the helper run and its credential tried, and the outcome
+//! reported to the server (codes and model ids only), which is what labels
+//! a route working in Settings.
 
 use std::collections::HashMap;
 use std::fs;
@@ -107,6 +125,11 @@ const CODEX_AUTH_FILE: &str = "auth.json";
 
 const ENROLL_PATH: &str = "/v1/cloud-workspace-bootstrap/agent-grant-key";
 const FETCH_PATH: &str = "/v1/cloud-workspace-bootstrap/agent-grants";
+const ROUTE_CHECK_PATH: &str = "/v1/cloud-workspace-bootstrap/agent-route-check";
+const CAPABILITIES_HEADER: &str = "x-terminalx-cloud-workspace-runtime-capabilities";
+/// Said on every fetch: this runtime applies personal routes (PRO-18).
+pub const ROUTES_CAPABILITY: &str = "agent-routes-v1";
+const ROUTE_STALE: &str = "cloud_agent_route_stale";
 const KEY_CONFLICT: &str = "cloud_agent_grant_key_conflict";
 const KEY_REQUIRED: &str = "cloud_agent_grant_key_required";
 
@@ -137,6 +160,21 @@ const CLAUDE_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 const CLAUDE_OAUTH_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const CODEX_API_KEY_ENV: &str = "CODEX_API_KEY";
 const CURSOR_API_KEY_ENV: &str = "CURSOR_API_KEY";
+const CLAUDE_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+const CLAUDE_GATEWAY_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+/// Where a Codex route's provider key travels (its `env_key`).
+const CODEX_ROUTE_KEY_ENV: &str = "TERMINALX_CODEX_ROUTE_KEY";
+/// The Codex model provider a route defines; not one of Codex's reserved ids.
+const CODEX_ROUTE_PROVIDER: &str = "terminalx";
+/// Claude Code's own endpoint, where a helper's credential goes when the
+/// route names none.
+const CLAUDE_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+/// How long a Codex auth command may take, and how often Codex runs it.
+const CODEX_AUTH_TIMEOUT_MS: i64 = 15_000;
+const CODEX_AUTH_REFRESH_MS: i64 = 300_000;
+/// A failed or unverified route check is tried again after this.
+const ROUTE_RECHECK_AFTER: Duration = Duration::from_secs(5 * 60);
 
 // ------------------------------------------------------------------ the wire
 
@@ -162,6 +200,15 @@ impl Provider {
             "codex" => Some(Self::Codex),
             "cursor" => Some(Self::Cursor),
             _ => None,
+        }
+    }
+
+    /// The agent's name, as the app shows it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
         }
     }
 
@@ -239,9 +286,13 @@ pub struct CredentialEntry {
     #[serde(default)]
     pub rotation: Option<String>,
     /// Why a credential is not connected (`shared-use-policy`,
-    /// `token-expired`), when the server says.
+    /// `token-expired`, or a `route-*` reason for a personal route the
+    /// server withholds), when the server says.
     #[serde(default)]
     pub reason: Option<String>,
+    /// `route` for the creator's personal route (PRO-18).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +340,11 @@ impl std::fmt::Display for GrantCallError {
 pub trait GrantApi {
     fn enroll(&self, grant_public_key_b64: &str) -> Result<Enrolled, GrantCallError>;
     fn fetch(&self, key_thumbprint: &str) -> Result<Fetched, GrantCallError>;
+    /// Report a route check (PRO-18): codes and model ids only. A server
+    /// without the route sends nothing to check.
+    fn report_route_check(&self, _report: &Value) -> Result<(), GrantCallError> {
+        Ok(())
+    }
 }
 
 /// The API over HTTP, authenticated with the bootstrap session's current
@@ -321,13 +377,16 @@ impl HttpGrantApi {
             .post(&format!("{}{path}", self.origin))
             .set("authorization", &bearer)
             .set("content-type", "application/json")
-            .set(crate::cloud_bootstrap::VERSION_HEADER, crate::cloud_bootstrap::VERSION);
+            .set(crate::cloud_bootstrap::VERSION_HEADER, crate::cloud_bootstrap::VERSION)
+            // A server from before routes ignores it.
+            .set(CAPABILITIES_HEADER, ROUTES_CAPABILITY);
         match request.send_json(body) {
             Ok(response) => response.into_json::<T>().map_err(|error| GrantCallError::Transient(anyhow!("{path}: unreadable response: {error}"))),
             Err(ureq::Error::Status(401, _)) => Err(GrantCallError::Rejected),
             Err(ureq::Error::Status(409, response)) => match response.into_json::<ErrorBody>().map(|body| body.error) {
                 Ok(code) if code == KEY_CONFLICT => Err(GrantCallError::KeyConflict),
                 Ok(code) if code == KEY_REQUIRED => Err(GrantCallError::KeyRequired),
+                Ok(code) if code == ROUTE_STALE => Err(GrantCallError::Transient(anyhow!("{path}: the route changed since it was checked"))),
                 _ => Err(GrantCallError::Transient(anyhow!("{path}: HTTP 409"))),
             },
             Err(ureq::Error::Status(status, _)) => Err(GrantCallError::Transient(anyhow!("{path}: HTTP {status}"))),
@@ -343,6 +402,10 @@ impl GrantApi for HttpGrantApi {
 
     fn fetch(&self, key_thumbprint: &str) -> Result<Fetched, GrantCallError> {
         self.post(FETCH_PATH, json!({ "v": 1, "keyThumbprint": key_thumbprint }))
+    }
+
+    fn report_route_check(&self, report: &Value) -> Result<(), GrantCallError> {
+        self.post::<Value>(ROUTE_CHECK_PATH, report.clone()).map(|_| ())
     }
 }
 
@@ -648,6 +711,94 @@ enum Material {
     CodexApiKey(Zeroizing<String>),
     CodexChatgpt { access_token: Zeroizing<String>, id_token: Zeroizing<String>, account_id: Option<String>, expires_at: Option<u64> },
     CursorApiKey(Zeroizing<String>),
+    Route(Route),
+}
+
+/// The templates this runtime applies (terminalx-saas
+/// `agentRouteTemplates.ts`), each by id and version: a template's meaning
+/// never changes under a version, so one this runtime does not list is not
+/// applied at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// `claude-gateway@1`: `ANTHROPIC_BASE_URL` with the stored credential as
+    /// `ANTHROPIC_AUTH_TOKEN` (bearer) or `ANTHROPIC_API_KEY` (x-api-key).
+    ClaudeGateway,
+    /// `claude-key-helper@1`: Claude Code's `apiKeyHelper`, user managed.
+    ClaudeKeyHelper,
+    /// `codex-provider@1`: a `model_providers` entry with `env_key`.
+    CodexProvider,
+    /// `codex-auth-command@1`: a `model_providers` entry with an `auth`
+    /// command, user managed.
+    CodexAuthCommand,
+}
+
+impl RouteKind {
+    fn of(template_id: &str, version: u64) -> Option<Self> {
+        match (template_id, version) {
+            ("claude-gateway", 1) => Some(Self::ClaudeGateway),
+            ("claude-key-helper", 1) => Some(Self::ClaudeKeyHelper),
+            ("codex-provider", 1) => Some(Self::CodexProvider),
+            ("codex-auth-command", 1) => Some(Self::CodexAuthCommand),
+            _ => None,
+        }
+    }
+
+    fn provider(self) -> Provider {
+        match self {
+            Self::ClaudeGateway | Self::ClaudeKeyHelper => Provider::Claude,
+            Self::CodexProvider | Self::CodexAuthCommand => Provider::Codex,
+        }
+    }
+
+    /// The member manages the credential (a helper); the app stores none.
+    fn user_managed(self) -> bool {
+        matches!(self, Self::ClaudeKeyHelper | Self::CodexAuthCommand)
+    }
+}
+
+/// A personal route (PRO-18), as granted. `kind` is None for a template
+/// this runtime does not apply, or settings that do not fit it: such a
+/// route still keeps the organization's login out, and injects nothing.
+struct Route {
+    id: String,
+    /// `<id>@<version>`, for the status and the tab's notice.
+    template: String,
+    kind: Option<RouteKind>,
+    base_url: Option<String>,
+    /// `authScheme: x-api-key` (Claude Code's `ANTHROPIC_API_KEY`), else bearer.
+    api_key_header: bool,
+    model: Option<String>,
+    helper_path: Option<String>,
+    credential: Option<Zeroizing<String>>,
+}
+
+impl Route {
+    /// The kind, when the settings fit it: what a custom endpoint needs is
+    /// there, a helper route carries no credential, every value has the
+    /// shape the server accepts.
+    fn fitting(kind: Option<RouteKind>, route: &Route) -> Option<RouteKind> {
+        let kind = kind?;
+        let shapes = route.base_url.as_deref().is_none_or(crate::agent_route_check::valid_base_url)
+            && route.model.as_deref().is_none_or(crate::agent_route_check::valid_model_id)
+            && route.helper_path.as_deref().is_none_or(crate::agent_route_check::valid_helper_path);
+        let fits = match kind {
+            RouteKind::ClaudeGateway => route.base_url.is_some() && route.credential.is_some() && route.helper_path.is_none(),
+            RouteKind::ClaudeKeyHelper => route.helper_path.is_some() && route.credential.is_none(),
+            RouteKind::CodexProvider => route.base_url.is_some() && route.model.is_some() && route.credential.is_some() && route.helper_path.is_none(),
+            RouteKind::CodexAuthCommand => route.base_url.is_some() && route.model.is_some() && route.helper_path.is_some() && route.credential.is_none(),
+        };
+        (shapes && fits).then_some(kind)
+    }
+
+    /// The helper as an absolute path: `./relative` is from the folder the
+    /// agent starts in.
+    fn helper_in(&self, cwd: &Path) -> Option<PathBuf> {
+        let helper = self.helper_path.as_deref()?;
+        Some(match helper.strip_prefix("./") {
+            Some(relative) => cwd.join(relative),
+            None => PathBuf::from(helper),
+        })
+    }
 }
 
 impl Material {
@@ -656,6 +807,14 @@ impl Material {
             Self::ClaudeApiKey(_) | Self::CodexApiKey(_) | Self::CursorApiKey(_) => "api-key",
             Self::ClaudeOauth { .. } => "oauth-access-token",
             Self::CodexChatgpt { .. } => "chatgpt-tokens",
+            Self::Route(_) => "route",
+        }
+    }
+
+    fn route(&self) -> Option<&Route> {
+        match self {
+            Self::Route(route) => Some(route),
+            _ => None,
         }
     }
 
@@ -685,11 +844,40 @@ struct Plaintext {
     #[serde(default)]
     expires_at: Option<u64>,
     version: u64,
+    /// A personal route (`mode: route`).
+    #[serde(default)]
+    route: Option<RoutePlain>,
+    /// A custom endpoint's stored credential, in a route.
+    #[serde(default)]
+    credential: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutePlain {
+    id: String,
+    template_id: String,
+    template_version: u64,
+    #[serde(default)]
+    settings: RouteSettingsPlain,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RouteSettingsPlain {
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    auth_scheme: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    helper_path: Option<String>,
 }
 
 impl Drop for Plaintext {
     fn drop(&mut self) {
-        for secret in [&mut self.api_key, &mut self.access_token, &mut self.id_token].into_iter().flatten() {
+        for secret in [&mut self.api_key, &mut self.access_token, &mut self.id_token, &mut self.credential].into_iter().flatten() {
             secret.zeroize();
         }
     }
@@ -726,6 +914,27 @@ fn parse_plaintext(bytes: &[u8]) -> Result<Option<(Material, u64, String)>> {
             expires_at: plain.expires_at,
         },
         (Some(Provider::Cursor), "api-key") => Material::CursorApiKey(take(&mut plain.api_key, "apiKey")?),
+        (Some(provider), "route") => {
+            let Some(route) = plain.route.take() else { bail!("the route grant lacks its route") };
+            let credential = plain.credential.take().filter(|credential| !credential.is_empty()).map(Zeroizing::new);
+            let settings = route.settings;
+            let mut parsed = Route {
+                id: route.id,
+                template: format!("{}@{}", route.template_id, route.template_version),
+                kind: None,
+                base_url: settings.base_url,
+                api_key_header: settings.auth_scheme.as_deref() == Some("x-api-key"),
+                model: settings.model,
+                helper_path: settings.helper_path,
+                credential,
+            };
+            let known = RouteKind::of(&route.template_id, route.template_version).filter(|kind| kind.provider() == provider);
+            parsed.kind = Route::fitting(known, &parsed);
+            if parsed.kind.is_none() {
+                log::warn!("not applying {} route template {}: this runtime does not apply it, or its settings do not fit it", provider.as_str(), parsed.template);
+            }
+            Material::Route(parsed)
+        }
         _ => {
             log::warn!("ignoring an agent grant with provider {:?} and mode {:?}", plain.provider, plain.mode);
             return Ok(None);
@@ -812,8 +1021,18 @@ struct State {
     highest_epoch: HashMap<String, u64>,
     /// Running sessions and the credential each was launched with.
     launches: HashMap<String, (Provider, (String, u64, u64))>,
+    /// The newest check of each personal route, by route id (PRO-18).
+    route_checks: HashMap<String, RouteCheck>,
     last_sync: Option<u64>,
     last_error: Option<String>,
+}
+
+/// A route version's newest check from this workspace; `checked` is None
+/// while one is running.
+struct RouteCheck {
+    version: u64,
+    at: Instant,
+    checked: Option<crate::agent_route_check::Checked>,
 }
 
 /// The runtime's grants, for one workspace.
@@ -1215,6 +1434,7 @@ impl GrantStore {
             Material::CodexChatgpt { .. } => Vec::new(),
             Material::CursorApiKey(key) => vec![set(CURSOR_API_KEY_ENV, key)],
             Material::CodexApiKey(_) => Vec::new(),
+            Material::Route(route) => route_env(provider, route),
         }
     }
 
@@ -1254,8 +1474,14 @@ impl GrantStore {
         if state.last_sync.is_none() || state.last_error.is_some() {
             return None;
         }
-        if state.active.get(&provider).is_some_and(|grant| grant.usable(now)) {
-            return None;
+        if let Some(grant) = state.active.get(&provider).filter(|grant| grant.usable(now)) {
+            // A route this runtime cannot apply gives the agent nothing.
+            return match grant.material.route() {
+                Some(route) if route.kind.is_none() => {
+                    Some(SignInRequired { provider: provider.as_str(), state: "unavailable".into(), reason: Some("route-template-unsupported".into()) })
+                }
+                _ => None,
+            };
         }
         if provider.auth_env().iter().any(|name| configured.iter().any(|set| set == name)) {
             return None;
@@ -1301,6 +1527,15 @@ impl GrantStore {
                     "epoch": entry.map(|entry| entry.epoch),
                     "reason": entry.and_then(|entry| entry.reason.clone()),
                     "mode": grant.map(|grant| grant.material.mode()),
+                    "route": grant.and_then(|grant| grant.material.route()).map(|route| {
+                        let check = state.route_checks.get(&route.id).filter(|check| Some(check.version) == current.as_ref().map(|current| current.1));
+                        json!({
+                            "template": route.template,
+                            "applied": route.kind.is_some(),
+                            "userManaged": route.kind.is_some_and(RouteKind::user_managed),
+                            "check": check.and_then(|check| check.checked.as_ref()).map(|checked| json!({ "outcome": checked.outcome, "code": checked.code })),
+                        })
+                    }),
                     "grantId": grant.map(|grant| grant.grant_id.clone()),
                     "grantExpiresAt": grant.map(|grant| grant.expires_at),
                     "injecting": grant.is_some_and(|grant| grant.usable(now)),
@@ -1330,6 +1565,319 @@ impl Drop for GrantStore {
         }
     }
 }
+
+// --------------------------------------------------------- personal routes
+
+/// Claude Code's provider switches: any of them would send its requests
+/// somewhere other than the route's endpoint.
+const CLAUDE_PROVIDER_SWITCHES: [&str; 3] = ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+
+/// The environment a route gives a new agent process: its endpoint and
+/// credential, with every other variable that could sign the agent in (or
+/// send it elsewhere) unset, so nothing app-managed, configured or left in a
+/// profile overrides what the member chose. A route this runtime does not
+/// apply sets nothing and still unsets them.
+fn route_env(provider: Provider, route: &Route) -> Vec<(String, Option<String>)> {
+    let set = |name: &str, value: &str| (name.to_string(), Some(value.to_string()));
+    let unset = |name: &str| (name.to_string(), None);
+    let mut env: Vec<(String, Option<String>)> = match provider {
+        Provider::Claude => [CLAUDE_API_KEY_ENV, CLAUDE_AUTH_TOKEN_ENV, CLAUDE_OAUTH_ENV].into_iter().chain(CLAUDE_PROVIDER_SWITCHES).map(unset).collect(),
+        Provider::Codex => [CODEX_API_KEY_ENV, OPENAI_API_KEY_ENV, CODEX_ROUTE_KEY_ENV].into_iter().map(unset).collect(),
+        Provider::Cursor => vec![unset(CURSOR_API_KEY_ENV)],
+    };
+    let mut put = |name: &str, value: &str| {
+        env.retain(|(set_name, _)| set_name != name);
+        env.push(set(name, value));
+    };
+    match route.kind {
+        Some(RouteKind::ClaudeGateway) => {
+            let token = if route.api_key_header { CLAUDE_API_KEY_ENV } else { CLAUDE_AUTH_TOKEN_ENV };
+            if let (Some(base), Some(credential)) = (&route.base_url, &route.credential) {
+                put(CLAUDE_BASE_URL_ENV, base);
+                put(token, credential);
+                put(CLAUDE_GATEWAY_DISCOVERY_ENV, "1");
+            }
+        }
+        Some(RouteKind::ClaudeKeyHelper) => match &route.base_url {
+            Some(base) => {
+                put(CLAUDE_BASE_URL_ENV, base);
+                put(CLAUDE_GATEWAY_DISCOVERY_ENV, "1");
+            }
+            // The helper's credential goes to Claude Code's own endpoint, not
+            // to one a profile names.
+            None => env.push(unset(CLAUDE_BASE_URL_ENV)),
+        },
+        Some(RouteKind::CodexProvider) => {
+            if let Some(credential) = &route.credential {
+                put(CODEX_ROUTE_KEY_ENV, credential);
+            }
+        }
+        Some(RouteKind::CodexAuthCommand) | None => {}
+    }
+    env
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Codex's `-c` overrides for a route: a `model_providers` entry of its own
+/// and `model_provider` pointing at it. They are user-level settings, which
+/// a repository's `.codex/config.toml` cannot set, so a checkout cannot
+/// redirect them either.
+fn codex_route_args(route: &Route, kind: RouteKind, cwd: &Path) -> String {
+    let mut table = toml::Table::new();
+    table.insert("name".into(), toml::Value::String("TerminalX route".into()));
+    table.insert("base_url".into(), toml::Value::String(route.base_url.clone().unwrap_or_default()));
+    table.insert("wire_api".into(), toml::Value::String("responses".into()));
+    if kind == RouteKind::CodexAuthCommand {
+        let mut auth = toml::Table::new();
+        auth.insert("command".into(), toml::Value::String(route.helper_in(cwd).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()));
+        auth.insert("timeout_ms".into(), toml::Value::Integer(CODEX_AUTH_TIMEOUT_MS));
+        auth.insert("refresh_interval_ms".into(), toml::Value::Integer(CODEX_AUTH_REFRESH_MS));
+        table.insert("auth".into(), toml::Value::Table(auth));
+    } else {
+        table.insert("env_key".into(), toml::Value::String(CODEX_ROUTE_KEY_ENV.into()));
+    }
+    let inline = toml::Value::Table(table).to_string();
+    format!(
+        " -c {} -c {}",
+        shell_quote(&format!("model_providers.{CODEX_ROUTE_PROVIDER}={}", inline.trim())),
+        shell_quote(&format!("model_provider=\"{CODEX_ROUTE_PROVIDER}\""))
+    )
+}
+
+/// What a route adds to a launch besides the environment.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RouteLaunch {
+    /// The model to start on instead of the tab's: the one the route names.
+    pub model: Option<String>,
+    /// Claude Code's `apiKeyHelper`, for the `--settings` payload: the
+    /// helper's absolute path, quoted for the shell Claude Code runs it in.
+    pub api_key_helper: Option<String>,
+    /// Codex's overrides, shell-quoted, each with a leading space.
+    pub codex_args: String,
+    /// A line for the tab: what keeps the route from working, as far as
+    /// this workspace knows.
+    pub notice: Option<String>,
+}
+
+/// What a failed check means, in words for a tab.
+fn check_words(code: &str) -> &'static str {
+    match code {
+        "unauthorized" | "forbidden" => "the endpoint refused the credential",
+        "unreachable" | "timeout" | "tls" => "the endpoint could not be reached from this workspace",
+        "redirect" => "the endpoint answered with a redirect, which is never followed with a credential",
+        "rate-limited" => "the endpoint is rate limiting",
+        "http-error" | "bad-response" => "the endpoint did not answer like a model API",
+        "helper-not-found" => "the credential helper is not in the workspace",
+        "helper-not-executable" => "the credential helper is not executable",
+        "helper-failed" => "the credential helper failed",
+        "helper-timeout" => "the credential helper did not finish in time",
+        "helper-empty" => "the credential helper printed nothing",
+        "helper-output" => "the credential helper printed more than one credential",
+        _ => "it did not pass",
+    }
+}
+
+fn route_notice(agent: &str, route: &Route, checked: &crate::agent_route_check::Checked) -> Option<String> {
+    if checked.outcome != "failed" {
+        return None;
+    }
+    let place = "Settings → Organizations → Your model access";
+    Some(match checked.code? {
+        "model-unsupported" => {
+            let listed: Vec<&str> = checked.models.iter().take(8).map(String::as_str).collect();
+            let lists = if listed.is_empty() { String::new() } else { format!(" It lists {}.", listed.join(", ")) };
+            format!(
+                "Your {agent} endpoint did not list the model {} when this workspace checked it, so prompts may fail.{lists} Choose a model it lists in {place}.",
+                route.model.as_deref().unwrap_or("the route names")
+            )
+        }
+        code => format!("Your {agent} route failed its last check from this workspace: {}. See {place}.", check_words(code)),
+    })
+}
+
+/// One check of a route version, with what it needs to run on its own.
+pub struct RouteCheckJob {
+    provider: Provider,
+    route_id: String,
+    version: u64,
+    kind: Option<RouteKind>,
+    base_url: Option<String>,
+    api_key_header: bool,
+    model: Option<String>,
+    helper: Option<PathBuf>,
+    helper_cwd: PathBuf,
+    credential: Option<Zeroizing<String>>,
+}
+
+/// Check a route as its agent would use it: run the helper for a
+/// user-managed route, then read the endpoint's model list with the
+/// credential, sent in the header the CLI sends it in.
+pub fn run_route_check(job: &RouteCheckJob) -> crate::agent_route_check::Checked {
+    use crate::agent_route_check::{probe, run_helper, Checked, CredentialHeader, ModelList, Probe, HELPER_TIMEOUT};
+    let Some(kind) = job.kind else { return Checked::failed("template-unsupported") };
+    let credential = if kind.user_managed() {
+        let Some(helper) = &job.helper else { return Checked::failed("helper-not-found") };
+        match run_helper(helper, &job.helper_cwd, HELPER_TIMEOUT) {
+            Ok(credential) => credential,
+            Err(code) => return Checked::failed(code),
+        }
+    } else {
+        match &job.credential {
+            Some(credential) => credential.clone(),
+            None => return Checked::failed("unauthorized"),
+        }
+    };
+    let (list, header, default_base) = match kind {
+        RouteKind::ClaudeGateway => (ModelList::Anthropic, if job.api_key_header { CredentialHeader::ApiKey } else { CredentialHeader::Bearer }, None),
+        RouteKind::ClaudeKeyHelper => (ModelList::Anthropic, CredentialHeader::Both, Some(CLAUDE_DEFAULT_BASE_URL)),
+        RouteKind::CodexProvider | RouteKind::CodexAuthCommand => (ModelList::OpenAi, CredentialHeader::Bearer, None),
+    };
+    let Some(base_url) = job.base_url.as_deref().or(default_base) else { return Checked::failed("unreachable") };
+    probe(&Probe { list, base_url, credential: &credential, header, model: job.model.as_deref() })
+}
+
+impl GrantStore {
+    /// What a route adds to a new launch of `provider` in `cwd`, when the
+    /// workspace runs one for it. None when the agent uses an organization
+    /// login, or nothing.
+    pub fn route_launch(&self, provider: Provider, cwd: &Path, now: Instant) -> Option<RouteLaunch> {
+        let state = self.state();
+        let grant = state.active.get(&provider).filter(|grant| grant.usable(now))?;
+        let route = grant.material.route()?;
+        let agent = provider.label();
+        let Some(kind) = route.kind else {
+            return Some(RouteLaunch {
+                notice: Some(format!(
+                    "Your {agent} route uses template {}, which this workspace's TerminalX does not apply, so {agent} has no way to sign in here. Update the workspace, or set the route up again in Settings → Organizations → Your model access.",
+                    route.template
+                )),
+                ..RouteLaunch::default()
+            });
+        };
+        let mut launch = RouteLaunch { model: route.model.clone(), ..RouteLaunch::default() };
+        match kind {
+            RouteKind::ClaudeKeyHelper => launch.api_key_helper = route.helper_in(cwd).map(|path| shell_quote(&path.to_string_lossy())),
+            RouteKind::CodexProvider | RouteKind::CodexAuthCommand => launch.codex_args = codex_route_args(route, kind, cwd),
+            RouteKind::ClaudeGateway => {}
+        }
+        launch.notice = state
+            .route_checks
+            .get(&route.id)
+            .filter(|check| check.version == grant.version)
+            .and_then(|check| check.checked.as_ref())
+            .and_then(|checked| route_notice(agent, route, checked));
+        Some(launch)
+    }
+
+    /// The route checks that are due, marked as running. A route version is
+    /// checked once; a failed or unverified one again after
+    /// `recheck_after`. A helper given as `./relative` is checked only with
+    /// the folder an agent starts in (`cwd`, at a launch), since that is
+    /// where the agent runs it.
+    pub fn due_route_checks(&self, cwd: Option<&Path>, now: Instant, recheck_after: Duration) -> Vec<RouteCheckJob> {
+        let mut state = self.state();
+        let mut jobs = Vec::new();
+        let candidates: Vec<(Provider, u64, String)> = state
+            .active
+            .iter()
+            .filter(|(_, grant)| grant.usable(now))
+            .filter_map(|(provider, grant)| grant.material.route().map(|route| (*provider, grant.version, route.id.clone())))
+            .collect();
+        for (provider, version, route_id) in candidates {
+            let due = match state.route_checks.get(&route_id) {
+                None => true,
+                Some(check) if check.version != version => true,
+                Some(check) => check.checked.as_ref().is_some_and(|checked| !checked.passed()) && now.saturating_duration_since(check.at) >= recheck_after,
+            };
+            let Some(route) = state.active.get(&provider).and_then(|grant| grant.material.route()) else { continue };
+            let relative = route.helper_path.as_deref().is_some_and(|helper| helper.starts_with("./"));
+            let helper_cwd = match cwd {
+                Some(cwd) => cwd.to_path_buf(),
+                None if relative && route.kind.is_some() => continue,
+                None => dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            };
+            if !due {
+                continue;
+            }
+            jobs.push(RouteCheckJob {
+                provider,
+                route_id: route_id.clone(),
+                version,
+                kind: route.kind,
+                base_url: route.base_url.clone(),
+                api_key_header: route.api_key_header,
+                model: route.model.clone(),
+                helper: route.helper_in(&helper_cwd),
+                helper_cwd,
+                credential: route.credential.clone(),
+            });
+            state.route_checks.insert(route_id, RouteCheck { version, at: now, checked: None });
+        }
+        jobs
+    }
+
+    /// Keep a check's outcome, unless the route moved on meanwhile; returns
+    /// the report for the server when it is still the route's own.
+    pub fn finish_route_check(&self, job: &RouteCheckJob, checked: crate::agent_route_check::Checked, now: Instant) -> Option<Value> {
+        let mut state = self.state();
+        let check = state.route_checks.get_mut(&job.route_id).filter(|check| check.version == job.version)?;
+        check.at = now;
+        check.checked = Some(checked.clone());
+        log::info!(
+            "{} route check (version {}): {}{}",
+            job.provider.as_str(),
+            job.version,
+            checked.outcome,
+            checked.code.map(|code| format!(" ({code})")).unwrap_or_default()
+        );
+        let thumbprint = state.enrollment.as_ref()?.thumbprint.clone();
+        let mut report = json!({
+            "v": 1,
+            "keyThumbprint": thumbprint,
+            "provider": job.provider.as_str(),
+            "routeId": job.route_id,
+            "version": job.version,
+            "outcome": checked.outcome,
+        });
+        if let Some(code) = checked.code {
+            report["code"] = json!(code);
+        }
+        if let Some(status) = checked.http_status {
+            report["httpStatus"] = json!(status);
+        }
+        if !checked.models.is_empty() {
+            report["models"] = json!(checked.models);
+        }
+        Some(report)
+    }
+}
+
+/// Run the due route checks, each on a thread of its own, and report them.
+fn spawn_route_checks(store: Arc<GrantStore>, api: Arc<dyn GrantApi + Send + Sync>, cwd: Option<&Path>, recheck_after: Duration) {
+    for job in store.due_route_checks(cwd, Instant::now(), recheck_after) {
+        let (store, api) = (store.clone(), api.clone());
+        let spawned = std::thread::Builder::new().name("agent-route-check".into()).spawn(move || {
+            let checked = run_route_check(&job);
+            if let Some(report) = store.finish_route_check(&job, checked, Instant::now()) {
+                if let Err(error) = api.report_route_check(&report) {
+                    log::warn!("report the {} route check: {error}", job.provider.as_str());
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            log::warn!("start a route check: {error}");
+        }
+    }
+}
+
+/// How long after a failed check a launch checks again: soon, as someone
+/// may just have fixed what failed.
+const LAUNCH_RECHECK_AFTER: Duration = Duration::from_secs(60);
+
+static CHECK_API: OnceLock<Arc<dyn GrantApi + Send + Sync>> = OnceLock::new();
 
 // ------------------------------------------------------------ the loop
 
@@ -1365,6 +1913,9 @@ fn step(store: &GrantStore, api: &dyn GrantApi, rejected: bool, backoff: &mut Du
 /// `refreshAfter`, before any grant expires, with backoff on errors, and
 /// paused (with nothing injected) while the runtime credential is rejected.
 pub fn spawn_sync_loop(store: Arc<GrantStore>, api: Arc<dyn GrantApi + Send + Sync>, rejected: impl Fn() -> bool + Send + 'static) {
+    if CHECK_API.set(api.clone()).is_err() {
+        log::warn!("the route check API is already set");
+    }
     let spawned = std::thread::Builder::new().name("cloud-agent-grants".into()).spawn(move || {
         let mut backoff = BACKOFF_START;
         loop {
@@ -1373,6 +1924,7 @@ pub fn spawn_sync_loop(store: Arc<GrantStore>, api: Arc<dyn GrantApi + Send + Sy
             if store.sign_in_answers(Instant::now()) != before {
                 sign_in_may_have_changed();
             }
+            spawn_route_checks(store.clone(), api.clone(), None, ROUTE_RECHECK_AFTER);
             std::thread::sleep(wait);
         }
     });
@@ -1420,6 +1972,18 @@ pub(crate) fn sign_in_may_have_changed() {
 pub fn agent_env_for_launch(harness: &str, launch: &str) -> Vec<(String, Option<String>)> {
     let (Some(store), Some(provider)) = (installed(), provider_of_harness(harness)) else { return Vec::new() };
     store.agent_env_for_launch(provider, launch, Instant::now())
+}
+
+/// What the workspace creator's route adds to a new launch of `harness` in
+/// `cwd` (PRO-18), and a check of the route from there when one is due.
+/// None outside a cloud workspace and for an agent on an organization login.
+pub fn route_launch(harness: &str, cwd: &Path) -> Option<RouteLaunch> {
+    let (store, provider) = (installed()?, provider_of_harness(harness)?);
+    let launch = store.route_launch(provider, cwd, Instant::now())?;
+    if let Some(api) = CHECK_API.get() {
+        spawn_route_checks(store.clone(), api.clone(), Some(cwd), LAUNCH_RECHECK_AFTER);
+    }
+    Some(launch)
 }
 
 /// Whether a new agent session of `harness` would have no way to sign in
@@ -1700,6 +2264,7 @@ mod tests {
                 version,
                 rotation: Some("new-sessions".into()),
                 reason: None,
+                kind: None,
             });
         }
 
@@ -2248,6 +2813,7 @@ mod tests {
             version: 1,
             rotation: None,
             reason: Some("token-expired".into()),
+            kind: None,
         });
         store.sync(&server, t0, NOW).unwrap();
         assert_eq!(
@@ -2407,5 +2973,277 @@ mod tests {
         }
         assert_eq!(provider_of_harness("cursor-agent"), Some(Provider::Cursor));
         assert_eq!(provider_of_harness("opencode"), None);
+    }
+
+    // ------------------------------------------------------ personal routes
+
+    fn route(template: &str, version: u64, settings: Value, credential: Option<&str>, route_version: u64, provider: &str) -> Value {
+        let mut plain = json!({
+            "v": 1,
+            "provider": provider,
+            "mode": "route",
+            "version": route_version,
+            "route": { "id": "route_1", "templateId": template, "templateVersion": version, "mode": if credential.is_some() { "custom-endpoint" } else { "user-managed" }, "settings": settings },
+        });
+        if let Some(credential) = credential {
+            plain["credential"] = json!(credential);
+        }
+        plain
+    }
+
+    fn routed(server: &FakeServer, provider: &'static str, plaintext: Value) {
+        server.credential(provider, "route_1", "connected", 1, 1);
+        server.grant(provider, "route_1", 1, plaintext);
+    }
+
+    fn sets<'a>(env: &'a [(String, Option<String>)], name: &str) -> Option<&'a str> {
+        env.iter().find(|(set, _)| set == name).and_then(|(_, value)| value.as_deref())
+    }
+
+    fn unsets(env: &[(String, Option<String>)], name: &str) -> bool {
+        env.iter().any(|(set, value)| set == name && value.is_none())
+    }
+
+    #[test]
+    fn a_gateway_route_sets_its_endpoint_and_unsets_every_other_way_in() {
+        let server = FakeServer::new();
+        routed(&server, "claude", route("claude-gateway", 1, json!({ "baseUrl": "https://llm.example.com/anthropic", "authScheme": "bearer" }), Some("sk-gw-route-1"), 1, "claude"));
+        let store = store(None);
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        let env = store.agent_env(Provider::Claude, t0);
+        assert_eq!(sets(&env, CLAUDE_BASE_URL_ENV), Some("https://llm.example.com/anthropic"));
+        assert_eq!(sets(&env, CLAUDE_AUTH_TOKEN_ENV), Some("sk-gw-route-1"));
+        assert_eq!(sets(&env, CLAUDE_GATEWAY_DISCOVERY_ENV), Some("1"));
+        for name in [CLAUDE_API_KEY_ENV, CLAUDE_OAUTH_ENV, "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"] {
+            assert!(unsets(&env, name), "{name} is unset so nothing app-managed or configured overrides the route");
+        }
+        assert_eq!(env.iter().filter(|(name, _)| name == CLAUDE_AUTH_TOKEN_ENV).count(), 1);
+        assert_eq!(store.sign_in_required(Provider::Claude, &[], t0), None);
+        let status = store.status(t0);
+        assert_eq!(status["credentials"][0]["mode"], "route");
+        assert_eq!(status["credentials"][0]["route"]["template"], "claude-gateway@1");
+        assert!(!status.to_string().contains("sk-gw-route-1"));
+
+        // x-api-key: the other variable carries it.
+        routed(&server, "claude", route("claude-gateway", 1, json!({ "baseUrl": "https://llm.example.com", "authScheme": "x-api-key" }), Some("sk-gw-route-2"), 2, "claude"));
+        server.credential("claude", "route_1", "connected", 2, 2);
+        server.grant("claude", "route_1", 2, route("claude-gateway", 1, json!({ "baseUrl": "https://llm.example.com", "authScheme": "x-api-key" }), Some("sk-gw-route-2"), 2, "claude"));
+        store.sync(&server, t0, NOW).unwrap();
+        let env = store.agent_env(Provider::Claude, t0);
+        assert_eq!(sets(&env, CLAUDE_API_KEY_ENV), Some("sk-gw-route-2"));
+        assert!(unsets(&env, CLAUDE_AUTH_TOKEN_ENV));
+    }
+
+    #[test]
+    fn a_helper_route_hands_claude_code_its_helper_and_no_credential() {
+        let server = FakeServer::new();
+        routed(&server, "claude", route("claude-key-helper", 1, json!({ "helperPath": "./scripts/llm-key", "model": "team-model" }), None, 1, "claude"));
+        let store = store(None);
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        let env = store.agent_env(Provider::Claude, t0);
+        assert!(env.iter().all(|(_, value)| value.is_none()), "a user-managed route sets no credential: {env:?}");
+        for name in [CLAUDE_API_KEY_ENV, CLAUDE_AUTH_TOKEN_ENV, CLAUDE_OAUTH_ENV, CLAUDE_BASE_URL_ENV] {
+            assert!(unsets(&env, name), "{name}");
+        }
+        let launch = store.route_launch(Provider::Claude, Path::new("/work/my repo"), t0).unwrap();
+        assert_eq!(launch.api_key_helper.as_deref(), Some("'/work/my repo/scripts/llm-key'"));
+        assert_eq!(launch.model.as_deref(), Some("team-model"));
+        assert_eq!(launch.codex_args, "");
+        assert_eq!(launch.notice, None);
+        // An organization login is no route.
+        server.credential("claude", "cred_c", "connected", 1, 1);
+        server.grant("claude", "cred_c", 1, claude_oauth("fake-oauth-1", 1));
+        store.sync(&server, t0, NOW).unwrap();
+        assert_eq!(store.route_launch(Provider::Claude, Path::new("/work"), t0), None);
+        assert_eq!(sets(&store.agent_env(Provider::Claude, t0), CLAUDE_OAUTH_ENV), Some("fake-oauth-1"), "back to the organization's login");
+    }
+
+    #[test]
+    fn a_codex_route_defines_its_own_provider_and_keeps_the_auth_file_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = FakeServer::new();
+        server.credential("codex", "cred_x", "connected", 2, 5);
+        server.grant("codex", "cred_x", 2, codex_chatgpt("fake-chatgpt-access"));
+        let store = store(Some(dir.path().to_path_buf()));
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        assert!(store.codex_auth_file(t0).is_some());
+
+        routed(&server, "codex", route("codex-provider", 1, json!({ "baseUrl": "https://llm.example.com/v1", "model": "team-model" }), Some("sk-provider-1"), 1, "codex"));
+        store.sync(&server, t0, NOW).unwrap();
+        assert_eq!(store.codex_auth_file(t0), None);
+        assert!(!dir.path().join("agent-homes/codex/auth.json").exists(), "the organization's ChatGPT tokens are gone");
+        let env = store.agent_env(Provider::Codex, t0);
+        assert_eq!(sets(&env, CODEX_ROUTE_KEY_ENV), Some("sk-provider-1"));
+        assert!(unsets(&env, CODEX_API_KEY_ENV) && unsets(&env, OPENAI_API_KEY_ENV));
+        let launch = store.route_launch(Provider::Codex, Path::new("/work"), t0).unwrap();
+        assert_eq!(launch.model.as_deref(), Some("team-model"));
+        assert!(launch.codex_args.contains(r#"model_provider="terminalx""#), "{}", launch.codex_args);
+        assert!(launch.codex_args.contains(r#"base_url = "https://llm.example.com/v1""#), "{}", launch.codex_args);
+        assert!(launch.codex_args.contains(r#"env_key = "TERMINALX_CODEX_ROUTE_KEY""#), "{}", launch.codex_args);
+        assert!(launch.codex_args.contains(r#"wire_api = "responses""#), "{}", launch.codex_args);
+        assert!(!launch.codex_args.contains("sk-provider-1"), "the key travels in the environment only");
+
+        // A helper: an auth command, and no key at all.
+        server.credential("codex", "route_1", "connected", 2, 2);
+        server.grant("codex", "route_1", 2, route("codex-auth-command", 1, json!({ "baseUrl": "https://llm.example.com/v1", "model": "team-model", "helperPath": "./bin/token" }), None, 2, "codex"));
+        store.sync(&server, t0, NOW).unwrap();
+        let launch = store.route_launch(Provider::Codex, Path::new("/work"), t0).unwrap();
+        assert!(launch.codex_args.contains(r#"command = "/work/bin/token""#), "{}", launch.codex_args);
+        assert!(!launch.codex_args.contains("env_key"), "{}", launch.codex_args);
+        assert!(store.agent_env(Provider::Codex, t0).iter().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn a_route_this_runtime_does_not_apply_gives_the_agent_nothing_and_says_so() {
+        let server = FakeServer::new();
+        routed(&server, "claude", route("claude-gateway", 2, json!({ "baseUrl": "https://llm.example.com", "authScheme": "bearer" }), Some("sk-gw-future"), 1, "claude"));
+        let store = store(None);
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        let env = store.agent_env(Provider::Claude, t0);
+        assert!(env.iter().all(|(_, value)| value.is_none()), "{env:?}");
+        assert!(unsets(&env, CLAUDE_API_KEY_ENV) && unsets(&env, CLAUDE_OAUTH_ENV));
+        assert_eq!(
+            store.sign_in_required(Provider::Claude, &[], t0),
+            Some(SignInRequired { provider: "claude", state: "unavailable".into(), reason: Some("route-template-unsupported".into()) })
+        );
+        assert!(store.route_launch(Provider::Claude, Path::new("/work"), t0).unwrap().notice.unwrap().contains("claude-gateway@2"));
+        // Settings that do not fit the template are not applied either.
+        server.credential("claude", "route_1", "connected", 2, 2);
+        server.grant("claude", "route_1", 2, route("claude-gateway", 1, json!({ "baseUrl": "http://llm.example.com", "authScheme": "bearer" }), Some("sk-gw"), 2, "claude"));
+        store.sync(&server, t0, NOW).unwrap();
+        assert_eq!(sets(&store.agent_env(Provider::Claude, t0), CLAUDE_AUTH_TOKEN_ENV), None);
+        // Nor a route granted for another agent's template.
+        server.credential("codex", "route_1", "connected", 3, 3);
+        server.grant("codex", "route_1", 3, route("claude-gateway", 1, json!({ "baseUrl": "https://llm.example.com", "authScheme": "bearer" }), Some("sk-gw"), 3, "codex"));
+        store.sync(&server, t0, NOW).unwrap();
+        assert!(store.agent_env(Provider::Codex, t0).iter().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn a_withheld_route_says_why_and_never_falls_back() {
+        let server = FakeServer::new();
+        server.credentials.borrow_mut().push(CredentialEntry {
+            provider: "claude".into(),
+            credential_id: "route_1".into(),
+            state: "unavailable".into(),
+            epoch: 1,
+            version: 1,
+            rotation: Some("new-sessions".into()),
+            reason: Some("route-shared-workspace".into()),
+            kind: Some("route".into()),
+        });
+        let store = store(None);
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        assert!(store.agent_env(Provider::Claude, t0).is_empty());
+        assert_eq!(
+            store.sign_in_required(Provider::Claude, &[], t0),
+            Some(SignInRequired { provider: "claude", state: "unavailable".into(), reason: Some("route-shared-workspace".into()) })
+        );
+    }
+
+    /// One answer to one request, on a local port; the request comes back.
+    fn model_list(status: &'static str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn a_route_is_checked_once_per_version_and_reported_without_its_credential() {
+        let (base, endpoint) = model_list("200 OK", r#"{"data":[{"id":"gw-sonnet"},{"id":"gw-haiku"}]}"#);
+        let server = FakeServer::new();
+        let settings = json!({ "baseUrl": base, "authScheme": "bearer", "model": "gw-opus" });
+        routed(&server, "claude", route("claude-gateway", 1, settings, Some("sk-gw-checked"), 1, "claude"));
+        let store = store(None);
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        let jobs = store.due_route_checks(None, t0, ROUTE_RECHECK_AFTER);
+        assert_eq!(jobs.len(), 1);
+        assert!(store.due_route_checks(None, t0, ROUTE_RECHECK_AFTER).is_empty(), "one check at a time");
+        let checked = run_route_check(&jobs[0]);
+        let request = endpoint.join().unwrap();
+        assert!(request.contains("authorization: Bearer sk-gw-checked"), "{request}");
+        assert_eq!((checked.outcome, checked.code), ("failed", Some("model-unsupported")));
+        let report = store.finish_route_check(&jobs[0], checked, t0).unwrap();
+        assert_eq!(report["routeId"], "route_1");
+        assert_eq!(report["version"], 1);
+        assert_eq!(report["code"], "model-unsupported");
+        assert_eq!(report["models"], json!(["gw-sonnet", "gw-haiku"]));
+        assert_eq!(report["keyThumbprint"], store.key.thumbprint());
+        assert!(!report.to_string().contains("sk-gw-checked"));
+        // The tab is told, in words.
+        let notice = store.route_launch(Provider::Claude, Path::new("/work"), t0).unwrap().notice.unwrap();
+        assert!(notice.contains("gw-opus") && notice.contains("gw-sonnet, gw-haiku"), "{notice}");
+        // A failed check is tried again later, not at once.
+        assert!(store.due_route_checks(None, t0 + MINUTE, ROUTE_RECHECK_AFTER).is_empty());
+        let mut again = store.due_route_checks(None, t0 + ROUTE_RECHECK_AFTER, ROUTE_RECHECK_AFTER);
+        assert_eq!(again.len(), 1);
+        // A new version is checked afresh, and an old check landing late is dropped.
+        let stale = again.pop().unwrap();
+        server.credential("claude", "route_1", "connected", 2, 2);
+        server.grant("claude", "route_1", 2, route("claude-gateway", 1, json!({ "baseUrl": "https://llm.example.com", "authScheme": "bearer" }), Some("sk-gw-2"), 2, "claude"));
+        store.sync(&server, t0, NOW).unwrap();
+        let fresh = store.due_route_checks(None, t0, ROUTE_RECHECK_AFTER);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(store.finish_route_check(&stale, crate::agent_route_check::Checked::failed("unreachable"), t0), None);
+        assert_eq!(store.route_launch(Provider::Claude, Path::new("/work"), t0).unwrap().notice, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_helper_is_checked_from_the_folder_the_agent_starts_in() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (base, endpoint) = model_list("200 OK", r#"{"data":[{"id":"gw-sonnet"}]}"#);
+        let work = tempfile::tempdir().unwrap();
+        fs::create_dir(work.path().join("scripts")).unwrap();
+        let helper = work.path().join("scripts/llm-key");
+        fs::write(&helper, "#!/bin/sh\necho sk-from-helper\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let server = FakeServer::new();
+        routed(&server, "claude", route("claude-key-helper", 1, json!({ "helperPath": "./scripts/llm-key", "baseUrl": base }), None, 1, "claude"));
+        let store = store(None);
+        let t0 = Instant::now();
+        store.sync(&server, t0, NOW).unwrap();
+        assert!(store.due_route_checks(None, t0, ROUTE_RECHECK_AFTER).is_empty(), "not before an agent starts somewhere");
+        let jobs = store.due_route_checks(Some(work.path()), t0, ROUTE_RECHECK_AFTER);
+        assert_eq!(jobs.len(), 1);
+        let checked = run_route_check(&jobs[0]);
+        let request = endpoint.join().unwrap();
+        // Sent as Claude Code sends a helper's credential: in both headers.
+        assert!(request.contains("authorization: Bearer sk-from-helper") && request.contains("x-api-key: sk-from-helper"), "{request}");
+        assert!(checked.passed(), "{checked:?}");
+        let report = store.finish_route_check(&jobs[0], checked, t0).unwrap();
+        assert_eq!(report["outcome"], "ok");
+        assert!(!report.to_string().contains("sk-from-helper"));
+        assert!(store.due_route_checks(Some(work.path()), t0 + 2 * ROUTE_RECHECK_AFTER, ROUTE_RECHECK_AFTER).is_empty(), "a passed check stands");
+        // A helper that is missing fails as a code.
+        let elsewhere = tempfile::tempdir().unwrap();
+        server.credential("claude", "route_1", "connected", 2, 2);
+        server.grant("claude", "route_1", 2, route("claude-key-helper", 1, json!({ "helperPath": "./scripts/llm-key" }), None, 2, "claude"));
+        store.sync(&server, t0, NOW).unwrap();
+        let job = store.due_route_checks(Some(elsewhere.path()), t0, ROUTE_RECHECK_AFTER).pop().unwrap();
+        assert_eq!(run_route_check(&job).code, Some("helper-not-found"));
     }
 }
