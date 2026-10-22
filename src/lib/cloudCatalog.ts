@@ -591,6 +591,16 @@ export function refreshCloudCatalog(orgId: string | null = defaultOrgId(getAccou
   return flight;
 }
 
+/**
+ * An organization's list asked for now. One already on its way was asked for
+ * earlier, perhaps before a change this caller must see, so it is let land and
+ * the list is read again.
+ */
+export async function relistCloudCatalog(orgId: string): Promise<void> {
+  await flights.get(orgId)?.catch(() => undefined);
+  await refreshCloudCatalog(orgId);
+}
+
 // ---- Cross-organization feed (PRO-74, CS-21) --------------------------------
 
 /** The last feed answer's cursor (this launch only): sent back so an unchanged catalog answers 304. */
