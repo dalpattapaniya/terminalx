@@ -440,6 +440,28 @@ export function loadCloudAgents(scope: CloudAgentScope): Promise<void> {
 }
 
 /**
+ * Read the workspace's checkpoint list again: `loadCloudAgents` reads it once,
+ * and a tab whose first checkpoint was saved since (a session started after
+ * that, PRO-109) is known from then on, as a placeholder until its checkpoint
+ * is read. A read of the API; never connects and never wakes anything.
+ */
+export async function relistCloudCheckpoints(scope: CloudAgentScope): Promise<void> {
+  if (isDevScope(scope)) return;
+  await loadCloudAgents(scope);
+  const s = store(scope);
+  const listed = await cloudAgentApi.checkpoints(scope);
+  // Dropped meanwhile (another account, a deleted workspace): nothing is added to a store nobody holds.
+  if (stores.get(cloudAgentsKey(scope)) !== s) return;
+  let added = false;
+  for (const meta of listed) {
+    if (s.tabs.has(meta.tabId)) continue;
+    s.tabs.set(meta.tabId, newTab(placeholderInfo(meta.tabId), "checkpoint", true));
+    added = true;
+  }
+  if (added) publish(s);
+}
+
+/**
  * Bring one tab up to date from its checkpoint, when that is newer than what
  * is shown. Skipped once the tab streams live: a live projection is always
  * stronger than a checkpoint.

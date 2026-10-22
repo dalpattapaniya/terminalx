@@ -4,7 +4,7 @@ import { api, type CloudWorkspaceListItem } from "@/lib/api";
 import { getAccount } from "@/lib/account";
 import { getTabLog } from "@/lib/agentEvents";
 import { WORKSPACE_STOPPED } from "@/lib/cloudAgentApi";
-import { getCloudAgents, loadCloudAgents, refreshFromCheckpoint, syncLiveTabs, type CloudAgentTab } from "@/lib/cloudAgents";
+import { getCloudAgents, loadCloudAgents, refreshFromCheckpoint, relistCloudCheckpoints, syncLiveTabs, type CloudAgentTab } from "@/lib/cloudAgents";
 import {
   applyCloudSnapshot,
   cloudOrgArg,
@@ -19,6 +19,7 @@ import {
 } from "@/lib/cloudCatalog";
 import { LIFECYCLE_ADMIN_REASON, NEW_SESSION_ADMIN_REASON, NOT_SHARED_REASON, effectiveYou, getCollab, listedYou, tabGate, workspaceAuthority } from "@/lib/cloudCollab";
 import { cloudConnectionInfo, connectedCloudClient, retainCloudConnection, waitCloudConnected, wakeCloudConnection, type CloudLease } from "@/lib/cloudConnections";
+import { failureMessage, PHASES, phaseOf, RUNTIME_NOT_PICKED_UP, runtimeNotPickedUp, settled } from "@/lib/cloudCreate";
 import { getCloudDashboard, type CloudDashboardSession } from "@/lib/cloudDashboard";
 import { archiving, deletion, isArchived, isOpen, lifecycleErrorMessage, machineRunning, resuming, stopping } from "@/lib/cloudLifecycle";
 import { confirmCloudCreate, planCloudStart, prepareCloudCreate, startInWorkspace, type CloudIssueOutcome, type CloudSessionRequest } from "@/lib/cloudNewSession";
@@ -399,29 +400,50 @@ async function tabsOf(target: Target): Promise<CloudAgentTab[]> {
   return getCloudAgents(scope).tabs.filter((tab) => tab.info.sessionId === target.sessionId);
 }
 
-/** How long a lookup waits for a running workspace's runtime to answer: well inside the 50 s the socket waits. */
-const LOOKUP_WITHIN_MS = 15_000;
+/** How long a lookup may take in all, catalog read and tab list included: well inside the 50 s the socket waits. */
+export const LOOKUP_WITHIN_MS = 15_000;
+/**
+ * A send's lookup is shorter: a send to a workspace that is not running may
+ * still ask the person (up to 40 s, the native question's limit), and their
+ * answer has to reach the CLI inside the same 50 s.
+ */
+export const SEND_LOOKUP_WITHIN_MS = 8_000;
 /** Tabs known only from checkpoint metadata that one lookup reads, as opening a session does. */
 const LOOKUP_CHECKPOINTS = 20;
+
+/** What `work` gives, or null once `deadline` (ms) has passed: what is still on its way is not waited for. */
+async function by<T>(deadline: number, work: Promise<T>): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+  });
+  try {
+    return await Promise.race([work, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Learn the session's tabs as opening it in the app does, for one this
  * desktop has no tab of yet: the first session of a workspace the CLI just
  * created, or one started elsewhere (PRO-109). A running workspace's runtime
  * is asked for its tab list over a `connect` lease, which attaches and never
- * resumes. Otherwise tabs known only from a checkpoint read it to learn their
- * session: a read of the API, never a wake. Nothing is asked of a workspace
- * this person has no role in, by the list's word first and then the
- * runtime's. Says what was found out, for the answer when the tab is still
+ * resumes. Otherwise the workspace's checkpoints are listed again and each
+ * tab known only from one reads it to learn its session: reads of the API,
+ * never a wake. Nothing is asked of a workspace this person has no role in,
+ * by the list's word first and then the runtime's. All of it within
+ * `withinMs`. Says what was found out, for the answer when the tab is still
  * not known.
  */
-async function lookUpTabs(target: Target): Promise<"listed" | "unreachable" | "starting" | "stopped"> {
+async function lookUpTabs(target: Target, withinMs: number): Promise<"listed" | "unreachable" | "starting" | "stopped"> {
+  const deadline = Date.now() + withinMs;
   const scope = { organizationId: target.orgId, workspaceId: target.workspaceId };
   const held = connectedCloudClient(target.workspaceKey);
   assertReadable(youIn(target, held ? held.connection : { state: "idle" }));
   if (!machineRunning(target.item)) {
     // The list held here can be behind a workspace that has just started: ask it again.
-    await refreshCloudCatalog(target.orgId).catch(() => undefined);
+    await by(deadline, refreshCloudCatalog(target.orgId).catch(() => undefined));
     const item = findCloudWorkspace(getCloudCatalog(), target.orgId, target.workspaceId);
     if (!item) throw notFound(`No cloud session ${target.key}.`, "List them with terminalx sessions list --cloud.");
     // What follows (a send's wake rules, a wait's live follow) goes by the list of now.
@@ -429,14 +451,16 @@ async function lookUpTabs(target: Target): Promise<"listed" | "unreachable" | "s
     assertReadable(youIn(target, held ? held.connection : { state: "idle" }));
   }
   if (machineRunning(target.item)) {
-    const lease = await retainCloudConnection({ orgId: target.orgId, workspaceId: target.workspaceId }, "connect").catch(() => null);
+    const leasing = retainCloudConnection({ orgId: target.orgId, workspaceId: target.workspaceId }, "connect").catch(() => null);
+    const lease = await by(deadline, leasing);
+    // A lease that comes after the deadline is given straight back.
+    if (!lease) void leasing.then((late) => late?.release());
     if (lease) {
       try {
-        const client = await waitCloudConnected(lease, LOOKUP_WITHIN_MS, { stoppedIsError: true });
+        const client = await waitCloudConnected(lease, Math.max(0, deadline - Date.now()), { stoppedIsError: true });
         // The runtime's own word on access decides before anything of the workspace is read.
         assertReadable(youIn(target, client.connection));
-        await syncLiveTabs(scope, client);
-        return "listed";
+        if (await by(deadline, syncLiveTabs(scope, client).then(() => true))) return "listed";
       } catch (error) {
         if (error instanceof CloudControlError) throw error;
       } finally {
@@ -444,19 +468,44 @@ async function lookUpTabs(target: Target): Promise<"listed" | "unreachable" | "s
       }
     }
   }
+  await by(deadline, relistCloudCheckpoints(scope).catch(() => undefined));
   const placeholders = getCloudAgents(scope).tabs.filter((tab) => tab.placeholder).slice(0, LOOKUP_CHECKPOINTS);
-  await Promise.all(placeholders.map((tab) => refreshFromCheckpoint(scope, tab.tabId).catch(() => false)));
+  await by(deadline, Promise.all(placeholders.map((tab) => refreshFromCheckpoint(scope, tab.tabId).catch(() => false))));
   if (machineRunning(target.item)) return "unreachable";
   return target.item.workspace.state === "provisioning" || resuming(target.item) ? "starting" : "stopped";
 }
 
-async function resolveTab(target: Target, wanted: string | null): Promise<CloudAgentTab> {
+const STARTING_RECOVERY = "Run the command again in a moment: terminalx projects list --cloud shows how far the workspace has got.";
+
+/**
+ * The session the workspace's launch names is listed (`sessions list`)
+ * before its agent has a tab. Until the launch has settled, that session is
+ * starting, not missing; once it failed, the answer says why. Null for any
+ * other session, or a launch that is running.
+ */
+function launchRefusal(target: Target, wanted: string | null): CloudControlError | null {
+  const { item } = target;
+  const launch = item.workspace.launch;
+  if (!launch || launch.sessionId !== target.sessionId || (wanted && launch.tabId !== wanted)) return null;
+  const phase = phaseOf(item);
+  if (phase === "failed") return notFound(`Session ${target.key} has no agent tab: its first prompt did not start one. ${failureMessage(item)}`);
+  if (settled(phase)) return null;
+  if (runtimeNotPickedUp(item, Date.now()) !== null) return notFound(`Session ${target.key} has no agent tab yet. ${RUNTIME_NOT_PICKED_UP}`);
+  const label = PHASES.find((known) => known.id === phase)?.label ?? phase;
+  return new CloudControlError("cloud_workspace_starting", `Session ${target.key} has no agent tab yet: its workspace is still starting it (${label.toLowerCase()}).`, STARTING_RECOVERY);
+}
+
+async function resolveTab(target: Target, wanted: string | null, withinMs = LOOKUP_WITHIN_MS): Promise<CloudAgentTab> {
   let tabs = await tabsOf(target);
   const found = () => (wanted ? tabs.some((candidate) => candidate.tabId === wanted) : tabs.length > 0);
   let lookedUp: Awaited<ReturnType<typeof lookUpTabs>> | null = null;
   if (!found()) {
-    lookedUp = await lookUpTabs(target);
+    lookedUp = await lookUpTabs(target, withinMs);
     tabs = await tabsOf(target);
+  }
+  if (!found()) {
+    const starting = launchRefusal(target, wanted);
+    if (starting) throw starting;
   }
   if (wanted) {
     const tab = tabs.find((candidate) => candidate.tabId === wanted);
@@ -465,8 +514,8 @@ async function resolveTab(target: Target, wanted: string | null): Promise<CloudA
   }
   if (!tabs.length) {
     if (lookedUp === "listed") throw notFound(`No cloud session ${target.key} with an agent tab is in its workspace.`, "List them with terminalx sessions list --cloud.");
-    if (lookedUp === "unreachable") throw notFound(`Nothing of session ${target.key} is on this desktop yet, and its workspace did not answer.`, "Run the command again in a moment.");
-    if (lookedUp === "starting") throw notFound(`Session ${target.key} has no agent tab yet: its workspace is still starting.`, "Run the command again once it is running (terminalx projects list --cloud shows its status).");
+    if (lookedUp === "unreachable") throw new CloudControlError("cloud_workspace_unreachable", `Nothing of session ${target.key} is on this desktop yet, and its workspace did not answer in time.`, "Run the command again in a moment.");
+    if (lookedUp === "starting") throw new CloudControlError("cloud_workspace_starting", `Session ${target.key} has no agent tab yet: its workspace is still starting.`, STARTING_RECOVERY);
     throw notFound(`Nothing of session ${target.key} is on this desktop yet, and its workspace is not running: no saved checkpoint names it.`, "Run the command again once the workspace is running (terminalx cloud resume resumes a stopped one).");
   }
   // The tab worked in last.
@@ -524,7 +573,7 @@ const workspaceStopped = (error: unknown) => (error instanceof Error ? error.mes
 async function sendOnce(params: Params) {
   const target = resolveSession(required(params, "target"));
   const message = required(params, "text");
-  const tab = await resolveTab(target, text(params, "tab"));
+  const tab = await resolveTab(target, text(params, "tab"), SEND_LOOKUP_WITHIN_MS);
   const scope = { organizationId: target.orgId, workspaceId: target.workspaceId };
   const client = connectedCloudClient(target.workspaceKey);
   const state: WorkspaceConnectionState = client ? client.connection : { state: "idle" };
