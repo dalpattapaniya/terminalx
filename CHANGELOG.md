@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Editor
+
+- Keep Preview / Source and neighbouring toolbar buttons readable in narrow
+  editor panes, stepping down to labelled icons as space runs out. Shared
+  segmented switches keep equal, content-sized options and aligned thumbs. (#482)
+
 ## 0.2.17
 
 ### Chats
