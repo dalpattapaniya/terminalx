@@ -10,6 +10,12 @@
   warning, and flag unavailable saved models before saving. Agent discovery
   and model loading fill empty launch settings without clearing a draft. (#553)
 
+### Issues
+
+- A cloud issue that cannot start because an agent needs sign-in now offers
+  **Open Agent logins** for the failed request’s organization, even if you
+  switch projects while it starts. (#573)
+
 ### Computer use
 
 - Screen Recording **Grant…** opens System Settings with the helper drag tile
