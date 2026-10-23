@@ -16,6 +16,8 @@
 // - the title bar names the workspace (its project, and its branch or the
 //   conversation's title, #584) and Share and the other actions sit at its
 //   right edge at every width;
+// - Continue in New Session follows Share, stays visible at narrow widths,
+//   and overlaps neither its neighbours nor the window controls (#590);
 // - the empty part of the title bar drags the window and a tab does not;
 // - a tab dragged to a new place lands there, shows where it will land on
 //   the way, and Escape puts it back;
@@ -33,7 +35,7 @@
 //   Set TAB_STRIP_SHOTS to a directory to also save screenshots.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { launch, report, serve, sidebar } from "./harness.mjs";
+import { launch, open, report, serve, sidebar } from "./harness.mjs";
 
 const stub = `${await readFile(new URL("./tauri-stub.js", import.meta.url), "utf8")}`;
 const shots = process.env.TAB_STRIP_SHOTS;
@@ -191,7 +193,10 @@ const measure = (page) =>
       allTabs: rect(strip.querySelector('[data-testid="all-tabs"]')),
       allTabsText: strip.querySelector('[data-testid="all-tabs"]')?.textContent.trim() ?? null,
       actions: rect(actions),
-      actionButtons: [...actions.querySelectorAll("button")].map((button) => ({ name: button.getAttribute("aria-label"), ...rect(button) })),
+      actionButtons: [...actions.querySelectorAll("button")].map((button) => {
+        const box = button.getBoundingClientRect();
+        return { name: button.getAttribute("aria-label"), ...rect(button), visible: visible(button), reachable: button.contains(document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2)) };
+      }),
       headerDrags: emptyAt ? drags(emptyAt) : null,
       tabDrags: tabs.length ? drags(tabs[0].querySelector('[role="tab"]')) : null,
       // #584: the title bar names the workspace again, by its branch or the conversation's title.
@@ -217,6 +222,7 @@ const measure = (page) =>
 /** The title bar and the row of tabs are each in one piece: nothing over the window controls, nothing off the edge, the row under the title bar. */
 function fits(layout, { sidebarHidden = false } = {}) {
   const lastTab = layout.tabs.at(-1);
+  const continuation = layout.actionButtons.find((button) => button.name === "Continue in New Session…");
   return {
     "the header does not overflow the window": !layout.headerOverflows && layout.actions.right <= layout.window + SLACK,
     "the row of tabs does not overflow the window": !layout.rowOverflows && layout.row.right <= layout.window + SLACK && (!layout.rowTrailing || layout.rowTrailing.right <= layout.row.right + SLACK),
@@ -236,6 +242,9 @@ function fits(layout, { sidebarHidden = false } = {}) {
     // The crumb gives way to the chips and the actions when the title bar is tight.
     ...(layout.content >= 600 ? { "with room, the title bar names the workspace, by its branch or the conversation's title": layout.named } : {}),
     "Share and the other actions are at the right edge": layout.actions.right >= layout.header.right - layout.paddingRight - SLACK && layout.actionButtons[0]?.name === "Share session…",
+    "Continue in New Session is visible and reachable immediately after Share": !!continuation && layout.actionButtons[1] === continuation && continuation.visible && continuation.reachable && continuation.width >= 28 - SLACK,
+    "the actions do not overlap each other": layout.actionButtons.every((button, index, buttons) => index === 0 || button.left >= buttons[index - 1].right - SLACK),
+    ...(sidebarHidden ? { "the continuation button leaves the window controls' inset clear": !!continuation && continuation.left >= 78 - SLACK } : {}),
   };
 }
 
@@ -454,6 +463,34 @@ for (const [name, viewport, prefs, tabs] of [
       layout,
     );
   }
+  await page.close();
+}
+
+// The floating window has no Share or workspace menu, but keeps the same
+// continuation button before its tab actions and window controls (#590).
+for (const width of [460, 360]) {
+  const page = await open(browser, server.url, { cloud: false, localProjects: 1, localSession: true, floating: true }, { width, height: 700 });
+  const button = page.getByRole("button", { name: "Continue in New Session…" });
+  await button.waitFor();
+  const layout = await button.evaluate((button) => {
+    const header = button.closest("header");
+    const actions = [...header.lastElementChild.querySelectorAll("button")];
+    const boxes = actions.map((action) => action.getBoundingClientRect());
+    const box = button.getBoundingClientRect();
+    return {
+      first: actions[0] === button,
+      share: !!header.querySelector('[aria-label="Share session…"]'),
+      visible: box.width >= 28 && box.left >= 78 && box.right <= innerWidth,
+      reachable: button.contains(document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2)),
+      fits: header.scrollWidth <= header.clientWidth + 1 && boxes.every((box, index) => box.right <= innerWidth && (index === 0 || box.left >= boxes[index - 1].right)),
+    };
+  });
+  failed += report(`floating window at ${width}px`, {
+    "Continue in New Session is first, without Share": layout.first && !layout.share,
+    "the button is visible, reachable, and clear of the window controls": layout.visible && layout.reachable,
+    "the actions fit without overlapping": layout.fits,
+  }, layout);
+  await snap(page, `floating-${width}`);
   await page.close();
 }
 

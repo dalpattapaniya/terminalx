@@ -438,7 +438,7 @@ export function SessionView({
   const workspaceTitle = session.removedWorkspace?.path ?? session.cwd;
   const baseNote = session.worktreeBase && !session.worktreeBase.warning ? `Base ${session.worktreeBase.commit.slice(0, 7)}${session.worktreeBase.fetched ? " · fetched at creation" : ""}` : null;
   const [continuationSource, setContinuationSource] = useState<TabEntry | null>(null);
-  // Carry the open tab's conversation into a new session: from the workspace menu, not a button of its own.
+  // The title-bar button and workspace menu carry the open tab into the same continuation dialog.
   const continueTab = activeTab && local ? () => setContinuationSource(activeTab) : null;
   const [renameError, setRenameError] = useState<string | null>(null);
   const workspace = managedWorkspaceFor(session);
@@ -684,6 +684,13 @@ export function SessionView({
           <div className={cn("ml-auto flex shrink-0 items-center gap-0.5", !compact && "max-w-[70%]")}>
             {/* The compact (floating) window has no share dialog to open. */}
             {local && !compact && <LocalShareButton sessionId={session.id} />}
+            {continueTab && (
+              <WithTooltip label="Continue in New Session…">
+                <Button variant="ghost" size="icon-sm" aria-label="Continue in New Session…" onClick={continueTab}>
+                  <MessageSquarePlus />
+                </Button>
+              </WithTooltip>
+            )}
             {/* The "+" that opens a tab, where no row of tabs ends with it (the floating window's row comes and goes). Keyed by session: a menu left open never carries over to another session. */}
             {(!stripRow || compact) && !cloud?.locked && <TabActions key={session.id} session={session} selected={selected} cloud={cloud} onShowPorts={showPorts} />}
             {activeTab && terminalOffer?.available && (!activeIsTerminal || terminalHasConversation) && (
