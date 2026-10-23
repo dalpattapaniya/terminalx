@@ -1,4 +1,5 @@
 import { workStatus, type WorkCloudSession } from "@/lib/api";
+import { cloudReviewerSessions, subscribeCloudPipelines } from "@/lib/cloudPipelines";
 import { getCloudCatalog } from "@/lib/cloudCatalog";
 import { cloudSessionMark, getCloudDashboard, subscribeCloudDashboard, type CloudDashboardSession } from "@/lib/cloudDashboard";
 
@@ -21,9 +22,9 @@ function githubRepository(repository: string | null): string | null {
 }
 
 /** What is handed over of each session: nothing of its conversation. Pure. */
-export function cloudWorkSessions(sessions: CloudDashboardSession[], createdBy: (orgId: string, workspaceId: string) => string | null): WorkCloudSession[] {
+export function cloudWorkSessions(sessions: CloudDashboardSession[], createdBy: (orgId: string, workspaceId: string) => string | null, reviewers: ReadonlySet<string> = new Set()): WorkCloudSession[] {
   return sessions
-    .filter((session) => session.branch || session.worktreeName)
+    .filter((session) => !reviewers.has(session.key) && (session.branch || session.worktreeName))
     .map((session) => ({
       orgId: session.orgId,
       workspaceId: session.workspaceId,
@@ -53,7 +54,7 @@ export function bootCloudWorkClaims() {
   let timer: number | null = null;
   const send = () => {
     timer = null;
-    const sessions = cloudWorkSessions(getCloudDashboard(), creatorOf);
+    const sessions = cloudWorkSessions(getCloudDashboard(), creatorOf, cloudReviewerSessions());
     const key = JSON.stringify(sessions);
     if (key === sent) return;
     sent = key;
@@ -63,8 +64,10 @@ export function bootCloudWorkClaims() {
         sent = "";
       });
   };
-  subscribeCloudDashboard(() => {
+  const schedule = () => {
     if (timer == null) timer = window.setTimeout(send, SETTLE_MS);
-  });
+  };
+  subscribeCloudDashboard(schedule);
+  subscribeCloudPipelines(schedule);
   timer = window.setTimeout(send, SETTLE_MS);
 }

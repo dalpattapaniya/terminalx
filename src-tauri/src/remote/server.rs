@@ -1039,6 +1039,7 @@ impl WorkspaceRpc {
             "workspace.removedRecords" => self.workspace_removed_records(),
             "workspace.restoreRemoved" => self.workspace_restore_removed(params),
             "pipeline.list" => self.pipeline_list(),
+            "pipeline.reviewers" => self.pipeline_reviewers(&params),
             "pipeline.act" => self.pipeline_act(params),
             "pipeline.noteMerge" => self.pipeline_note_merge(params),
             "pipeline.noteTracker" => self.pipeline_note_tracker(params),
@@ -2459,6 +2460,22 @@ impl WorkspaceRpc {
         Ok(json!({ "pipelines": listed, "truncated": listed.len() < pipelines.len() }))
     }
 
+    /// Persistent reviewer identities for existing sessions in this workspace.
+    /// Page independently of the bounded pipeline history, using stable ID order.
+    fn pipeline_reviewers(&self, params: &Value) -> Result<Value, RpcError> {
+        let after = params.get("after").and_then(Value::as_str).unwrap_or("");
+        let reviewers = crate::issue_pipeline::store::reviewer_sessions().map_err(RpcError::internal)?;
+        let root = self.root.to_string_lossy();
+        let mut ids: Vec<_> = index::load().map_err(RpcError::internal)?.into_iter()
+            .filter(|session| session.project_path == root && session.id.as_str() > after && reviewers.contains(&session.id))
+            .map(|session| session.id).collect();
+        ids.sort();
+        let more = ids.len() > 500;
+        ids.truncate(500);
+        let next = if more { ids.last().cloned() } else { None };
+        Ok(json!({ "sessionIds": ids, "next": next }))
+    }
+
     /// `pipeline/1`: what a person can do from the issue page, less the
     /// merge, which a runtime never makes. A pipeline not in a position to
     /// do it is refused and left as it was.
@@ -3333,3 +3350,7 @@ mod cleanup_tests;
 #[cfg(test)]
 #[path = "pipeline_tests.rs"]
 mod pipeline_tests;
+
+#[cfg(test)]
+#[path = "pipeline_reviewer_tests.rs"]
+mod pipeline_reviewer_tests;

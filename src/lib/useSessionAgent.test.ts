@@ -10,7 +10,7 @@ import { handoffStart, launchDefaults, launchSettingsOf, useSessionAgent, type L
 const catalog = vi.hoisted(() => ({ models: [] as ModelInfo[] }));
 vi.mock("@/lib/models", async (original) => ({
   ...(await original<typeof import("@/lib/models")>()),
-  useModels: (harness?: string) => catalog.models.filter((m) => m.harness === harness),
+  useModels: (harness?: string) => catalog.models.filter((m) => !harness || m.harness === harness),
 }));
 
 const model = (id: string, harness: string, extra: Partial<ModelInfo> = {}): ModelInfo => ({
