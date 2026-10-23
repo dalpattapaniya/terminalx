@@ -2401,6 +2401,11 @@ pub async fn head_tree(cwd: String) -> CmdResult<Option<String>> {
 }
 
 #[tauri::command]
+pub async fn review_range(cwd: String, target: Option<String>, uncommitted: bool) -> CmdResult<git::ReviewRange> {
+    tauri::async_runtime::spawn_blocking(move || git::review_range(Path::new(&cwd), target.as_deref(), uncommitted).map_err(err)).await.map_err(err)?
+}
+
+#[tauri::command]
 pub async fn changes_between(cwd: String, base: String, head: Option<String>) -> CmdResult<Vec<git::ChangedFile>> {
     tauri::async_runtime::spawn_blocking(move || git::changes_between(Path::new(&cwd), &base, head.as_deref()).map_err(err))
         .await

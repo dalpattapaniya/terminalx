@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changes
+
+- Default workspace review to All changes against a displayed merge-base target,
+  including committed, uncommitted and untracked files. Remember repository-specific
+  scope and target choices, with Uncommitted and turn review available in the same
+  panel; keep local and cloud diffs and unavailable states consistent. (#465)
+
 ### Stats & Usage
 
 - Refresh usage for non-Git projects without blocking healthy locations, and
@@ -43,6 +50,8 @@
 - Signing out drains an active work-status publish before withdrawing this Mac’s
   claims, and prevents further publishing until a new sign-in, including one
   started while the previous logout request is still finishing. (#578)
+- Keep cloud sessions openable when their first prompt fails, with the error
+  in their transcript, and stop their issue pipeline and partial agent launch. (#577)
 - Require completed workflow and check-suite evidence on the reviewed commit
   before an issue pipeline merges, including queued jobs and pending reruns.
   Missing or unreadable validation no longer passes after a fixed delay.

@@ -980,6 +980,8 @@ export class WorkspaceRpcClient {
    * after it (`worktreeName`), and unless `pipeline` is false the runtime
    * carries it on to a pull request and a review, adding its brief to the
    * prompt. `issueBody` is the issue as read here, for the reviewer.
+   * If the first send fails, creation still returns the openable session:
+   * `startError` explains the failure, also recorded in the tab's transcript.
    */
   createAgentTab(params: {
     agent: string;
@@ -994,7 +996,7 @@ export class WorkspaceRpcClient {
     pipeline?: boolean;
     pipelineSettings?: Record<string, unknown>;
     worktreeName?: string | null;
-  }): Promise<{ sessionId: string; tabId: string; tab?: AgentTabInfo; session?: RuntimeSession; pipeline?: RuntimeIssuePipeline | null; pipelineNote?: string | null }> {
+  }): Promise<{ sessionId: string; tabId: string; tab?: AgentTabInfo; session?: RuntimeSession; pipeline?: RuntimeIssuePipeline | null; pipelineNote?: string | null; startError?: string | null }> {
     const defined = Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== ""));
     return this.mutate("session.create", defined);
   }

@@ -561,6 +561,7 @@ pub fn run() {
             commands::snapshot_tree,
             commands::head_tree,
             commands::changes_between,
+            commands::review_range,
             commands::file_contents_at,
             commands::log_commits,
             commands::load_tab_events,

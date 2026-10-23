@@ -1,3 +1,4 @@
+import { WorkspaceRpcError } from "@terminalx/portable/workspace";
 import { RemoteGit, gitErrorMessage, type GitAuthor } from "@terminalx/portable/workspaceGit";
 import { api, errorMessage, gh, git, type PullRequest } from "@/lib/api";
 import type { BranchInfo, ChangedFile, CommitInfo, WorkStatus } from "@/types/session";
@@ -24,6 +25,7 @@ export interface GitSource {
   /** False for a read-only (participate) attachment. */
   canWrite: boolean;
   workingChanges(): Promise<{ head: string | null; files: ChangedFile[] }>;
+  reviewRange(target: string | null, uncommitted: boolean): Promise<{ target: string; base: string; head: string }>;
   changesBetween(base: string, head: string | null): Promise<ChangedFile[]>;
   fileContentsAt(path: string, base: string, head: string | null): Promise<{ before: string | null; after: string | null }>;
   workStatus(): Promise<SourceStatus>;
@@ -55,6 +57,7 @@ export function localGitSource(cwd: string): GitSource {
     cloud: false,
     canWrite: true,
     workingChanges: () => git.workingChanges(cwd).then(([head, files]) => ({ head, files })),
+    reviewRange: (target, uncommitted) => api.reviewRange(cwd, target, uncommitted),
     changesBetween: (base, head) => api.changesBetween(cwd, base, head),
     fileContentsAt: (path, base, head) => api.fileContentsAt(cwd, path, base, head),
     workStatus: () => api.workStatus(cwd),
@@ -110,7 +113,11 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     cloud: true,
     canWrite: input.canWrite,
     workingChanges: () => remote.workingChanges().then(({ head, files }) => ({ head, files })),
-    changesBetween: (base, head) => remote.changesBetween(base, head).then((answer) => answer.files),
+    reviewRange: (target, uncommitted) => remote.reviewRange(target, uncommitted),
+    changesBetween: (base, head) => remote.changesBetween(base, head).then((answer) => {
+      if (answer.truncated) throw new WorkspaceRpcError("response_truncated", "Too many changed files to load a complete comparison.", "git.changesBetween");
+      return answer.files;
+    }),
     fileContentsAt: (path, base, head) => remote.fileContents(path, base, head),
     workStatus: statusOf,
     logCommits: (from, limit) => remote.log(limit, from),

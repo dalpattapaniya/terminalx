@@ -332,6 +332,7 @@ impl WorkspaceGit {
             "git.status" => self.status(params),
             "git.diff" => self.diff(params),
             "git.workingChanges" => self.working_changes(params),
+            "git.reviewRange" => self.review_range(params),
             "git.changesBetween" => self.changes_between(params),
             "git.fileContents" => self.file_contents(params),
             "git.log" => self.log(params),
@@ -584,6 +585,14 @@ impl WorkspaceGit {
         let truncated = files.len() > MAX_CHANGED_FILES;
         files.truncate(MAX_CHANGED_FILES);
         Ok(json!({ "repo": repo.name, "head": head, "files": files, "truncated": truncated }))
+    }
+
+    fn review_range(&self, params: &Value) -> Result<Value, RpcError> {
+        let repo = self.repo(params)?;
+        let target = params.get("target").and_then(Value::as_str);
+        let uncommitted = params.get("uncommitted").and_then(Value::as_bool).unwrap_or(false);
+        let range = crate::git::review_range(&repo.dir, target, uncommitted).map_err(git_error)?;
+        Ok(json!(range))
     }
 
     fn changes_between(&self, params: &Value) -> Result<Value, RpcError> {

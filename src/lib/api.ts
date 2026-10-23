@@ -646,6 +646,8 @@ export const api = {
   listBranches: (cwd: string) => invoke<BranchInfo[]>("list_branches", { cwd }),
   snapshotTree: (cwd: string) => invoke<string>("snapshot_tree", { cwd }),
   headTree: (cwd: string) => invoke<string | null>("head_tree", { cwd }),
+  reviewRange: (cwd: string, target: string | null, uncommitted: boolean) =>
+    invoke<{ target: string; base: string; head: string }>("review_range", { cwd, target, uncommitted }),
   changesBetween: (cwd: string, base: string, head: string | null) =>
     invoke<ChangedFile[]>("changes_between", { cwd, base, head }),
   fileContentsAt: (cwd: string, path: string, base: string, head: string | null) =>
