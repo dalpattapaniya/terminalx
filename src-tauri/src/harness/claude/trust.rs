@@ -32,12 +32,24 @@ use serde_json::{json, Value};
 /// The CLI's config file, and the directory it keeps timestamped backups of
 /// that file in.
 fn config_paths() -> Option<(PathBuf, PathBuf)> {
-    match std::env::var("CLAUDE_CONFIG_DIR") {
-        Ok(dir) if !dir.is_empty() => {
-            let dir = PathBuf::from(dir);
-            Some((dir.join(".claude.json"), dir.join("backups")))
+    #[cfg(test)]
+    {
+        // Never inspect or rewrite the developer's config, even when
+        // CLAUDE_CONFIG_DIR points outside the test's temporary home.
+        crate::store::state_home_env().map(|home| {
+            let home = PathBuf::from(home).join("test-user-home");
+            (home.join(".claude.json"), home.join(".claude").join("backups"))
+        })
+    }
+    #[cfg(not(test))]
+    {
+        match std::env::var("CLAUDE_CONFIG_DIR") {
+            Ok(dir) if !dir.is_empty() => {
+                let dir = PathBuf::from(dir);
+                Some((dir.join(".claude.json"), dir.join("backups")))
+            }
+            _ => dirs::home_dir().map(|h| (h.join(".claude.json"), h.join(".claude").join("backups"))),
         }
-        _ => dirs::home_dir().map(|h| (h.join(".claude.json"), h.join(".claude").join("backups"))),
     }
 }
 
@@ -117,6 +129,20 @@ fn prepare_at(path: &Path, backups: &Path, cwd: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_config_and_backups_stay_in_the_test_home() {
+        let _home = crate::store::temp_home();
+        let home = PathBuf::from(crate::store::state_home_env().unwrap()).join("test-user-home");
+        let (path, backups) = config_paths().unwrap();
+        assert_eq!(path, home.join(".claude.json"));
+        assert_eq!(backups, home.join(".claude/backups"));
+
+        // The public entry point must use these paths too.
+        prepare("/test/worktree").unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(written, ready("/test/worktree"));
+    }
 
     fn ready(cwd: &str) -> Value {
         json!({"hasCompletedOnboarding": true, "projects": {cwd: {"hasTrustDialogAccepted": true}}})
