@@ -2865,6 +2865,11 @@ pub async fn pr_list(cwd: String, branch: String) -> CmdResult<Vec<crate::github
 }
 
 #[tauri::command]
+pub async fn pr_landed(cwd: String) -> CmdResult<crate::landed::Landed> {
+    tauri::async_runtime::spawn_blocking(move || crate::landed::check(Path::new(&cwd), Path::new(&cwd), crate::landed::Fetch::Fresh)).await.map_err(err)
+}
+
+#[tauri::command]
 pub async fn pr_details(cwd: String, number: u64, url: Option<String>) -> CmdResult<crate::github::PullRequest> {
     tauri::async_runtime::spawn_blocking(move || crate::github::associated_pr_details(Path::new(&cwd), number, url.as_deref()).map_err(err)).await.map_err(err)?
 }

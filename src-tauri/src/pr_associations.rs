@@ -70,7 +70,79 @@ pub fn record_local(session: &str, cwd: &Path, url: &str, head: &str) -> Result<
     Ok(())
 }
 
+/// The normalized journal is written even with no panel mounted. Recover only
+/// successful creation tool calls, never PR links in prose, reviews or reads.
+/// Reading it here also repairs associations after a crash or an older version.
+fn creation_evidence(events: impl IntoIterator<Item = crate::events::AgentEvent>, session: &str, cwd: &str) -> Vec<Association> {
+    use crate::events::{Payload, ToolType};
+    let mut calls = BTreeMap::new();
+    let mut found = Vec::new();
+    for event in events {
+        if event.session_id != session { continue; }
+        let key = |id: &str| (event.tab_id.clone(), event.subagent.as_ref().map(|s| s.id.clone()), id.to_string());
+        match event.payload {
+            Payload::ToolCallStarted { call_id, tool_type: ToolType::Shell, input, .. } => {
+                let command = input.get("cmd").or_else(|| input.get("command")).and_then(|v| v.as_str()).unwrap_or_default();
+                if creates_pr(command) { calls.insert(key(&call_id), ()); }
+            }
+            Payload::ToolCallCompleted { call_id, result } if calls.remove(&key(&call_id)).is_some() && !result.is_error && result.exit_code.is_none_or(|code| code == 0) => {
+                // gh prints the created URL on its own line. Do not extract
+                // arbitrary links from a command's echoed arguments or prose.
+                let urls: std::collections::BTreeSet<_> = result.text.lines().filter_map(|line| identity(line.trim()).ok()).collect();
+                if urls.len() == 1 {
+                    let url = urls.into_iter().next().unwrap();
+                    found.push(Association { number: url.rsplit('/').next().unwrap().parse().unwrap(), url, head: String::new(), scope: Scope::Local { cwd: cwd.into() } });
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Recognize a shell command, not quoted documentation or an echo of one.
+/// Deliberately leave substitutions and heredocs to explicit association.
+fn creates_pr(command: &str) -> bool {
+    if command.contains("<<") || command.contains('`') || command.contains("$(") { return false; }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut found = false;
+    let matches = |words: &[String]| words.len() >= 3 && words[0].rsplit('/').next() == Some("gh") && words[1] == "pr" && words[2] == "create";
+    for c in command.chars().chain(std::iter::once(';')) {
+        if escaped { word.push(c); escaped = false; continue; }
+        if c == '\\' && quote != Some('\'') { escaped = true; continue; }
+        if let Some(q) = quote {
+            if c == q { quote = None; } else { word.push(c); }
+            continue;
+        }
+        if c == '\'' || c == '"' { quote = Some(c); continue; }
+        if c.is_whitespace() || matches!(c, ';' | '&' | '|') {
+            if !word.is_empty() { words.push(std::mem::take(&mut word)); }
+            if matches!(c, ';' | '&' | '|' | '\n') {
+                found |= matches(&words);
+                words.clear();
+            }
+        } else { word.push(c); }
+    }
+    found && quote.is_none()
+}
+
+fn journal_associations(session: &str) -> Result<Vec<Association>> {
+    let Ok(entry) = crate::store::index::get(session) else { return Ok(Vec::new()); };
+    let mut found = Vec::new();
+    for file in std::fs::read_dir(crate::store::session_dir(session)?)? {
+        let path = file?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") { continue; }
+        let events: Vec<crate::events::AgentEvent> = crate::store::read_lines(&path)?;
+        found.extend(creation_evidence(events, session, &entry.cwd));
+    }
+    Ok(found)
+}
+
 pub fn for_session(session: &str, mut additions: Vec<Association>) -> Result<Vec<Association>> {
+    additions.extend(journal_associations(session)?);
     // Read existing author evidence, never infer authorship from a shared cwd
     // or import the reviewer's PRs. Retain it beyond pipeline history pruning.
     for pipeline in crate::issue_pipeline::store::list()?.into_iter().filter(|p| p.author.session_id == session) {
@@ -95,6 +167,47 @@ mod tests {
 
     fn entry(repo: &str, number: u64, head: &str) -> Association {
         Association { url: format!("https://github.com/acme/{repo}/pull/{number}"), number, head: head.into(), scope: Scope::Local { cwd: "/fixture".into() } }
+    }
+
+    #[test]
+    fn recovers_creation_from_durable_tools_without_branch_or_panel_state() {
+        use crate::events::{AgentEvent, Payload, ToolResult, ToolType};
+        let event = |session: &str, payload| AgentEvent { id: "event".into(), session_id: session.into(), tab_id: "tab".into(), harness: "codex".into(), seq: 1, ts: String::new(), message_ts: None, subagent: None, payload };
+        let call = |id: &str, command: &str| Payload::ToolCallStarted { call_id: id.into(), name: "exec_command".into(), tool_type: ToolType::Shell, input: serde_json::json!({ "cmd": command }), title: None };
+        let result = |id: &str, text: &str, is_error| Payload::ToolCallCompleted { call_id: id.into(), result: ToolResult { text: text.into(), is_error, exit_code: Some(if is_error { 1 } else { 0 }), ..Default::default() } };
+        let url = "https://github.com/acme/widgets/pull/2";
+        let events = vec![
+            event("author", call("create", "cd /fixture && gh pr create --head followup --title 'Fix'")),
+            event("author", result("create", url, false)),
+            event("author", call("read", "gh pr view 99")),
+            event("author", result("read", "https://github.com/acme/widgets/pull/99", false)),
+            event("author", call("failed", "gh pr create")),
+            event("author", result("failed", "https://github.com/acme/widgets/pull/98", true)),
+            event("other", call("other", "gh pr create")),
+            event("other", result("other", "https://github.com/acme/widgets/pull/97", false)),
+            event("author", Payload::AssistantText { block: None, text: "Review https://github.com/acme/widgets/pull/96".into() }),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("tab.jsonl");
+        for e in &events { crate::store::append_line(&journal, &serde_json::to_string(e).unwrap()).unwrap(); }
+        let recovered = creation_evidence(crate::store::read_lines::<AgentEvent>(&journal).unwrap(), "author", "/different-checkout");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].url, url);
+        let registry = dir.path().join("associations.json");
+        update(&registry, "author", recovered).unwrap();
+        std::fs::remove_file(journal).unwrap();
+        assert_eq!(update(&registry, "author", vec![]).unwrap()[0].url, url);
+        assert!(update(&registry, "other", vec![]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn creation_commands_are_not_quoted_mentions_or_read_commands() {
+        for command in ["gh pr create --title 'a; gh pr view 3'", "cd /repo && gh pr create", "git switch followup\ngh pr create --draft"] {
+            assert!(creates_pr(command), "{command}");
+        }
+        for command in ["echo 'gh pr create'", "printf '%s' 'example; gh pr create'", "gh pr view 3", "cat <<EOF\ngh pr create\nEOF"] {
+            assert!(!creates_pr(command), "{command}");
+        }
     }
 
     #[test]

@@ -33,14 +33,17 @@ export async function sessionPrs(source: GitSource, sessionId: string | undefine
   // checkout. It must not attach that session's newly discovered PRs here.
   if (!isCurrent()) return { rows: [] };
   const current = discovery.current;
-  const discovered = [...discovery.initial, ...current];
+  // A shared checkout is not session ownership evidence. Only its saved
+  // branch and explicit identities may contribute rows to this session.
+  const owned = new Set(remembered.map((entry) => prIdentity(entry.url)));
+  const discovered = [...discovery.initial, ...current.filter((pr) => !sessionId || branch === sessionBranch || owned.has(prIdentity(pr.url)))];
   const additions = source.prScope ? discovered.map((pr): PrAssociation => ({ url: pr.url, number: pr.number, head: pr.head, scope: source.prScope! })) : [];
   const associations = sessionId && additions.length ? await gh.associations(sessionId, additions) : remembered;
   const rows = new Map<string, SessionPr>();
   for (const association of associations) rows.set(prIdentity(association.url), { identity: prIdentity(association.url), association, current: false });
   for (const pr of discovered) {
     const identity = prIdentity(pr.url);
-    rows.set(identity, { identity, pr, association: additions.find((entry) => prIdentity(entry.url) === identity), current: current.some((entry) => prIdentity(entry.url) === identity) });
+    rows.set(identity, { identity, pr, association: associations.find((entry) => prIdentity(entry.url) === identity), current: current.some((entry) => prIdentity(entry.url) === identity) });
   }
   await Promise.all([...rows.values()].filter((row) => !row.pr).map(async (row) => {
     try {

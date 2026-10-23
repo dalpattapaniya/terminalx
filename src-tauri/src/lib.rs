@@ -612,6 +612,7 @@ pub fn run() {
             commands::pr_list,
             commands::pr_associations,
             commands::pr_details,
+            commands::pr_landed,
             commands::pr_create,
             commands::pr_merge,
             commands::pr_ready,

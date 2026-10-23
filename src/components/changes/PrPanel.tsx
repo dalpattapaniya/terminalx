@@ -14,7 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/menu";
-import type { WorkspaceDisposition, WorkStatus } from "@/types/session";
+import type { Landed, WorkspaceDisposition, WorkStatus } from "@/types/session";
 
 type WorkspaceCleanup = {
   projectPath: string;
@@ -67,6 +67,7 @@ export function PrPanel({
   const [loadedSelection, setLoadedSelection] = useState<string | null>(null);
   const visibleRows = loadedSelection === selection ? rows : [];
   const prs = visibleRows.flatMap((row) => row.pr ? [row.pr] : []);
+  const [landed, setLanded] = useState<Landed | null>(null);
   const [status, setStatus] = useState<WorkStatus | null>(null);
   const [checkedWorkspace, setCheckedWorkspace] = useState<{ key: string; disposition: WorkspaceDisposition } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -98,17 +99,21 @@ export function PrPanel({
       ? api.workspaceDisposition(workspace.projectPath, cwd ?? "").then((disposition) => ({ key: workspaceKey, disposition }))
       : Promise.resolve(null);
     Promise.all([
-      source.workStatus().then(async (workStatus) => ({
-        workStatus,
-        pullRequests: await sessionPrs(source, sessionId, workStatus.branch !== workStatus.defaultBranch ? workStatus.branch : null, branch !== workStatus.defaultBranch ? branch : null, () => !cancelled),
-      })),
+      source.workStatus().then(async (workStatus) => {
+        const pullRequests = await sessionPrs(source, sessionId, workStatus.branch !== workStatus.defaultBranch ? workStatus.branch : null, branch !== workStatus.defaultBranch ? branch : null, () => !cancelled);
+        const needsLandedCheck = (workStatus.aheadOfBase ?? 0) > 0
+          && pullRequests.rows.some((row) => row.current && row.pr?.state === "MERGED");
+        const landedWork = !cancelled && needsLandedCheck && source.landed ? await source.landed() : null;
+        return { workStatus, pullRequests, landedWork };
+      }),
       dispositionRequest,
     ])
-      .then(([{ pullRequests, workStatus }, workspaceCheck]) => {
+      .then(([{ pullRequests, workStatus, landedWork }, workspaceCheck]) => {
         if (cancelled) return;
         setRows(pullRequests.rows);
         setLoadedSelection(selection);
         setStatus(workStatus);
+        setLanded(landedWork);
         setCheckedWorkspace(workspaceCheck);
         setError(pullRequests.error ?? null);
       })
@@ -125,6 +130,7 @@ export function PrPanel({
 
   useEffect(() => {
     setStatus(null);
+    setLanded(null);
     setError(null);
     setNotice(null);
     setCreating(false);
@@ -199,10 +205,11 @@ export function PrPanel({
   const currentBranch = status?.branch ?? branch;
   const fresh = loadedSelection === selection && !loading && !error && !visibleRows.some((row) => row.error);
   const currentOpen = visibleRows.some((row) => row.current && row.pr?.state === "OPEN");
-  const canCreate = fresh && !currentOpen && status && status.defaultBranch && currentBranch && currentBranch !== status.defaultBranch && (status.aheadOfBase ?? 0) > 0;
+  const workLanded = status?.aheadOfBase === 0 || !!(landed?.safe && landed.head === status?.head && landed.branch === currentBranch);
+  const canCreate = fresh && !workLanded && !currentOpen && status && status.defaultBranch && currentBranch && currentBranch !== status.defaultBranch && (status.aheadOfBase ?? 0) > 0;
   const latestCurrent = visibleRows.filter((row) => row.current && row.pr?.head === currentBranch).sort((a, b) => (b.pr?.number ?? 0) - (a.pr?.number ?? 0))[0]?.pr;
   const merged = fresh && !busy && latestCurrent?.state === "MERGED" && open.length === 0
-    && status && !status.dirty && status.ahead === 0 && status.aheadOfBase === 0;
+    && status && !status.dirty && status.ahead === 0 && workLanded;
   const canDelete = !!workspaceKey && checkedWorkspace?.key === workspaceKey
     && checkedWorkspace.disposition.branch === currentBranch && checkedWorkspace.disposition.pr?.url === latestCurrent?.url
     && canDeleteMergedWorkspace(checkedWorkspace.disposition);

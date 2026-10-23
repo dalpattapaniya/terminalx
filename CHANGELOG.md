@@ -5,7 +5,9 @@
 ### Changes
 
 - Retain session pull requests across follow-up branches and restarts, including
-  PRs created or adopted by the issue pipeline. Refresh each saved PR by its
+  PRs created or adopted by the issue pipeline and successful CLI creation
+  recorded in session tool journals. Avoid importing another session’s checkout
+  PRs and recognize squash/rebase-landed work. Refresh each saved PR by its
   repository identity, keep open PRs above history, and prevent older merged
   work from offering cleanup while follow-ups or unmerged work remain. (#463)
 

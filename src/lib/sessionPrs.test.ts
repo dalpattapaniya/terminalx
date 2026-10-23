@@ -25,7 +25,7 @@ describe("session PR transport", () => {
       if (command === "pr_list") return [history, followup, history];
       throw Error(command);
     });
-    const { rows } = await sessionPrs(localGitSource("/fixture"), "session", a.head);
+    const { rows } = await sessionPrs(localGitSource("/fixture"), "session", a.head, a.head);
     expect(rows.map((row) => row.pr?.number)).toEqual([2, 1]);
     expect(rows[1]?.pr?.state).toBe(state);
     expect(invoke).toHaveBeenCalledWith("pr_associations", expect.objectContaining({ sessionId: "session", additions: expect.arrayContaining([reference(followup)]) }));
@@ -68,7 +68,7 @@ describe("session PR transport", () => {
   it("uses cloud repository transport for saved identities without importing other PRs on historical branches", async () => {
     const saved: PrAssociation = { ...reference(a), scope: { kind: "cloud", workspace: "workspace", repo: "old-repo" } };
     invoke.mockImplementation(async (command) => {
-      if (command === "pr_associations") return [saved];
+      if (command === "pr_associations") return [saved, { ...reference(b), scope: { kind: "cloud", workspace: "workspace", repo: "new-repo" } }];
       throw Error(`Cloud PRs must not use native gh: ${command}`);
     });
     const call = vi.fn(async (_method: string, args: { repo: string }) => ({ prs: args.repo === "old-repo" ? [a, { ...b, number: 99, url: "https://github.com/acme/widgets/pull/99", head: a.head }] : [b] }));
@@ -98,15 +98,15 @@ it("saves cloud creation immediately, before a later branch change or refresh", 
   expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [{ url: b.url, number: b.number, head: b.head, scope: { kind: "cloud", workspace: "workspace", repo: "repo/path" } }] });
 });
 
-it("backfills the original session branch alongside live follow-up discovery", async () => {
+it("backfills the session branch without importing another session’s live checkout PR", async () => {
   invoke.mockImplementation(async (command, args) => {
     if (command === "pr_associations") return [];
     if (command === "pr_list") return args.branch === a.head ? [a] : [b];
     throw Error(command);
   });
   const { rows } = await sessionPrs(localGitSource("/fixture"), "author", b.head, a.head);
-  expect(rows.map((row) => [row.pr?.number, row.current])).toEqual([[2, true], [1, false]]);
-  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [reference(a), reference(b)] });
+  expect(rows.map((row) => [row.pr?.number, row.current])).toEqual([[1, false]]);
+  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [reference(a)] });
 });
 
 it("includes associations recorded concurrently with branch discovery", async () => {
@@ -116,7 +116,7 @@ it("includes associations recorded concurrently with branch discovery", async ()
     if (command === "pr_details") return b;
     throw Error(command);
   });
-  const { rows } = await sessionPrs(localGitSource("/fixture"), "author", a.head);
+  const { rows } = await sessionPrs(localGitSource("/fixture"), "author", a.head, a.head);
   expect(rows.map((row) => row.pr?.number)).toEqual([2, 1]);
 });
 

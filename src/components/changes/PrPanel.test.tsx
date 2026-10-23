@@ -161,11 +161,11 @@ const association = (pr: PullRequest) => ({ url: pr.url, number: pr.number, head
 const workStatus = (branch: string, aheadOfBase = 0) => ({ isRepo: true, dirty: false, branch, upstream: `origin/${branch}`, ahead: 0, behind: 0, defaultBranch: "main", aheadOfBase, head: "abc123" });
 
 describe("session PR history", () => {
-  it("discovers the actual follow-up branch despite stale session metadata and refreshes its checks", async () => {
+  it("loads recorded follow-up creation despite stale session metadata and refreshes its checks", async () => {
     let check = "pending";
     mocks.invoke.mockImplementation(async (command: string, args: { branch?: string }) => {
       if (command === "gh_available") return true;
-      if (command === "pr_associations") return [association(mergedPr)];
+      if (command === "pr_associations") return [association(mergedPr), association(followup)];
       if (command === "work_status") return workStatus(followup.head, 1);
       if (command === "pr_list") return args.branch === mergedPr.head ? [mergedPr] : [{ ...followup, checks: [{ name: "Follow-up CI", state: check }] }];
       if (command === "pr_details") return mergedPr;
@@ -189,6 +189,7 @@ describe("session PR history", () => {
       if (command === "gh_available") return true;
       if (command === "pr_associations") return [association(mergedPr)];
       if (command === "work_status") return workStatus(mergedPr.head, 2);
+      if (command === "pr_landed") return { safe: false, merged: null, branch: mergedPr.head, head: "abc123" };
       if (command === "pr_list") return [mergedPr];
       throw Error(command);
     });
@@ -290,4 +291,32 @@ it("updates a follow-up's state and offers settle only after current work is con
   expect(screen.queryByRole("button", { name: "Create pull request" })).toBeNull();
   expect(screen.getByText(mergedPr.title)).toBeTruthy();
   expect(screen.getByText(followup.title)).toBeTruthy();
+});
+
+it.each(["squash", "rebase"])("recognizes %s-merged work despite commits outside base ancestry", async (method) => {
+  mocks.invoke.mockImplementation(async (command: string) => {
+    if (command === "gh_available") return true;
+    if (command === "pr_associations") return [association(mergedPr)];
+    if (command === "work_status") return workStatus(mergedPr.head, 3);
+    if (command === "pr_list") return [mergedPr];
+    if (command === "pr_landed") return { safe: true, merged: method, branch: mergedPr.head, head: "abc123" };
+    throw Error(command);
+  });
+  render(<PrPanel cwd={cwd} sessionId="author" branch={mergedPr.head} active busy={false} onSettle={() => {}} />);
+  await screen.findByRole("button", { name: "Settle worktree" });
+  expect(screen.queryByRole("button", { name: "Create pull request" })).toBeNull();
+});
+
+it("does not apply landed evidence from a different checkout HEAD", async () => {
+  mocks.invoke.mockImplementation(async (command: string) => {
+    if (command === "gh_available") return true;
+    if (command === "pr_associations") return [association(mergedPr)];
+    if (command === "work_status") return workStatus(mergedPr.head, 3);
+    if (command === "pr_list") return [mergedPr];
+    if (command === "pr_landed") return { safe: true, merged: "squash", branch: mergedPr.head, head: "different" };
+    throw Error(command);
+  });
+  render(<PrPanel cwd={cwd} sessionId="author" branch={mergedPr.head} active busy={false} onSettle={() => {}} />);
+  await screen.findByRole("button", { name: "Create pull request" });
+  expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
 });

@@ -29,6 +29,7 @@ export interface GitSource {
   changesBetween(base: string, head: string | null): Promise<ChangedFile[]>;
   fileContentsAt(path: string, base: string, head: string | null): Promise<{ before: string | null; after: string | null }>;
   workStatus(): Promise<SourceStatus>;
+  landed?(): Promise<import("@/types/session").Landed>;
   logCommits(from: string | null, limit: number): Promise<CommitInfo[]>;
   branches(): Promise<BranchInfo[]>;
   /** Resolves to a notice worth showing (e.g. what a reconciled push found), or null. */
@@ -68,6 +69,7 @@ export function localGitSource(cwd: string): GitSource {
     changesBetween: (base, head) => api.changesBetween(cwd, base, head),
     fileContentsAt: (path, base, head) => api.fileContentsAt(cwd, path, base, head),
     workStatus: () => api.workStatus(cwd),
+    landed: () => gh.landed(cwd),
     logCommits: (from, limit) => api.logCommits(cwd, from, limit),
     branches: () => api.listBranches(cwd),
     commit: (message) => git.commit(cwd, message).then(() => null),
