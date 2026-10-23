@@ -8,6 +8,11 @@
   without also showing a macOS permission prompt. The permission remains
   attributed to TerminalX Computer Use Helper. (#569)
 
+### Development
+
+- Pipeline tests keep Claude trust configuration in their temporary home and
+  verify the stand-in agent actually launched with the expected session ID. (#576)
+
 ### Editor
 
 - Keep Preview / Source and neighbouring toolbar buttons readable in narrow
