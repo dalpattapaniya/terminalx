@@ -30,6 +30,7 @@ import { deriveCloudActivity } from "@/lib/cloudRowState";
 import { mayStartCloudSessions } from "@/lib/multiOrg";
 import { cloudControlNative } from "@/lib/cloudControlNative";
 import { getPrefs } from "@/lib/prefs";
+import { DEFAULT_PERMISSION_MODE, pickerMode } from "@/lib/models";
 import { cloudAsleep, cloudSessionBackend } from "@/lib/sessionBackend";
 import { cloudWorkspaceKey, isCloudKey, parseCloudWorkspaceKey, type CloudProject } from "@/types/target";
 import type { RuntimeIssueRef, WorkspaceConnectionState, WorkspaceYou } from "@terminalx/portable/workspace";
@@ -734,11 +735,14 @@ async function sessionsCreate(params: Params) {
   if (!project.selected) throw forbidden("This repository is no longer selected for cloud workspaces in its organization.");
   const prefs = getPrefs();
   const agent = text(params, "agent") ?? "claude";
+  const explicitMode = typeof params.mode === "string";
+  const mode = pickerMode(explicitMode ? (text(params, "mode") ?? "") : prefs.lastMode)?.id;
+  if (explicitMode && !mode) throw invalid(`Unknown permission mode ${params.mode}.`);
   const request: CloudSessionRequest = {
     agent,
     model: text(params, "model") ?? prefs.lastModel[agent] ?? "",
     effort: text(params, "effort") ?? prefs.lastEffort[agent] ?? null,
-    mode: text(params, "mode") ?? prefs.lastMode,
+    mode: mode ?? DEFAULT_PERMISSION_MODE,
     prompt,
     useWorktree: params.useWorktree !== false,
   };
