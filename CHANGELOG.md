@@ -47,6 +47,8 @@
 
 ### Issues
 
+- Keep cloud sessions openable when their first prompt fails, with the error
+  in their transcript, and stop their issue pipeline and partial agent launch. (#577)
 - Require completed workflow and check-suite evidence on the reviewed commit
   before an issue pipeline merges, including queued jobs and pending reruns.
   Missing or unreadable validation no longer passes after a fixed delay.
