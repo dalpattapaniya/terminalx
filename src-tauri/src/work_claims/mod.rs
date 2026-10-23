@@ -360,7 +360,7 @@ impl WorkClaims {
 
     /// Fence publishers before draining the one bounded request already in flight.
     /// Keep the fence through account sign-out, including token refresh and failure.
-    pub fn sign_out<T>(&self, end_session: impl FnOnce() -> T) -> T {
+    pub fn sign_out<T>(&self, end_session: impl FnOnce() -> (T, u64)) -> T {
         self.state.lock().unwrap().signing_out += 1;
         let _publish = self.publish_gate.lock().unwrap();
         // `sent` may be empty after an unanswered first PUT or an app restart.
@@ -369,11 +369,13 @@ impl WorkClaims {
                 log::info!("withdraw work status at sign-out: {}", error.code);
             }
         }
-        let result = end_session();
+        let (result, generation) = end_session();
         let mut state = self.state.lock().unwrap();
         state.signing_out -= 1;
         // Refresh keeps the generation; only a subsequent sign-in can resume.
-        state.blocked_generation = Some(self.account.current_generation());
+        // This generation was captured with removal, before logout HTTP.
+        // A sign-in begun during that request must not inherit the fence.
+        state.blocked_generation = Some(generation);
         state.sent = None;
         state.last_put = None;
         state.failures = 0;

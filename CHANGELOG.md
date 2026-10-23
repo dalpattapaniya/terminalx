@@ -19,7 +19,8 @@
 ### Issues
 
 - Signing out drains an active work-status publish before withdrawing this Mac’s
-  claims, and prevents further publishing until a new sign-in. (#578)
+  claims, and prevents further publishing until a new sign-in, including one
+  started while the previous logout request is still finishing. (#578)
 
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)

@@ -75,6 +75,7 @@ fn serve_observing(status: &'static str, headers: &'static str, body: &'static s
 fn service(base: &str) -> WorkClaims {
     let account = Arc::new(AccountManager::default());
     account.set_context_for_test(Some(context()));
+    account.use_secrets_for_test(Arc::new(crate::keychain::testing::MemorySecrets::default()));
     account.set_capability_for_test(CAPABILITY, true);
     WorkClaims::with_base(account, || Some("host-0123456789ab".into()), Url::parse(base).unwrap())
 }
@@ -264,7 +265,7 @@ fn signing_out_withdraws_this_devices_claims() {
     let (base, requests) = serve(r#"{"claims":0}"#);
     let claims = service(&base);
     claims.publish(&Linker::default());
-    claims.sign_out(|| claims.account.set_context_for_test(None));
+    claims.sign_out(|| ((), claims.account.end_session_generation_for_test()));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].starts_with("DELETE /v1/desktop/work-claims/devices/host-0123456789ab "), "{}", requests[1]);
@@ -476,7 +477,7 @@ fn sign_out_drains_the_first_publish_and_blocks_queued_work_through_account_remo
     let logout = std::thread::spawn(move || signing_out.sign_out(|| {
         ending_tx.send(()).unwrap();
         end_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        signing_out.account.set_context_for_test(None);
+        ((), signing_out.account.end_session_generation_for_test())
     }));
     let deadline = Instant::now() + Duration::from_secs(10);
     while claims.state.lock().unwrap().signing_out == 0 {
@@ -523,7 +524,7 @@ fn sign_out_without_sent_withdraws_and_failure_stays_fenced_until_new_sign_in() 
     // Includes an unanswered/failed publish and its backoff, with no Sent entry.
     assert!(claims.publish(&Linker::default()));
     assert!(claims.state.lock().unwrap().retry_at.is_some());
-    claims.sign_out(|| {}); // Simulate account removal failing, retaining its session.
+    claims.sign_out(|| ((), claims.account.current_generation())); // Simulate account removal failing, retaining its session.
     assert!(requests.lock().unwrap()[1].starts_with("DELETE /v1/desktop/work-claims/devices/host-0123456789ab "));
     let mut refreshed = context();
     refreshed.access_token = "refreshed-test-token".into();
@@ -545,7 +546,7 @@ fn sign_out_without_sent_withdraws_and_failure_stays_fenced_until_new_sign_in() 
 fn sign_out_with_no_publish_still_withdraws_the_known_device() {
     let (base, requests) = serve(r#"{}"#);
     let claims = service(&base);
-    claims.sign_out(|| claims.account.set_context_for_test(None));
+    claims.sign_out(|| ((), claims.account.end_session_generation_for_test()));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("DELETE /v1/desktop/work-claims/devices/host-0123456789ab "));
@@ -573,7 +574,7 @@ fn a_timed_out_publish_and_withdrawal_do_not_prevent_local_sign_out() {
     let signing_out = claims.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let logout = std::thread::spawn(move || {
-        signing_out.sign_out(|| signing_out.account.set_context_for_test(None));
+        signing_out.sign_out(|| ((), signing_out.account.end_session_generation_for_test()));
         done_tx.send(()).unwrap();
     });
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -582,4 +583,40 @@ fn a_timed_out_publish_and_withdrawal_do_not_prevent_local_sign_out() {
     logout.join().unwrap();
     assert!(claims.account.context().is_none());
     assert!(claims.state.lock().unwrap().retry_at.is_none());
+}
+
+
+#[test]
+fn a_sign_in_during_logout_is_not_fenced_when_the_old_logout_returns() {
+    let _home = crate::store::temp_home();
+    // Both signing back in as the same person and switching accounts must resume.
+    for user_id in ["user-1", "other-user"] {
+        let (base, requests) = serve(r#"{"claims":0}"#);
+        let claims = Arc::new(service(&base));
+        let signing_out = claims.clone();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let logout = std::thread::spawn(move || signing_out.sign_out(|| {
+            let generation = signing_out.account.end_session_generation_for_test();
+            removed_tx.send(generation).unwrap();
+            // AccountManager emits signed-out status here, then waits on logout HTTP.
+            finish_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            ((), generation)
+        }));
+        let removed_generation = removed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut new_session = context();
+        new_session.generation = removed_generation + 1;
+        new_session.user_id = user_id.into();
+        claims.account.set_context_for_test(Some(new_session));
+        claims.account.set_capability_for_test(CAPABILITY, true);
+        assert!(!claims.publish(&Linker::default()), "still fenced while logout is in progress");
+        finish_tx.send(()).unwrap();
+        logout.join().unwrap();
+        claims.nudge();
+        assert!(claims.publish(&Linker::default()));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "new sign-in must publish after the old logout returns");
+        assert!(requests[0].starts_with("DELETE "));
+        assert!(requests[1].starts_with("PUT "));
+    }
 }

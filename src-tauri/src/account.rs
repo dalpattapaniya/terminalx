@@ -496,7 +496,13 @@ impl AccountManager {
     /// Tests: sign out on this Mac; true when the Keychain let the session go.
     #[cfg(test)]
     pub(crate) fn sign_out_for_test(&self) -> bool {
-        self.end_session().is_some()
+        self.end_session().0.is_some()
+    }
+
+    /// Tests: run local removal with an injected secret store, without logout HTTP.
+    #[cfg(test)]
+    pub(crate) fn end_session_generation_for_test(&self) -> u64 {
+        self.end_session().1
     }
 
     /// Tests: a forced role refresh the server answers with `role` in the
@@ -909,9 +915,11 @@ impl AccountManager {
         Ok(status)
     }
 
-    pub fn sign_out(&self, app: &AppHandle) -> AccountStatus {
+    /// Return the removal generation as well as the UI status. A later sign-in
+    /// may already own the account by the time the logout request finishes.
+    pub fn sign_out(&self, app: &AppHandle) -> (AccountStatus, u64) {
         self.ensure_loaded();
-        let session = self.end_session();
+        let (session, generation) = self.end_session();
         let status = self.snapshot();
         self.emit(app);
 
@@ -920,15 +928,16 @@ impl AccountManager {
                 log::debug!("TerminalX account logout request failed: {error}");
             }
         }
-        status
+        (status, generation)
     }
 
     /// Sign out on this Mac: at once in memory (everything made for the
     /// account is fenced by the new generation), then in the Keychain.
-    /// Returns the session that ended, for the server to be told. When the
+    /// Returns the session that ended and its removal generation, captured
+    /// together under the account lock, for the server and publishers. When the
     /// Keychain keeps the session it is still signed in, as the next launch
-    /// would find: the session is put back and nothing is returned.
-    fn end_session(&self) -> Option<DesktopSession> {
+    /// would find: the session is put back and no session is returned.
+    fn end_session(&self) -> (Option<DesktopSession>, u64) {
         let (generation, session) = {
             let mut inner = self.inner.lock().unwrap();
             inner.generation = inner.generation.wrapping_add(1);
@@ -949,7 +958,7 @@ impl AccountManager {
         let mut inner = self.inner.lock().unwrap();
         // With the outcome, in one step: confirmed, or put back just below.
         inner.ending -= 1;
-        let Err(error) = stored else { return session };
+        let Err(error) = stored else { return (session, generation) };
         log::warn!("could not remove TerminalX account session from Keychain: {:#}", error.into_error());
         // A sign-in begun meanwhile owns the account now.
         if inner.generation == generation {
@@ -958,7 +967,7 @@ impl AccountManager {
                 inner.set_session(session);
             }
         }
-        None
+        (None, generation)
     }
 
     pub fn handle_deep_link(self: &Arc<Self>, app: &AppHandle, url: &Url) -> bool {
@@ -2131,6 +2140,28 @@ mod tests {
         (manager, store)
     }
 
+    #[test]
+    fn removal_returns_its_own_generation_when_a_sign_in_overtakes_the_store() {
+        for fail in [false, true] {
+            let (manager, store) = signed_in_with_store();
+            let mut replacement = manager.context().unwrap();
+            let removal_generation = replacement.generation + 1;
+            replacement.generation += 2;
+            store.block_writes();
+            store.fail_writes(fail);
+            let signing_out = manager.clone();
+            let logout = std::thread::spawn(move || signing_out.end_session());
+            store.wait_for_blocked(1);
+            manager.set_context_for_test(Some(replacement.clone()));
+            store.release();
+            let (ended, generation) = logout.join().unwrap();
+            assert_eq!(generation, removal_generation);
+            assert_eq!(ended.is_none(), fail);
+            assert_eq!(manager.current_generation(), replacement.generation);
+            assert!(manager.context().is_some(), "the new sign-in survives the old removal");
+        }
+    }
+
     /// What `work` returns, or a failure when it does not return at once: a
     /// read that waits for the Keychain is the bug.
     fn promptly<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
@@ -2235,7 +2266,7 @@ mod tests {
         store.release();
         assert!(stuck.join().unwrap());
         assert!(waiting.join().unwrap());
-        assert!(signing_out.join().unwrap().is_some(), "the ended session is returned for the server to be told");
+        assert!(signing_out.join().unwrap().0.is_some(), "the ended session is returned for the server to be told");
         assert_eq!(manager.settled_scope(), Some(None), "confirmed");
         assert_eq!(stored_session(&store).map(|session| session.access_token), None, "the saved session is gone, not put back by a late write");
         let calls = store.calls();
@@ -2264,7 +2295,7 @@ mod tests {
         let reads = manager.clone();
         assert!(promptly("current_scope", move || reads.current_scope()).is_some());
         let signing_out = manager.clone();
-        assert!(promptly("the sign-out", move || signing_out.end_session()).is_some());
+        assert!(promptly("the sign-out", move || signing_out.end_session()).0.is_some());
         answer.send(()).unwrap();
         assert!(!refreshing.join().unwrap(), "the answer was for a session that ended");
         assert!(manager.current_scope().is_none());
@@ -2343,7 +2374,7 @@ mod tests {
         assert!(manager.apply_exchange(generation, Ok(saved)));
         assert!(!manager.persist(generation, Some("not saved")));
         assert!(stored_session(&store).is_some());
-        assert!(manager.end_session().is_some());
+        assert!(manager.end_session().0.is_some());
         assert_eq!(stored_session(&store).map(|session| session.access_token), None);
         let calls = store.calls();
         assert_eq!(calls.iter().filter(|call| matches!(call, Call::Set(_))).count(), 4, "the seeded session, the roles, the rotation and the sign-in");
@@ -2365,7 +2396,7 @@ mod tests {
         assert_eq!(manager.snapshot().last_error.as_deref(), Some(REFRESH_NOT_SAVED));
         // A sign-out that cannot remove the saved session stays signed in, as
         // the next launch would be.
-        assert!(manager.end_session().is_none());
+        assert!(manager.end_session().0.is_none());
         assert!(manager.settled_scope().is_some_and(|scope| scope.is_some()), "settled, and signed in");
         let status = serde_json::to_value(manager.snapshot()).unwrap();
         assert_eq!(status["state"], "signed-in");
@@ -2373,7 +2404,7 @@ mod tests {
         assert_eq!(manager.context().unwrap().access_token, "rotated-access");
         // Once the Keychain answers again the sign-out goes through.
         store.fail_writes(false);
-        assert!(manager.end_session().is_some());
+        assert!(manager.end_session().0.is_some());
         assert!(manager.current_scope().is_none());
         assert_eq!(stored_session(&store).map(|session| session.access_token), None);
     }
