@@ -247,6 +247,10 @@ impl Host for LocalHost {
         pr_number(&url).with_context(|| format!("GitHub opened the pull request but answered with {url:?}, which names no number."))
     }
 
+    fn associate_pull_request(&self, session_id: &str, cwd: &Path, pr: &PrSnapshot) -> Result<()> {
+        crate::pr_associations::record_local(session_id, cwd, &pr.url, &pr.head)
+    }
+
     fn pull_request(&self, cwd: &Path, number: u64) -> Result<PrSnapshot> {
         crate::github::pr_snapshot(cwd, number)
     }

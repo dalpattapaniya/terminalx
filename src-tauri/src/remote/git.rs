@@ -891,6 +891,10 @@ impl WorkspaceGit {
 
     fn prs(&self, params: &Value) -> Result<Value, RpcError> {
         let repo = self.repo(params)?;
+        if params.get("number").is_some() {
+            let pr = self.pr_view(&repo, &Self::pr_number(params)?)?;
+            return Ok(json!({ "repo": repo.name, "branch": pr.head, "prs": [pr] }));
+        }
         let branch = self.branch_param(&repo, params)?;
         let prs = self.list_prs(&repo, &branch, "all", NETWORK_TIMEOUT)?;
         Ok(json!({ "repo": repo.name, "branch": branch, "prs": prs }))

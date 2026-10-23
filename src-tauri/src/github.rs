@@ -147,9 +147,19 @@ pub fn prs_for_branch(cwd: &Path, branch: &str) -> Result<Vec<PullRequest>> {
 }
 
 fn prs_for_branch_with(cwd: &Path, branch: &str, run: impl FnOnce(&Path, &[&str]) -> Result<String>) -> Result<Vec<PullRequest>> {
-    let out = run(cwd, &["pr", "list", "--head", branch, "--state", "all", "--json", FIELDS, "--limit", "1000"])?;
+    let fields = format!("{FIELDS},isCrossRepository,headRepository,headRepositoryOwner");
+    let out = run(cwd, &["pr", "list", "--head", branch, "--state", "all", "--json", &fields, "--limit", "1000"])?;
     let v: Value = serde_json::from_str(&out)?;
-    let mut prs: Vec<PullRequest> = v.as_array().map(|a| a.iter().map(parse_pr).collect()).unwrap_or_default();
+    let origin = crate::git::remote_url(cwd).as_deref().and_then(crate::issues::github_repo_from_url);
+    let mut prs: Vec<PullRequest> = v.as_array().map(|a| a.iter().filter(|pr| {
+        // Another fork can reuse the same branch name. Only explicit identity
+        // associations may bring in a PR whose head repository isn't ours.
+        pr["isCrossRepository"].as_bool() != Some(true) || origin.as_ref().is_some_and(|origin| {
+            let owner = pr["headRepositoryOwner"]["login"].as_str().unwrap_or_default();
+            let repo = pr["headRepository"]["name"].as_str().unwrap_or_default();
+            origin.eq_ignore_ascii_case(&format!("{owner}/{repo}"))
+        })
+    }).map(parse_pr).collect()).unwrap_or_default();
     prs.sort_by(|a, b| (b.state == "OPEN").cmp(&(a.state == "OPEN")).then(b.number.cmp(&a.number)));
     // Lookup is also used by workspace deletion checks, and runs while Stats
     // is closed. Only known workspaces/branches contribute installation totals.
@@ -216,6 +226,36 @@ pub fn pr_details(cwd: &Path, number: u64) -> Result<PullRequest> {
     let out = run(cwd, &["pr", "view", &number.to_string(), "--json", FIELDS])?;
     let value: Value = serde_json::from_str(&out)?;
     Ok(parse_pr(&value))
+}
+
+/// An associated PR is addressed by its full identity, not a number in the
+/// currently selected repository. Use gh's host routing from the URL.
+fn associated_target(number: u64, url: Option<&str>) -> Result<String> {
+    let Some(url) = url else { return Ok(number.to_string()); };
+    let identity = crate::pr_associations::identity(url)?;
+    if identity.rsplit('/').next().and_then(|n| n.parse::<u64>().ok()) != Some(number) {
+        bail!("Pull request number does not match its URL");
+    }
+    Ok(identity)
+}
+
+pub fn associated_pr_details(cwd: &Path, number: u64, url: Option<&str>) -> Result<PullRequest> {
+    if url.is_none() { return pr_details(cwd, number); }
+    let target = associated_target(number, url)?;
+    let out = run(&outside_checkouts(), &["pr", "view", &target, "--json", FIELDS])?;
+    Ok(parse_pr(&serde_json::from_str(&out)?))
+}
+
+pub fn merge_associated_pr(cwd: &Path, number: u64, method: &str, url: Option<&str>) -> Result<()> {
+    if url.is_none() { return merge_pr(cwd, number, method); }
+    let target = associated_target(number, url)?;
+    merge_pr_target(&outside_checkouts(), &target, method)
+}
+
+pub fn ready_associated_pr(cwd: &Path, number: u64, url: Option<&str>) -> Result<()> {
+    if url.is_none() { return mark_ready(cwd, number); }
+    let target = associated_target(number, url)?;
+    run(&outside_checkouts(), &["pr", "ready", &target]).map(|_| ())
 }
 
 pub fn create_pr(cwd: &Path, title: &str, body: &str, base: Option<&str>, draft: bool) -> Result<String> {
@@ -668,12 +708,15 @@ pub fn merge_pr_at_in(repo: &str, number: u64, method: &str, commit: &str) -> Re
 }
 
 pub fn merge_pr(cwd: &Path, number: u64, method: &str) -> Result<()> {
-    let n = number.to_string();
+    merge_pr_target(cwd, &number.to_string(), method)
+}
+
+fn merge_pr_target(cwd: &Path, target: &str, method: &str) -> Result<()> {
     let flag = merge_flag(method);
-    let result = run(cwd, &["pr", "merge", &n, flag]);
+    let result = run(cwd, &["pr", "merge", target, flag]);
     if result.is_err() {
         // `gh pr merge` can fail with the merge already through; ask again.
-        let out = run(cwd, &["pr", "view", &n, "--json", "state"])?;
+        let out = run(cwd, &["pr", "view", target, "--json", "state"])?;
         let v: Value = serde_json::from_str(&out)?;
         if v["state"].as_str() == Some("MERGED") {
             return Ok(());
@@ -948,6 +991,32 @@ pub fn enable_head_branch_deletion(cwd: &Path) -> Result<HeadBranchSetting> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_discovery_keeps_same_branch_followups_but_not_an_unrelated_fork() {
+        let _home = crate::store::temp_home();
+        let cwd = crate::store::root().unwrap();
+        crate::git::run(&cwd, &["init", "-q"]).unwrap();
+        crate::git::run(&cwd, &["remote", "add", "origin", "https://github.com/acme/widgets.git"]).unwrap();
+        let prs = prs_for_branch_with(&cwd, "feature", |_, args| {
+            assert!(args.windows(2).any(|pair| pair == ["--head", "feature"]));
+            assert!(args.windows(2).any(|pair| pair == ["--state", "all"]));
+            Ok(serde_json::json!([
+                {"number":1,"url":"https://github.com/acme/widgets/pull/1","headRefName":"feature","state":"MERGED","isCrossRepository":false},
+                {"number":2,"url":"https://github.com/acme/widgets/pull/2","headRefName":"feature","state":"OPEN","isCrossRepository":false},
+                {"number":3,"url":"https://github.com/acme/widgets/pull/3","headRefName":"feature","state":"OPEN","isCrossRepository":true,"headRepositoryOwner":{"login":"unrelated"},"headRepository":{"name":"widgets"}}
+            ]).to_string())
+        }).unwrap();
+        assert_eq!(prs.iter().map(|pr| pr.number).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn associated_targets_keep_repository_identity_and_reject_mismatched_numbers() {
+        assert_eq!(associated_target(7, Some("https://github.com/Acme/one/pull/7/")).unwrap(), "https://github.com/acme/one/pull/7");
+        assert_eq!(associated_target(7, Some("https://github.com/Acme/two/pull/7")).unwrap(), "https://github.com/acme/two/pull/7");
+        assert!(associated_target(8, Some("https://github.com/acme/one/pull/7")).is_err());
+        assert!(associated_target(7, Some("--repo=unrelated")).is_err());
+    }
 
     #[test]
     fn branch_discovery_counts_cli_pr_once_and_retains_merge_close_history() {

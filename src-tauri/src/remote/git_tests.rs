@@ -350,6 +350,14 @@ fn pull_requests_are_created_once_after_the_branch_is_pushed_into_the_chosen_bas
     assert_eq!(listed["prs"].as_array().unwrap().len(), 1);
     let ready = f.call("git.prReady", json!({ "repo": "app", "number": 1 })).unwrap();
     assert_eq!(ready["pr"]["isDraft"], false);
+    // An associated identity is readable after switching branches, even if a
+    // branch listing would omit it (or its old branch has been removed).
+    f.call("git.checkout", json!({ "repo": "app", "branch": "main" })).unwrap();
+    let retained = f.call("git.prs", json!({ "repo": "app", "branch": "deleted-old-branch", "number": 1 })).unwrap();
+    assert_eq!(retained["prs"][0]["number"], 1);
+    assert_eq!(retained["prs"][0]["head"], "feature/pr");
+    assert!(f.gh_calls().contains("\"view\", \"1\""));
+    assert_eq!(f.code("git.prs", json!({ "repo": "app", "number": 0 })), "invalid_params");
 }
 
 #[test]

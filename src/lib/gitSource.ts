@@ -1,6 +1,6 @@
 import { WorkspaceRpcError } from "@terminalx/portable/workspace";
 import { RemoteGit, gitErrorMessage, type GitAuthor } from "@terminalx/portable/workspaceGit";
-import { api, errorMessage, gh, git, type PullRequest } from "@/lib/api";
+import { api, errorMessage, gh, git, type PullRequest, type PrAssociation, type PrScope } from "@/lib/api";
 import type { BranchInfo, ChangedFile, CommitInfo, WorkStatus } from "@/types/session";
 
 /** A workspace's Git status, plus what only a cloud repository reports so far. */
@@ -40,7 +40,14 @@ export interface GitSource {
   discard?(path: string): Promise<void>;
   ghAvailable(): Promise<boolean>;
   prs(branch: string): Promise<PullRequest[]>;
-  createPr(input: { title: string; body: string; base: string | null; draft: boolean }): Promise<string | null>;
+  /** Durable transport locator, separate from the repository/PR URL identity. */
+  prScope?: PrScope;
+  prAccess?(association: PrAssociation): {
+    read(): Promise<PullRequest>;
+    ready(): Promise<void>;
+    merge(method: "merge" | "squash" | "rebase"): Promise<void>;
+  };
+  createPr(input: { title: string; body: string; base: string | null; draft: boolean; sessionId?: string }): Promise<string | null>;
   readyPr(number: number): Promise<void>;
   mergePr(number: number, method: "merge" | "squash" | "rebase"): Promise<void>;
   errorMessage(error: unknown): string;
@@ -69,7 +76,16 @@ export function localGitSource(cwd: string): GitSource {
     discard: (path) => git.discard(cwd, path),
     ghAvailable: () => gh.available(),
     prs: (branch) => gh.list(cwd, branch),
-    createPr: ({ title, body, base, draft }) => gh.create(cwd, title, body, base, draft).then(() => null),
+    prScope: { kind: "local", cwd },
+    prAccess: (association) => {
+      if (association.scope.kind !== "local") throw new Error("Reconnect this PR's cloud workspace to refresh it.");
+      return {
+        read: () => gh.details(cwd, association.number, association.url),
+        ready: () => gh.ready(cwd, association.number, association.url),
+        merge: (method) => gh.merge(cwd, association.number, method, association.url),
+      };
+    },
+    createPr: ({ title, body, base, draft, sessionId }) => gh.create(cwd, title, body, base, draft, sessionId).then(() => null),
     readyPr: (number) => gh.ready(cwd, number),
     mergePr: (number, method) => gh.merge(cwd, number, method),
     errorMessage,
@@ -137,8 +153,24 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     fetch: () => remote.fetch().then(() => null),
     ghAvailable: () => Promise.resolve(true),
     prs: (branch) => remote.prs(branch).then((answer) => answer.prs),
-    createPr: async ({ title, body, base, draft }) => {
+    prScope: { kind: "cloud", workspace: input.workspaceKey, repo: remote.repo },
+    prAccess: (association) => {
+      if (association.scope.kind !== "cloud" || association.scope.workspace !== input.workspaceKey) throw new Error("Reconnect this PR's workspace to refresh it.");
+      const repository = new RemoteGit(remote.client, association.scope.repo);
+      return {
+        read: async () => {
+          const { prs } = await repository.prs(association.head, association.number);
+          const pr = prs.find((pr) => pr.url.toLowerCase().replace(/\/$/, "") === association.url.toLowerCase().replace(/\/$/, ""));
+          if (!pr) throw new Error(`GitHub did not return associated PR #${association.number}.`);
+          return pr;
+        },
+        ready: () => repository.readyPr(association.number).then(() => undefined),
+        merge: (method) => repository.mergePr(association.number, method).then(() => undefined),
+      };
+    },
+    createPr: async ({ title, body, base, draft, sessionId }) => {
       const result = await remote.createPr({ title, body, base, draft });
+      if (sessionId) await gh.associations(sessionId, [{ url: result.pr.url, number: result.pr.number, head: result.pr.head, scope: { kind: "cloud", workspace: input.workspaceKey, repo: remote.repo } }]);
       if (result.existing) return `Pull request #${result.pr.number} for this branch already exists; it is linked below, not duplicated.`;
       return result.reconciled ? `Created #${result.pr.number} (found on GitHub after the answer was lost).` : null;
     },

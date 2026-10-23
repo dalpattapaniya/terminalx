@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest } from "@/lib/api";
 import type { WorkspaceDisposition } from "@/types/session";
@@ -112,6 +112,8 @@ describe("merged workspace action", () => {
     ["has no confirmed pull-request status", { ...cleanMerged, pr: null, prChecked: false }],
     ["has an unknown pull-request state", { ...cleanMerged, pr: { ...cleanMerged.pr!, state: "UNKNOWN" } }],
     ["is the main workspace", { ...cleanMerged, isMain: true }],
+    ["changed branches during refresh", { ...cleanMerged, branch: "another-branch" }],
+    ["returned a different PR during refresh", { ...cleanMerged, pr: { ...cleanMerged.pr!, url: "https://example.test/pull/999" } }],
   ])("does not offer deletion when the workspace %s", async (_case, disposition) => {
     mockBackend(disposition);
 
@@ -131,6 +133,7 @@ describe("merged workspace action", () => {
       expect(mocks.invoke).toHaveBeenCalledWith("workspace_disposition", { projectPath, path: cwd, fetch: false });
     });
     expect(screen.queryByRole("button", { name: "Delete workspace" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
   });
 
   it("removes deletion eligibility when a workspace safety recheck fails", async () => {
@@ -148,4 +151,143 @@ describe("merged workspace action", () => {
     await screen.findByText("Unable to verify workspace");
     expect(screen.queryByRole("button", { name: "Delete workspace" })).toBeNull();
   });
+});
+
+const followup: PullRequest = {
+  ...mergedPr, number: 63, title: "Follow-up work", url: "https://example.test/pull/63", head: "followup", state: "OPEN",
+  mergeable: "MERGEABLE", checks: [{ name: "Follow-up CI", state: "pending" }],
+};
+const association = (pr: PullRequest) => ({ url: pr.url, number: pr.number, head: pr.head, scope: { kind: "local", cwd } });
+const workStatus = (branch: string, aheadOfBase = 0) => ({ isRepo: true, dirty: false, branch, upstream: `origin/${branch}`, ahead: 0, behind: 0, defaultBranch: "main", aheadOfBase, head: "abc123" });
+
+describe("session PR history", () => {
+  it("discovers the actual follow-up branch despite stale session metadata and refreshes its checks", async () => {
+    let check = "pending";
+    mocks.invoke.mockImplementation(async (command: string, args: { branch?: string }) => {
+      if (command === "gh_available") return true;
+      if (command === "pr_associations") return [association(mergedPr)];
+      if (command === "work_status") return workStatus(followup.head, 1);
+      if (command === "pr_list") return args.branch === mergedPr.head ? [mergedPr] : [{ ...followup, checks: [{ name: "Follow-up CI", state: check }] }];
+      if (command === "pr_details") return mergedPr;
+      throw Error(command);
+    });
+    render(<PrPanel cwd={cwd} sessionId="author" branch={mergedPr.head} active busy={false} onSettle={() => {}} />);
+    await screen.findByText("Follow-up work");
+    expect(screen.getByText(mergedPr.title)).toBeTruthy();
+    expect(mocks.invoke).toHaveBeenCalledWith("pr_list", { cwd, branch: followup.head });
+    expect(screen.queryByText("This branch has been merged.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create pull request" })).toBeNull();
+    expect(screen.getByLabelText("Follow-up CI: pending")).toBeTruthy();
+    check = "success";
+    fireEvent.click(screen.getByRole("button", { name: "Refresh pull requests" }));
+    await screen.findByLabelText("Follow-up CI: success");
+  });
+
+  it("never offers settle for new commits on a reused merged branch", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "gh_available") return true;
+      if (command === "pr_associations") return [association(mergedPr)];
+      if (command === "work_status") return workStatus(mergedPr.head, 2);
+      if (command === "pr_list") return [mergedPr];
+      throw Error(command);
+    });
+    render(<PrPanel cwd={cwd} sessionId="author" branch={mergedPr.head} active busy={false} onSettle={() => {}} />);
+    await screen.findByRole("button", { name: "Create pull request" });
+    expect(screen.queryByText("This branch has been merged.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
+  });
+
+  it("keeps the create action scoped to current work when another branch has an open PR", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "gh_available") return true;
+      if (command === "pr_associations") return [association(followup)];
+      if (command === "work_status") return workStatus("third-branch", 1);
+      if (command === "pr_list") return [];
+      if (command === "pr_details") return followup;
+      throw Error(command);
+    });
+    render(<PrPanel cwd={cwd} sessionId="author" branch="third-branch" active busy={false} onSettle={() => {}} />);
+    await screen.findByText("Follow-up work");
+    expect(screen.getByRole("button", { name: "Create pull request" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
+  });
+
+  it("keeps an unavailable association visible and blocks cleanup when its state is unknown", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "gh_available") return true;
+      if (command === "pr_associations") return [association(followup)];
+      if (command === "work_status") return workStatus(mergedPr.head);
+      if (command === "pr_list") return [mergedPr];
+      if (command === "pr_details") throw Error("PR unavailable");
+      throw Error(command);
+    });
+    render(<PrPanel cwd={cwd} sessionId="author" branch={mergedPr.head} active busy={false} onSettle={() => {}} />);
+    await screen.findByText("Could not refresh: PR unavailable");
+    expect(screen.getByText(followup.url)).toBeTruthy();
+    expect(screen.queryByText("This branch has been merged.")).toBeNull();
+  });
+
+  it("ignores an old refresh completing after a session switch, even with the same checkout and branch", async () => {
+    let finishOld!: (value: ReturnType<typeof association>[]) => void;
+    const delayed = new Promise<ReturnType<typeof association>[]>((resolve) => { finishOld = resolve; });
+    mocks.invoke.mockImplementation(async (command: string, args: { sessionId?: string }) => {
+      if (command === "gh_available") return true;
+      if (command === "pr_associations") return args.sessionId === "old" ? delayed : [];
+      if (command === "work_status") return workStatus("main");
+      if (command === "pr_details") return mergedPr;
+      throw Error(command);
+    });
+    const view = render(<PrPanel cwd={cwd} sessionId="old" branch="main" active busy={false} />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "old", additions: [] }));
+    view.rerender(<PrPanel cwd={cwd} sessionId="new" branch="main" active busy={false} />);
+    await screen.findByText("On the default branch; nothing to open a pull request from.");
+    await act(async () => {
+      finishOld([association(mergedPr)]);
+      await delayed;
+    });
+    expect(mocks.invoke).not.toHaveBeenCalledWith("pr_details", expect.anything());
+    expect(screen.queryByText(mergedPr.title)).toBeNull();
+  });
+});
+
+it("does not overwrite a newer refresh when an older request finishes last", async () => {
+  let finishOld!: (value: PullRequest[]) => void;
+  const delayed = new Promise<PullRequest[]>((resolve) => { finishOld = resolve; });
+  let reads = 0;
+  mocks.invoke.mockImplementation(async (command: string) => {
+    if (command === "gh_available") return true;
+    if (command === "work_status") return workStatus(followup.head, 1);
+    if (command === "pr_list") return ++reads === 1 ? delayed : [followup];
+    throw Error(command);
+  });
+  const view = render(<PrPanel cwd={cwd} branch={followup.head} active busy={false} />);
+  await waitFor(() => expect(reads).toBe(1));
+  view.rerender(<PrPanel cwd={cwd} branch={followup.head} active busy />);
+  await screen.findByText(followup.title);
+  finishOld([mergedPr]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(screen.queryByText(mergedPr.title)).toBeNull();
+  expect(screen.getByText(followup.title)).toBeTruthy();
+});
+
+it("updates a follow-up's state and offers settle only after current work is confirmed merged", async () => {
+  let merged = false;
+  mocks.invoke.mockImplementation(async (command: string) => {
+    if (command === "gh_available") return true;
+    if (command === "pr_associations") return [association(mergedPr)];
+    if (command === "work_status") return workStatus(followup.head, merged ? 0 : 1);
+    if (command === "pr_list") return [{ ...followup, state: merged ? "MERGED" : "OPEN" }];
+    if (command === "pr_details") return mergedPr;
+    throw Error(command);
+  });
+  render(<PrPanel cwd={cwd} sessionId="author" branch={followup.head} active busy={false} onSettle={() => {}} />);
+  await screen.findByText(followup.title);
+  expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
+  merged = true;
+  fireEvent.click(screen.getByRole("button", { name: "Refresh pull requests" }));
+  await screen.findByRole("button", { name: "Settle worktree" });
+  expect(screen.queryByRole("button", { name: "Create pull request" })).toBeNull();
+  expect(screen.getByText(mergedPr.title)).toBeTruthy();
+  expect(screen.getByText(followup.title)).toBeTruthy();
 });

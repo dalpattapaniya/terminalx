@@ -4,6 +4,11 @@
 
 ### Changes
 
+- Retain session pull requests across follow-up branches and restarts, including
+  PRs created or adopted by the issue pipeline. Refresh each saved PR by its
+  repository identity, keep open PRs above history, and prevent older merged
+  work from offering cleanup while follow-ups or unmerged work remain. (#463)
+
 - Default workspace review to All changes against a displayed merge-base target,
   including committed, uncommitted and untracked files. Remember repository-specific
   scope and target choices, with Uncommitted and turn review available in the same
