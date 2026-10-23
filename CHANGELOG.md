@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Stats & Usage
+
+- Refresh usage for non-Git projects without blocking healthy locations, and
+  show incomplete worktree discovery, saved refresh time, reporting scope, and
+  omitted pricing explicitly. Read configured provider homes and Codex archives;
+  reconcile whitespace, streamed copies, model switches and counter resets.
+  Price individual requests, include Astra's published rates and Claude's
+  one-hour cache writes, and retain recorded usage after transcript or worktree
+  removal without keeping prompt contents. Zero-valued counter resets update
+  the baseline; retained legacy records with unavailable pricing detail stay
+  explicitly unpriced after cache migration. (#602)
+
 ### Automations
 
 - Use the shared session launch controls for agent, model, effort and permissions,
