@@ -5,7 +5,7 @@ final class ScreenCapturePermissionPreflightSafetyTests: XCTestCase {
         let source = try computerUseSource()
         let start = try XCTUnwrap(source.range(of: "private func screenCaptureTrusted()"))
         let end = try XCTUnwrap(
-            source.range(of: "private func requestScreenCaptureAccess()", range: start.upperBound..<source.endIndex)
+            source.range(of: "private func openAccessibilitySettings()", range: start.upperBound..<source.endIndex)
         )
         let preflightSource = source[start.lowerBound..<end.lowerBound]
 
@@ -14,6 +14,25 @@ final class ScreenCapturePermissionPreflightSafetyTests: XCTestCase {
         XCTAssertFalse(preflightSource.contains("CGRequestScreenCaptureAccess()"))
         XCTAssertFalse(preflightSource.contains("CGWindowListCreateImage"))
         XCTAssertFalse(preflightSource.contains("SCScreenshotManager"))
+    }
+
+    func testGrantOpensSettingsAndDragAssistantWithoutRequestingCaptureAccess() throws {
+        let source = try computerUseSource()
+        // Source checks deliberately avoid calling TCC or opening real Settings.
+        XCTAssertFalse(source.contains("CGRequestScreenCaptureAccess"))
+        let start = try XCTUnwrap(source.range(of: "func openPermission(_ permission: PermissionKind)"))
+        let end = try XCTUnwrap(source.range(of: "func refreshPermissions()", range: start.upperBound..<source.endIndex))
+        let grantSource = source[start.lowerBound..<end.lowerBound]
+        XCTAssertTrue(grantSource.contains("permission.openSettings()"))
+        XCTAssertTrue(grantSource.contains("showDragAssistant(for: permission)"))
+
+        let settingsStart = try XCTUnwrap(source.range(of: "func openSettings()"))
+        let settingsEnd = try XCTUnwrap(source.range(of: "private final class PermissionView", range: settingsStart.upperBound..<source.endIndex))
+        let settingsSource = source[settingsStart.lowerBound..<settingsEnd.lowerBound]
+        XCTAssertTrue(settingsSource.contains("case .accessibility:\n            openAccessibilitySettings()"))
+        XCTAssertTrue(settingsSource.contains("case .screenshots:"))
+        XCTAssertTrue(settingsSource.contains("openScreenRecordingSettings()"))
+        XCTAssertTrue(source.contains("Drag TerminalX Computer Use Helper into the list above to allow Screenshots."))
     }
 
     private func computerUseSource() throws -> String {
