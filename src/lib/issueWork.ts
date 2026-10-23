@@ -1,6 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { workStatus, type Issue, type WorkClaim, type WorkClaimsAnswer } from "@/lib/api";
 import { sessionStatus, type IssueLinkSource, type IssueRef, type SessionEntry } from "@/types/session";
+import { getAccount, subscribeAccount, useAccount } from "@/lib/account";
+import { liveCloudOrgIds, useCloudCatalog, type CloudCatalogState } from "@/lib/cloudCatalog";
+import { cloudSessionMark, useCloudDashboard, type CloudDashboardSession } from "@/lib/cloudDashboard";
+import { connectedCloudClient } from "@/lib/cloudConnections";
+import { cloudReviewerSessions } from "@/lib/cloudPipelines";
+import { liveCloudSessionList } from "@/lib/cloudSessions";
+import { cloudWorkspaceKey, parseCloudWorkspaceKey } from "@/types/target";
+import type { IssuePipeline } from "@/types/issuePipeline";
+import type { RuntimeSession } from "@terminalx/portable/workspace";
 
 /**
  * Who is working on an issue (#441): this Mac's own sessions linked to it,
@@ -20,6 +29,7 @@ export const RECENT_MS = 30 * 60 * 1000;
 export const FORGET_MS = 24 * 60 * 60 * 1000;
 /** How often the Issues list reads the claims again while it is open. */
 export const POLL_MS = 20 * 1000;
+const WINDOW_STARTED_AT = Date.now();
 
 export type WorkState = "working" | "waiting" | "idle" | "pull_request";
 /** `now`: working on it now; `faded`: was, a while ago. */
@@ -48,6 +58,10 @@ export interface IssueWorker {
   sessionId: string | null;
   /** The reader's remote claim identity; never used to open a local session. */
   claimSessionId?: string | null;
+  /** Own cloud navigation target, never a local session ID. */
+  cloudSession?: { key: string; tabId?: string };
+  /** Older account publishers omit the organization; absent when ambiguous. */
+  legacyCloudClaimId?: string;
   /** How this Mac's session got its link, when not started on the issue. */
   link: IssueLinkSource | null;
 }
@@ -191,6 +205,126 @@ function remoteWorker(claim: WorkClaim, offset: number, now: number): IssueWorke
   };
 }
 
+export interface StartedCloudWork {
+  key: string;
+  projectPath: string;
+  issue: IssueRef;
+  at: number;
+}
+
+/** Inputs already held by the window; projecting work never connects or writes. */
+export interface CloudWorkInput {
+  projectPath: string | null | undefined;
+  windowStartedAt: number;
+  catalog: CloudCatalogState;
+  organizations: readonly string[];
+  sessions: readonly CloudDashboardSession[];
+  pipelines: readonly IssuePipeline[];
+  reviewers: ReadonlySet<string>;
+  started: readonly StartedCloudWork[];
+  /** Authors already observed in a session list in this window. */
+  observed?: ReadonlySet<string>;
+  liveSessions: (orgId: string, workspaceId: string) => RuntimeSession[] | null;
+  readerId: (orgId: string, workspaceId: string) => string | null;
+}
+
+/** Only positively identified own authors, with full workspace and tracker identity. */
+export function cloudWorkers(input: CloudWorkInput, now = Date.now()): Map<string, IssueWorker[]> {
+  const out = new Map<string, IssueWorker[]>();
+  const rows = new Map(input.sessions.map((row) => [row.key, row]));
+  // Older claims omit the organization. Match that alias only when it names
+  // exactly one of the window's known cloud sessions.
+  const aliases = new Map<string, Set<string>>();
+  for (const key of [...rows.keys(), ...input.pipelines.filter((pipeline) => pipeline.place).map((pipeline) => pipeline.author.sessionId), ...input.started.map((entry) => entry.key)]) {
+    const target = parseCloudWorkspaceKey(key);
+    if (!target?.sessionId) continue;
+    const alias = `cloud:${target.workspaceId}:${target.sessionId}`;
+    const keys = aliases.get(alias) ?? new Set<string>();
+    keys.add(key);
+    aliases.set(alias, keys);
+  }
+  const pipelines = input.pipelines.filter((pipeline) => pipeline.place && pipeline.projectPath === input.projectPath);
+  const reviewers = new Set([...input.reviewers, ...pipelines.flatMap((pipeline) => pipeline.reviewer ? [pipeline.reviewer.sessionId] : [])]);
+  const candidates = new Map<string, { issue: IssueRef; pipeline?: IssuePipeline; started?: StartedCloudWork }>();
+  for (const row of input.sessions) {
+    if (row.projectKey !== input.projectPath) continue;
+    const list = input.liveSessions(row.orgId, row.workspaceId) ?? input.catalog.orgs[row.orgId]?.sessions[row.workspaceId]?.sessions;
+    const issue = list?.find((session) => session.id === row.sessionId)?.issue;
+    if (issue) candidates.set(row.key, { issue });
+  }
+  for (const pipeline of pipelines) candidates.set(pipeline.author.sessionId, { issue: pipeline.issue, pipeline });
+  for (const started of input.started.filter((entry) => entry.projectPath === input.projectPath)) candidates.set(started.key, { ...candidates.get(started.key), issue: started.issue, started });
+  for (const [key, candidate] of candidates) {
+    const target = parseCloudWorkspaceKey(key);
+    if (!target?.sessionId || !input.organizations.includes(target.orgId) || reviewers.has(key)) continue;
+    const { orgId, workspaceId, sessionId } = target;
+    const org = input.catalog.orgs[orgId];
+    const workspace = org?.workspaces.find((item) => item.workspace.id === workspaceId)?.workspace;
+    if (!workspace || workspace.archivedAt || workspace.deletedAt || workspace.state === "archived" || workspace.state === "destroyed" || workspace.you?.role === "none") continue;
+    const reader = input.readerId(orgId, workspaceId);
+    if (!candidate.started && (!reader || workspace.createdBy !== reader)) continue;
+    const row = rows.get(key);
+    const pipeline = candidate.pipeline;
+    if (pipeline?.place && (pipeline.place.orgId !== orgId || pipeline.place.workspaceId !== workspaceId)) continue;
+    if (row && row.projectKey !== input.projectPath) continue;
+    if (!row && pipeline?.projectPath !== input.projectPath && !candidate.started) continue;
+    // A pipeline can precede the session index. Once a newer list removes it,
+    // its saved pipeline must not resurrect a deleted or archived author.
+    const cached = org.sessions[workspaceId];
+    const list = input.liveSessions(orgId, workspaceId) ?? cached?.sessions;
+    const session = list?.find((session) => session.id === sessionId);
+    const heardAt = Math.max(candidate.started?.at ?? 0, pipeline?.place?.readAt ?? 0);
+    if (session?.archived || row?.archived) continue;
+    const settling = !input.observed?.has(key) && now - heardAt < POLL_MS * 2;
+    if (!session && cached && cached.at > heardAt && !settling) continue;
+    if (!row && !session && now - heardAt >= RECENT_MS) continue;
+    const lastActive = Math.max(Date.parse(row?.modified ?? session?.modified ?? pipeline?.modified ?? "") || 0, candidate.started?.at ?? 0);
+    // A freshly fetched workspace catalog does not make a saved tab state live.
+    const runtimeEvidence = row && (row.connected || row.tabs.some((tab) => tab.from !== "cache") || (row.reportedAt !== null && now - row.reportedAt < RECENT_MS));
+    const justStarted = candidate.started && now - candidate.started.at < POLL_MS * 2;
+    const fresh = row ? !row.stopped && ((row.fresh && !!runtimeEvidence) || !!justStarted) : org.source === "live" && workspace.state === "ready" && heardAt >= input.windowStartedAt && now - heardAt < RECENT_MS;
+    const mark = row ? cloudSessionMark(row) : null;
+    const state: WorkState = !fresh ? "idle" : mark === "waiting" ? "waiting" : mark === "in_progress" ? "working" : !row && pipeline?.state === "working" ? "working" : "idle";
+    const phase = phaseOf(state, lastActive, now, fresh);
+    if (!phase) continue;
+    const worker: IssueWorker = {
+      key, place: "cloud", you: true, person: "You", machine: null, cloud: true,
+      title: row?.title ?? session?.title ?? candidate.issue.title, branch: row?.branch ?? pipeline?.branch ?? null,
+      state, phase, since: Date.parse(session?.created ?? pipeline?.created ?? "") || lastActive, lastActive,
+      sessionId: null, claimSessionId: key,
+      legacyCloudClaimId: aliases.get(`cloud:${workspaceId}:${sessionId}`)?.size === 1 ? `cloud:${workspaceId}:${sessionId}` : undefined,
+      cloudSession: { key, tabId: pipeline?.author.tabId }, link: null,
+    };
+    const issue = workKeyOf(candidate.issue);
+    out.set(issue, [...(out.get(issue) ?? []), worker]);
+  }
+  return out;
+}
+
+// Successful starts survive leaving the Issues view while the index settles.
+let startedCloudWork: StartedCloudWork[] = [];
+const observedCloudWork = new Set<string>();
+const startListeners = new Set<() => void>();
+let startOwner: string | null = null;
+const accountOwner = () => {
+  const { status } = getAccount();
+  return status.state === "signed-in" ? status.context?.account ?? status.identity?.email ?? null : null;
+};
+let watchingAccount = false;
+function watchStartAccount() {
+  if (watchingAccount) return;
+  watchingAccount = true;
+  startOwner = accountOwner();
+  subscribeAccount(() => {
+    const owner = accountOwner();
+    if (owner === startOwner) return;
+    startOwner = owner;
+    startedCloudWork = [];
+    observedCloudWork.clear();
+    for (const listener of startListeners) listener();
+  });
+}
+
 const PLACE_ORDER: Record<WorkPlace, number> = { team: 0, machine: 1, cloud: 2, this: 3 };
 
 /** Who works on an issue, the most telling first: now before a while ago, others before this Mac. */
@@ -204,12 +338,14 @@ export function issueClosed(issue: Pick<Issue, "stateType" | "state">): boolean 
 }
 
 /** Everyone working on each issue, by `workKeyOf`. */
-export function workersByIssue(issues: Issue[], sessions: SessionEntry[], remote: Map<string, IssueWorker[]>, now = Date.now()): Map<string, IssueWorker[]> {
+export function workersByIssue(issues: Issue[], sessions: SessionEntry[], remote: Map<string, IssueWorker[]>, now = Date.now(), cloud = new Map<string, IssueWorker[]>()): Map<string, IssueWorker[]> {
   const out = new Map<string, IssueWorker[]>();
   for (const issue of issues) {
     if (issueClosed(issue)) continue;
     const key = workKeyOf(issue);
-    const workers = sortWorkers([...localWorkers(sessions, issue, now), ...(remote.get(key) ?? [])]);
+    const ownCloud = cloud.get(key) ?? [];
+    const claims = (remote.get(key) ?? []).filter((worker) => !worker.you || worker.place !== "cloud" || !(worker.claimSessionId && ownCloud.some((own) => own.claimSessionId === worker.claimSessionId || own.legacyCloudClaimId === worker.claimSessionId)));
+    const workers = sortWorkers([...localWorkers(sessions, issue, now), ...ownCloud, ...claims]);
     if (workers.length) out.set(key, workers);
   }
   return out;
@@ -297,15 +433,16 @@ export function warningText(worker: IssueWorker, now = Date.now()): string {
 }
 
 /** Why the shared status cannot be shown, or null when it can. */
-export function unavailableText(answer: WorkClaimsAnswer | null): string | null {
+export function unavailableText(answer: WorkClaimsAnswer | null, hasCloud = false): string | null {
   if (!answer || answer.available) return null;
+  const showing = hasCloud ? "Showing this Mac and your known cloud sessions." : "Showing this Mac only.";
   switch (answer.reason) {
     case "signed_out":
-      return "Sign in to see work on your other machines and your team’s. Showing this Mac only.";
+      return `Sign in to see work on your other machines and your team’s. ${showing}`;
     case "offline":
-      return "Shared work status is unavailable offline. Showing this Mac only.";
+      return `Shared work status is unavailable offline. ${showing}`;
     default:
-      return "Shared work status is unavailable. Showing this Mac only.";
+      return `Shared work status is unavailable. ${showing}`;
   }
 }
 
@@ -314,11 +451,11 @@ export function unavailableText(answer: WorkClaimsAnswer | null): string | null 
  * mounted and the window is visible, so work elsewhere appears without a
  * refresh. `refreshKey` reads again at once.
  */
-export function useWorkClaims(projectPath: string | null | undefined, provider: string, issueUrls: string[], refreshKey: unknown = 0, every = POLL_MS): { answer: WorkClaimsAnswer | null; receivedAt: number } {
+export function useWorkClaims(projectPath: string | null | undefined, provider: string, issueUrls: string[], refreshKey: unknown = 0, every = POLL_MS, accountScope = ""): { answer: WorkClaimsAnswer | null; receivedAt: number } {
   const [read, setRead] = useState<{ answer: WorkClaimsAnswer | null; receivedAt: number; of: string }>({ answer: null, receivedAt: 0, of: "" });
   const urls = useMemo(() => [...new Set(issueUrls)].sort(), [issueUrls]);
   const urlsKey = urls.join("\n");
-  const of = `${projectPath}\n${provider}\n${urlsKey}`;
+  const of = `${accountScope}\n${projectPath}\n${provider}\n${urlsKey}`;
   const asking = useRef(0);
   useEffect(() => {
     if (!projectPath || urls.length === 0) return;
@@ -342,23 +479,47 @@ export function useWorkClaims(projectPath: string | null | undefined, provider: 
       document.removeEventListener("visibilitychange", visible);
     };
     // `urls` is named by `urlsKey`.
-  }, [projectPath, provider, urlsKey, refreshKey, every]);
+  }, [projectPath, provider, urlsKey, refreshKey, every, accountScope]);
   return read.of === of ? read : { answer: null, receivedAt: 0 };
 }
 
 /** Everyone working on the issues shown, this Mac's sessions included, refreshed as both change. */
-export function useIssueWork(projectPath: string | null | undefined, provider: string, issues: Issue[], sessions: SessionEntry[], refreshKey: unknown = 0) {
+export function useIssueWork(projectPath: string | null | undefined, provider: string, issues: Issue[], sessions: SessionEntry[], refreshKey: unknown = 0, pipelines: IssuePipeline[] = []) {
+  watchStartAccount();
+  const account = useAccount();
+  const owner = accountOwner();
   const urls = useMemo(() => issues.filter((issue) => !issueClosed(issue)).map((issue) => issue.url), [issues]);
-  const { answer, receivedAt } = useWorkClaims(projectPath, provider, urls, refreshKey);
+  const { answer, receivedAt } = useWorkClaims(projectPath, provider, urls, refreshKey, POLL_MS, owner ?? "");
   // Ages move on with the clock, not only when something is read.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30 * 1000);
     return () => window.clearInterval(timer);
   }, []);
-  const remote = useMemo(() => remoteWorkers(answer, receivedAt, now), [answer, receivedAt, now]);
-  const byIssue = useMemo(() => workersByIssue(issues, sessions, remote, now), [issues, sessions, remote, now]);
-  return { byIssue, answer, now };
+  const catalog = useCloudCatalog();
+  const dashboard = useCloudDashboard();
+  const started = useSyncExternalStore((listener) => { startListeners.add(listener); return () => { startListeners.delete(listener); }; }, () => startedCloudWork);
+  for (const row of dashboard) {
+    const list = liveCloudSessionList(row.orgId, row.workspaceId) ?? catalog.orgs[row.orgId]?.sessions[row.workspaceId]?.sessions;
+    if (list?.some((session) => session.id === row.sessionId)) observedCloudWork.add(row.key);
+  }
+  const cloud = cloudWorkers({
+    projectPath, windowStartedAt: WINDOW_STARTED_AT, catalog, organizations: catalog.owner === account.status.identity?.email ? liveCloudOrgIds(account.status) : [], sessions: dashboard, pipelines,
+    reviewers: cloudReviewerSessions(catalog), observed: observedCloudWork, started: owner && owner === startOwner ? started : [], liveSessions: liveCloudSessionList,
+    readerId: (orgId, workspaceId) => {
+      const connection = connectedCloudClient(cloudWorkspaceKey(orgId, workspaceId))?.connection;
+      return connection?.state === "connected" ? connection.you?.userId ?? null : null;
+    },
+  }, now);
+  const recordCloudStart = (key: string, issue: IssueRef) => {
+    if (!owner || !projectPath || accountOwner() !== owner) return;
+    startOwner = owner;
+    startedCloudWork = [...startedCloudWork.filter((entry) => entry.key !== key), { key, projectPath, issue, at: Date.now() }];
+    for (const listener of startListeners) listener();
+  };
+  const remote = useMemo(() => remoteWorkers(account.ready && !owner ? null : answer, receivedAt, now), [answer, receivedAt, now, account.ready, owner]);
+  const byIssue = workersByIssue(issues, sessions, remote, now, cloud);
+  return { byIssue, answer, now, recordCloudStart, hasCloud: cloud.size > 0 };
 }
 
 /**

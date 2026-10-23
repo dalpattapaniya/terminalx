@@ -98,6 +98,7 @@ export function TakenIssueDialog({
   onStart,
   onOpen,
   onCancel,
+  onOpenCloud,
 }: {
   workers: IssueWorker[];
   now?: number;
@@ -105,10 +106,12 @@ export function TakenIssueDialog({
   /** The existing session, when it is on this Mac. */
   onOpen: ((sessionId: string) => void) | null;
   onCancel: () => void;
+  onOpenCloud?: (key: string, tabId?: string) => void;
 }) {
   const first = workers[0];
   if (!first) return null;
   const local = workers.find((worker) => worker.place === "this" && worker.sessionId);
+  const cloud = workers.find((worker) => worker.you && worker.place === "cloud" && worker.cloudSession);
   return (
     <Dialog open onOpenChange={(open) => !open && onCancel()}>
       <DialogContent width="max-w-[28rem]" onEscapeKeyDown={(e) => e.stopPropagation()}>
@@ -124,6 +127,11 @@ export function TakenIssueDialog({
           <Button variant="ghost" onClick={onCancel}>Cancel</Button>
           {local && onOpen && (
             <Button variant="secondary" onClick={() => onOpen(local.sessionId!)}>
+              Open the existing session
+            </Button>
+          )}
+          {!local && cloud?.cloudSession && onOpenCloud && (
+            <Button variant="secondary" onClick={() => onOpenCloud(cloud.cloudSession!.key, cloud.cloudSession!.tabId)}>
               Open the existing session
             </Button>
           )}
