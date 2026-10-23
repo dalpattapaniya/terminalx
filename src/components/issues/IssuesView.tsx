@@ -20,6 +20,7 @@ import { IssueWorkPanel, TakenIssueDialog } from "@/components/issues/IssueWork"
 import { issueKey as writeKey, useIssueWrites } from "@/components/issues/issueWrites";
 import { IssueDescription, IssueLabels, IssuePriority, IssueTitle, editableIssue, useIssueEdits } from "@/components/issues/IssueFields";
 import { SessionAgentControls } from "@/components/session/SessionAgentControls";
+import { AgentLoginsLink } from "@/components/cloud/AgentLoginsLink";
 import { cloudStartError, useCloudProjectChoices } from "@/components/session/CloudNewSession";
 import { useSessionAgent } from "@/lib/useSessionAgent";
 import { Markdown } from "@/components/chat/Markdown";
@@ -164,7 +165,7 @@ export function IssuesView({
   // until the next read, dimmed, rather than vanish under the pointer.
   const [changedHere, setChangedHere] = useState<ReadonlySet<string>>(new Set());
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; organizationId: string | null } | null>(null);
   const [selected, setSelected] = useState<Issue | null>(null);
   const [detail, setDetail] = useState<Issue | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -372,7 +373,7 @@ export function IssuesView({
         if (live) {
           setList([]);
           setListOf(`${projectPath}\n${provider}`);
-          setError(errorMessage(e));
+          setError({ message: errorMessage(e), organizationId: null });
         }
       } finally {
         if (live) setLoading(false);
@@ -409,7 +410,7 @@ export function IssuesView({
       .details(projectPath, selected.provider, selected.id)
       // Not over a status change that began or ended since the read started.
       .then((d) => live && setDetail((now) => (now && writeKey(now) === writeKey(d) && writes.outdated(writeKey(d), started) ? now : newer(now, d))))
-      .catch((e) => live && setError(errorMessage(e)))
+      .catch((e) => live && setError({ message: errorMessage(e), organizationId: null }))
       .finally(() => live && setDetailLoading(false));
     return () => {
       live = false;
@@ -499,7 +500,10 @@ export function IssuesView({
       selectSession(s.id);
       onCreated?.(s.id, s.tabs[0].id, prompt);
     } catch (e) {
-      setError(cloud ? cloudStartError(e, cloud.project.orgId) : errorMessage(e));
+      setError({
+        message: cloud ? cloudStartError(e, cloud.project.orgId) : errorMessage(e),
+        organizationId: cloud?.project.orgId ?? null,
+      });
     } finally {
       setStarting(false);
     }
@@ -769,7 +773,12 @@ export function IssuesView({
 
         {workNote && !emptyReason && <div className="px-4 pb-1.5 text-[11px] text-faint" data-testid="issues-work-note">{workNote}</div>}
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
-          {error && <div className="mx-4 mb-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{error}</div>}
+          {error && (
+            <div className="mx-4 mb-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {error.message}
+              {error.organizationId && <AgentLoginsLink message={error.message} organizationId={error.organizationId} className="ml-2" />}
+            </div>
+          )}
           {emptyReason ? (
             <div className="flex flex-col items-start gap-2 px-4 py-6 text-sm text-muted-foreground">
               <span>{emptyReason}</span>
