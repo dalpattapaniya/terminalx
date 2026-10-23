@@ -390,6 +390,51 @@ mod tests {
     }
 
     #[test]
+    fn title_backfill_on_restart_preserves_all_projected_message_times() {
+        let _home = super::super::temp_home();
+        seed();
+        index::update(|sessions| {
+            let mut other = sessions[0].clone();
+            other.id = "other".into();
+            other.created = at(2);
+            other.tabs[0].title = Some("Existing title".into());
+            sessions.push(other);
+            Ok(())
+        })
+        .unwrap();
+        for (id, day) in [("synthetic", 4), ("other", 3)] {
+            let mut message = prompt(1, day);
+            message.session_id = id.into();
+            let log = super::super::log_path(id, "tab").unwrap();
+            super::super::append_line(&log, &serde_json::to_string(&message).unwrap()).unwrap();
+            assert_eq!(scan(id, "tab").unwrap(), (true, false));
+        }
+        super::super::conversation_titles::backfill().unwrap();
+        index::update(|sessions| {
+            sessions[0].tabs[0].title = None;
+            Ok(())
+        })
+        .unwrap();
+
+        // The startup list must retain persisted activity even when naming one
+        // tab rewrites the raw index. No new message will repair the snapshot.
+        let sessions = super::super::conversation_titles::backfill().unwrap();
+        assert_eq!(sessions[0].tabs[0].title.as_deref(), Some("Synthetic prompt"));
+        assert_eq!(sessions[1].tabs[0].title.as_deref(), Some("Existing title"));
+        for (session, day) in sessions.iter().zip([4, 3]) {
+            assert_eq!(session.unknown[FIELD], at(day));
+            assert_eq!(session.tabs[0].unknown[FIELD], at(day));
+            assert_eq!(session.modified, "2026-10-01T00:00:00Z");
+            assert_eq!(scan(&session.id, "tab").unwrap(), (false, false));
+        }
+        let again = super::super::conversation_titles::backfill().unwrap();
+        assert_eq!(
+            serde_json::to_value(sessions).unwrap(),
+            serde_json::to_value(again).unwrap()
+        );
+    }
+
+    #[test]
     fn streaming_repeats_and_completion_do_not_bump_the_list() {
         let _home = super::super::temp_home();
         seed();

@@ -27,7 +27,8 @@
 - Order session lists by verified user and assistant message time, retaining
   pins and filters across local and cloud updates and restarts. Metadata
   edits no longer bump conversations; older logs are indexed in background
-  batches without treating legacy import times as message times. (#599)
+  batches without treating legacy import times as message times. Title backfill
+  preserves message ordering when the app restarts. (#599)
 
 - Show compact local message times with full dates available by keyboard or
   tap, across local, cloud and mobile chats. Keep source timestamps through
