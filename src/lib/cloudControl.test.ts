@@ -474,6 +474,55 @@ describe("wait", () => {
 });
 
 describe("creating a session", () => {
+  describe.each(["saved", "explicit"] as const)("%s permission modes", (source) => {
+    it.each([
+      ["default", "manual"],
+      ["ask", "manual"],
+      ["accept_edits", "acceptEdits"],
+      ["bypass", "bypassPermissions"],
+      ["", "bypassPermissions"],
+      ["   ", "bypassPermissions"],
+      ...(source === "saved" ? [["unknown", "bypassPermissions"]] : []),
+      ["plan", "plan"],
+      ["manual", "manual"],
+      ["auto", "auto"],
+      ["acceptEdits", "acceptEdits"],
+      ["bypassPermissions", "bypassPermissions"],
+    ])("sends %j as %s when starting an issue", async (mode, expected) => {
+      const { getPrefs, setPrefs } = await import("@/lib/prefs");
+      const previousMode = getPrefs().lastMode;
+      setPrefs({ lastMode: source === "saved" ? mode : "plan" });
+      try {
+        await handleCloudControl("sessions.create", {
+          project: PROJECT,
+          prompt: "Work on GitHub issue #433",
+          issue: { provider: "github", id: "433", identifier: "#433", title: "Carry issue sessions on", url: "https://github.com/acme/api/issues/433" },
+          ...(source === "explicit" ? { mode } : {}),
+        });
+        expect(vi.mocked(newSession.startInWorkspace).mock.calls[0][1]).toMatchObject({ mode: expected });
+      } finally {
+        setPrefs({ lastMode: previousMode });
+      }
+    });
+  });
+
+  it.each(["unknown", "manuaI"])("rejects unknown explicit mode %j before starting anything", async (mode) => {
+    const { getPrefs, setPrefs } = await import("@/lib/prefs");
+    const previousMode = getPrefs().lastMode;
+    setPrefs({ lastMode: "manual" });
+    try {
+      expect(await refusal("sessions.create", { project: PROJECT, prompt: "fix the login", mode })).toMatchObject({
+        code: "invalid_arguments",
+        message: `Unknown permission mode ${mode}.`,
+      });
+      expect(newSession.startInWorkspace).not.toHaveBeenCalled();
+      expect(newSession.prepareCloudCreate).not.toHaveBeenCalled();
+      expect(newSession.confirmCloudCreate).not.toHaveBeenCalled();
+    } finally {
+      setPrefs({ lastMode: previousMode });
+    }
+  });
+
   it("adds it to the project's running workspace, without moving the window's selection", async () => {
     const created = await handleCloudControl("sessions.create", { project: PROJECT, prompt: "fix the login", agent: "codex", useWorktree: false });
     expect(created).toEqual({ created: "session", session: `cloud:${ORG}:ws-1:new-session`, workspace: `cloud:${ORG}:ws-1`, resumed: false });
