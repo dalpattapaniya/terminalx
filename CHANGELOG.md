@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.2.17
+
+### Chats
+
+- **Continue in New Session** is back in the title bar, to the right of
+  Share, and opens the same continuation dialog as the workspace menu. It
+  follows the selected chat and stays reachable in a narrow window. (#591)
+
+### Organizations
+
+- Organization setup now says when new machines are paused and offers
+  **Allow new machines**. Allowing them moves setup on to Agent logins
+  without needing **Check again**; the compute controls and setup steps
+  update each other. (PRO-112)
+- Owners and admins see **API keys and webhooks** on each organization's
+  settings page. **Manage in the console** opens that organization's page
+  in the system browser, without switching the active organization. Needs
+  the account service's organization-console redirect. (PRO-40)
+
 ### Cloud workspaces
 
 - Your own model access: in Settings → Organizations, each organization's
@@ -17,10 +36,33 @@
   is called out with the models it does, and the organization's login is
   never injected beside a route. A stored credential reaches only the
   member's own workspaces that nobody else drives, so those can't be shared
-  with Can send while it is stored. **Switch back to the organization
-  login** removes the route. Cursor's CLI supports neither, so it always uses
+  with Can send until the workspace is restarted after delivery stops.
+  **Switch back to the organization login** removes the route for new
+  sessions; running sessions keep their launch credentials until restarted. Cursor's CLI supports neither, so it always uses
   the organization's login. Needs the account service's agent model routes
   (terminalx-saas, PRO-18). (PRO-18)
+- A cloud session's agent tab shows **Needs sign-in** with a link to its
+  organization's Agent logins when the launch has no login. The runtime
+  checks the credentials the tab actually started with and refreshes the
+  tab list when a sync changes that answer. (PRO-110)
+
+### Command line
+
+- `read`, `send` and `wait` can find a cloud session the CLI just created,
+  before it has been opened in the app. They look up its tabs from the
+  running workspace, or its saved checkpoints while stopped, without
+  waking it; a launch still starting is reported as starting. (PRO-109)
+- Cloud `stop` and `resume` report stopping/stopped or resuming/running
+  instead of provisioning. They read the server's current state first and
+  wait briefly for an opposite operation in progress, so a resume just
+  after a stop can proceed. (PRO-113)
+
+### Mobile companion
+
+- Sharing explains when a workspace has received its creator's own model
+  credential and cannot yet be shared with Can send. It offers view-only
+  sharing or switching the agent's login and restarting the workspace.
+  These source changes require a separately updated mobile app.
 
 ## 0.2.16
 
