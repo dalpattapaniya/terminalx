@@ -62,6 +62,9 @@
 
 ### Issues
 
+- Signing out drains an active work-status publish before withdrawing this Mac’s
+  claims, and prevents further publishing until a new sign-in, including one
+  started while the previous logout request is still finishing. (#578)
 - Count your known cloud issue authors immediately in work filters and duplicate-start
   warnings, deduplicate arriving account claims, and open an existing cloud author
   from the warning. Preserve live account evidence when deduplicating and keep

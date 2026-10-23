@@ -29,6 +29,10 @@ fn serve(body: &'static str) -> (String, Requests) {
 
 /// Answer every request with this status, extra headers and body.
 fn serve_with(status: &'static str, headers: &'static str, body: &'static str) -> (String, Requests) {
+    serve_observing(status, headers, body, |_| {})
+}
+
+fn serve_observing(status: &'static str, headers: &'static str, body: &'static str, mut before_response: impl FnMut(&str) + Send + 'static) -> (String, Requests) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let requests: Requests = Arc::default();
@@ -60,6 +64,7 @@ fn serve_with(status: &'static str, headers: &'static str, body: &'static str) -
                 }
             }
             seen.lock().unwrap().push(String::from_utf8_lossy(&request).into_owned());
+            before_response(&String::from_utf8_lossy(&request));
             let response = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
             let _ = stream.write_all(response.as_bytes());
         }
@@ -70,6 +75,7 @@ fn serve_with(status: &'static str, headers: &'static str, body: &'static str) -
 fn service(base: &str) -> WorkClaims {
     let account = Arc::new(AccountManager::default());
     account.set_context_for_test(Some(context()));
+    account.use_secrets_for_test(Arc::new(crate::keychain::testing::MemorySecrets::default()));
     account.set_capability_for_test(CAPABILITY, true);
     WorkClaims::with_base(account, || Some("host-0123456789ab".into()), Url::parse(base).unwrap())
 }
@@ -259,7 +265,7 @@ fn signing_out_withdraws_this_devices_claims() {
     let (base, requests) = serve(r#"{"claims":0}"#);
     let claims = service(&base);
     claims.publish(&Linker::default());
-    claims.sign_out();
+    claims.sign_out(|| ((), claims.account.end_session_generation_for_test()));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].starts_with("DELETE /v1/desktop/work-claims/devices/host-0123456789ab "), "{}", requests[1]);
@@ -447,4 +453,170 @@ fn reviewer_identity_survives_pipeline_eviction_and_replacement_on_disk() {
     claims.link_pass(&mut Linker::default(), &trackers);
     assert!(index::get(&reviewer.id).unwrap().issue.is_none());
     assert_eq!(index::get(&author.id).unwrap().issue, author.issue);
+}
+
+#[test]
+fn sign_out_drains_the_first_publish_and_blocks_queued_work_through_account_removal() {
+    let _home = crate::store::temp_home();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (base, requests) = serve_observing("200 OK", "", r#"{"claims":0}"#, move |request| {
+        if request.starts_with("PUT ") {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+    });
+    let claims = Arc::new(service(&base));
+    let publisher = claims.clone();
+    let publishing = std::thread::spawn(move || publisher.publish(&Linker::default()));
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(claims.state.lock().unwrap().sent.is_none(), "first PUT is unanswered");
+    let signing_out = claims.clone();
+    let (ending_tx, ending_rx) = std::sync::mpsc::channel();
+    let (end_tx, end_rx) = std::sync::mpsc::channel();
+    let logout = std::thread::spawn(move || signing_out.sign_out(|| {
+        ending_tx.send(()).unwrap();
+        end_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        ((), signing_out.account.end_session_generation_for_test())
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while claims.state.lock().unwrap().signing_out == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    // Refresh cannot lift the sign-out fence, even before withdrawal starts.
+    let mut refreshed = context();
+    refreshed.access_token = "refreshed-test-token".into();
+    claims.account.set_context_for_test(Some(refreshed));
+    claims.account.set_capability_for_test(CAPABILITY, true);
+    claims.nudge();
+    assert!(!claims.publish(&Linker::default()));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    release_tx.send(()).unwrap();
+    assert!(publishing.join().unwrap());
+    ending_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(!claims.publish(&Linker::default()), "withdrawal finished but account is still signed in");
+    let mut replacement = context();
+    replacement.generation += 1;
+    replacement.user_id = "other-user".into();
+    claims.account.set_context_for_test(Some(replacement));
+    claims.account.set_capability_for_test(CAPABILITY, true);
+    assert!(!claims.publish(&Linker::default()), "an account change cannot undo an in-progress sign-out");
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("PUT "));
+        assert!(requests[1].starts_with("DELETE "));
+        assert!(requests[1].contains("Bearer refreshed-test-token"));
+    }
+    end_tx.send(()).unwrap();
+    logout.join().unwrap();
+    assert!(claims.publish(&Linker::default()));
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(claims.state.lock().unwrap().sent.is_none());
+}
+
+#[test]
+fn sign_out_without_sent_withdraws_and_failure_stays_fenced_until_new_sign_in() {
+    let _home = crate::store::temp_home();
+    let (base, requests) = serve_with("503 Service Unavailable", "", r#"{"error":"unavailable"}"#);
+    let claims = service(&base);
+    // Includes an unanswered/failed publish and its backoff, with no Sent entry.
+    assert!(claims.publish(&Linker::default()));
+    assert!(claims.state.lock().unwrap().retry_at.is_some());
+    claims.sign_out(|| ((), claims.account.current_generation())); // Simulate account removal failing, retaining its session.
+    assert!(requests.lock().unwrap()[1].starts_with("DELETE /v1/desktop/work-claims/devices/host-0123456789ab "));
+    let mut refreshed = context();
+    refreshed.access_token = "refreshed-test-token".into();
+    claims.account.set_context_for_test(Some(refreshed.clone()));
+    claims.account.set_capability_for_test(CAPABILITY, true);
+    claims.nudge();
+    assert!(claims.publish(&Linker::default()));
+    assert_eq!(requests.lock().unwrap().len(), 2, "refresh must not resume publishing");
+    assert!(claims.state.lock().unwrap().retry_at.is_none());
+    // A later sign-in to the same user is allowed, without the old backoff/gap.
+    refreshed.generation += 2;
+    claims.account.set_context_for_test(Some(refreshed));
+    claims.account.set_capability_for_test(CAPABILITY, true);
+    assert!(claims.publish(&Linker::default()));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn sign_out_with_no_publish_still_withdraws_the_known_device() {
+    let (base, requests) = serve(r#"{}"#);
+    let claims = service(&base);
+    claims.sign_out(|| ((), claims.account.end_session_generation_for_test()));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("DELETE /v1/desktop/work-claims/devices/host-0123456789ab "));
+}
+
+#[test]
+fn a_timed_out_publish_and_withdrawal_do_not_prevent_local_sign_out() {
+    let _home = crate::store::temp_home();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (base, _) = serve_observing("200 OK", "", r#"{}"#, move |request| {
+        if request.starts_with("PUT ") {
+            entered_tx.send(()).unwrap();
+            // The test releases the server only AFTER local sign-out completes.
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+    });
+    let mut claims = service(&base);
+    claims.client = Client::new(Url::parse(&base).unwrap(), Duration::from_millis(100));
+    claims.sign_out_client = Client::new(Url::parse(&base).unwrap(), Duration::from_millis(100));
+    let claims = Arc::new(claims);
+    let publisher = claims.clone();
+    let publishing = std::thread::spawn(move || publisher.publish(&Linker::default()));
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let signing_out = claims.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let logout = std::thread::spawn(move || {
+        signing_out.sign_out(|| ((), signing_out.account.end_session_generation_for_test()));
+        done_tx.send(()).unwrap();
+    });
+    done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    release_tx.send(()).unwrap();
+    publishing.join().unwrap();
+    logout.join().unwrap();
+    assert!(claims.account.context().is_none());
+    assert!(claims.state.lock().unwrap().retry_at.is_none());
+}
+
+
+#[test]
+fn a_sign_in_during_logout_is_not_fenced_when_the_old_logout_returns() {
+    let _home = crate::store::temp_home();
+    // Both signing back in as the same person and switching accounts must resume.
+    for user_id in ["user-1", "other-user"] {
+        let (base, requests) = serve(r#"{"claims":0}"#);
+        let claims = Arc::new(service(&base));
+        let signing_out = claims.clone();
+        let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let logout = std::thread::spawn(move || signing_out.sign_out(|| {
+            let generation = signing_out.account.end_session_generation_for_test();
+            removed_tx.send(generation).unwrap();
+            // AccountManager emits signed-out status here, then waits on logout HTTP.
+            finish_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            ((), generation)
+        }));
+        let removed_generation = removed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut new_session = context();
+        new_session.generation = removed_generation + 1;
+        new_session.user_id = user_id.into();
+        claims.account.set_context_for_test(Some(new_session));
+        claims.account.set_capability_for_test(CAPABILITY, true);
+        assert!(!claims.publish(&Linker::default()), "still fenced while logout is in progress");
+        finish_tx.send(()).unwrap();
+        logout.join().unwrap();
+        claims.nudge();
+        assert!(claims.publish(&Linker::default()));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "new sign-in must publish after the old logout returns");
+        assert!(requests[0].starts_with("DELETE "));
+        assert!(requests[1].starts_with("PUT "));
+    }
 }
