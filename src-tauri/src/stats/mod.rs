@@ -169,7 +169,18 @@ fn scan_snapshot_with(
     let mut previous_by_path: HashMap<PathBuf, CachedFile> = previous
         .files
         .into_iter()
-        .map(|file| (file.path.clone(), file))
+        .map(|mut file| {
+            // Version 3 omitted tier eligibility and cache-write duration.
+            // Only reparsing a surviving record can establish its price;
+            // missing files and records retained from a rewritten suffix must
+            // keep this uncertainty after the cache is upgraded.
+            if reparse {
+                for event in &mut file.events {
+                    event.unpriced = true;
+                }
+            }
+            (file.path.clone(), file)
+        })
         .collect();
     let mut current = Vec::with_capacity(files.len());
     for (path, provider) in files {
@@ -735,6 +746,8 @@ fn parse_codex(path: &Path) -> Result<Vec<UsageEvent>> {
                     continue;
                 };
                 let Delta::Event(mut delta, next) = resolved;
+                // A zero-valued reset still advances the cumulative baseline.
+                previous_totals = next;
                 delta.cached_input = delta.cached_input.min(delta.input);
                 if delta.input == 0
                     && delta.cached_input == 0
@@ -744,7 +757,6 @@ fn parse_codex(path: &Path) -> Result<Vec<UsageEvent>> {
                 {
                     continue;
                 }
-                previous_totals = next;
                 let model = extract_model(payload).or_else(|| current_model.clone());
                 let cwd = current_cwd.clone().or_else(|| session_cwd.clone());
                 let project = project_label(cwd.as_deref());

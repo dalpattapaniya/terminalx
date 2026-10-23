@@ -530,3 +530,97 @@ fn resumed_codex_baseline_does_not_rebill_unobserved_prior_requests() {
         "returning to standard tier restores request pricing"
     );
 }
+
+#[test]
+fn zero_counter_reset_updates_the_baseline_without_emitting_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zero-reset.jsonl");
+    write_rows(
+        &path,
+        &[
+            token_row("2026-09-03T12:00:00Z", counts(100, 0, 0, 0), Value::Null),
+            token_row("2026-09-03T12:00:01Z", counts(0, 0, 0, 0), Value::Null),
+            token_row("2026-09-03T12:00:02Z", counts(150, 0, 0, 0), Value::Null),
+        ],
+        true,
+    );
+    let events = parse_codex(&path).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.total_tokens)
+            .collect::<Vec<_>>(),
+        vec![100, 150]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.new_input_tokens)
+            .sum::<u64>(),
+        250
+    );
+}
+
+#[test]
+fn unreparsed_legacy_records_keep_tokens_but_remain_unpriced_after_upgrade() {
+    for deleted in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let path = dir.path().join("claude.jsonl");
+        let timestamp = Local::now().to_rfc3339();
+        let mut fast = claude_row(&cwd, &timestamp, "fast", 9);
+        fast["message"]["usage"]["service_tier"] = json!("fast");
+        let standard = claude_row(&cwd, &timestamp, "standard", 9);
+        write_rows(&path, &[fast, standard.clone()], false);
+        let sources = || {
+            if deleted {
+                Ok(vec![])
+            } else {
+                Ok(vec![(path.clone(), Provider::Claude)])
+            }
+        };
+        let inputs = || Ok((AppStats::default(), UsageScope::from_paths([cwd.clone()])));
+        scan_snapshot_with(
+            dir.path(),
+            || Ok(vec![(path.clone(), Provider::Claude)]),
+            inputs,
+        )
+        .unwrap();
+        let cache_path = dir.path().join(CACHE_FILE);
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        legacy["schemaVersion"] = json!(3);
+        for event in legacy["files"][0]["events"].as_array_mut().unwrap() {
+            let event = event.as_object_mut().unwrap();
+            event.remove("unpriced");
+            event.remove("cacheWriteHourTokens");
+        }
+        fs::write(&cache_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        if deleted {
+            fs::remove_file(&path).unwrap();
+        } else {
+            // The missing prefix has the same uncertainty as a deleted file.
+            write_rows(&path, &[standard], false);
+        }
+        for _ in 0..2 {
+            let snapshot = scan_snapshot_with(dir.path(), sources, inputs).unwrap();
+            assert_eq!(snapshot.total_tokens, 68);
+            assert!(snapshot.has_partial_cost);
+            assert!(snapshot.providers[0].has_partial_cost);
+            if deleted {
+                assert_eq!(snapshot.estimated_cost_usd, None);
+            } else {
+                assert!((snapshot.estimated_cost_usd.unwrap() - 0.00027125).abs() < 1e-12);
+            }
+        }
+        let upgraded: ScanCache = crate::store::read_json(&cache_path).unwrap().unwrap();
+        assert_eq!(upgraded.schema_version, CACHE_SCHEMA);
+        assert_eq!(
+            upgraded.files[0]
+                .events
+                .iter()
+                .filter(|event| event.unpriced)
+                .count(),
+            if deleted { 2 } else { 1 }
+        );
+    }
+}
