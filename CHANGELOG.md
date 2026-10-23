@@ -5,7 +5,8 @@
 ### Issues
 
 - Pipeline reviewers no longer count as another session working on the issue,
-  locally or in cloud workspaces. Existing local reviewer links are removed. (#570)
+  locally or in cloud workspaces, even after their pipeline history is trimmed.
+  Existing local reviewer links are removed. (#570)
 
 ### Command line
 

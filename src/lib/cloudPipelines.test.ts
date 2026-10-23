@@ -49,7 +49,7 @@ vi.mock("@/lib/cloudConnections", async (importOriginal) => ({
 
 const catalog = await import("@/lib/cloudCatalog");
 const connections = await import("@/lib/cloudConnections");
-const { actOnCloudPipeline, bootCloudPipelines, getCloudPipelines, lookAtCloudPipeline, mergeCloudPipeline, resetCloudPipelines } = await import("./cloudPipelines");
+const { actOnCloudPipeline, bootCloudPipelines, cloudReviewerSessions, getCloudPipelines, lookAtCloudPipeline, mergeCloudPipeline, resetCloudPipelines } = await import("./cloudPipelines");
 
 const ORG = "org-a";
 const TARGET = { orgId: ORG, workspaceId: "ws-1" };
@@ -324,4 +324,38 @@ describe("a cloud workspace's Linear issue", () => {
     expect(mocks.invoke.mock.calls.filter(([command]) => command === "issue_pipeline_linear_to_review")).toEqual([]);
     expect([...early.calls, ...recorded.calls, ...viewer.calls].some((call) => call.startsWith("noteTracker"))).toBe(false);
   });
+});
+
+it("keeps reviewer identity through initial list trimming, updates, and a saved catalog reload", async () => {
+  const fake = runtime();
+  fake.listed = Array.from({ length: 51 }, (_, n) => raw({
+    id: `p-${n}`, created: String(n).padStart(3, "0"), state: "working",
+    reviewer: { sessionId: `reviewer-${n}`, tabId: "t" },
+  }));
+  await connect(fake);
+  expect(getCloudPipelines()).toHaveLength(50);
+  expect(getCloudPipelines().some((pipeline) => pipeline.id === "p-0")).toBe(false);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:reviewer-0`)).toBe(true);
+  // A replacement and later list must not discard previously learned identity.
+  fake.announce(raw({ id: "p-50", created: "050", reviewer: { sessionId: "replacement", tabId: "t" } }));
+  fake.listed = [raw({ id: "latest", reviewer: null })];
+  await connect(fake);
+  const current = catalog.getCloudCatalog();
+  const parsed = catalog.parseCatalog(JSON.parse(JSON.stringify(catalog.serializeCatalog(current))))!;
+  const reviewers = cloudReviewerSessions({ ...current, ...parsed });
+  expect(reviewers.has(`cloud:${ORG}:ws-1:reviewer-0`)).toBe(true);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:reviewer-50`)).toBe(true);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:replacement`)).toBe(true);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:s1`)).toBe(false);
+  const { cloudWorkSessions } = await import("@/lib/cloudWorkClaims");
+  const sessions = ["reviewer-0", "s1"].map((sessionId) => ({ key: `cloud:${ORG}:ws-1:${sessionId}`, orgId: ORG, workspaceId: "ws-1", sessionId, branch: "raccoon/433-carry", stopped: true }));
+  expect(cloudWorkSessions(sessions as never, () => "me", reviewers).map((session) => session.sessionId)).toEqual(["s1"]);
+});
+
+it("migrates reviewer identity from an older cloud catalog before evicting its pipelines", () => {
+  const current = catalog.getCloudCatalog();
+  current.orgs[ORG].pipelines = { "ws-1": { pipelines: [raw()], at: 1 } };
+  catalog.cacheCloudPipelines(ORG, "ws-1", []);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:s2`)).toBe(true);
+  expect(getCloudPipelines()).toHaveLength(0);
 });

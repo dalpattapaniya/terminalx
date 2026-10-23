@@ -6,6 +6,7 @@
 //! step. So a commit never writes the switches: it takes whatever is stored,
 //! and a step about to merge reads them again first.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -26,6 +27,15 @@ static WAITING: Mutex<Vec<DateTime<Utc>>> = Mutex::new(Vec::new());
 struct PipelineFile {
     #[serde(default)]
     pipelines: Vec<Pipeline>,
+    /// Session identity outlives the bounded history, including replaced reviewers.
+    #[serde(default)]
+    reviewers: BTreeSet<String>,
+}
+
+impl PipelineFile {
+    fn reviewer_sessions(&self) -> BTreeSet<String> {
+        self.reviewers.iter().cloned().chain(self.pipelines.iter().filter_map(|pipeline| pipeline.reviewer.as_ref().map(|reviewer| reviewer.session_id.clone()))).collect()
+    }
 }
 
 fn file_path() -> Result<PathBuf> {
@@ -62,7 +72,11 @@ pub fn waits() -> Vec<DateTime<Utc>> {
 }
 
 fn write(pipelines: Vec<Pipeline>) -> Result<()> {
-    crate::store::write_json(&file_path()?, &PipelineFile { pipelines })?;
+    // Read before replacing the history: insert may already have trimmed it,
+    // and commit may have replaced a reviewer whose tab was deleted.
+    let mut reviewers = crate::store::read_json::<PipelineFile>(&file_path()?)?.unwrap_or_default().reviewer_sessions();
+    reviewers.extend(pipelines.iter().filter_map(|pipeline| pipeline.reviewer.as_ref().map(|reviewer| reviewer.session_id.clone())));
+    crate::store::write_json(&file_path()?, &PipelineFile { pipelines, reviewers })?;
     Ok(())
 }
 
@@ -142,6 +156,6 @@ pub fn takes_part(session_id: &str, tab_id: &str) -> bool {
 }
 
 /// Reviewers never own issue work, including after their pipeline stops.
-pub fn reviewer_sessions() -> Result<std::collections::HashSet<String>> {
-    Ok(list()?.into_iter().filter_map(|pipeline| pipeline.reviewer.map(|reviewer| reviewer.session_id)).collect())
+pub fn reviewer_sessions() -> Result<HashSet<String>> {
+    Ok(crate::store::read_json::<PipelineFile>(&file_path()?)?.unwrap_or_default().reviewer_sessions().into_iter().collect())
 }

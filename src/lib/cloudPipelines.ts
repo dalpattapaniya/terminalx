@@ -1,6 +1,6 @@
 import type { RuntimeIssuePipeline, WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import { issuePipelines as pipelinesApi } from "@/lib/api";
-import { cacheCloudPipelines, dropCachedCloudPipelines, getCloudCatalog, repositoryOf, subscribeCloudCatalog, type CloudCatalogState } from "@/lib/cloudCatalog";
+import { cacheCloudPipelines, dropCachedCloudPipelines, getCloudCatalog, pipelineReviewerIds, repositoryOf, subscribeCloudCatalog, type CloudCatalogState } from "@/lib/cloudCatalog";
 import { onWorkspaceAccess } from "@/lib/cloudCollab";
 import { connectedCloudClient, onCloudConnected, retainCloudConnection, waitCloudConnected, wakeCloudConnection, type CloudTarget } from "@/lib/cloudConnections";
 import { notePipelineState } from "@/lib/notify";
@@ -21,8 +21,6 @@ import type { CloudMerge, IssuePipeline, IssuePipelineSettings, PipelineAction, 
  * own `gh` (`issue_pipeline_merge_cloud`), and the runtime is then told.
  */
 
-/** At most this many per workspace are kept, newest first: the runtime keeps a longer record of finished ones. */
-const KEPT_PER_WORKSPACE = 50;
 /** How long an action may wait for a workspace to wake and connect. */
 const WAKE_WITHIN_MS = 5 * 60 * 1000;
 /** How long the look a page takes on opening waits for a running workspace to connect. */
@@ -93,6 +91,18 @@ export function getCloudPipelines(): IssuePipeline[] {
   return views;
 }
 
+/** Reviewer identity is independent of the catalog's bounded pipeline history. */
+export function cloudReviewerSessions(catalog: CloudCatalogState = getCloudCatalog()): Set<string> {
+  const reviewers = new Set<string>();
+  for (const [orgId, org] of Object.entries(catalog.orgs)) {
+    for (const [workspaceId, cached] of Object.entries(org.pipelines ?? {})) {
+      const ids = [...(cached.reviewerSessionIds ?? []), ...pipelineReviewerIds(cached.pipelines)];
+      for (const id of ids) reviewers.add(cloudSessionKey(orgId, workspaceId, id));
+    }
+  }
+  return reviewers;
+}
+
 export function subscribeCloudPipelines(listener: () => void): () => void {
   listeners.add(listener);
   const stop = subscribeCloudCatalog(listener);
@@ -110,14 +120,14 @@ function stored(target: CloudTarget): RuntimeIssuePipeline[] {
 
 /** What the runtime listed: the whole of what it carries. */
 function takeList(target: CloudTarget, pipelines: RuntimeIssuePipeline[]) {
-  cacheCloudPipelines(target.orgId, target.workspaceId, [...pipelines].map(kept).sort(newestFirst).slice(0, KEPT_PER_WORKSPACE));
+  cacheCloudPipelines(target.orgId, target.workspaceId, [...pipelines].map(kept).sort(newestFirst));
 }
 
 /** One pipeline as the runtime wrote it. A change of state that comes to rest is news. */
 function takeOne(target: CloudTarget, raw: RuntimeIssuePipeline) {
   const before = stored(target);
   const previous = before.find((each) => each.id === raw.id);
-  const next = [kept(raw), ...before.filter((each) => each.id !== raw.id)].sort(newestFirst).slice(0, KEPT_PER_WORKSPACE);
+  const next = [kept(raw), ...before.filter((each) => each.id !== raw.id)].sort(newestFirst);
   cacheCloudPipelines(target.orgId, target.workspaceId, next);
   if (previous && previous.state !== raw.state) {
     const view = getCloudPipelines().find((each) => each.id === raw.id && each.place?.workspaceId === target.workspaceId);

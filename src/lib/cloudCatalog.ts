@@ -74,6 +74,8 @@ export interface OrgCatalog {
 /** A workspace's issue pipelines as its runtime last reported them (`pipeline/1`). */
 export interface CachedWorkspacePipelines {
   pipelines: RuntimeIssuePipeline[];
+  /** Reviewer identity survives history eviction and reviewer replacement. Workspace-local IDs. */
+  reviewerSessionIds?: string[];
   at: number;
 }
 
@@ -440,12 +442,25 @@ export function cacheCloudSessions(orgId: string, workspaceId: string, sessions:
   set({ ...state, orgs: { ...state.orgs, [orgId]: { ...current, sessions: { ...current.sessions, [workspaceId]: { sessions, capabilities, at: now } } } } });
 }
 
+/** Read reviewer IDs from runtime records, including older saved catalogs. */
+export function pipelineReviewerIds(pipelines: RuntimeIssuePipeline[]): string[] {
+  return pipelines.flatMap((pipeline) => isObject(pipeline.reviewer) && typeof pipeline.reviewer.sessionId === "string" ? [pipeline.reviewer.sessionId] : []);
+}
+
 /** Keep a workspace's issue pipelines with the catalog (#433), so its issues show them while it sleeps. */
 export function cacheCloudPipelines(orgId: string, workspaceId: string, pipelines: RuntimeIssuePipeline[], now = Date.now()) {
   const current = state.orgs[orgId];
   if (!current) return;
-  if (JSON.stringify(current.pipelines?.[workspaceId]?.pipelines) === JSON.stringify(pipelines)) return;
-  set({ ...state, orgs: { ...state.orgs, [orgId]: { ...current, pipelines: { ...current.pipelines, [workspaceId]: { pipelines, at: now } } } } });
+  const previous = current.pipelines?.[workspaceId];
+  // Capture the full runtime list before trimming it, and migrate older caches.
+  const reviewerSessionIds = [...new Set([
+    ...(previous?.reviewerSessionIds ?? []),
+    ...pipelineReviewerIds([...(previous?.pipelines ?? []), ...pipelines]),
+  ])].sort();
+  // The issue view keeps only the newest 50 records; identities above are not history.
+  pipelines = pipelines.slice(0, 50);
+  if (JSON.stringify(previous?.pipelines) === JSON.stringify(pipelines) && JSON.stringify(previous?.reviewerSessionIds) === JSON.stringify(reviewerSessionIds)) return;
+  set({ ...state, orgs: { ...state.orgs, [orgId]: { ...current, pipelines: { ...current.pipelines, [workspaceId]: { pipelines, reviewerSessionIds, at: now } } } } });
 }
 
 /** Forget a workspace's saved pipelines: this person lost access to it. */
@@ -1036,7 +1051,8 @@ function parsePipelines(value: unknown, workspaces: ReadonlySet<string>): Record
   for (const [workspaceId, raw] of Object.entries(value)) {
     if (!workspaces.has(workspaceId) || !isObject(raw) || !Array.isArray(raw.pipelines)) continue;
     const pipelines = raw.pipelines.filter((pipeline): pipeline is RuntimeIssuePipeline => isObject(pipeline) && typeof pipeline.id === "string" && isObject(pipeline.issue));
-    out[workspaceId] = { pipelines, at: typeof raw.at === "number" ? raw.at : 0 };
+    const reviewerSessionIds = Array.isArray(raw.reviewerSessionIds) ? raw.reviewerSessionIds.filter((id): id is string => typeof id === "string") : [];
+    out[workspaceId] = { pipelines, reviewerSessionIds, at: typeof raw.at === "number" ? raw.at : 0 };
   }
   return out;
 }

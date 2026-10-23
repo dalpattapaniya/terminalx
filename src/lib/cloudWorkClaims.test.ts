@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CloudDashboardSession } from "@/lib/cloudDashboard";
 import stored from "../../src-tauri/src/fixtures/issue_pipeline.json";
-import type { IssuePipeline } from "@/types/issuePipeline";
 import { cloudPipelineView } from "@/lib/cloudPipelines";
 import { cloudWorkSessions } from "@/lib/cloudWorkClaims";
 
@@ -62,25 +61,25 @@ describe("the cloud sessions handed to the work status publisher", () => {
 it.each([false, true])("excludes a cloud reviewer (stopped: %s), retaining authors and same IDs in other workspaces", (stopped) => {
   const pipeline = cloudPipelineView({ ...stored, stopped } as never, { orgId: "org", workspaceId: "ws", identity: "github.com/Acme/Widgets", readAt: 1 });
   const cloud = (sessionId: string, workspaceId = "ws") => session({ sessionId, workspaceId, key: `cloud:org:${workspaceId}:${sessionId}` });
-  const handed = cloudWorkSessions([cloud("author"), cloud("reviewer-1"), cloud("ordinary"), cloud("reviewer-1", "other")], () => "me", [pipeline]);
+  const handed = cloudWorkSessions([cloud("author"), cloud("reviewer-1"), cloud("ordinary"), cloud("reviewer-1", "other")], () => "me", new Set([pipeline.reviewer!.sessionId]));
   expect(handed.map((each) => [each.workspaceId, each.sessionId])).toEqual([["ws", "author"], ["ws", "ordinary"], ["other", "reviewer-1"]]);
 });
 
 it("withdraws a reviewer when pipeline identity arrives after the session list", async () => {
   vi.resetModules();
   vi.useFakeTimers();
-  let pipelines: IssuePipeline[] = [];
+  let reviewers = new Set<string>();
   let changed = () => {};
   const setCloud = vi.fn().mockResolvedValue(undefined);
   vi.doMock("@/lib/api", () => ({ workStatus: { setCloud } }));
-  vi.doMock("@/lib/cloudPipelines", () => ({ getCloudPipelines: () => pipelines, subscribeCloudPipelines: (listener: () => void) => { changed = listener; } }));
+  vi.doMock("@/lib/cloudPipelines", () => ({ cloudReviewerSessions: () => reviewers, subscribeCloudPipelines: (listener: () => void) => { changed = listener; } }));
   vi.doMock("@/lib/cloudDashboard", () => ({ getCloudDashboard: () => [session()], subscribeCloudDashboard: vi.fn(), cloudSessionMark: () => "in_progress" }));
   try {
     const { bootCloudWorkClaims } = await import("@/lib/cloudWorkClaims");
     bootCloudWorkClaims();
     await vi.advanceTimersByTimeAsync(2000);
     expect(setCloud.mock.calls[0][0]).toHaveLength(1);
-    pipelines = [{ ...stored, reviewer: { sessionId: "cloud:org:ws:c1", tabId: "t" } } as IssuePipeline];
+    reviewers = new Set(["cloud:org:ws:c1"]);
     changed();
     await vi.advanceTimersByTimeAsync(2000);
     expect(setCloud).toHaveBeenLastCalledWith([]);
