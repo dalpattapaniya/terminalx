@@ -46,7 +46,7 @@ import { errorCode } from "@/lib/cloudTerminals";
 import { mayStartCloudSessions } from "@/lib/multiOrg";
 import { getPrefs, setPrefs, usePrefs } from "@/lib/prefs";
 import { useSidebarFilter } from "@/lib/sidebarFilter";
-import { getSessionStore, selectCloudSession, selectCloudWorkspace, selectSession, startCloudSessionIn, useSessionStore } from "@/lib/sessions";
+import { getSessionStore, selectCloudSession, selectCloudWorkspace, openWelcome, startCloudSessionIn, useSessionStore } from "@/lib/sessions";
 import { cn } from "@/lib/cn";
 import { parseCloudWorkspaceKey, type CloudProject, type CloudWorkspaceNode } from "@/types/target";
 import type { TabStatus } from "@/types/session";
@@ -549,7 +549,7 @@ function CloudSessionItem({ row, status, manage, selected }: { row: CloudSession
         await deleteCloudSession(row, { confirmedUnsafe: true });
       }
       // Read at the time of the action, not of the render.
-      if (getSessionStore().selectedSessionId === row.key) selectSession(null);
+      if (getSessionStore().selectedSessionId === row.key) openWelcome();
     });
   };
   return (

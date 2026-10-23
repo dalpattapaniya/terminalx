@@ -1,3 +1,4 @@
+import { EmptyView } from "./EmptyView";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { CircleAlert, ExternalLink, FolderGit2, FolderOpen, Loader2, RefreshCw, Zap, type LucideIcon } from "@/icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -77,10 +78,8 @@ export function StartScreen({ onOpenSettings }: { onOpenSettings: (tab?: "agents
   const signedOut = account.ready && account.status.state === "signed-out";
 
   return (
-    <div ref={root} data-testid="start-screen" className="@container relative flex h-full min-h-0 flex-col items-center justify-center overflow-y-auto px-6 py-8">
-      <div className="w-full max-w-2xl">
-        <h1 className="text-center text-3xl font-semibold tracking-tight">TerminalX</h1>
-        <p className="mt-2 text-center text-sm text-muted-foreground">Welcome. Open a project to start working with an agent.</p>
+    <div ref={root} data-testid="start-screen" className="relative flex h-full min-h-0 flex-col">
+      <EmptyView branded guidance="Welcome. Open a project to start working with an agent.">
 
         <div role="group" aria-label="Get started" className="mt-8 grid grid-cols-1 gap-3 @xl:grid-cols-3" onKeyDown={moveFocus}>
           {START_ACTIONS.map((action) => {
@@ -148,7 +147,7 @@ export function StartScreen({ onOpenSettings }: { onOpenSettings: (tab?: "agents
             Read the docs <ExternalLink className="size-3" />
           </SecondaryLink>
         </div>
-      </div>
+      </EmptyView>
 
       <div
         aria-hidden

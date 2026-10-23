@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Welcome
+
+- Show a resting welcome screen when nothing is selected, with the app mark,
+  build name, project/session actions and the current keyboard shortcuts.
+  Share its layout with first-run open/clone/quick-start options and compact
+  Issues and Skills empty detail panes. Explicit New session still opens the
+  form; closing, archiving or deleting the selection returns to welcome. (#445)
+
 ### Stats & Usage
 
 - Refresh usage for non-Git projects without blocking healthy locations, and

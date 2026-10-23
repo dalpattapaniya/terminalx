@@ -16,7 +16,7 @@ const { sessionStore } = vi.hoisted(() => ({
     harnesses: [],
     selectedSessionId: null,
     selectedAutomationId: null as string | null,
-    view: "new" as "new" | "issues" | "agents" | "stats" | "automations" | "skills",
+    view: "new" as "welcome" | "new" | "issues" | "agents" | "stats" | "automations" | "skills",
     showArchived: false,
     selectedProject: "/repo" as string | null,
     workspaces: {
@@ -102,6 +102,7 @@ vi.mock("@/components/layout/Sidebar", () => ({
   ),
 }));
 vi.mock("@/components/session/NewSessionView", () => ({ NewSessionView: () => <div data-testid="new-session" /> }));
+vi.mock("@/components/start/WelcomeScreen", () => ({ WelcomeScreen: () => <div data-testid="welcome" /> }));
 vi.mock("@/components/start/StartScreen", () => ({
   StartScreen: ({ onOpenSettings }: { onOpenSettings: (tab?: string) => void }) => (
     <div data-testid="start-screen">
@@ -402,5 +403,32 @@ describe("cloud followers at launch", () => {
     expect(mirrorApi.cloudMirrorStatus).toHaveBeenCalledWith("org-1", "ws-1");
     // Live session lists follow from launch too, for the same reason.
     expect(bootCloudSessions).toHaveBeenCalled();
+  });
+});
+
+
+describe("welcome routing", () => {
+  it("shows the resting view without checkout panels and keeps the titlebar draggable", () => {
+    sessionStore.view = "welcome";
+    const { container } = render(<AppShell />);
+    expect(screen.getByTestId("welcome")).toBeTruthy();
+    expect(screen.queryByTestId("new-session")).toBeNull();
+    expect(screen.queryByTestId("right-panel")).toBeNull();
+    expect(container.querySelector('header[data-tauri-drag-region="deep"]')).toBeTruthy();
+  });
+
+  it("uses first-run content on welcome with no projects", () => {
+    sessionStore.view = "welcome";
+    sessionStore.projects = [];
+    render(<AppShell />);
+    expect(screen.getByTestId("start-screen")).toBeTruthy();
+    expect(screen.queryByTestId("welcome")).toBeNull();
+  });
+
+  it.each(["issues", "agents", "automations", "skills"] as const)("keeps %s navigation", (view) => {
+    sessionStore.view = view;
+    render(<AppShell />);
+    expect(screen.getByTestId(view)).toBeTruthy();
+    expect(screen.queryByTestId("welcome")).toBeNull();
   });
 });

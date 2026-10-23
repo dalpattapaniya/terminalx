@@ -6,6 +6,7 @@ import { WithTooltip } from "@/components/ui/tooltip";
 import type { SettingsTab } from "@/components/settings/SettingsPage";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { NewSessionView } from "@/components/session/NewSessionView";
+import { WelcomeScreen } from "@/components/start/WelcomeScreen";
 import { StartScreen } from "@/components/start/StartScreen";
 import { ProjectStartDialogHost } from "@/components/start/ProjectStartDialogs";
 import { IssuesView } from "@/components/issues/IssuesView";
@@ -324,7 +325,7 @@ function UnselectedWorkspace({
   const labelMode = preset?.cwd && store.view === "new" ? "branch" : useWorktree ? "base" : "branch";
   // With no local project there is nothing to start a session in: the start screen offers the ways to get one.
   // Not before the projects are read, and not over a cloud draft, which needs no local project.
-  const startScreen = store.view === "new" && store.loaded && store.projects.length === 0 && !store.cloudSessionPreset;
+  const startScreen = (store.view === "new" || store.view === "welcome") && store.loaded && store.projects.length === 0 && !store.cloudSessionPreset;
 
   return (
     <>
@@ -350,7 +351,7 @@ function UnselectedWorkspace({
                 ? ""
                 : store.view === "automations"
                   ? "Automations"
-                  : startScreen
+                  : startScreen || store.view === "welcome"
                     ? ""
                     : "New session"}
           </span>
@@ -389,6 +390,8 @@ function UnselectedWorkspace({
               />
             ) : startScreen ? (
               <StartScreen onOpenSettings={onOpenSettings} />
+            ) : store.view === "welcome" ? (
+              <WelcomeScreen />
             ) : (
               <NewSessionView onCreated={onCreated} useWorktree={useWorktree} onUseWorktreeChange={setUseWorktree} />
             )}

@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { activateBrowserPage, closeBrowserPage, getBrowserState, pagesFor, useBrowser } from "@/lib/browser";
 import type { BrowserPage, TabLayout, TabState } from "@/lib/api";
 import { getPrefs, usePrefs } from "@/lib/prefs";
-import { getSessionStore, removeTab, selectSession, setActiveTab, useSessionStore } from "@/lib/sessions";
+import { getSessionStore, openWelcome, removeTab, selectSession, setActiveTab, useSessionStore } from "@/lib/sessions";
 import { followedSelection, isTerminalTab, tabLabel, tabPaneId } from "@/lib/tabFront";
 import { closeTerminal, getTerminalState, setActiveTerminal, useTerminals, type SelectedSessionTab, type TerminalPane } from "@/lib/terminal";
 import { NO_LAYOUT, branchSessionsAsTabs, followedLayout, getTabState, layoutOf, rememberClosed, saveTabLayout, settleLayout, sortByLayout, tabKey, useTabState, workspaceKey, workspaceSessions } from "@/lib/tabLayouts";
@@ -218,6 +218,8 @@ export async function closePeer(sessionId: string, tab: PeerTab, tabs: PeerTab[]
     activatePeer(target, next);
   }
   await endPeer(sessionId, tab);
+  const current = getSessionStore().sessions.find((session) => session.id === sessionId);
+  if (current && getSessionStore().selectedSessionId === sessionId && !workspaceRow(current).tabs.length) openWelcome();
 }
 
 /** A page's label for the sidebar and tab strip: its title, else its host. */

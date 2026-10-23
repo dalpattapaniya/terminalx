@@ -60,7 +60,7 @@ function item(id: string, fields: Record<string, unknown> = {}): CloudWorkspaceL
 function relaunch() {
   resetCloudSelection();
   catalog.resetCloudCatalog();
-  sessions.selectSession(null);
+  sessions.openWelcome();
   bootCloudSelection();
 }
 
@@ -121,6 +121,15 @@ describe("the selected cloud session across a relaunch", () => {
     relaunch();
     await catalog.ingestCloudList({ workspaces: [item("alpha")] } as never, ORG);
     expect(selected()).toBeNull();
+  });
+
+  it("does not restore over an explicit new-session request", async () => {
+    bootCloudSelection();
+    sessions.selectCloudSession(KEY);
+    relaunch();
+    sessions.selectSession(null);
+    await catalog.ingestCloudList({ workspaces: [item("alpha")] } as never, ORG);
+    expect(sessions.getSessionStore()).toMatchObject({ view: "new", selectedSessionId: null });
   });
 
   it("a local session chosen later replaces it", async () => {

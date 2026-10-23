@@ -311,3 +311,46 @@ describe("new chat", () => {
     await expect(sessions.startChat()).rejects.toThrow("Install and sign in to an agent");
   });
 });
+
+
+describe("resting navigation", () => {
+  it("boots at welcome and keeps explicit creation and deep links", () => {
+    expect(sessions.getSessionStore().view).toBe("welcome");
+    sessions.selectSession(null);
+    expect(sessions.getSessionStore().view).toBe("new");
+    sessions.startSessionIn(projectPath, worktreePath);
+    expect(sessions.getSessionStore().newSessionPreset).toEqual({ projectPath, cwd: worktreePath });
+    sessions.openTarget({ sessionId: attached.id, tabId: attached.tabs[0].id });
+    expect(sessions.getSessionStore().selectedSessionId).toBe(attached.id);
+  });
+
+  it("returns to welcome when the selection is deleted or archived", () => {
+    sessions.selectSession(attached.id);
+    sessions.patchSession(attached.id, { archived: true });
+    expect(sessions.getSessionStore()).toMatchObject({ view: "welcome", selectedSessionId: null });
+    sessions.selectSession(attached.id);
+    sessions.removeSessions([attached.id]);
+    expect(sessions.getSessionStore()).toMatchObject({ view: "welcome", selectedSessionId: null });
+  });
+
+  it("handles background deletion during refresh", async () => {
+    sessions.selectSession(attached.id);
+    mocks.invoke.mockResolvedValueOnce([]);
+    await sessions.refreshSessions();
+    expect(sessions.getSessionStore()).toMatchObject({ view: "welcome", selectedSessionId: null });
+  });
+
+  it("keeps a replacement selection and unrelated destinations", () => {
+    const other = { ...attached, id: "other" };
+    sessions.upsertSession(other);
+    sessions.selectSession(other.id);
+    sessions.removeSessions([attached.id]);
+    expect(sessions.getSessionStore().selectedSessionId).toBe(other.id);
+    sessions.openIssues();
+    sessions.patchSession(other.id, { archived: true });
+    expect(sessions.getSessionStore().view).toBe("issues");
+    sessions.selectSession(null);
+    sessions.removeSessions([other.id]);
+    expect(sessions.getSessionStore().view).toBe("new");
+  });
+});

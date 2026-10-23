@@ -116,6 +116,13 @@ const menu = async (name: string | RegExp) => {
 };
 
 describe("NewIssueForm", () => {
+  it("opens creation from the compact empty detail pane", async () => {
+    render(<IssuesView />);
+    expect(screen.getByRole("heading", { name: "Issues" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create an issue" }));
+    expect(await screen.findByTestId("new-issue")).toBeTruthy();
+  });
+
   it("loads and applies templates using a cloud repository key", async () => {
     const projectPath = "cloud:org-a:github.com/acme/widgets";
     clearIssueDraft(projectPath, "github");

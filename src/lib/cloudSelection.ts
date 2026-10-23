@@ -57,7 +57,7 @@ export function bootCloudSelection() {
   // Untouched since launch: the start screen, nothing chosen.
   const untouched = () => {
     const now = getSessionStore();
-    return now.navigationVersion === start.navigationVersion && !now.selectedSessionId && now.view === "new" && !now.cloudSessionPreset && !now.newSessionPreset && !now.selectedCloudWorkspace;
+    return now.navigationVersion === start.navigationVersion && !now.selectedSessionId && now.view === "welcome" && !now.cloudSessionPreset && !now.newSessionPreset && !now.selectedCloudWorkspace;
   };
   let restoring = true;
   // Undefined: what is shown now is written whatever it is.

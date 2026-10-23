@@ -251,6 +251,7 @@ describe("closing several tabs", () => {
   it("closes every tab of the row for 'close all', and only those", async () => {
     await actions.closeTabs(row(), actions.planBulkClose("all", row().tabs, null).targets, { kind: "agent", id: "a1" });
     expect(keys()).toEqual([]);
+    expect(store()).toMatchObject({ selectedSessionId: null, view: "welcome" });
     expect(closedKeys()).not.toContain("agent:o1");
     expect(closedKeys()).not.toContain(`terminal:${otherShell}`);
     expect(closedKeys()).not.toContain("browser:page-main");
@@ -259,6 +260,13 @@ describe("closing several tabs", () => {
 });
 
 describe("closing one tab", () => {
+  it("returns to welcome after closing the last tab of the selected workspace", async () => {
+    for (const tab of [...row().tabs]) {
+      await closePeer("a", tab, row().tabs, null);
+    }
+    expect(store()).toMatchObject({ selectedSessionId: null, view: "welcome" });
+  });
+
   it("hands the view to its neighbour, in another session if that is where the neighbour is", async () => {
     selectSession("b");
     setSelectedAgent("b", "b1");

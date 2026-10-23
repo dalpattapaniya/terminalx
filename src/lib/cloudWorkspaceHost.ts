@@ -1,6 +1,6 @@
 import type { RuntimeWorkspaceRemoved, WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import { forgetCloudSessions, liveCloudSessionList } from "@/lib/cloudSessions";
-import { getSessionStore, selectSession } from "@/lib/sessions";
+import { getSessionStore, openWelcome } from "@/lib/sessions";
 import { turnLive, type WorkspaceHost } from "@/lib/workspaceRemoval";
 import type { BranchOutcome } from "@/lib/worktreeConfirm";
 import type { WorkspaceDisposition } from "@/types/session";
@@ -31,7 +31,7 @@ export function cloudWorkspaceHost(input: { orgId: string; workspaceId: string; 
         });
       forgetCloudSessions({ orgId, workspaceId }, removed.deleted);
       // Read at the time of the action, not of the render.
-      if (removed.deleted.includes(sessionId) && getSessionStore().selectedSessionId === input.sessionKey) selectSession(null);
+      if (removed.deleted.includes(sessionId) && getSessionStore().selectedSessionId === input.sessionKey) openWelcome();
       return removed;
     },
     turnRunning: (sessionIds) =>

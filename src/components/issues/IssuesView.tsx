@@ -1,3 +1,4 @@
+import { EmptyView } from "@/components/start/EmptyView";
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Check, ChevronDown, Cloud, Copy, ExternalLink, FolderGit2, GitBranch, Loader2, Plus, RefreshCw, Search, Settings2, Users } from "@/icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -871,7 +872,11 @@ export function IssuesView({
             onClose={() => setComposing(false)}
           />
         ) : !selected ? (
-          <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-faint">Pick an issue to read it and start a session on it.</div>
+          <EmptyView title="Issues" guidance="Pick an issue to read it and start a session on it.">
+            <div className="mt-5 flex justify-center">
+              <Button variant="secondary" disabled={!projectPath} onClick={() => setComposing(true)}><Plus aria-hidden /> Create an issue</Button>
+            </div>
+          </EmptyView>
         ) : (
           <>
             <div className="flex shrink-0 flex-col gap-2 border-b border-hairline px-5 pb-3 pt-4">

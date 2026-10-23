@@ -80,7 +80,7 @@ import { TERMINAL_APPROVAL_REASON, VIEWER_REASON, resetCollab } from "@/lib/clou
 import { dropSessionTerminals, selectSessionTab } from "@/lib/terminal";
 import { TERMINAL_VIEW_OLD_RUNTIME, resetCloudWakes } from "@/lib/sessionBackend";
 import { resetTabViews } from "@/lib/tabViews";
-import { addProject, upsertSession, useSessionStore } from "@/lib/sessions";
+import { addProject, getSessionStore, selectSession, upsertSession, useSessionStore } from "@/lib/sessions";
 import { cloudSessionKey } from "@/types/target";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FakeAgentRuntime, agentTab, fakeXterm, type FakeXterm } from "@/test/fakeAgentRuntime";
@@ -421,12 +421,13 @@ describe("a local session's row of tabs under the title bar", () => {
     expect(spawned()).toHaveLength(1);
   });
 
-  it("opens a shell, as before, when the last tab of any kind closes", async () => {
+  it("returns to welcome without spawning a shell when the last tab closes", async () => {
     const header = show({ tabs: [tab("st-1", "claude", "Investigate")] }).parentElement!;
-    expect(spawned()).toHaveLength(0);
+    act(() => selectSession("strip-1"));
     fireEvent.click(header.querySelector('[aria-label="Close Investigate"]') as HTMLElement);
-    await waitFor(() => expect(spawned()).toHaveLength(1));
-    await waitFor(() => expect(within(header).getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(["Terminal 1"]));
+    await waitFor(() => expect(getSessionStore()).toMatchObject({ selectedSessionId: null, view: "welcome" }));
+    await settle();
+    expect(spawned()).toHaveLength(0);
   });
 });
 
