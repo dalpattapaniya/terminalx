@@ -150,9 +150,12 @@ export function AutomationEditor({
   }, [open, automation, prefill]);
 
   useEffect(() => {
-    // The catalog may arrive after the editor opens. Seed only an empty new
-    // selection, without discarding any other fields the reader has edited.
-    if (open && !automation && !input.model && input.harness === firstHarness?.id && defaultModel) {
+    // Agent discovery and the catalog may arrive after the editor opens.
+    // Seed only empty new selections, without discarding other draft fields.
+    if (!open || automation || !firstHarness) return;
+    if (!input.harness) {
+      setInput((current) => current.harness ? current : { ...current, harness: firstHarness.id, model: defaultModel });
+    } else if (!input.model && input.harness === firstHarness.id && defaultModel) {
       setInput((current) => ({ ...current, model: defaultModel }));
     }
   }, [open, automation, input.model, input.harness, firstHarness?.id, defaultModel]);

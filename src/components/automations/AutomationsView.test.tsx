@@ -58,6 +58,9 @@ const { catalog, refreshModels, setPrefs } = vi.hoisted(() => ({
   refreshModels: vi.fn(async () => {}),
   setPrefs: vi.fn(),
 }));
+const discovery = vi.hoisted(() => ({
+  harnesses: [{ id: "claude", name: "Claude Code", available: true }, { id: "codex", name: "Codex", available: true }],
+}));
 const prefs = vi.hoisted(() => ({ lastProject: "/repo", lastAgent: "claude", lastModel: {} as Record<string, string>, lastMode: "auto", lastEffort: {} as Record<string, string> }));
 vi.mock("@/lib/prefs", () => ({
   setPrefs,
@@ -69,13 +72,14 @@ vi.mock("@/lib/sessions", () => ({
   selectSession,
   useSessionStore: () => ({
     projects: [{ path: "/repo", name: "Raccoon" }, { path: "/docs", name: "Docs", kind: "folder" }],
-    harnesses: [{ id: "claude", name: "Claude Code", available: true }, { id: "codex", name: "Codex", available: true }],
+    harnesses: discovery.harnesses,
     sessions: [{ id: "session-7", title: "Automation run 7", projectPath: "/repo", archived: false }],
   }),
 }));
 
 const { AutomationsView } = await import("./AutomationsView");
 const initialModels = structuredClone(catalog.models);
+const initialHarnesses = structuredClone(discovery.harnesses);
 
 function automation(id: string, name: string): Automation {
   return {
@@ -141,6 +145,7 @@ function run(overrides: Partial<AutomationRun> = {}): AutomationRun {
 
 beforeEach(() => {
   catalog.models = structuredClone(initialModels);
+  discovery.harnesses = structuredClone(initialHarnesses);
   automationStore.automations = [
     automation("automation-1", "Dependency audit"),
     { ...automation("automation-2", "Release notes"), projectPath: "/docs" },
@@ -393,6 +398,38 @@ describe("automation launch controls", () => {
     await screen.findByRole("heading", { name: "Edit automation" });
     return view;
   }
+
+  it.each([false, true])("seeds a discovered agent without clearing the draft (models arrive later: %s)", async (lateModels) => {
+    discovery.harnesses = [];
+    prefs.lastModel = { claude: "claude-sonnet-4-6" };
+    if (lateModels) catalog.models = [];
+    const view = render(<AutomationsView />);
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Draft before discovery" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Prompt" }), { target: { value: "Keep this prompt." } });
+    await pick("Permissions", "Ask every time");
+    expect((screen.getByRole("button", { name: "Create automation" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Only one installed agent: there is no other agent to switch through.
+    discovery.harnesses = [structuredClone(initialHarnesses[0])];
+    view.rerender(<AutomationsView />);
+    if (lateModels) {
+      catalog.models = structuredClone(initialModels);
+      view.rerender(<AutomationsView />);
+    }
+    expect(screen.getByTitle("Agent").textContent).toContain("Claude Code");
+    expect(screen.getByTitle("Model").textContent).toBe("Sonnet 4.6");
+    expect(screen.getByTitle("Permissions").textContent).toBe("Ask every time");
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Draft before discovery");
+    expect((screen.getByRole("textbox", { name: "Prompt" }) as HTMLTextAreaElement).value).toBe("Keep this prompt.");
+    expect((screen.getByRole("button", { name: "Create automation" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Create automation" }));
+    await waitFor(() => expect(createAutomation).toHaveBeenCalledWith(expect.objectContaining({
+      name: "Draft before discovery", prompt: "Keep this prompt.", harness: "claude",
+      model: "claude-sonnet-4-6", effort: null, mode: "manual",
+    })));
+    expect(setPrefs).not.toHaveBeenCalled();
+  });
 
   it("uses a valid saved preference when models arrive after opening a new draft", async () => {
     prefs.lastModel = { claude: "claude-sonnet-4-6" };

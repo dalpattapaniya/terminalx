@@ -7,7 +7,8 @@
 - Use the shared session launch controls for agent, model, effort and permissions,
   including refreshed model groups and notes. Automation choices stay separate
   from session preferences, retain Default effort and the unattended bypass
-  warning, and flag unavailable saved models before saving. (#553)
+  warning, and flag unavailable saved models before saving. Agent discovery
+  and model loading fill empty launch settings without clearing a draft. (#553)
 
 ### Computer use
 
