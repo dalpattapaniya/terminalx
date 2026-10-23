@@ -15,19 +15,18 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirro
 import { bracketMatching, indentOnInput } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { highlightSelectionMatches, openSearchPanel, searchKeymap } from "@codemirror/search";
-import { AlertTriangle, FolderOpen, Save } from "@/icons";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { Segmented } from "@/components/ui/controls";
+import { AlertTriangle } from "@/icons";
 import { Markdown } from "@/components/chat/Markdown";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { registerLiveEditor } from "@/lib/editorViews";
 import { languageFor, raccoonHighlight, raccoonTheme } from "@/lib/codemirror";
 import { diffLines } from "@/lib/diff";
-import { clearJump, editorLinkContext, getEditors, isMarkdown, setEditorDirty, setViewMode, type EditorEntry, type ViewMode } from "@/lib/editors";
+import { clearJump, editorLinkContext, getEditors, isMarkdown, setEditorDirty, setViewMode, type EditorEntry } from "@/lib/editors";
 import { changedSince, fileErrorText, isConflict, stashBuffer, takeStashedBuffer, useFileSource, type FileState } from "@/lib/workspaceFiles";
 import { useShortcut, useShortcutKeys } from "@/lib/hotkeys";
 import { cn } from "@/lib/cn";
+import { EditorToolbar } from "./EditorToolbar";
 import { FindBar, findPanel, type FindPanelHandle } from "./FindPanel";
 
 // ---- git gutter: which lines differ from HEAD
@@ -393,38 +392,20 @@ export function EditorPane({ entry, visible }: { entry: EditorEntry; visible: bo
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-8 shrink-0 items-center gap-2 border-b border-hairline px-3 text-xs">
-        <span className="truncate text-muted-foreground" title={abs}>
-          {entry.rel}
-        </span>
-        {truncated && <span className="text-warning">first 4 MB shown</span>}
-        {cloud && <span className="text-faint" data-testid="editor-cloud-file">cloud workspace</span>}
-        <span className="ml-auto flex items-center gap-1">
-          {readOnly && <span className="text-faint">read-only</span>}
-          {dirty && <span className="text-faint">unsaved</span>}
-          {markdown && (
-            <Segmented<ViewMode>
-              aria-label="View"
-              value={entry.viewMode}
-              onChange={(m) => setViewMode(entry.id, m)}
-              options={[
-                { value: "preview", label: "Preview" },
-                { value: "source", label: "Source" },
-              ]}
-            />
-          )}
-          {!cloud && (
-            <Button variant="ghost" size="icon-xs" aria-label="Reveal in Finder" onClick={() => void revealItemInDir(abs).catch(() => {})}>
-              <FolderOpen />
-            </Button>
-          )}
-          <Button variant="ghost" size="xs" onClick={() => void save()} disabled={!dirty || readOnly || !source} aria-label="Save">
-            <Save className="size-3.5" />
-            Save
-            <kbd className="ml-1 text-[10px] text-faint">{saveKeys.join("")}</kbd>
-          </Button>
-        </span>
-      </div>
+      <EditorToolbar
+        path={abs}
+        relativePath={entry.rel}
+        markdown={markdown}
+        viewMode={entry.viewMode}
+        onViewModeChange={(mode) => setViewMode(entry.id, mode)}
+        cloud={cloud}
+        readOnly={readOnly}
+        dirty={dirty}
+        truncated={truncated}
+        saveDisabled={!dirty || readOnly || !source}
+        saveKeys={saveKeys}
+        onSave={() => void save()}
+      />
       {conflict && (
         <div role="alert" className="flex shrink-0 flex-wrap items-center gap-2 bg-destructive/10 px-3 py-1.5 text-xs text-foreground" data-testid="editor-conflict">
           <AlertTriangle className="size-3.5 text-destructive" />
