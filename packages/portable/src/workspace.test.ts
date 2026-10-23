@@ -214,6 +214,8 @@ class FakeRuntime implements WorkspaceTransport {
       }
       case "workspace.holdMerged":
         return ok({});
+      case "pipeline.reviewers":
+        return ok(params.after ? { sessionIds: ["r2"], next: null } : { sessionIds: ["r1"], next: "r1" });
       case "pipeline.list":
         return ok({ pipelines: [{ id: "p1", cloud: true, state: "working" }] });
       case "pipeline.act": {
@@ -697,6 +699,21 @@ describe("workspace RPC client", () => {
       await expect(before.removedWorkspaceRecords()).rejects.toMatchObject({ code: "capability_not_granted" });
       await expect(before.restoreRemovedWorkspace("r1")).rejects.toMatchObject({ code: "capability_not_granted" });
       expect(old.sent.some((frame) => ["workspace.sweepMerged", "workspace.holdMerged", "workspace.removedRecords", "workspace.restoreRemoved"].includes(frame.method))).toBe(false);
+      before.close();
+    });
+
+    it("pipeline/2: reads every reviewer page independently of pipeline history", async () => {
+      const runtime = new FakeRuntime();
+      const client = new WorkspaceRpcClient(runtime, ids);
+      runtime.connect([...WORKSPACE_CAPABILITIES]);
+      expect(await client.listPipelineReviewers()).toEqual(["r1", "r2"]);
+      expect(runtime.sent.filter((frame) => frame.method === "pipeline.reviewers").map((frame) => frame.params)).toEqual([{}, { after: "r1" }]);
+      client.close();
+      const old = new FakeRuntime();
+      const before = new WorkspaceRpcClient(old, ids);
+      old.connect(WORKSPACE_CAPABILITIES.filter((capability) => capability !== "pipeline/2"));
+      await expect(before.listPipelineReviewers()).rejects.toMatchObject({ code: "capability_not_granted" });
+      expect(old.sent.some((frame) => frame.method === "pipeline.reviewers")).toBe(false);
       before.close();
     });
 

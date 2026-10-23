@@ -49,7 +49,7 @@ vi.mock("@/lib/cloudConnections", async (importOriginal) => ({
 
 const catalog = await import("@/lib/cloudCatalog");
 const connections = await import("@/lib/cloudConnections");
-const { actOnCloudPipeline, bootCloudPipelines, getCloudPipelines, lookAtCloudPipeline, mergeCloudPipeline, resetCloudPipelines } = await import("./cloudPipelines");
+const { actOnCloudPipeline, bootCloudPipelines, cloudReviewerSessions, getCloudPipelines, lookAtCloudPipeline, mergeCloudPipeline, resetCloudPipelines } = await import("./cloudPipelines");
 
 const ORG = "org-a";
 const TARGET = { orgId: ORG, workspaceId: "ws-1" };
@@ -109,7 +109,7 @@ interface FakeRuntime {
   listed: RuntimeIssuePipeline[];
 }
 
-function runtime(options: { capable?: boolean; role?: string } = {}): FakeRuntime {
+function runtime(options: { capable?: boolean; role?: string; reviewers?: string[] } = {}): FakeRuntime {
   const calls: string[] = [];
   let announce: (pipeline: RuntimeIssuePipeline) => void = () => undefined;
   const fake: FakeRuntime = {
@@ -118,7 +118,8 @@ function runtime(options: { capable?: boolean; role?: string } = {}): FakeRuntim
     announce: (pipeline) => announce(pipeline),
     client: {
       connection: { state: "connected", authority: options.role === "none" || options.role === "viewer" ? "participate" : "manage", capabilities: [], runtimeGeneration: 1, you: options.role ? { userId: "u", role: options.role, canApprove: false, listed: true } : undefined },
-      hasCapability: (capability: string) => capability === "pipeline/1" && options.capable !== false,
+      hasCapability: (capability: string) => (capability === "pipeline/1" || (capability === "pipeline/2" && options.reviewers !== undefined)) && options.capable !== false,
+      listPipelineReviewers: async () => options.reviewers ?? [],
       listPipelines: async () => {
         calls.push("list");
         return fake.listed;
@@ -324,4 +325,52 @@ describe("a cloud workspace's Linear issue", () => {
     expect(mocks.invoke.mock.calls.filter(([command]) => command === "issue_pipeline_linear_to_review")).toEqual([]);
     expect([...early.calls, ...recorded.calls, ...viewer.calls].some((call) => call.startsWith("noteTracker"))).toBe(false);
   });
+});
+
+it("keeps reviewer identity through initial list trimming, updates, and a saved catalog reload", async () => {
+  const fake = runtime();
+  fake.listed = Array.from({ length: 51 }, (_, n) => raw({
+    id: `p-${n}`, created: String(n).padStart(3, "0"), state: "working",
+    reviewer: { sessionId: `reviewer-${n}`, tabId: "t" },
+  }));
+  await connect(fake);
+  expect(getCloudPipelines()).toHaveLength(50);
+  expect(getCloudPipelines().some((pipeline) => pipeline.id === "p-0")).toBe(false);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:reviewer-0`)).toBe(true);
+  // A replacement and later list must not discard previously learned identity.
+  fake.announce(raw({ id: "p-50", created: "050", reviewer: { sessionId: "replacement", tabId: "t" } }));
+  fake.listed = [raw({ id: "latest", reviewer: null })];
+  await connect(fake);
+  const current = catalog.getCloudCatalog();
+  const parsed = catalog.parseCatalog(JSON.parse(JSON.stringify(catalog.serializeCatalog(current))))!;
+  const reviewers = cloudReviewerSessions({ ...current, ...parsed });
+  expect(reviewers.has(`cloud:${ORG}:ws-1:reviewer-0`)).toBe(true);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:reviewer-50`)).toBe(true);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:replacement`)).toBe(true);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:s1`)).toBe(false);
+  const { cloudWorkSessions } = await import("@/lib/cloudWorkClaims");
+  const sessions = ["reviewer-0", "s1"].map((sessionId) => ({ key: `cloud:${ORG}:ws-1:${sessionId}`, orgId: ORG, workspaceId: "ws-1", sessionId, branch: "raccoon/433-carry", stopped: true }));
+  expect(cloudWorkSessions(sessions as never, () => "me", reviewers).map((session) => session.sessionId)).toEqual(["s1"]);
+});
+
+it("migrates reviewer identity from an older cloud catalog before evicting its pipelines", () => {
+  const current = catalog.getCloudCatalog();
+  current.orgs[ORG].pipelines = { "ws-1": { pipelines: [raw()], at: 1 } };
+  catalog.cacheCloudPipelines(ORG, "ws-1", []);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:s2`)).toBe(true);
+  expect(getCloudPipelines()).toHaveLength(0);
+});
+
+it("learns reviewers omitted by the runtime list on first connection and reconnect", async () => {
+  const fake = runtime({ reviewers: ["unlisted-reviewer", "replaced-reviewer"] });
+  fake.listed = [raw({ reviewer: null })];
+  await connect(fake);
+  expect(getCloudPipelines().every((pipeline) => !pipeline.reviewer)).toBe(true);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:unlisted-reviewer`)).toBe(true);
+  catalog.dropCachedCloudPipelines(ORG, "ws-1");
+  expect(cloudReviewerSessions().size).toBe(0);
+  await connect(fake);
+  const { cloudWorkSessions } = await import("@/lib/cloudWorkClaims");
+  const sessions = ["unlisted-reviewer", "replaced-reviewer", "author"].map((sessionId) => ({ key: `cloud:${ORG}:ws-1:${sessionId}`, orgId: ORG, workspaceId: "ws-1", sessionId, branch: "raccoon/433-carry", stopped: true }));
+  expect(cloudWorkSessions(sessions as never, () => "me", cloudReviewerSessions()).map((session) => session.sessionId)).toEqual(["author"]);
 });
