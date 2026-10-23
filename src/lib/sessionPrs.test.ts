@@ -28,7 +28,7 @@ describe("session PR transport", () => {
     const { rows } = await sessionPrs(localGitSource("/fixture"), "session", a.head);
     expect(rows.map((row) => row.pr?.number)).toEqual([2, 1]);
     expect(rows[1]?.pr?.state).toBe(state);
-    expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "session", additions: [] });
+    expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionKey: "session", additions: [] });
   });
 
   it("refreshes retained different-branch PRs by URL after reload, including identical numbers in another repository", async () => {
@@ -66,16 +66,16 @@ describe("session PR transport", () => {
   });
 
   it("uses cloud repository transport for saved identities without importing other PRs on historical branches", async () => {
-    const saved: PrAssociation = { ...reference(a), scope: { kind: "cloud", workspace: "workspace", repo: "old-repo" } };
+    const saved: PrAssociation = { ...reference(a), scope: { kind: "cloud", workspace: "cloud:org:workspace", repo: "old-repo" } };
     invoke.mockImplementation(async (command) => {
-      if (command === "pr_associations") return [saved, { ...reference(b), scope: { kind: "cloud", workspace: "workspace", repo: "new-repo" } }];
+      if (command === "pr_associations") return [saved, { ...reference(b), scope: { kind: "cloud", workspace: "cloud:org:workspace", repo: "new-repo" } }];
       throw Error(`Cloud PRs must not use native gh: ${command}`);
     });
-    const call = vi.fn(async (_method: string, args: { repo: string }) => ({ prs: args.repo === "old-repo" ? [a, { ...b, number: 99, url: "https://github.com/acme/widgets/pull/99", head: a.head }] : [b] }));
+    const call = vi.fn(async (method: string, args: { repo: string }) => method === "git.prAssociations" ? { associations: [] } : ({ prs: args.repo === "old-repo" ? [a, { ...b, number: 99, url: "https://github.com/acme/widgets/pull/99", head: a.head }] : [b] }));
     const mutate = vi.fn(async () => ({}));
     const remote = new RemoteGit({ call, mutate } as unknown as WorkspaceRpcClient, "new-repo");
-    const source = cloudGitSource({ workspaceKey: "workspace", remote, canWrite: true, author: async () => null });
-    const { rows } = await sessionPrs(source, "session", "followup");
+    const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote, canWrite: true, author: async () => null });
+    const { rows } = await sessionPrs(source, "cloud:org:workspace:session", "followup");
     expect(rows.map((row) => row.identity)).toEqual([b.url, a.url]);
     expect(call).toHaveBeenCalledWith("git.prs", expect.objectContaining({ repo: "old-repo", branch: "initial", number: 1 }));
     await source.prAccess!(saved).ready();
@@ -93,9 +93,9 @@ it("saves cloud creation immediately, before a later branch change or refresh", 
   invoke.mockResolvedValue([]);
   const mutate = vi.fn(async () => ({ pr: b, created: true, existing: false }));
   const remote = new RemoteGit({ mutate } as unknown as WorkspaceRpcClient, "repo/path");
-  const source = cloudGitSource({ workspaceKey: "workspace", remote, canWrite: true, author: async () => null });
+  const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote, canWrite: true, author: async () => null });
   await source.createPr({ title: b.title, body: "", base: "main", draft: false, sessionId: "author" });
-  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [{ url: b.url, number: b.number, head: b.head, scope: { kind: "cloud", workspace: "workspace", repo: "repo/path" } }] });
+  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionKey: "author", additions: [{ url: b.url, number: b.number, head: b.head, scope: { kind: "cloud", workspace: "cloud:org:workspace", repo: "repo/path" } }] });
 });
 
 it.each([a.head, b.head])("does not import another session’s PR from checkout branch %s", async (branch) => {
@@ -107,7 +107,7 @@ it.each([a.head, b.head])("does not import another session’s PR from checkout 
   });
   const { rows } = await sessionPrs(localGitSource("/fixture"), "author", branch);
   expect(rows.map((row) => [row.pr?.number, row.current])).toEqual([[1, false]]);
-  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [] });
+  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionKey: "author", additions: [] });
 });
 
 it("includes associations recorded concurrently with branch discovery", async () => {
@@ -135,4 +135,42 @@ it("does not persist a superseded discovery into the previously selected session
   finish([a]);
   expect((await request).rows).toEqual([]);
   expect(invoke.mock.calls.filter(([command, args]) => command === "pr_associations" && args.additions.length)).toHaveLength(0);
+});
+
+it("recovers runtime agent and pipeline PRs on a fresh desktop, retaining each cloud repository", async () => {
+  const other = { ...a, url: "https://github.com/acme/other/pull/1" };
+  const refs = [{ ...reference(b), repo: "app" }, { ...reference(other), repo: "libs/other" }];
+  const sessionId = "cloud:org:workspace:author";
+  let saved: PrAssociation[] = [];
+  invoke.mockImplementation(async (command, args) => {
+    if (command !== "pr_associations") throw Error(`Unexpected native PR access: ${command}`);
+    saved = [...new Map([...saved, ...args.additions].map((entry) => [entry.url, entry])).values()] as PrAssociation[];
+    return saved;
+  });
+  const call = vi.fn(async (method: string, args: { sessionId?: string; repo?: string; number?: number }) => {
+    if (method === "git.prAssociations") {
+      expect(args.sessionId).toBe("author");
+      return { associations: refs };
+    }
+    if (method === "git.prs") return { prs: args.number ? [args.repo === "app" ? b : other] : [] };
+    throw Error(method);
+  });
+  const source = () => cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({ call } as unknown as WorkspaceRpcClient, "app"), canWrite: true, author: async () => null });
+  for (let restart = 0; restart < 2; restart++) {
+    saved = []; // A new desktop has none of the runtime's creation evidence.
+    const { rows } = await sessionPrs(source(), sessionId, "next-branch");
+    expect(rows.map((row) => row.identity)).toEqual([b.url, other.url]);
+    expect(saved.map((entry) => entry.scope)).toEqual([
+      { kind: "cloud", workspace: "cloud:org:workspace", repo: "app" },
+      { kind: "cloud", workspace: "cloud:org:workspace", repo: "libs/other" },
+    ]);
+  }
+  const requests = call.mock.calls.length;
+  await expect(sessionPrs(source(), "cloud:other:workspace:author", null)).rejects.toThrow("different cloud workspace");
+  expect(call.mock.calls).toHaveLength(requests);
+});
+
+it("does not offer a fetching landed check to a read-only cloud viewer", () => {
+  const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({} as WorkspaceRpcClient, "app"), canWrite: false, author: async () => null });
+  expect(source.landed).toBeUndefined();
 });

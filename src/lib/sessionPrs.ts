@@ -22,7 +22,7 @@ export async function sessionPrs(source: GitSource, sessionId: string | undefine
   if (!isCurrent()) return { rows: [] };
   // Read after discovery to include creation evidence recorded while it was
   // in flight. The native registry also recovers durable session tool results.
-  const associations = sessionId ? await gh.associations(sessionId) : [];
+  const associations = sessionId ? await (source.prAssociations ? source.prAssociations(sessionId) : gh.associations(sessionId)) : [];
   if (!isCurrent()) return { rows: [] };
   const rows = new Map<string, SessionPr>();
   for (const association of associations) rows.set(prIdentity(association.url), { identity: prIdentity(association.url), association, current: false });

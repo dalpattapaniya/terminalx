@@ -1,3 +1,6 @@
+import { RemoteGit } from "@terminalx/portable/workspaceGit";
+import type { WorkspaceRpcClient } from "@terminalx/portable/workspace";
+import { cloudGitSource } from "@/lib/gitSource";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest } from "@/lib/api";
@@ -232,15 +235,15 @@ describe("session PR history", () => {
   it("ignores an old refresh completing after a session switch, even with the same checkout and branch", async () => {
     let finishOld!: (value: ReturnType<typeof association>[]) => void;
     const delayed = new Promise<ReturnType<typeof association>[]>((resolve) => { finishOld = resolve; });
-    mocks.invoke.mockImplementation(async (command: string, args: { sessionId?: string }) => {
+    mocks.invoke.mockImplementation(async (command: string, args: { sessionKey?: string }) => {
       if (command === "gh_available") return true;
-      if (command === "pr_associations") return args.sessionId === "old" ? delayed : [];
+      if (command === "pr_associations") return args.sessionKey === "old" ? delayed : [];
       if (command === "work_status") return workStatus("main");
       if (command === "pr_details") return mergedPr;
       throw Error(command);
     });
     const view = render(<PrPanel cwd={cwd} sessionId="old" branch="main" active busy={false} />);
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "old", additions: [] }));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("pr_associations", { sessionKey: "old", additions: [] }));
     view.rerender(<PrPanel cwd={cwd} sessionId="new" branch="main" active busy={false} />);
     await screen.findByText("On the default branch; nothing to open a pull request from.");
     await act(async () => {
@@ -319,4 +322,32 @@ it("does not apply landed evidence from a different checkout HEAD", async () => 
   render(<PrPanel cwd={cwd} sessionId="author" branch={mergedPr.head} active busy={false} onSettle={() => {}} />);
   await screen.findByRole("button", { name: "Create pull request" });
   expect(screen.queryByRole("button", { name: "Settle worktree" })).toBeNull();
+});
+
+it.each(["squash", "rebase"])("uses runtime landed evidence for a cloud panel-created %s merge", async () => {
+  const sessionId = "cloud:org:workspace:author";
+  let saved: unknown[] = [];
+  let safe = true;
+  mocks.invoke.mockImplementation(async (command: string, args: { additions: unknown[] }) => {
+    if (command !== "pr_associations") throw Error(`Cloud must not use native Git: ${command}`);
+    if (args.additions.length) saved = args.additions;
+    return saved;
+  });
+  const call = vi.fn(async (method: string) => {
+    if (method === "git.status") return workStatus(mergedPr.head, 3);
+    if (method === "git.prs") return { prs: [mergedPr] };
+    if (method === "git.prAssociations") return { associations: [] };
+    if (method === "git.prLanded") return { safe, head: "abc123", branch: mergedPr.head };
+    throw Error(method);
+  });
+  const mutate = vi.fn(async () => ({ pr: { ...mergedPr, state: "OPEN" }, created: true }));
+  const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({ call, mutate } as unknown as WorkspaceRpcClient, "app"), canWrite: true, author: async () => null });
+  await source.createPr({ title: "Work", body: "", base: "main", draft: false, sessionId });
+  render(<PrPanel source={source} sessionId={sessionId} branch={mergedPr.head} active busy={false} />);
+  await screen.findByText(mergedPr.title);
+  expect(call).toHaveBeenCalledWith("git.prLanded", { repo: "app" });
+  expect(screen.queryByRole("button", { name: "Create pull request" })).toBeNull();
+  safe = false; // New follow-up work after the rewritten merge.
+  fireEvent.click(screen.getByRole("button", { name: "Refresh pull requests" }));
+  await screen.findByRole("button", { name: "Create pull request" });
 });

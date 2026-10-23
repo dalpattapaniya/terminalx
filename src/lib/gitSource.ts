@@ -1,3 +1,4 @@
+import { cloudWorkspaceKey, parseCloudWorkspaceKey } from "@/types/target";
 import { WorkspaceRpcError } from "@terminalx/portable/workspace";
 import { RemoteGit, gitErrorMessage, type GitAuthor } from "@terminalx/portable/workspaceGit";
 import { api, errorMessage, gh, git, type PullRequest, type PrAssociation, type PrScope } from "@/lib/api";
@@ -29,7 +30,8 @@ export interface GitSource {
   changesBetween(base: string, head: string | null): Promise<ChangedFile[]>;
   fileContentsAt(path: string, base: string, head: string | null): Promise<{ before: string | null; after: string | null }>;
   workStatus(): Promise<SourceStatus>;
-  landed?(): Promise<import("@/types/session").Landed>;
+  landed?(): Promise<Pick<import("@/types/session").Landed, "safe" | "head" | "branch">>;
+  prAssociations?(sessionId: string): Promise<PrAssociation[]>;
   logCommits(from: string | null, limit: number): Promise<CommitInfo[]>;
   branches(): Promise<BranchInfo[]>;
   /** Resolves to a notice worth showing (e.g. what a reconciled push found), or null. */
@@ -138,6 +140,7 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     }),
     fileContentsAt: (path, base, head) => remote.fileContents(path, base, head),
     workStatus: statusOf,
+    landed: input.canWrite ? () => remote.prLanded() : undefined,
     logCommits: (from, limit) => remote.log(limit, from),
     branches: () => remote.branches().then((answer) => answer.branches),
     commit: async (message) => {
@@ -155,9 +158,19 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     fetch: () => remote.fetch().then(() => null),
     ghAvailable: () => Promise.resolve(true),
     prs: (branch) => remote.prs(branch).then((answer) => answer.prs),
+    prAssociations: async (sessionId) => {
+      const parsed = parseCloudWorkspaceKey(sessionId);
+      if (!parsed?.sessionId || cloudWorkspaceKey(parsed.orgId, parsed.workspaceId) !== input.workspaceKey) throw new Error("This session belongs to a different cloud workspace.");
+      const { associations } = await remote.prAssociations(parsed.sessionId);
+      return gh.associations(sessionId, associations.map((entry) => ({
+        url: entry.url, number: entry.number, head: entry.head,
+        scope: { kind: "cloud", workspace: input.workspaceKey, repo: entry.repo ?? "" },
+      })));
+    },
     prScope: { kind: "cloud", workspace: input.workspaceKey, repo: remote.repo },
     prAccess: (association) => {
       if (association.scope.kind !== "cloud" || association.scope.workspace !== input.workspaceKey) throw new Error("Reconnect this PR's workspace to refresh it.");
+      if (!association.scope.repo) throw new Error("This PR’s repository is unavailable in the workspace.");
       const repository = new RemoteGit(remote.client, association.scope.repo);
       return {
         read: async () => {

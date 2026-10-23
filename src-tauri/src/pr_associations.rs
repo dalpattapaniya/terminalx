@@ -51,9 +51,18 @@ fn update(path: &Path, session: &str, additions: Vec<Association>) -> Result<Vec
         }
         // Keep the original transport locator: pipeline migration may name the
         // project root whereas the panel already knows the live workspace.
-        if let std::collections::btree_map::Entry::Vacant(slot) = saved.entry(entry.url.clone()) {
-            slot.insert(entry);
-            changed = true;
+        match saved.entry(entry.url.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => { slot.insert(entry); changed = true; }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                // The runtime can resolve a previously unavailable or moved
+                // repository. Refresh only a locator within the same workspace.
+                if matches!((&slot.get().scope, &entry.scope),
+                    (Scope::Cloud { workspace: old, repo: old_repo }, Scope::Cloud { workspace, repo })
+                    if old == workspace && !repo.is_empty() && old_repo != repo) {
+                    slot.get_mut().scope = entry.scope;
+                    changed = true;
+                }
+            }
         }
     }
     let result = saved.values().cloned().collect();
@@ -101,16 +110,16 @@ fn creation_evidence(events: impl IntoIterator<Item = crate::events::AgentEvent>
 }
 
 /// Recognize a shell command, not quoted documentation or an echo of one.
-/// Deliberately leave substitutions and heredocs to explicit association.
+/// Once the executable and subcommand are known, its arguments (including
+/// body heredocs and substitutions) cannot change that creation evidence.
 fn creates_pr(command: &str) -> bool {
-    if command.contains("<<") || command.contains('`') || command.contains("$(") { return false; }
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
     let mut escaped = false;
-    let mut found = false;
     let matches = |words: &[String]| words.len() >= 3 && words[0].rsplit('/').next() == Some("gh") && words[1] == "pr" && words[2] == "create";
-    for c in command.chars().chain(std::iter::once(';')) {
+    let mut chars = command.chars().chain(std::iter::once(';')).peekable();
+    while let Some(c) = chars.next() {
         if escaped { word.push(c); escaped = false; continue; }
         if c == '\\' && quote != Some('\'') { escaped = true; continue; }
         if let Some(q) = quote {
@@ -118,15 +127,23 @@ fn creates_pr(command: &str) -> bool {
             continue;
         }
         if c == '\'' || c == '"' { quote = Some(c); continue; }
+        // Do not mistake a heredoc's contents or nested shell text for a
+        // top-level command. A real gh prefix has already returned above.
+        if c == '`' || (c == '$' && chars.peek() == Some(&'(')) || (c == '<' && chars.peek() == Some(&'<')) { return false; }
+        if c == '#' && word.is_empty() {
+            for next in chars.by_ref() { if next == '\n' { break; } }
+            words.clear();
+            continue;
+        }
         if c.is_whitespace() || matches!(c, ';' | '&' | '|') {
             if !word.is_empty() { words.push(std::mem::take(&mut word)); }
+            if matches(&words) { return true; }
             if matches!(c, ';' | '&' | '|' | '\n') {
-                found |= matches(&words);
                 words.clear();
             }
         } else { word.push(c); }
     }
-    found && quote.is_none()
+    false
 }
 
 fn journal_associations(session: &str) -> Result<Vec<Association>> {
@@ -142,6 +159,11 @@ fn journal_associations(session: &str) -> Result<Vec<Association>> {
 }
 
 pub fn for_session(session: &str, mut additions: Vec<Association>) -> Result<Vec<Association>> {
+    // A synthetic cloud key names only this desktop's cache. Its journal and
+    // pipelines live on the runtime and must never be looked up locally.
+    if session.starts_with("cloud:") {
+        return update(&crate::store::root()?.join("session-pr-associations.json"), session, additions);
+    }
     additions.extend(journal_associations(session)?);
     // Read existing author evidence, never infer authorship from a shared cwd
     // or import the reviewer's PRs. Retain it beyond pipeline history pruning.
@@ -170,6 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn cloud_cache_refreshes_its_resolved_repository_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("associations.json");
+        let session = "cloud:org:workspace:author";
+        let mut reference = entry("a", 1, "topic");
+        reference.scope = Scope::Cloud { workspace: "cloud:org:workspace".into(), repo: String::new() };
+        update(&path, session, vec![reference.clone()]).unwrap();
+        reference.scope = Scope::Cloud { workspace: "cloud:org:workspace".into(), repo: "libs/a".into() };
+        update(&path, session, vec![reference]).unwrap();
+        let saved = update(&path, session, vec![]).unwrap();
+        assert!(matches!(&saved[0].scope, Scope::Cloud { repo, .. } if repo == "libs/a"));
+    }
+
+    #[test]
     fn recovers_creation_from_durable_tools_without_branch_or_panel_state() {
         use crate::events::{AgentEvent, Payload, ToolResult, ToolType};
         let event = |session: &str, payload| AgentEvent { id: "event".into(), session_id: session.into(), tab_id: "tab".into(), harness: "codex".into(), seq: 1, ts: String::new(), message_ts: None, subagent: None, payload };
@@ -177,7 +213,7 @@ mod tests {
         let result = |id: &str, text: &str, is_error| Payload::ToolCallCompleted { call_id: id.into(), result: ToolResult { text: text.into(), is_error, exit_code: Some(if is_error { 1 } else { 0 }), ..Default::default() } };
         let url = "https://github.com/acme/widgets/pull/2";
         let events = vec![
-            event("author", call("create", "cd /fixture && gh pr create --head followup --title 'Fix'")),
+            event("author", call("create", "cd /fixture && gh pr create --head followup --body-file - <<'EOF'\nUse `code`.\nEOF")),
             event("author", result("create", url, false)),
             event("author", call("read", "gh pr view 99")),
             event("author", result("read", "https://github.com/acme/widgets/pull/99", false)),
@@ -202,7 +238,11 @@ mod tests {
 
     #[test]
     fn creation_commands_are_not_quoted_mentions_or_read_commands() {
-        for command in ["gh pr create --title 'a; gh pr view 3'", "cd /repo && gh pr create", "git switch followup\ngh pr create --draft"] {
+        for command in ["gh pr create --title 'a; gh pr view 3'", "cd /repo && gh pr create", "git switch followup\ngh pr create --draft",
+            "gh pr create --body-file - <<'EOF'\nUse `code` and $(literal).\nEOF",
+            "gh pr create --body 'Use `code` and $(literal) and << in Markdown'",
+            "gh pr create --body \"$(cat /tmp/body)\"",
+            "gh pr create --body `cat /tmp/body`"] {
             assert!(creates_pr(command), "{command}");
         }
         for command in ["echo 'gh pr create'", "printf '%s' 'example; gh pr create'", "gh pr view 3", "cat <<EOF\ngh pr create\nEOF"] {

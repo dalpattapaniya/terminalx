@@ -220,6 +220,14 @@ export class RemoteGit {
     return this.read("git.prs", { ...(branch ? { branch } : {}), ...(number ? { number } : {}) });
   }
 
+  prAssociations(sessionId: string): Promise<{ associations: { url: string; number: number; head: string; repo: string | null }[] }> {
+    return this.read("git.prAssociations", { sessionId });
+  }
+
+  prLanded(): Promise<{ safe: boolean; head: string | null; branch: string | null }> {
+    return this.read("git.prLanded");
+  }
+
   stage(paths: string[]): Promise<unknown> {
     return this.write("git.stage", { paths });
   }

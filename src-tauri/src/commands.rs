@@ -2856,8 +2856,8 @@ pub async fn working_changes(cwd: String) -> CmdResult<(String, Vec<git::Changed
 }
 
 #[tauri::command]
-pub async fn pr_associations(session_id: String, additions: Vec<crate::pr_associations::Association>) -> CmdResult<Vec<crate::pr_associations::Association>> {
-    tauri::async_runtime::spawn_blocking(move || crate::pr_associations::for_session(&session_id, additions).map_err(err)).await.map_err(err)?
+pub async fn pr_associations(session_key: String, additions: Vec<crate::pr_associations::Association>) -> CmdResult<Vec<crate::pr_associations::Association>> {
+    tauri::async_runtime::spawn_blocking(move || crate::pr_associations::for_session(&session_key, additions).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]

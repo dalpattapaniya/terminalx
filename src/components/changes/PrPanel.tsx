@@ -67,7 +67,7 @@ export function PrPanel({
   const [loadedSelection, setLoadedSelection] = useState<string | null>(null);
   const visibleRows = loadedSelection === selection ? rows : [];
   const prs = visibleRows.flatMap((row) => row.pr ? [row.pr] : []);
-  const [landed, setLanded] = useState<Landed | null>(null);
+  const [landed, setLanded] = useState<Pick<Landed, "safe" | "head" | "branch"> | null>(null);
   const [status, setStatus] = useState<WorkStatus | null>(null);
   const [checkedWorkspace, setCheckedWorkspace] = useState<{ key: string; disposition: WorkspaceDisposition } | null>(null);
   const [loading, setLoading] = useState(false);

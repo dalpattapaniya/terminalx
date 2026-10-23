@@ -1885,7 +1885,7 @@ export interface PrAssociation {
 export const gh = {
   landed: (cwd: string) => invoke<import("@/types/session").Landed>("pr_landed", { cwd }),
   available: () => invoke<boolean>("gh_available"),
-  associations: (sessionId: string, additions: PrAssociation[] = []) => invoke<PrAssociation[]>("pr_associations", { sessionId, additions }),
+  associations: (sessionId: string, additions: PrAssociation[] = []) => invoke<PrAssociation[]>("pr_associations", { sessionKey: sessionId, additions }),
   list: (cwd: string, branch: string) => invoke<PullRequest[]>("pr_list", { cwd, branch }),
   details: (cwd: string, number: number, url?: string) => invoke<PullRequest>("pr_details", { cwd, number, ...(url ? { url } : {}) }),
   create: (cwd: string, title: string, body: string, base: string | null, draft: boolean, sessionId?: string) =>
