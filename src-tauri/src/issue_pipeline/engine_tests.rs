@@ -43,6 +43,7 @@ struct World {
     merges: Vec<(String, String)>,
     moved_to_review: Vec<String>,
     reviewers: u32,
+    reviewer_tabs: bool,
     announced: u32,
     issue_body: Option<String>,
     push_error: Option<String>,
@@ -106,6 +107,7 @@ impl FakeHost {
             merges: Vec::new(),
             moved_to_review: Vec::new(),
             reviewers: 0,
+            reviewer_tabs: false,
             announced: 0,
             issue_body: Some("Sessions stop at code.".into()),
             push_error: None,
@@ -180,6 +182,14 @@ impl Host for FakeHost {
         let mut world = self.world();
         world.reviewers += 1;
         let id = format!("reviewer-{}", world.reviewers);
+        if world.reviewer_tabs {
+            let mut tab = session("unused", None).tabs.remove(0);
+            tab.id = id.clone();
+            tab.title = Some("Reviewer".into());
+            world.sessions.get_mut(&author.id).unwrap().tabs.push(tab);
+            return Ok(SessionRef { session_id: author.id.clone(), tab_id: id });
+        }
+
         let mut entry = session(&id, None);
         entry.cwd = author.cwd.clone();
         world.sessions.insert(id.clone(), entry);
@@ -1801,4 +1811,137 @@ fn a_cloud_workspace_that_wakes_picks_its_pipelines_up_where_they_were() {
     run.to_gate();
     resume(&run.host, &[("author".into(), "t1".into())]);
     assert_eq!(run.pipeline().state, State::ReadyToMerge);
+}
+
+#[test]
+fn reviewer_tabs_are_independent_and_reused_after_a_changed_head() {
+    let host = FakeHost::new(&github_issue());
+    host.world().reviewer_tabs = true;
+    let run = Run::start_in(host, false);
+    run.to_review();
+    let self_review = run.author(&reviewed(C1, "merge", "[]"));
+    assert_eq!(self_review.stage, Stage::Review);
+    assert!(self_review.verdict.is_none(), "the author cannot certify its own change");
+    let ready = run.reviewer(&reviewed(C1, "merge", "[]"));
+    let reviewer = ready.reviewer.clone().unwrap();
+    assert_eq!(reviewer.session_id, ready.author.session_id);
+    assert_ne!(reviewer.tab_id, ready.author.tab_id);
+    assert_eq!(run.host.world().sessions.len(), 1);
+    assert!(store::reviewer_sessions().unwrap().is_empty(), "the owning session still owns issue work");
+    run.host.commit(C2);
+    run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+    let again = run.poll();
+    assert_eq!((again.stage, again.state, again.round), (Stage::Review, State::Working, 2));
+    assert_eq!(again.reviewer, Some(reviewer));
+    assert_eq!(again.verdict.as_ref().unwrap().commit, C1, "retain findings until a fresh verdict");
+    assert_eq!(run.host.world().reviewers, 1);
+    assert!(run.merges().is_empty());
+    assert_eq!(run.reviewer(&reviewed(C2, "merge", "[]")).state, State::ReadyToMerge);
+}
+
+#[test]
+fn automatic_head_review_waits_for_idle_clean_current_checkout_and_respects_limits() {
+    for obstacle in ["active", "waiting", "dirty", "stale", "stopped", "limit"] {
+        let run = Run::start(&github_issue(), false);
+        run.to_gate();
+        run.host.commit(C2);
+        run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+        match obstacle {
+            "active" => run.host.world().sessions.get_mut("author").unwrap().tabs[0].status = crate::store::index::TabStatus::InProgress,
+            "waiting" => run.host.world().sessions.get_mut("author").unwrap().tabs[0].status = crate::store::index::TabStatus::Waiting,
+            "dirty" => run.host.world().workspace.dirty.push("work.rs".into()),
+            "stale" => run.host.commit(C1),
+            "stopped" => { act(&run.host, &run.id, Action::Stop).unwrap(); }
+            "limit" => { let mut p = run.pipeline(); p.max_rounds = p.round; store::commit(&mut p).unwrap(); }
+            _ => unreachable!(),
+        }
+        let parked = run.poll();
+        assert_ne!(parked.stage, Stage::Review, "{obstacle}");
+        assert_eq!(parked.round, 1, "{obstacle}");
+        assert!(run.merges().is_empty());
+    }
+}
+
+#[test]
+fn agent_merge_uses_the_gate_without_person_authority() {
+    for hold in ["none", "person", "protected", "security", "ci", "workflow", "unread", "findings", "stale", "unpublished", "dirty", "stopped", "cloud"] {
+        let run = Run::start(&github_issue(), false);
+        run.to_gate();
+        match hold {
+            "person" => run.host.world().settings.require_person = true,
+            "protected" => run.host.world().diff.paths = vec![".github/workflows/ci.yml".into()],
+            "security" => { let mut p = run.pipeline(); p.security_areas = vec!["authorization".into()]; store::commit(&mut p).unwrap(); }
+            "ci" => run.host.world().pr.as_mut().unwrap().checks = vec![check("build", "failure")],
+            "workflow" => run.host.world().pr.as_mut().unwrap().validation = Some(vec![check("rerun", "pending")]),
+            "unread" => run.host.world().pr.as_mut().unwrap().checks_unread = true,
+            "findings" => { let mut p = run.pipeline(); p.verdict.as_mut().unwrap().decision = super::verdict::Decision::Changes; store::commit(&mut p).unwrap(); }
+            "unpublished" => run.host.commit(C2),
+            "dirty" => run.host.world().workspace.dirty.push("work.rs".into()),
+            "stale" => run.host.world().pr.as_mut().unwrap().head_sha = C2.into(),
+            "stopped" => { act(&run.host, &run.id, Action::Stop).unwrap(); }
+            "cloud" => { let mut p = run.pipeline(); p.cloud = true; store::commit(&mut p).unwrap(); }
+            _ => {}
+        }
+        let result = engine::act_from_agent(&run.host, &run.id, Action::Merge);
+        if hold == "none" {
+            assert_eq!(result.unwrap().merged.unwrap().by, MergedBy::Pipeline);
+            assert_eq!(run.merges(), [("merge".into(), C1.into())]);
+        } else {
+            assert!(run.merges().is_empty(), "{hold}");
+        }
+    }
+}
+
+#[test]
+fn failed_local_checks_cannot_be_advanced_to_merge_by_an_agent() {
+    let run = Run::start(&github_issue(), false);
+    run.author("```terminalx-status\n{\"status\":\"done\",\"checks\":\"failed\"}\n```");
+    assert!(engine::act_from_agent(&run.host, &run.id, Action::Merge).is_err());
+    assert!(run.merges().is_empty());
+}
+
+#[test]
+fn legacy_separate_reviewer_is_reused_without_migrating_history() {
+    let run = Run::start(&github_issue(), false);
+    let ready = run.to_gate();
+    let reviewer = ready.reviewer.clone().unwrap();
+    assert_ne!(reviewer.session_id, ready.author.session_id);
+    assert!(store::reviewer_sessions().unwrap().contains(&reviewer.session_id));
+    run.host.commit(C2);
+    run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+    let next = run.poll();
+    assert_eq!(next.reviewer, Some(reviewer));
+    assert_eq!(next.round, 2);
+    assert_eq!(run.host.world().sessions.len(), 2);
+    assert_eq!(run.host.world().reviewers, 1);
+}
+
+#[test]
+fn stop_during_head_review_preparation_sends_no_review() {
+    let run = Run::start(&github_issue(), false);
+    run.to_gate();
+    run.host.commit(C2);
+    run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+    let id = run.id.clone();
+    run.host.world().during_diff = Some(Box::new(move || { store::set_switches(&id, |p| p.stopped = true).unwrap(); }));
+    let stopped = run.poll();
+    assert_eq!(stopped.state, State::Stopped);
+    assert_eq!(stopped.round, 1);
+    assert!(run.merges().is_empty());
+}
+
+#[test]
+fn a_missing_reviewer_can_be_replaced_when_the_head_moves() {
+    let host = FakeHost::new(&github_issue());
+    host.world().reviewer_tabs = true;
+    let run = Run::start_in(host, false);
+    let old = run.to_gate().reviewer.unwrap();
+    run.host.world().sessions.get_mut("author").unwrap().tabs.retain(|tab| tab.id != old.tab_id);
+    run.host.commit(C2);
+    run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+    let again = run.poll();
+    assert_eq!(again.stage, Stage::Review);
+    assert_ne!(again.reviewer.as_ref(), Some(&old));
+    assert_eq!(again.reviewer.unwrap().session_id, "author");
+    assert_eq!(run.host.world().sessions.len(), 1);
 }

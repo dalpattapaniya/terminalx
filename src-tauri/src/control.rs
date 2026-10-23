@@ -734,12 +734,7 @@ impl ControlService {
             }
             "pipelines.act" => {
                 let action: engine::Action = serde_json::from_value(params.get("action").cloned().unwrap_or(Value::Null)).map_err(|_| ControlError::invalid("Unknown pipeline action."))?;
-                // Merging by hand is the reader's own act, on the issue page:
-                // it is what "a person merges this" waits for.
-                if action == engine::Action::Merge {
-                    return Err(ControlError::invalid("A pipeline is merged by hand from the issue page in TerminalX, not from the command line."));
-                }
-                engine::act(&host, &pipeline.id, action)
+                engine::act_from_agent(&host, &pipeline.id, action)
             }
             other => return Err(ControlError::invalid(format!("Unknown control command {other}."))),
         }

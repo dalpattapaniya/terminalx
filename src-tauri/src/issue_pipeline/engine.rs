@@ -78,7 +78,7 @@ pub trait Host: Send + Sync {
     fn last_reply(&self, _session: &SessionRef) -> Option<(DateTime<Utc>, String)> {
         None
     }
-    /// A new session in the author's checkout, for the review.
+    /// An independent tab in the author's session, for the review.
     fn open_reviewer(&self, pipeline: &Pipeline, author: &SessionEntry) -> Result<SessionRef>;
     fn workspace(&self, cwd: &Path) -> Result<Workspace>;
     /// What this checkout calls the branch a pull request merges into.
@@ -168,6 +168,8 @@ enum Merger {
     Pipeline,
     /// A person pressed Merge on the issue page.
     Person,
+    /// An authenticated CLI request; never grants person-only authority.
+    Agent,
 }
 
 /// What a step that failed does about it.
@@ -570,16 +572,23 @@ impl Step<'_> {
             return Ok(());
         }
 
+        // Diff reads may take time: recheck before handing the shared checkout
+        // to the reviewer after an external push.
+        if self.p.stage == Stage::Merge && self.p.verdict.as_ref().is_some_and(|verdict| !same_commit(&verdict.commit, &pr.head_sha)) && !self.ready_for_review(&pr.head_sha)? {
+            self.needs_you(StopReason::HeadMoved { reviewed: self.p.verdict.as_ref().unwrap().commit.clone(), head: pr.head_sha });
+            return Ok(());
+        }
+
         // The same reviewer for every round, so it can say what became of its
         // own findings. One that was deleted is replaced.
-        let existing = self.p.reviewer.clone().filter(|reviewer| self.host.session(&reviewer.session_id).is_ok_and(|session| session.tab(&reviewer.tab_id).is_some()));
+        let existing = self.p.reviewer.clone().filter(|reviewer| reviewer != &self.p.author).filter(|reviewer| self.host.session(&reviewer.session_id).is_ok_and(|session| session.tab(&reviewer.tab_id).is_some()));
         let first = existing.is_none();
         let reviewer = match existing {
             Some(reviewer) => reviewer,
             None => {
                 let reviewer = self.host.open_reviewer(&self.p, &author)?;
-                if reviewer.session_id == self.p.author.session_id {
-                    bail!("The reviewer must be a different session from the author.");
+                if reviewer == self.p.author {
+                    bail!("The reviewer must be a different conversation from the author.");
                 }
                 reviewer
             }
@@ -597,7 +606,7 @@ impl Step<'_> {
         self.p.waiting_since = None;
         self.p.merge_requested = None;
         self.p.merge_refused = None;
-        let note = format!("Review {} of {}: the reviewer session is reading {}.", self.p.round, self.p.max_rounds, short(&pr.head_sha));
+        let note = format!("Review {} of {}: the reviewer conversation is reading {}.", self.p.round, self.p.max_rounds, short(&pr.head_sha));
         self.enter(Stage::Review, note.clone());
         // Written before the prompt goes out: the reviewer's turn ending must
         // find its pipeline waiting for it.
@@ -658,7 +667,39 @@ impl Step<'_> {
         self.evaluate_snapshot(pr, merger)
     }
 
+    fn ready_for_review(&self, head: &str) -> Result<bool> {
+        let idle = |tab: &crate::store::index::TabEntry| matches!(tab.status, crate::store::index::TabStatus::Idle | crate::store::index::TabStatus::Completed);
+        let author_idle = self.host.session(&self.p.author.session_id).is_ok_and(|session| session.tab(&self.p.author.tab_id).is_some_and(idle));
+        // A missing reviewer can be replaced by request_review; a missing
+        // author cannot supply a workspace or authorize further work.
+        let reviewer_idle = self.p.reviewer.as_ref().is_none_or(|reviewer| match self.host.session(&reviewer.session_id) {
+            Ok(session) => session.tab(&reviewer.tab_id).is_none_or(idle),
+            Err(_) => true,
+        });
+        if !author_idle || !reviewer_idle {
+            return Ok(false);
+        }
+        let workspace = self.host.workspace(&self.cwd)?;
+        Ok(workspace.dirty.is_empty() && workspace.branch.as_deref() == Some(self.p.branch.as_str()) && same_commit(&workspace.head, head))
+    }
+
     fn evaluate_snapshot(&mut self, pr: PrSnapshot, merger: Merger) -> Result<()> {
+        // A changed head gets another independent review only when the
+        // checkout is current and neither conversation is active. Otherwise
+        // the gate keeps its actionable head-moved reason for the next poll.
+        if merger == Merger::Pipeline && pr.state == "OPEN"
+            && self.p.verdict.as_ref().is_some_and(|verdict| !same_commit(&verdict.commit, &pr.head_sha))
+            && !self.halted() && self.ready_for_review(&pr.head_sha)?
+        {
+            return self.request_review(false);
+        }
+        if merger == Merger::Agent && pr.state == "OPEN" {
+            let Some(workspace) = self.clean_workspace()? else { return Ok(()) };
+            if !same_commit(&workspace.head, &pr.head_sha) {
+                self.needs_you(StopReason::HeadMoved { reviewed: pr.head_sha.clone(), head: workspace.head });
+                return Ok(());
+            }
+        }
         let link = PrLink { number: pr.number, url: pr.url.clone(), base: pr.base.clone() };
         let verdict = self.p.verdict.clone();
         let reviewed_head = verdict.as_ref().is_some_and(|verdict| same_commit(&verdict.commit, &pr.head_sha));
@@ -677,7 +718,7 @@ impl Step<'_> {
         let by_person = merger == Merger::Person;
         let (auto_merge, _) = self.switches();
         let decision = gate::decide(&Facts {
-            auto_merge: by_person || auto_merge,
+            auto_merge: merger == Merger::Agent || by_person || auto_merge,
             require_person: !by_person && self.settings.require_person,
             cloud: !by_person && self.p.cloud,
             verdict: verdict.as_ref(),
@@ -717,7 +758,7 @@ impl Step<'_> {
             Gate::Merge { commit } => {
                 // A project whose settings cannot be read may be one that keeps
                 // the merge for a person: nothing is merged on a guess.
-                if let (Merger::Pipeline, Some(error)) = (merger, self.settings_error.clone()) {
+                if let (Merger::Pipeline | Merger::Agent, Some(error)) = (merger, self.settings_error.clone()) {
                     self.needs_you(StopReason::Failed { step: "Reading the project's settings".into(), message: format!("{error} Nothing is merged automatically until they can be read.") });
                     return Ok(());
                 }
@@ -1124,6 +1165,19 @@ pub fn act(host: &dyn Host, id: &str, action: Action) -> Result<Pipeline> {
         Action::Merge => run(host, id, false, OnError::NeedsYou, |step| if still(step) { step.evaluate(Merger::Person) } else { Ok(()) }),
         Action::Refresh => run(host, id, false, OnError::Report, |step| if step.p.stage == Stage::Merge && step.p.pr.is_some() { step.evaluate(Merger::Pipeline) } else { Ok(()) }),
     }
+}
+
+/// Control-socket actions carry agent authority, never the issue page's
+/// person override. Explicit merge may override auto-merge being off only.
+pub fn act_from_agent(host: &dyn Host, id: &str, action: Action) -> Result<Pipeline> {
+    if !matches!(action, Action::Merge | Action::Review) {
+        return act(host, id, action);
+    }
+    refuse(&store::get(id)?, action)?;
+    run(host, id, false, OnError::NeedsYou, |step| {
+        refuse(&step.p, action)?;
+        if action == Action::Merge { step.evaluate(Merger::Agent) } else { step.request_review(false) }
+    })
 }
 
 /// A person merged a cloud workspace's pull request from their computer, with

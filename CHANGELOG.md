@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Issue pipelines
+
+- Keep independent reviews in a named Reviewer tab in the issue session, reuse
+  it for later rounds, and review changed heads again when the checkout is
+  current and idle. Route author review/merge requests through the pipeline;
+  `pipelines merge` preserves person-only, security and check gates. (#568)
+
 ### Stats & Usage
 
 - Refresh usage for non-Git projects without blocking healthy locations, and
