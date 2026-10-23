@@ -245,6 +245,7 @@ impl Host for FakeHost {
             checks: world.checks.clone(),
             required_checks: None,
             checks_unread: false,
+            validation: Some(vec![check("CI", "success")]),
         });
         Ok(7)
     }
@@ -933,7 +934,7 @@ fn a_pull_request_the_session_opened_itself_is_used_and_linked_to_the_issue() {
         world.pr = Some(PrSnapshot {
             number: 12, url: "https://github.com/acme/widgets/pull/12".into(), title: "wip".into(), body: "Pads minutes.".into(), state: "OPEN".into(), is_draft: false,
             base: "main".into(), head: "raccoon/433-open-a-pull-request".into(), head_sha: C1.into(), mergeable: "MERGEABLE".into(), merge_state: "CLEAN".into(),
-            review_decision: None, checks, required_checks: None, checks_unread: false,
+            review_decision: None, checks, required_checks: None, checks_unread: false, validation: Some(vec![check("CI", "success")]),
         });
     }
     let run = Run::start_in(host, false);
@@ -1390,43 +1391,41 @@ fn a_pipeline_is_stored_in_the_shape_the_issue_page_reads() {
 // ---- what the review of this change found ------------------------------------------
 
 #[test]
-fn a_repository_with_no_checks_merges_only_once_checks_have_had_time_to_appear() {
+fn missing_validation_never_becomes_success_with_age_and_no_ci_requires_opt_in() {
     let host = FakeHost::new(&github_issue());
     host.world().checks = Vec::new();
     let run = Run::start_in(host, true);
-    run.to_review();
-    // A quick reviewer: its verdict is in ten seconds after the push. No
-    // checks are listed, which this soon says nothing.
-    let early = run.reviewer_after(TimeDelta::seconds(10), &reviewed(C1, "merge", "[]"));
-    assert_eq!((early.stage, early.state), (Stage::Merge, State::Waiting));
-    assert_eq!(early.note.as_deref(), Some("Giving checks a moment to be reported on 1111111111."));
+    assert_eq!(run.to_gate().state, State::Waiting);
+    run.host.world().now += TimeDelta::minutes(10);
+    assert_eq!(run.poll().state, State::Waiting);
     assert!(run.merges().is_empty());
-    // CI turns out to exist and to fail: it is caught, because the merge waited.
-    run.host.world().pr.as_mut().unwrap().checks = vec![check("build", "failure")];
-    run.host.world().now += TimeDelta::seconds(100);
-    poll(&run.host);
-    assert!(matches!(run.pipeline().reason, Some(StopReason::ChecksFailed { .. })));
-    assert!(run.merges().is_empty());
+    run.host.world().settings.allow_no_ci = true;
+    run.host.world().pr.as_mut().unwrap().validation = Some(Vec::new());
+    assert_eq!(run.poll().state, State::Merged);
+}
 
-    // And in a repository that really has none, the same wait ends in the merge.
-    drop(run);
-    let host = FakeHost::new(&github_issue());
-    host.world().checks = Vec::new();
-    let run = Run::start_in(host, true);
-    run.to_review();
-    assert_eq!(run.reviewer_after(TimeDelta::seconds(10), &reviewed(C1, "merge", "[]")).state, State::Waiting);
-    run.host.world().now += TimeDelta::seconds(100);
-    poll(&run.host);
-    assert_eq!(run.pipeline().state, State::Merged);
-
-    // Ready to merge is not announced early either.
-    drop(run);
-    let run = Run::start(&github_issue(), false);
-    run.to_review();
-    assert_eq!(run.reviewer_after(TimeDelta::seconds(10), &reviewed(C1, "merge", "[]")).state, State::Waiting);
-    run.host.world().now += TimeDelta::seconds(100);
-    poll(&run.host);
-    assert_eq!(run.pipeline().state, State::ReadyToMerge);
+#[test]
+fn queued_workflows_partial_checks_and_pending_reruns_hold_the_pipeline() {
+    for checks in [vec![], vec![check("build", "success")], vec![check("build", "success"), check("test", "success")]] {
+        let run = Run::start(&github_issue(), true);
+        run.to_review();
+        {
+            let mut world = run.host.world();
+            let pr = world.pr.as_mut().unwrap();
+            pr.checks = checks;
+            pr.validation = Some(vec![check("CI workflow", "queued")]);
+        }
+        assert_eq!(run.reviewer_after(TimeDelta::minutes(10), &reviewed(C1, "merge", "[]")).state, State::Waiting);
+        assert!(run.merges().is_empty());
+        {
+            let mut world = run.host.world();
+            let pr = world.pr.as_mut().unwrap();
+            pr.checks = vec![check("build", "success"), check("test", "success")];
+            pr.validation = Some(vec![check("CI workflow", "success")]);
+        }
+        assert_eq!(run.poll().state, State::Merged);
+        assert_eq!(run.merges(), [("merge".into(), C1.into())]);
+    }
 }
 
 #[test]

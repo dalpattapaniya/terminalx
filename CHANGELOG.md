@@ -24,6 +24,11 @@
 
 ### Chats
 
+- Keep completed Claude compaction idle instead of raising a false stall
+  warning, including manual `/compact` queued behind a running turn. Record
+  privacy-safe turn-opener labels in stall diagnostics while retaining warnings
+  for real silent turns. (#523)
+
 - Show compact local message times with full dates available by keyboard or
   tap, across local, cloud and mobile chats. Keep source timestamps through
   transcript imports and the first text-chunk time through streaming; omit
@@ -37,6 +42,13 @@
 
 - Keep cloud sessions openable when their first prompt fails, with the error
   in their transcript, and stop their issue pipeline and partial agent launch. (#577)
+- Require completed workflow and check-suite evidence on the reviewed commit
+  before an issue pipeline merges, including queued jobs and pending reruns.
+  Missing or unreadable validation no longer passes after a fixed delay.
+  Validation reads must agree on workflow attempts and child results, so a
+  rerun cannot use an older optional failure to hide a new required failure.
+  Repositories without CI must explicitly set `allowNoCi` in their project
+  pipeline settings; reported validation and branch protection still apply. (#609)
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
 

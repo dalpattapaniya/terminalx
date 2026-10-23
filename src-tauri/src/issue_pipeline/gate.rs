@@ -1,9 +1,9 @@
 //! The merge gate: whether a pull request may be merged by TerminalX, and if
 //! not, the one reason it stops.
 //!
-//! Everything here is a function of facts read at one moment: the reviewer's
-//! last verdict, the pull request as GitHub reported it (head commit, checks
-//! and mergeability from a single reply), what the diff touches, and the
+//! Everything here is a function of collected facts: the reviewer's last
+//! verdict, the pull request as GitHub reported it (head commit, validation
+//! bound to that head, and mergeability), what the diff touches, and the
 //! switches. It touches nothing, so every stop reason can be checked without a
 //! repository. The merge itself is then made with `--match-head-commit`, so a
 //! head that moves after this decision is refused by GitHub rather than merged.
@@ -200,6 +200,8 @@ pub struct Facts<'a> {
     /// The areas TerminalX saw the diff touch that call for a security pass.
     pub security_areas: &'a [String],
     pub protected: &'a [ProtectedHit],
+    /// Explicit project policy for repositories with no CI.
+    pub allow_no_ci: bool,
     /// Checks the project says never gate a merge. They only apply to checks
     /// branch protection does not require.
     pub ignored_checks: &'a [String],
@@ -306,12 +308,34 @@ pub fn decide(facts: &Facts<'_>) -> Gate {
         // GitHub says BLOCKED while required checks run or fail, too: with
         // the checks unread that says nothing more than that they are unread.
         "BLOCKED" if !pr.checks_unread => return Gate::NeedsYou(StopReason::Blocked),
-        _ => {}
+        "BLOCKED" | "CLEAN" | "UNSTABLE" | "HAS_HOOKS" => {}
+        _ => return Gate::Wait(Wait::Mergeability),
     }
     // Nothing merges on checks nobody read. In a cloud workspace a person
     // merges anyway, and their own sign-in reads them first.
     if pr.checks_unread {
         return if facts.cloud { Gate::ReadyToMerge(StopReason::ChecksUnreadable { workspace: true }) } else { Gate::NeedsYou(StopReason::ChecksUnreadable { workspace: false }) };
+    }
+    match &pr.validation {
+        None => return Gate::Wait(Wait::Checks(vec!["workflow and check-suite evidence".into()])),
+        Some(validation) => {
+            // Producer completion is independent of the check-name policy:
+            // required/ignored names cannot hide jobs not published yet.
+            let pending: Vec<_> = validation.iter().filter(|check| check_bucket(&check.state) == CheckBucket::Pending).map(|check| check.name.clone()).collect();
+            if !pending.is_empty() {
+                return Gate::Wait(Wait::Checks(pending));
+            }
+            let failed: Vec<_> = validation.iter().filter(|check| check_bucket(&check.state) == CheckBucket::Fail).map(|check| check.name.clone()).collect();
+            if !failed.is_empty() {
+                return Gate::NeedsYou(StopReason::ChecksFailed { names: failed });
+            }
+            if !pr.checks.is_empty() && validation.is_empty() && pr.required_checks.as_ref().is_none_or(|checks| checks.is_empty()) {
+                return Gate::Wait(Wait::Checks(vec!["CI producer evidence or required status checks".into()]));
+            }
+            if pr.checks.is_empty() && (!facts.allow_no_ci || !validation.is_empty()) {
+                return Gate::Wait(Wait::Checks(vec!["checks on the reviewed commit (or explicit allowNoCi policy)".into()]));
+            }
+        }
     }
     // Ahead of the project's own holds: in a cloud workspace none of them is
     // what stands between this change and a merge.
@@ -368,6 +392,7 @@ pub(crate) mod tests {
             checks: vec![check("build", "success"), check("lint", "skipped")],
             required_checks: None,
             checks_unread: false,
+            validation: Some(vec![check("CI", "success")]),
         }
     }
 
@@ -388,12 +413,13 @@ pub(crate) mod tests {
         security_areas: Vec<String>,
         protected: Vec<ProtectedHit>,
         ignored_checks: Vec<String>,
+        allow_no_ci: bool,
     }
 
     impl Case {
         /// Everything in order and the switch on: the one case that merges.
         fn clean() -> Self {
-            Self { auto_merge: true, require_person: false, cloud: false, verdict: Some(merge_verdict(HEAD)), pr: clean_pr(), security_areas: Vec::new(), protected: Vec::new(), ignored_checks: Vec::new() }
+            Self { auto_merge: true, require_person: false, cloud: false, verdict: Some(merge_verdict(HEAD)), pr: clean_pr(), security_areas: Vec::new(), protected: Vec::new(), ignored_checks: Vec::new(), allow_no_ci: false }
         }
 
         fn decide(&self) -> Gate {
@@ -406,6 +432,7 @@ pub(crate) mod tests {
                 security_areas: &self.security_areas,
                 protected: &self.protected,
                 ignored_checks: &self.ignored_checks,
+                allow_no_ci: self.allow_no_ci,
             })
         }
     }
@@ -535,9 +562,47 @@ pub(crate) mod tests {
         // A state nobody has seen before is not a pass.
         case.pr.checks = vec![check("build", "something_new")];
         assert_eq!(case.decide(), Gate::Wait(Wait::Checks(vec!["build".into()])));
-        // No checks at all: nothing is required, so nothing is waited for.
+        // No checks at all is unknown, however long the head has existed.
         case.pr.checks = Vec::new();
+        assert!(matches!(case.decide(), Gate::Wait(Wait::Checks(_))));
+    }
+
+    #[test]
+    fn no_ci_is_explicit_and_never_overrides_validation_or_other_gates() {
+        let mut case = Case::clean();
+        case.pr.checks.clear();
+        case.pr.validation = Some(Vec::new());
+        assert!(matches!(case.decide(), Gate::Wait(_)));
+        case.allow_no_ci = true;
         assert_eq!(case.decide(), Gate::Merge { commit: HEAD.into() });
+        case.pr.validation = None;
+        assert!(matches!(case.decide(), Gate::Wait(_)));
+        case.pr.validation = Some(vec![check("CI rerun", "queued")]);
+        assert!(matches!(case.decide(), Gate::Wait(_)));
+        case.pr.validation = Some(Vec::new());
+        case.pr.required_checks = Some(vec!["required test".into()]);
+        assert_eq!(case.decide(), Gate::Wait(Wait::Checks(vec!["required test".into()])));
+        case.pr.required_checks = None;
+        case.pr.checks = vec![check("reported CI", "failure")];
+        assert!(matches!(case.decide(), Gate::NeedsYou(StopReason::ChecksFailed { .. })));
+        case.pr.checks.clear();
+        case.pr.checks_unread = true;
+        assert_eq!(case.decide(), Gate::NeedsYou(StopReason::ChecksUnreadable { workspace: false }));
+        case.pr.checks_unread = false;
+        case.pr.merge_state = "BLOCKED".into();
+        assert_eq!(case.decide(), Gate::NeedsYou(StopReason::Blocked));
+    }
+
+    #[test]
+    fn legacy_statuses_without_producer_completion_need_required_checks() {
+        let mut case = Case::clean();
+        case.pr.validation = Some(Vec::new());
+        case.pr.checks = vec![check("external CI", "success")];
+        assert!(matches!(case.decide(), Gate::Wait(_)));
+        case.pr.required_checks = Some(vec!["external CI".into()]);
+        assert_eq!(case.decide(), Gate::Merge { commit: HEAD.into() });
+        case.pr.validation = Some(vec![check("another provider", "requested")]);
+        assert!(matches!(case.decide(), Gate::Wait(_)));
     }
 
     #[test]
@@ -585,6 +650,12 @@ pub(crate) mod tests {
         case.pr.mergeable = "UNKNOWN".into();
         case.pr.merge_state = "UNKNOWN".into();
         assert_eq!(case.decide(), Gate::Wait(Wait::Mergeability));
+
+        for unknown in ["UNKNOWN", "NEW_STATE", ""] {
+            let mut case = Case::clean();
+            case.pr.merge_state = unknown.into();
+            assert_eq!(case.decide(), Gate::Wait(Wait::Mergeability));
+        }
 
         for (decision, state, reason) in [
             (Some("REVIEW_REQUIRED"), "BLOCKED", StopReason::ReviewRequired),
