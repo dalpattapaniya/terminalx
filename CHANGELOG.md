@@ -4,6 +4,9 @@
 
 ### Issues
 
+- Pipeline rows omit only their own author from the work chip, keeping other
+  sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
+
 - A cloud issue that cannot start because an agent needs sign-in now offers
   **Open Agent logins** for the failed request’s organization, even if you
   switch projects while it starts. (#573)
