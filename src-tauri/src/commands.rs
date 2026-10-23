@@ -1774,7 +1774,8 @@ pub async fn project_create(parent: String, name: String) -> StartResult<String>
 // ------------------------------------------------------------------ sessions
 
 #[tauri::command]
-pub fn list_sessions() -> CmdResult<Vec<SessionEntry>> {
+pub fn list_sessions(app: tauri::AppHandle) -> CmdResult<Vec<SessionEntry>> {
+    store::message_activity::backfill(std::sync::Arc::new(app));
     store::conversation_titles::backfill().map_err(err)
 }
 

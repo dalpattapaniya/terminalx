@@ -96,6 +96,12 @@ pub struct AgentTabInfo {
     pub last_seq: u64,
     pub created: String,
     pub modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_created: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_last_message_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -272,6 +278,9 @@ impl AgentOps for ManagerOps {
                     last_seq,
                     created: tab.created.clone(),
                     modified: tab.modified.clone(),
+                    last_message_at: tab.unknown.get("lastMessageAt").and_then(|value| value.as_str()).map(str::to_owned),
+                    session_created: Some(entry.created.clone()),
+                    session_last_message_at: entry.unknown.get("lastMessageAt").and_then(|value| value.as_str()).map(str::to_owned),
                 });
             }
         }

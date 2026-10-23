@@ -575,7 +575,9 @@ fn update_file<R>(f: impl FnOnce(&mut IndexFile) -> Result<R>) -> Result<R> {
 }
 
 pub fn load() -> Result<Vec<SessionEntry>> {
-    Ok(load_file()?.sessions)
+    let mut sessions = load_file()?.sessions;
+    super::message_activity::project(&mut sessions)?;
+    Ok(sessions)
 }
 
 /// Replace the sessions. What the file holds besides them (tab layouts,

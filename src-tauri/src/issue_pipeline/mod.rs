@@ -149,7 +149,7 @@ pub struct Pipeline {
     /// session was on when the pipeline started. Nothing is pushed from any other.
     pub branch: String,
     pub author: SessionRef,
-    /// Never the author's session.
+    /// An independent conversation, possibly in the author's session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<SessionRef>,
     /// "Merge automatically when the review is addressed", for this issue.
@@ -192,6 +192,10 @@ pub struct Pipeline {
     /// The reviewer's last verdict, with the findings still open at its commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
+    /// Known local-check failures, pinned to commits. Only a passing author
+    /// report for the same commit clears one; review and CI cannot certify it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_local_checks: Vec<String>,
     /// The areas of the reviewed diff that called for a security pass.
     #[serde(default)]
     pub security_areas: Vec<String>,

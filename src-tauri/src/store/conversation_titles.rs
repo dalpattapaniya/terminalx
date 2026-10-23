@@ -159,8 +159,10 @@ pub fn backfill() -> Result<Vec<SessionEntry>> {
             }
         }
         // Naming is metadata; do not reorder worktrees by touching modified.
-        Ok(sessions.clone())
-    })
+        Ok(())
+    })?;
+    // Updates read the raw index; reload to include message-activity sidecars.
+    index::load()
 }
 
 /// Called after a top-level user message is persisted, including provider TUI

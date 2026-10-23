@@ -96,6 +96,7 @@ mod tests {
             review_requested_at: None,
             findings_sent_round: 0,
             verdict: None,
+            failed_local_checks: Vec::new(),
             security_areas: Vec::new(),
             summary: None,
             reminded: false,
