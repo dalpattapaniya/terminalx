@@ -120,6 +120,20 @@ pub fn diagnose_delivery(path: &std::path::Path, seq: u64, stage: &str, elapsed:
     append_diagnostic(path, &line.to_string());
 }
 
+/// Fixed opener labels and elapsed time only, safe to include in bug reports.
+pub fn diagnose_stall(path: &std::path::Path, opener: Option<(&'static str, &'static str)>, quiet: std::time::Duration) {
+    let (source, kind) = opener.unwrap_or(("unknown", "unknown"));
+    let line = serde_json::json!({
+        "type": "session_stall",
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "opener_source": source,
+        "opener_kind": kind,
+        "quiet_ms": quiet.as_millis() as u64,
+    });
+    log::info!("session stall: {line}");
+    append_diagnostic(path, &line.to_string());
+}
+
 fn append_diagnostic(path: &std::path::Path, line: &str) {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();

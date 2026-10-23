@@ -467,6 +467,11 @@ pub struct TabRuntime {
     pub pending: HashMap<String, PendingAsk>,
     pub queued: Vec<QueuedMessage>,
     pub turn_open: bool,
+    /// Allowlisted labels only; never retain prompt or hook payload text.
+    turn_opener: Option<(&'static str, &'static str)>,
+    /// A compact boundary observed during this command, not proof a model turn ended.
+    compact_completed: bool,
+    compact_boundary_at: Option<chrono::DateTime<chrono::FixedOffset>>,
     pub turn_started_at: Option<Instant>,
     /// The open turn is a slash command's, with no work seen yet. The CLI
     /// runs `/help` or `/model` by itself and no `Stop` closes it, so the
@@ -504,6 +509,9 @@ impl TabRuntime {
     fn open_turn(&mut self) {
         if !self.turn_open {
             self.turn_by_command = false;
+            self.turn_opener = Some(("session", "prompt"));
+            self.compact_completed = false;
+            self.compact_boundary_at = None;
         }
         self.turn_open = true;
         self.last_activity = Instant::now();
@@ -512,16 +520,32 @@ impl TabRuntime {
         }
     }
 
-    /// The CLI has a prompt (`command`: a slash command), and a turn is
+    /// The CLI has a prompt (possibly a slash command), and a turn is
     /// open. Its clock starts here unless a turn with work in it was already
     /// running: a prompt then is one typed into that turn.
-    fn prompt_taken(&mut self, command: bool) {
-        let fresh = !self.turn_open || (self.turn_by_command && !command);
+    fn prompt_taken(&mut self, prompt: &str, source: &'static str) {
+        let command = tui::is_slash_command(prompt);
+        let compact = self.harness == "claude" && prompt.split_whitespace().next() == Some("/compact");
+        let ended = matches!(&self.engine, Engine::Cli(p) if p.transcript_turn.is_some_and(tui::TurnMark::ends));
+        let fresh = !self.turn_open || (self.turn_by_command && !command)
+            || (compact && (self.turn_by_command || ended));
         self.open_turn();
         if fresh {
             self.turn_started_at = Some(Instant::now());
             self.turn_by_command = command;
+            self.compact_completed = false;
+            self.compact_boundary_at = None;
+            let kind = if compact { "compact_command" } else if command { "slash_command" } else { "prompt" };
+            self.turn_opener = Some((source, kind));
         }
+    }
+
+    /// Claude writes the command again after the boundary, but retains the
+    /// earlier command timestamp. Missing times cannot prove a duplicate.
+    fn repeats_completed_compact(&self, prompt: &str) -> bool {
+        self.harness == "claude" && prompt.split_whitespace().next() == Some("/compact") && self.compact_completed
+            && self.source_timestamp.as_deref().and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .zip(self.compact_boundary_at).is_some_and(|(prompt, boundary)| prompt <= boundary)
     }
 
     /// The tab's private diagnostics, beside its log.
@@ -780,7 +804,18 @@ impl SessionManager {
             };
             self.give_up_on_unanswered_settings(&mut rt, now);
             let silent = now.saturating_duration_since(rt.last_activity);
-            if rt.turn_open && ended && silent >= patience.settle {
+            // /compact has no model turn or Stop hook. Its compact boundary
+            // confirms completion; Claude may repeat the command after the summary.
+            let compact_done = rt.turn_by_command && rt.compact_completed
+                && rt.turn_opener.is_some_and(|(_, kind)| kind == "compact_command");
+            if rt.turn_open && (ended || compact_done) && silent >= patience.settle {
+                if compact_done {
+                    if let Engine::Cli(p) = &mut rt.engine {
+                        // The boundary is the command's completion. No later
+                        // turn_duration is owed for it; that belongs to the next turn.
+                        p.transcript_turn = Some(tui::TurnMark::Ended);
+                    }
+                }
                 let final_message = match &rt.engine {
                     Engine::Cli(p) => p.turn_tail.last_assistant_message().map(str::to_owned),
                     _ => None,
@@ -856,12 +891,13 @@ impl SessionManager {
             // its own screen, and nothing says when it is doing so: silence
             // there is not a stall the app can call.
             let by_hand = matches!(&rt.engine, Engine::Cli(p) if p.by_hand.is_some());
-            if !by_hand && recovery::is_stale(rt.status == TabStatus::InProgress, quiet, patience) {
+            if !by_hand && recovery::is_stale(rt.turn_open && rt.status == TabStatus::InProgress, quiet, patience) {
                 let kind = if matches!(&rt.engine, Engine::Cli(p) if p.awaiting_delivery.is_some()) {
                     RecoveryKind::DeliveryUnconfirmed
                 } else {
                     RecoveryKind::Timeout
                 };
+                recovery::diagnose_stall(&rt.diagnostics_path(), rt.turn_opener, quiet);
                 self.needs_recovery(&mut rt, kind);
                 rt.stalled_at = Some(now);
             }
@@ -928,6 +964,9 @@ impl SessionManager {
                 pending: HashMap::new(),
                 queued: Vec::new(),
                 turn_open: false,
+                turn_opener: None,
+                compact_completed: false,
+                compact_boundary_at: None,
                 source_timestamp: None,
                 message_times: HashMap::new(),
                 turn_started_at: None,
@@ -2784,7 +2823,14 @@ impl SessionManager {
     /// the turn.
     fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, records: Vec<tui::Record>) {
         let mark = records.iter().rev().find_map(|(_, mark, _)| *mark);
-        let payloads: Vec<_> = records.into_iter().flat_map(|(payloads, _, ts)| payloads.into_iter().map(move |payload| (payload, ts.clone()))).collect();
+        // Keep the preceding record's boundary for a command immediately after
+        // a completed turn, even when both arrive in one tail read.
+        let mut preceding_mark = None;
+        let payloads: Vec<_> = records.into_iter().flat_map(|(payloads, mark, ts)| {
+            let before = preceding_mark;
+            if mark.is_some() { preceding_mark = mark; }
+            payloads.into_iter().map(move |payload| (payload, ts.clone(), before))
+        }).collect();
         if payloads.is_empty() && mark.is_none() {
             return;
         }
@@ -2799,7 +2845,7 @@ impl SessionManager {
             _ => Vec::new(),
         };
         self.queued_prompts_unsent(&mut rt, &unsent);
-        for (payload, ts) in payloads {
+        for (payload, ts, preceding_mark) in payloads {
             rt.source_timestamp = Some(ts);
             // A prompt sent from the composer was published when it was sent;
             // the transcript's copy of it would be the same message twice.
@@ -2843,7 +2889,7 @@ impl SessionManager {
                 let starts_turn = echo.overtaken || resent || (echo.queued && (!rt.turn_open || matches!(&rt.engine, Engine::Cli(p) if p.turn_tail.is_closed())));
                 if starts_turn {
                     if !rt.turn_open {
-                        rt.prompt_taken(false);
+                        rt.prompt_taken("", "transcript_queued_prompt");
                     }
                     if let Engine::Cli(p) = &mut rt.engine {
                         p.turn_tail.opened();
@@ -2865,17 +2911,29 @@ impl SessionManager {
                     continue; // the app already said this for a Stop hook
                 }
             }
-            // A reply is work: the turn is not a bare command's.
-            if matches!(payload, Payload::AssistantText { .. }) {
+            if matches!(payload, Payload::ContextCompacted { .. }) {
+                rt.compact_completed = true;
+                rt.compact_boundary_at = rt.source_timestamp.as_deref().and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok());
+            }
+            // Model/tool work is not a bare command, even after compaction.
+            if matches!(payload, Payload::AssistantText { .. } | Payload::Reasoning { .. } | Payload::ToolCallStarted { .. }) {
                 rt.turn_by_command = false;
             }
-            if matches!(payload, Payload::UserMessage { .. }) {
+            if let Payload::UserMessage { text, .. } = &payload {
+                if rt.repeats_completed_compact(text) {
+                    self.apply(&mut rt, payload, None);
+                    continue;
+                }
                 self.delivery_confirmed(&mut rt);
                 // A prompt typed into the terminal with no hook ahead of it
                 // (a CLI started by hand, #437) is where its turn's time is
                 // counted from.
-                let command = matches!(&payload, Payload::UserMessage { text, .. } if tui::is_slash_command(text));
-                rt.prompt_taken(command);
+                if text.split_whitespace().next() == Some("/compact") && preceding_mark.is_some_and(tui::TurnMark::ends) {
+                    if let Engine::Cli(p) = &mut rt.engine {
+                        if !p.transcript_end_owed { p.transcript_turn = preceding_mark; }
+                    }
+                }
+                rt.prompt_taken(text, "transcript_user_message");
                 if let Engine::Cli(p) = &mut rt.engine {
                     p.turn_tail.opened();
                 }
@@ -2885,7 +2943,7 @@ impl SessionManager {
             // from here: the tab is working, a message sent now is queued
             // behind it, and `Stop` closes it. Nobody's prompt was delivered.
             if matches!(payload, Payload::TurnStarted { started_by: Some(_), .. }) {
-                rt.prompt_taken(false);
+                rt.prompt_taken("", "transcript_turn_started");
                 if let Engine::Cli(p) = &mut rt.engine {
                     p.turn_tail.opened();
                 }
@@ -3067,7 +3125,7 @@ impl SessionManager {
             }
         }
         if !queued {
-            rt.prompt_taken(tui::is_slash_command(&prompt.agent));
+            rt.prompt_taken(&prompt.agent, "composer");
             self.set_status(rt, TabStatus::InProgress);
         }
         (ev, queued)
@@ -3496,10 +3554,11 @@ impl SessionManager {
                     // A slash command the CLI runs on a schedule is work, not
                     // a command typed at it that may never end.
                     let command = source == claude::transcript::PromptSource::Reader && frame.payload["prompt"].as_str().is_some_and(tui::is_slash_command);
-                    rt.prompt_taken(command);
+                    rt.prompt_taken(if command { frame.payload["prompt"].as_str().unwrap_or("") } else { "" }, "hook_user_prompt_submit");
                 } else {
                     if !rt.turn_open {
                         rt.open_turn();
+                        rt.turn_opener = Some(("hook", if frame.event == "PreToolUse" { "pre_tool_use" } else { "post_tool_use" }));
                         rt.turn_started_at = Some(Instant::now());
                     }
                     // A tool running is work: the turn is not a bare command's.

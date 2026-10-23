@@ -12,6 +12,10 @@
 
 ### Chats
 
+- Keep completed Claude compaction idle instead of raising a false stall
+  warning, including manual `/compact`. Record privacy-safe turn-opener
+  labels in stall diagnostics while retaining warnings for real silent turns. (#523)
+
 - Show compact local message times with full dates available by keyboard or
   tap, across local, cloud and mobile chats. Keep source timestamps through
   transcript imports and the first text-chunk time through streaming; omit
