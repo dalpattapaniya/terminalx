@@ -357,8 +357,8 @@ describe("issue session targets", () => {
     fireEvent.click(await screen.findByText("Automate this label: raccoon…"));
     await screen.findByRole("heading", { name: "New automation" });
 
-    const permissions = screen.getByRole("combobox", { name: "Permissions" }) as HTMLSelectElement;
-    expect(permissions.value).toBe("bypassPermissions");
+    const permissions = screen.getByTitle("Permissions");
+    expect(permissions.textContent).toBe("Bypass permissions");
     const warning = screen.getByRole("note", { name: "Bypass permissions warning" });
     expect(warning.textContent).toContain("Claude Code stops asking about anything.");
     expect(screen.getByText(/Issue titles and descriptions can be untrusted/).textContent).toContain("quoted as context");
@@ -378,7 +378,8 @@ describe("issue session targets", () => {
     fireEvent.click(await screen.findByText("Automate this label: raccoon…"));
     await screen.findByRole("heading", { name: "New automation" });
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Permissions" }), { target: { value: "manual" } });
+    fireEvent.click(screen.getByTitle("Permissions"));
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "Ask every time" }));
     expect(screen.queryByRole("note", { name: "Bypass permissions warning" })).toBeNull();
     await screen.findByText("2 matching issues");
     fireEvent.click(screen.getByRole("button", { name: "Create automation" }));
