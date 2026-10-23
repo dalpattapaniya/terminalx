@@ -9,8 +9,17 @@
   Existing local reviewer links are removed. New cloud connections read reviewer
   identities separately from the runtime’s limited pipeline list. (#570)
 
+### Computer use
+
+- Screen Recording **Grant…** opens System Settings with the helper drag tile
+  without also showing a macOS permission prompt. The permission remains
+  attributed to TerminalX Computer Use Helper. (#569)
+
 ### Development
 
+- Give the permission-probe identity regression more time to start its helper
+  on loaded Macs, while keeping the app's five-second timeout and helper
+  cleanup unchanged. (#579)
 - Pipeline tests keep Claude trust configuration in their temporary home and
   verify the stand-in agent actually launched with the expected session ID. (#576)
 
