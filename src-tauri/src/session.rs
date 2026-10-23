@@ -2889,7 +2889,9 @@ impl SessionManager {
                 let starts_turn = echo.overtaken || resent || (echo.queued && (!rt.turn_open || matches!(&rt.engine, Engine::Cli(p) if p.turn_tail.is_closed())));
                 if starts_turn {
                     if !rt.turn_open {
-                        rt.prompt_taken("", "transcript_queued_prompt");
+                        if let Payload::UserMessage { text, .. } = &payload {
+                            rt.prompt_taken(text, "transcript_queued_prompt");
+                        }
                     }
                     if let Engine::Cli(p) = &mut rt.engine {
                         p.turn_tail.opened();

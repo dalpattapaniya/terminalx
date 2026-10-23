@@ -628,6 +628,48 @@ fn a_repeated_compact_record_does_not_reopen_a_completed_command() {
 }
 
 #[test]
+fn a_queued_compact_echo_preserves_command_classification() {
+    for completed in [false, true] {
+        let rig = Rig::new();
+        rig.start_turn();
+        let prompt = PromptText { shared_connection: None, author: None, agent: "/compact".into(), display: "/compact".into() };
+        let (sent, queued) = rig.manager.record_composer_prompt(
+            &mut rig.rt.lock().unwrap(), &prompt, vec![], rig._dir.path().to_str().unwrap(), None,
+        );
+        assert!(queued);
+        rig.end_turn_in_transcript();
+        rig.advance(PATIENCE.settle);
+        rig.tick();
+        assert!(!rig.turn_open());
+
+        rig.append(&compact_prompt());
+        assert!(rig.turn_open());
+        {
+            let rt = rig.rt.lock().unwrap();
+            assert!(rt.turn_by_command);
+            assert_eq!(rt.turn_opener, Some(("transcript_queued_prompt", "compact_command")));
+        }
+        assert!(rig.events().iter().any(|event| matches!(event.payload,
+            Payload::TurnStarted { prompt_seq: Some(seq), .. } if seq == sent.seq)));
+        if completed {
+            rig.append(&compact_records("manual"));
+            rig.append(&compact_prompt().replace("compact-command", "repeated-command"));
+        }
+        rig.advance(PATIENCE.stall + MOMENT);
+        rig.tick();
+        if completed {
+            assert!(!rig.turn_open());
+            assert_ne!(rig.status(), TabStatus::InProgress);
+            assert_eq!(rig.recovery(), None);
+            assert_eq!(rig.banner(), None);
+        } else {
+            assert!(rig.turn_open());
+            assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+        }
+    }
+}
+
+#[test]
 fn completed_compaction_does_not_consume_the_next_turns_end() {
     let rig = Rig::new();
     rig.append(&compact_prompt());
