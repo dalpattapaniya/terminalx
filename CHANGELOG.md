@@ -11,6 +11,13 @@
   cloud authors in work claims, and retain commit-specific local-check failures
   until the author reports those checks passing. (#568)
 
+### Changes
+
+- Default workspace review to All changes against a displayed merge-base target,
+  including committed, uncommitted and untracked files. Remember repository-specific
+  scope and target choices, with Uncommitted and turn review available in the same
+  panel; keep local and cloud diffs and unavailable states consistent. (#465)
+
 ### Stats & Usage
 
 - Refresh usage for non-Git projects without blocking healthy locations, and

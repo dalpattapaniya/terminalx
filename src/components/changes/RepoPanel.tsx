@@ -140,6 +140,7 @@ export function RepoPanel({ cwd, source: given, active, view: sub, onViewChange:
 
       {sub === "uncommitted" && (
         <>
+          <p className="px-3 pb-2 text-xs text-muted-foreground">Commit uncommitted changes here. Changes reviews all workspace work against your target branch.</p>
           {writable && <div className="px-3 pb-2">
             {author !== undefined && (
               <div className="mb-1 truncate px-1 text-[11px] text-faint" data-testid="commit-author">

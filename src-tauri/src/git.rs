@@ -318,6 +318,45 @@ pub fn head_tree(cwd: &Path) -> Result<String> {
     }
 }
 
+/// A stable pair for workspace review. Both the list and file contents use
+/// these trees, including untracked files, without changing the real index.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRange {
+    pub target: String,
+    pub base: String,
+    pub head: String,
+}
+
+pub fn review_range(cwd: &Path, target: Option<&str>, uncommitted: bool) -> Result<ReviewRange> {
+    if !is_repo(cwd) {
+        bail!("Not a Git repository");
+    }
+    let unborn = head_commit(cwd).is_none();
+    let target = if uncommitted {
+        "HEAD".to_string()
+    } else if let Some(target) = target {
+        target.to_string()
+    } else if let Ok(remote) = run(cwd, &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"]) {
+        remote.trim().to_string()
+    } else {
+        default_branch(cwd).unwrap_or_else(|| "HEAD".into())
+    };
+    let base = if uncommitted || (unborn && target == current_branch(cwd).unwrap_or_else(|| "HEAD".into())) {
+        head_tree(cwd)?
+    } else {
+        // Resolve first, with option parsing terminated, before merge-base.
+        let commit = run(cwd, &["rev-parse", "--verify", "--end-of-options", &format!("{target}^{{commit}}")])?;
+        if unborn {
+            EMPTY_TREE.to_string()
+        } else {
+            let base = run(cwd, &["merge-base", "HEAD", commit.trim()])?;
+            run(cwd, &["rev-parse", &format!("{}^{{tree}}", base.trim())])?.trim().to_string()
+        }
+    };
+    Ok(ReviewRange { target, base, head: snapshot_tree(cwd)? })
+}
+
 pub fn head_commit(cwd: &Path) -> Option<String> {
     run(cwd, &["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
 }
@@ -367,12 +406,20 @@ pub fn changes_between(cwd: &Path, base: &str, head: Option<&str>) -> Result<Vec
     let num_out = run(cwd, &args.iter().filter(|a| **a != "--name-status").cloned().collect::<Vec<_>>())?;
 
     let mut counts = std::collections::HashMap::new();
-    for rec in num_out.split('\0').filter(|s| !s.is_empty()) {
-        // "adds\tdels\tpath" — renames put the two paths as following NUL fields.
+    let mut records = num_out.split('\0');
+    while let Some(rec) = records.next() {
+        if rec.is_empty() {
+            continue;
+        }
         let mut it = rec.splitn(3, '\t');
         let a = it.next().unwrap_or("0");
         let d = it.next().unwrap_or("0");
-        let p = it.next().unwrap_or("");
+        let mut p = it.next().unwrap_or("");
+        if p.is_empty() {
+            // A rename is counts, old path, new path in separate NUL fields.
+            records.next();
+            p = records.next().unwrap_or("");
+        }
         counts.insert(p.to_string(), (a.parse().unwrap_or(0), d.parse().unwrap_or(0)));
     }
     let mut out = Vec::new();
@@ -1211,6 +1258,71 @@ mod tests {
         let ws = work_status(p);
         assert!(ws.is_repo && ws.dirty);
         assert_eq!(ws.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn review_accumulated_work_and_merge_base() {
+        let _home = crate::store::temp_home();
+        let dir = repo();
+        let p = dir.path();
+        let initial = head_tree(p).unwrap();
+        run(p, &["checkout", "-qb", "feature"]).unwrap();
+        std::fs::write(p.join("A"), "committed\n").unwrap();
+        run(p, &["add", "A"]).unwrap();
+        run(p, &["commit", "-qm", "A"]).unwrap();
+        std::fs::write(p.join("a.txt"), "hello\nmodified\n").unwrap();
+        std::fs::write(p.join("C"), "untracked\n").unwrap();
+        let all = review_range(p, Some("main"), false).unwrap();
+        assert_eq!(all.base, initial);
+        let files = changes_between(p, &all.base, Some(&all.head)).unwrap();
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["A", "C", "a.txt"]);
+        assert_eq!(files.iter().map(|f| f.additions).sum::<u32>(), 3);
+        let uncommitted = review_range(p, None, true).unwrap();
+        assert_eq!(changes_between(p, &uncommitted.base, Some(&uncommitted.head)).unwrap().len(), 2);
+        assert_eq!(blob_at(p, &all.head, "C").unwrap().as_deref(), Some("untracked\n"));
+        assert!(run(p, &["diff", "--cached", "--name-only"]).unwrap().is_empty());
+        assert!(review_range(p, Some("missing"), false).is_err());
+        assert!(review_range(p, Some("--help"), false).is_err());
+        // Advance the target independently: review still starts at the merge base.
+        run(p, &["stash", "-u"]).unwrap();
+        run(p, &["checkout", "main"]).unwrap();
+        std::fs::write(p.join("other"), "target only\n").unwrap();
+        run(p, &["add", "."]).unwrap();
+        run(p, &["commit", "-qm", "advance target"]).unwrap();
+        run(p, &["checkout", "feature"]).unwrap();
+        assert_eq!(review_range(p, Some("main"), false).unwrap().base, initial);
+        assert_eq!(review_range(p, Some("feature"), false).unwrap().base, head_tree(p).unwrap());
+    }
+
+    #[test]
+    fn review_unborn_clean_rename_and_delete() {
+        let _home = crate::store::temp_home();
+        let empty = tempfile::tempdir().unwrap();
+        let p = empty.path();
+        run(p, &["init", "-qb", "main"]).unwrap();
+        let range = review_range(p, None, false).unwrap();
+        assert!(changes_between(p, &range.base, Some(&range.head)).unwrap().is_empty());
+        std::fs::write(p.join("new"), "new\n").unwrap();
+        let range = review_range(p, None, false).unwrap();
+        assert_eq!(changes_between(p, &range.base, Some(&range.head)).unwrap().len(), 1);
+        assert!(review_range(p, Some("missing"), false).is_err());
+        let dir = repo();
+        let p = dir.path();
+        std::fs::write(p.join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        std::fs::write(p.join("deleted"), "remove\n").unwrap();
+        run(p, &["add", "."]).unwrap();
+        run(p, &["commit", "-qm", "seed"]).unwrap();
+        std::fs::rename(p.join("a.txt"), p.join("renamed")).unwrap();
+        std::fs::write(p.join("renamed"), "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+        std::fs::remove_file(p.join("deleted")).unwrap();
+        let range = review_range(p, None, true).unwrap();
+        let files = changes_between(p, &range.base, Some(&range.head)).unwrap();
+        let rename = files.iter().find(|f| f.status == ChangeStatus::Renamed).unwrap();
+        assert_eq!(rename.old_path.as_deref(), Some("a.txt"));
+        assert_eq!((rename.additions, rename.deletions), (1, 0));
+        let deleted = files.iter().find(|f| f.status == ChangeStatus::Deleted).unwrap();
+        assert_eq!(deleted.deletions, 1);
+        assert!(blob_at(p, &range.head, "deleted").unwrap().is_none());
     }
 
     fn stale_clone() -> (tempfile::TempDir, tempfile::TempDir) {
