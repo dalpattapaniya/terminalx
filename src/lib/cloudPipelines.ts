@@ -96,7 +96,7 @@ export function cloudReviewerSessions(catalog: CloudCatalogState = getCloudCatal
   const reviewers = new Set<string>();
   for (const [orgId, org] of Object.entries(catalog.orgs)) {
     for (const [workspaceId, cached] of Object.entries(org.pipelines ?? {})) {
-      const ids = [...(cached.reviewerSessionIds ?? []), ...pipelineReviewerIds(cached.pipelines)];
+      const ids = pipelineReviewerIds(cached.pipelines, cached.reviewerSessionIds);
       for (const id of ids) reviewers.add(cloudSessionKey(orgId, workspaceId, id));
     }
   }

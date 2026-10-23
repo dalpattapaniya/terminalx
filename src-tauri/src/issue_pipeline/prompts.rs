@@ -23,8 +23,9 @@ pub fn issue_prompt(issue: &crate::issues::Issue) -> String {
 /// Added to the author's first prompt: how the work is handed over.
 pub fn author_brief() -> String {
     format!(
-        "---\n\nTerminalX carries this issue on from here. When you report the work done it opens the pull request, has a separate reviewer session review it, and brings any findings back to you.\n\n\
+        "---\n\nTerminalX carries this issue on from here. When you report the work done it opens the pull request, has an independent Reviewer tab in this session review it, and brings any findings back to you.\n\n\
 - Commit your work on this branch. Do not push and do not open a pull request: TerminalX does both.\n\
+- TerminalX owns review and merge. Do not review your own work or run `gh pr merge`. Find this issue's pipeline id with `terminalx pipelines list`; use `terminalx pipelines review <id>` after later committed and pushed fixes, and `terminalx pipelines merge <id>` when asked to merge. After requesting a review, finish your turn so the reviewer can run once your tab is idle; do not keep polling from an active turn. These commands preserve review, security, local-check and CI gates. Person-only or protected changes need Merge on the issue page; cloud merges require the desktop issue page and the user's GitHub authority. A refusal is not permission to bypass the gate.\n\
 - Before you report the work done, run the project's own checks (tests, type checks, linters) for what you changed.\n\
 - End every reply with a status block in exactly this form:\n\n\
 ```{STATUS_FENCE}\n{{\"status\": \"done\", \"checks\": \"passed\", \"summary\": \"One or two sentences on what changed and why.\"}}\n```\n\n\
@@ -94,7 +95,7 @@ pub fn review(request: &ReviewRequest<'_>) -> String {
         None => String::new(),
     };
     format!(
-        "You are reviewing a pull request you did not write. Another session wrote it. You are not given its account of the change and should not go looking for one: judge the code.\n\n\
+        "You are reviewing a pull request you did not write. Another conversation wrote it. You are not given its account of the change and should not go looking for one: judge the code.\n\n\
 Pull request: #{pr_number} {pr_url}\n\
 Issue it is meant to resolve: {} {} ({})\n\
 Commit to review: {commit}\n\
@@ -135,9 +136,10 @@ pub fn reviewer_reminder(commit: &str, problem: &str) -> String {
 /// The findings, taken back to the author.
 pub fn address(findings: &[Finding], commit: &str, pr_url: &str, round: u32, max_rounds: u32) -> String {
     format!(
-        "A reviewer session read commit {} of the pull request ({pr_url}) and asks for changes. This was review {round} of {max_rounds}.\n\n\
+        "The independent reviewer read commit {} of the pull request ({pr_url}) and asks for changes. This was review {round} of {max_rounds}.\n\n\
 {}\n\n\
 Fix each finding on this branch. Where you are sure a finding is wrong, leave the code as it is and say why in your reply. Then run the project's checks and commit. Do not push: TerminalX pushes and has the new commit reviewed.\n\n\
+TerminalX owns review and merge. Do not review your own work or run `gh pr merge`. Find this issue's pipeline id with `terminalx pipelines list`; use `terminalx pipelines review <id>` after later committed and pushed fixes, and `terminalx pipelines merge <id>` when asked to merge. After requesting a review, finish your turn so the reviewer can run once your tab is idle; do not keep polling from an active turn. These commands preserve review, security, local-check and CI gates. Person-only or protected changes need Merge on the issue page; cloud merges require the desktop issue page and the user's GitHub authority. A refusal is not permission to bypass the gate.\n\n\
 End your reply with the `{STATUS_FENCE}` block as before.",
         short(commit),
         findings_markdown(findings),
@@ -199,6 +201,17 @@ mod tests {
 
     fn linear() -> IssueRef {
         IssueRef { provider: "linear".into(), id: "uuid-1".into(), identifier: "ENG-42".into(), title: "Fix login timeout".into(), url: "https://linear.app/acme/issue/ENG-42".into() }
+    }
+
+    #[test]
+    fn author_and_address_prompts_route_review_and_merge_through_the_pipeline() {
+        for prompt in [author_brief(), address(&[], "head", "https://example.test/pr/1", 1, 3)] {
+            assert!(prompt.contains("terminalx pipelines review <id>"));
+            assert!(prompt.contains("terminalx pipelines merge <id>"));
+            assert!(prompt.contains("Do not review your own work or run `gh pr merge`"));
+            assert!(prompt.contains("Person-only or protected changes need Merge on the issue page"));
+        }
+        assert!(author_brief().contains("independent Reviewer tab"));
     }
 
     #[test]

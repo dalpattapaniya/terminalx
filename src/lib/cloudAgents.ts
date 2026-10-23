@@ -1,3 +1,4 @@
+import { keepMessageTime, newestMessageTime } from "@/lib/messageActivity";
 import { useSyncExternalStore } from "react";
 import { WorkspaceRpcError, type RuntimeIssuePipeline, type WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import { applyEvent, dropTabLog, getTabLog, lastSeq, mergeTabEvents } from "@/lib/agentEvents";
@@ -507,12 +508,19 @@ export async function refreshFromCheckpoint(scope: CloudAgentScope, tabId: strin
       process: p.process,
       followUps: p.followUps ?? [],
       lastSeq: upTo ?? current.info.lastSeq,
-      created: current.info.created || new Date(p.updatedAt || 0).toISOString(),
       modified: new Date(p.updatedAt || 0).toISOString(),
     };
     current.source = "checkpoint";
     current.placeholder = false;
   }
+  // Chronology is independent of the retained event tail: a large event can
+  // leave a checkpoint with no events, while its verified metadata still advances.
+  current.info = { ...current.info,
+    created: p.created || current.info.created,
+    lastMessageAt: newestMessageTime(current.info.lastMessageAt, p.lastMessageAt),
+    sessionCreated: p.sessionCreated ?? current.info.sessionCreated,
+    sessionLastMessageAt: newestMessageTime(current.info.sessionLastMessageAt, p.sessionLastMessageAt),
+  };
   mergeTabEvents(p.sessionId, tabId, p.events);
   current.historyRead = true;
   publish(s);
@@ -544,7 +552,9 @@ export function applyLiveTabs(scope: CloudAgentScope, tabs: AgentTabInfo[]) {
     } else {
       noteStatus(existing, info.status);
       // Settings chosen here and not sent yet stay shown as chosen.
-      existing.info = withPending(info, existing.pendingConfig);
+      existing.info = withPending({ ...keepMessageTime(info, existing.info),
+        sessionLastMessageAt: newestMessageTime(info.sessionLastMessageAt, existing.info.sessionLastMessageAt),
+      }, existing.pendingConfig);
       existing.source = "live";
       existing.placeholder = false;
       if (!info.lastSeq) existing.historyRead = true;

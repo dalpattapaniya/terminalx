@@ -73,6 +73,8 @@ export interface IssuePipeline {
   maxRounds: number;
   reviewCommit?: string | null;
   verdict?: PipelineVerdict | null;
+  /** Author-reported local failures, pinned to commits until explicitly passed. */
+  failedLocalChecks?: string[];
   securityAreas: string[];
   merged?: { commit: string; at: string; by: "pipeline" | "person" | "elsewhere" } | null;
   events: PipelineEvent[];

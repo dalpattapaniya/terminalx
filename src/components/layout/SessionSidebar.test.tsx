@@ -354,3 +354,29 @@ describe("ordering conversations", () => {
     expect(ordered.map((entry) => entry.id)).toEqual(["pin", "new", "open", "old"]);
   });
 });
+
+it("orders by messages through background updates, metadata edits, persistence, pins and filters", () => {
+  const at = (n: number) => new Date(Date.UTC(2026, 9, n)).toISOString();
+  const oldest = session("old", chatsPath, at(1));
+  const middle = session("middle", chatsPath, at(2));
+  const newest = session("new", chatsPath, at(3));
+  const list = [oldest, middle, newest];
+  const ids = (entries = list) => orderConversations(entries, null).map((entry) => entry.id);
+  expect(ids()).toEqual(["new", "middle", "old"]);
+  oldest.lastMessageAt = at(4); // user sends in the oldest conversation
+  expect(ids()).toEqual(["old", "new", "middle"]);
+  middle.lastMessageAt = at(5); // background assistant reply
+  expect(ids()).toEqual(["middle", "old", "new"]);
+  newest.modified = at(9);
+  newest.title = "Renamed";
+  newest.activeTab = newest.tabs[0].id;
+  newest.tabs[0].model = "synthetic-model";
+  expect(ids()).toEqual(["middle", "old", "new"]);
+  expect(ids(JSON.parse(JSON.stringify(list)))).toEqual(ids());
+  newest.pinned = true;
+  expect(ids()).toEqual(["new", "middle", "old"]);
+  expect(ids(list.filter((entry) => entry.id !== "middle"))).toEqual(["new", "old"]);
+  oldest.lastMessageAt = at(5);
+  expect(ids()).toEqual(["new", "middle", "old"]);
+  expect(ids([...list].reverse())).toEqual(ids());
+});

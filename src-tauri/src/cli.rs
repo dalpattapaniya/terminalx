@@ -93,7 +93,7 @@ Usage:
   terminalx pipelines list [--project PROJECT] [--json]
   terminalx pipelines show PIPELINE [--project PROJECT] [--json]
   terminalx pipelines auto-merge PIPELINE on|off [--project PROJECT] [--json]
-  terminalx pipelines stop|resume|advance|review|refresh PIPELINE [--project PROJECT] [--json]
+  terminalx pipelines stop|resume|advance|review|merge|refresh PIPELINE [--project PROJECT] [--json]
   terminalx skills get terminalx-cli|computer-use [--full] [--json]
 
 Computer use (desktop apps on macOS, Linux and Windows):
@@ -932,7 +932,7 @@ fn parse_pipelines(tokens: &mut Tokens) -> Result<Action, ControlError> {
             tokens.finish()?;
             Ok(Action::Rpc { command: "pipelines.autoMerge".into(), params: json!({"pipeline": pipeline, "project": project, "value": value}), timeout: PIPELINE_TIMEOUT })
         }
-        "stop" | "resume" | "advance" | "review" | "refresh" => {
+        "stop" | "resume" | "advance" | "review" | "merge" | "refresh" => {
             let project = tokens.option("--project")?;
             let pipeline = tokens.required_front("pipeline")?;
             tokens.finish()?;
@@ -1382,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn pipelines_are_listed_shown_and_steered_but_not_merged_from_the_command_line() {
+    fn pipelines_are_listed_shown_and_steered_through_authenticated_control() {
         assert_eq!(rpc_of(&["pipelines", "list"]).0, "pipelines.list");
         assert_eq!(rpc_of(&["pipelines", "list", "--project", "raccoon"]).1, json!({"project": "raccoon"}));
         assert_eq!(rpc_of(&["pipelines", "show", "433"]), ("pipelines.show".to_string(), json!({"pipeline": "433", "project": null}), Duration::from_secs(30)));
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!((command.as_str(), params), ("pipelines.autoMerge", json!({"pipeline": "ENG-42", "project": null, "value": false})));
         assert_eq!(timeout, PIPELINE_TIMEOUT);
         assert_eq!(rpc_of(&["pipelines", "auto-merge", "ENG-42", "on"]).1["value"], json!(true));
-        for action in ["stop", "resume", "advance", "review", "refresh"] {
+        for action in ["stop", "resume", "advance", "review", "merge", "refresh"] {
             let (command, params, _) = rpc_of(&["pipelines", action, "433"]);
             assert_eq!((command.as_str(), params), ("pipelines.act", json!({"pipeline": "433", "project": null, "action": action})));
         }
@@ -1398,8 +1398,8 @@ mod tests {
         assert_eq!(rpc_of(&["pipelines", "auto-merge", "12", "on", "--project", "widgets"]).1, json!({"pipeline": "12", "project": "widgets", "value": true}));
         assert_eq!(rpc_of(&["pipelines", "stop", "--project", "widgets", "12"]).1["project"], json!("widgets"));
         assert_eq!(rpc_of(&["pipelines", "show", "12", "--project", "widgets"]).1["project"], json!("widgets"));
-        // Merging by hand is done on the issue page.
-        assert!(parse(&args(&["pipelines", "merge", "433"])).unwrap_err().message.contains("Unknown pipelines command merge"));
+        assert_eq!(rpc_of(&["pipelines", "merge", "433", "--project", "widgets"]).1["project"], json!("widgets"));
+        assert!(parse(&args(&["pipelines", "merge"])).is_err());
         assert!(parse(&args(&["pipelines", "auto-merge", "433", "maybe"])).is_err());
         assert!(parse(&args(&["pipelines", "auto-merge", "433"])).is_err());
         assert!(parse(&args(&["pipelines", "show"])).is_err());

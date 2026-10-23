@@ -170,6 +170,16 @@ pub enum LocalChecks {
     None,
 }
 
+/// The explicit check result, including reports that say work is blocked.
+pub fn reported_checks(message: &str) -> Option<LocalChecks> {
+    let value = last_block(message, STATUS_FENCE).and_then(|block| serde_json::from_str::<Value>(&block).ok())?;
+    Some(match text_field(&value, &["checks"])?.to_ascii_lowercase().as_str() {
+        "passed" | "pass" => LocalChecks::Passed,
+        "none" => LocalChecks::None,
+        _ => LocalChecks::Failed,
+    })
+}
+
 pub fn author_report(message: &str) -> AuthorReport {
     let Some(value) = last_block(message, STATUS_FENCE).and_then(|block| serde_json::from_str::<Value>(&block).ok()) else {
         return AuthorReport::Missing;

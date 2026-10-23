@@ -271,7 +271,7 @@ has the pipeline turned off or the session is not on a branch of its own).
 terminalx pipelines list [--project <project>] --json
 terminalx pipelines show <pipeline> [--project <project>] --json
 terminalx pipelines auto-merge <pipeline> on|off [--project <project>] --json
-terminalx pipelines stop|resume|advance|review|refresh <pipeline> [--project <project>] --json
+terminalx pipelines stop|resume|advance|review|merge|refresh <pipeline> [--project <project>] --json
 ```
 
 `<pipeline>` is a pipeline id or its unique prefix, the issue (`433`, `ENG-42`; the newest
@@ -283,17 +283,25 @@ has a pipeline for the same issue number the command fails with `ambiguous_selec
 sentence, a structured `reason` when it is at `readyToMerge` or `needsYou`, the reviewer's last
 `verdict` with its open `findings`, and `events`, the record of every stage, verdict and merge.
 
+- `merge` requests a merge pinned to the independent review's exact commit. It can merge
+  with auto-merge off, but cannot override person-only, protected-category, security, local-check
+  or required CI holds. A hold needs the action in the returned reason; never use `gh pr merge`
+  to evade it. Cloud merges still require the desktop issue page and the user's GitHub authority.
+- New reviewers are named Reviewer tabs in the author session, with independent conversations.
+  Later rounds reuse that tab; legacy separate reviewer sessions remain supported.
 - `advance` pushes the current stage forward on your say-so: opens the pull request for work
   that was not reported done, retries a failed step, asks for another review, or looks at the
   checks again.
 - `review` has the reviewer read the pull request's current head, for a branch that moved
-  after its last review.
+  after its last review. It respects the round limit. After requesting review from the author
+  tab, finish the turn: a changed-head review waits for idle conversations and a clean,
+  current checkout. Do not keep the author active polling for that review.
 - `refresh` looks at the pull request now instead of at the next pass.
 - `stop` halts the pipeline; `resume` picks it up at the stage it was in.
 - `auto-merge on` merges at once if the pull request was only waiting for the switch. A merge
   is only ever made at the exact commit the reviewer approved, with its checks passed, and
-  never where the project keeps the merge for a person. There is no command to merge by hand:
-  that is done on the issue's page in TerminalX.
+  never where the project keeps the merge for a person. The person-only override is available only
+  on the issue page in TerminalX; `merge` never grants that authority.
 
 Do not wait on a pipeline with `terminalx wait`: that waits for one session's turn. Poll
 `pipelines show` until `state` is `readyToMerge`, `needsYou`, `merged` or `stopped`.
