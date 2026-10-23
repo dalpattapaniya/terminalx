@@ -14,8 +14,10 @@ publish = false
 # 1 = launch intents and the serve bootstrap (PRO-21).
 # 2 = scheduled runs: claims them, reports them and ends a turn at the
 #     schedule's limit (PRO-37).
+# 3 = types a public API message into the tab its run names (`target`),
+#     refusing a tab that is gone or mid-turn (PRO-40).
 [package.metadata.terminalx]
-runtime-protocol = 2
+runtime-protocol = 3
 
 [[bin]]
 name = "terminalx-serve"

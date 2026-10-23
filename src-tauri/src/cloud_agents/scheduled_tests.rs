@@ -15,6 +15,7 @@ fn run(id: &str) -> Run {
         mode: Some("acceptEdits".into()),
         prompt: PROMPT.into(),
         max_run_minutes: 1,
+        target: None,
     }
 }
 
@@ -124,6 +125,13 @@ struct FakeAgent {
     answered: Option<(Duration, usize)>,
     asked: Mutex<Option<Instant>>,
     answers: AtomicUsize,
+    /// What `send_into` answers instead of typing: `gone`, `busy`, `unfit`,
+    /// `sign-in` or `not-sent`.
+    refuse_target: Option<&'static str>,
+    /// The tab's agent was running before the prompt was typed into it.
+    target_running: bool,
+    /// Each prompt typed into a named tab: `(session, tab, prompt)`.
+    sent_into: Mutex<Vec<(String, String, String)>>,
 }
 
 impl FakeAgent {
@@ -147,6 +155,9 @@ impl FakeAgent {
             answered: None,
             asked: Mutex::default(),
             answers: AtomicUsize::new(0),
+            refuse_target: None,
+            target_running: false,
+            sent_into: Mutex::default(),
         }
     }
 }
@@ -167,6 +178,19 @@ impl Agent for FakeAgent {
         self.started.lock().unwrap().push(new_tab(run));
         *self.record.lock().unwrap() = self.record_path.lock().unwrap().as_ref().and_then(|path| std::fs::read_to_string(path).ok());
         Ok(("session-1".into(), "tab-1".into()))
+    }
+
+    fn send_into(&self, run: &Run, session_id: &str, tab_id: &str) -> Result<bool, TargetError> {
+        match self.refuse_target {
+            Some("gone") => return Err(TargetError::Gone),
+            Some("busy") => return Err(TargetError::Busy),
+            Some("unfit") => return Err(TargetError::Unfit),
+            Some("sign-in") => return Err(TargetError::SignInRequired),
+            Some(_) => return Err(TargetError::NotSent(anyhow!("the pane is closed"))),
+            None => {}
+        }
+        self.sent_into.lock().unwrap().push((session_id.into(), tab_id.into(), run.prompt.clone()));
+        Ok(self.target_running)
     }
 
     fn turn(&self, _session_id: &str, _tab_id: &str) -> Turn {
@@ -677,4 +701,103 @@ fn a_long_schedule_name_is_a_short_title() {
     assert_eq!(title_of(&Run { name: "  Nightly checks\nsecond line".into(), ..run("r") }), "Nightly checks");
     assert_eq!(title_of(&Run { name: String::new(), ..run("r") }), "Scheduled task");
     assert_eq!(title_of(&Run { name: "x".repeat(200), ..run("r") }).chars().count(), 80);
+}
+
+/// A later turn of a public API session (PRO-40): its prompt goes into the
+/// tab an earlier turn started.
+fn message(id: &str) -> Run {
+    Run { target: Some(Target { session_id: "session-7".into(), tab_id: "tab-7".into() }), ..run(id) }
+}
+
+#[test]
+fn a_message_is_typed_into_the_tab_it_names_and_no_tab_is_started() {
+    let rig = rig(vec![message("turn_1")], FakeAgent::new(&[Turn::Pending, Turn::Running, Turn::Ended(TurnStatus::Ok)]));
+    rig.runner.pass().unwrap();
+    assert!(rig.agent.started.lock().unwrap().is_empty(), "no new session or tab");
+    assert_eq!(*rig.agent.sent_into.lock().unwrap(), [("session-7".to_string(), "tab-7".to_string(), PROMPT.to_string())]);
+    assert_eq!(rig.api.reports(), [end("started", None), end("completed", None)]);
+    for report in rig.api.reports.lock().unwrap().iter() {
+        assert_eq!((report.session_id.as_deref(), report.tab_id.as_deref()), (Some("session-7"), Some("tab-7")));
+    }
+    // The agent it started for the turn ends with it, as a run's does.
+    assert_eq!(rig.agent.stops.load(Ordering::SeqCst), 1);
+    assert!(rig.runner.store.get().is_none());
+}
+
+#[test]
+fn an_agent_already_running_in_the_tab_is_left_running() {
+    let agent = FakeAgent { target_running: true, ..FakeAgent::new(&[Turn::Running, Turn::Ended(TurnStatus::Ok)]) };
+    let rig = rig(vec![message("turn_1")], agent);
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.api.ends(), [end("completed", None)]);
+    assert_eq!(rig.agent.stops.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_message_for_a_tab_that_is_gone_or_busy_is_refused_and_nothing_is_typed() {
+    for (refusal, category) in [
+        ("gone", "canceled"),
+        ("busy", "agent-unavailable"),
+        ("unfit", "agent-unavailable"),
+        ("sign-in", "agent-credential-required"),
+        ("not-sent", "agent-start-failed"),
+    ] {
+        let agent = FakeAgent { refuse_target: Some(refusal), ..FakeAgent::new(&[Turn::Ended(TurnStatus::Ok)]) };
+        let rig = rig(vec![message("turn_1")], agent);
+        assert_eq!(rig.runner.pass().unwrap(), Duration::ZERO, "{refusal}: the next turn is asked for at once");
+        assert!(rig.agent.started.lock().unwrap().is_empty(), "{refusal}: never a new tab instead");
+        assert!(rig.agent.sent_into.lock().unwrap().is_empty(), "{refusal}");
+        assert_eq!(rig.api.reports(), [end("failed", Some(category))], "{refusal}: no `started` first");
+        assert_eq!((rig.agent.interrupts.load(Ordering::SeqCst), rig.agent.stops.load(Ordering::SeqCst)), (0, 0), "{refusal}: the tab is not touched");
+        assert_eq!(rig.agent.held.load(Ordering::SeqCst), 0, "{refusal}");
+        assert!(rig.runner.store.get().is_none(), "{refusal}");
+    }
+}
+
+#[test]
+fn a_message_is_held_to_the_rules_of_an_unattended_run_before_it_is_typed() {
+    for mode in [None, Some("bypassPermissions")] {
+        let rig = rig(vec![Run { mode: mode.map(String::from), ..message("turn_1") }], FakeAgent::new(&[Turn::Ended(TurnStatus::Ok)]));
+        rig.runner.pass().unwrap();
+        assert!(rig.agent.sent_into.lock().unwrap().is_empty(), "{mode:?}");
+        assert_eq!(rig.api.reports(), [end("failed", Some("runtime-error"))], "{mode:?}");
+    }
+    let rig = rig(vec![Run { prompt: "!rm -rf .".into(), ..message("turn_1") }], FakeAgent::new(&[Turn::Ended(TurnStatus::Ok)]));
+    rig.runner.pass().unwrap();
+    assert!(rig.agent.sent_into.lock().unwrap().is_empty());
+    assert_eq!(rig.api.reports(), [end("failed", Some("shell-command-forbidden"))]);
+}
+
+#[test]
+fn a_message_waiting_for_an_approval_nobody_can_give_is_ended_and_says_so() {
+    let timing = Timing { approval_grace: Duration::from_millis(40), ..fast() };
+    let agent = FakeAgent::new(&[Turn::Running]);
+    agent.awaiting_approval.store(true, Ordering::SeqCst);
+    let rig = rig_in(tempfile::tempdir().unwrap(), FakeApi::with(vec![message("turn_1")]), agent, timing.clone());
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.api.ends(), [end("failed", Some("needs-approval"))]);
+    assert_eq!(rig.api.reports.lock().unwrap().last().unwrap().tab_id.as_deref(), Some("tab-7"));
+    assert_eq!(rig.agent.interrupts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_message_past_its_limit_is_interrupted_and_reported_timed_out() {
+    let timing = Timing { minute: Duration::from_millis(30), ..fast() };
+    let rig = rig_in(tempfile::tempdir().unwrap(), FakeApi::with(vec![message("turn_1")]), FakeAgent::new(&[Turn::Running]), timing);
+    rig.runner.pass().unwrap();
+    assert_eq!(rig.agent.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.api.ends(), [end("failed", Some("timed-out"))]);
+}
+
+#[test]
+fn a_claim_names_the_tab_of_a_message_and_a_run_without_one_starts_a_tab() {
+    let sent = json!({
+        "runId": "turn_1", "name": "Deploy", "scheduledFor": 1_792_713_600_000u64, "agent": "claude", "mode": "acceptEdits",
+        "prompt": "and now the tests", "maxRunMinutes": 30, "target": { "sessionId": "s-1", "tabId": "t-1" },
+    });
+    let run: Run = serde_json::from_value(sent).unwrap();
+    let target = run.target.unwrap();
+    assert_eq!((target.session_id.as_str(), target.tab_id.as_str()), ("s-1", "t-1"));
+    let run: Run = serde_json::from_value(json!({ "runId": "run_1", "agent": "claude", "prompt": "p", "maxRunMinutes": 5 })).unwrap();
+    assert!(run.target.is_none());
 }

@@ -14,6 +14,11 @@
 //! schedule stores and never in bypass permissions, and its prompt is held
 //! to the rules of a person who may drive but not configure
 //! (`slash::check`).
+//!
+//! A turn of a public API session (PRO-40) comes the same way. Its first
+//! turn starts a tab like a schedule's run; a later one names that tab
+//! (`target`) and is typed into it, held to the same rules, and only into a
+//! tab that is idle and fit to run unattended.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -71,6 +76,48 @@ pub struct Run {
     pub mode: Option<String>,
     pub prompt: String,
     pub max_run_minutes: u32,
+    /// The tab an earlier turn of the same public API session started, to
+    /// type this prompt into instead of starting a new one (PRO-40). A
+    /// server sends it only to a runtime of protocol 3 or later.
+    #[serde(default)]
+    pub target: Option<Target>,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Target {
+    pub session_id: String,
+    pub tab_id: String,
+}
+
+/// Why a prompt was not typed into the tab a run names.
+#[derive(Debug)]
+pub enum TargetError {
+    /// The session or the tab was removed.
+    Gone,
+    /// Its agent is in a turn or stopped at a permission request.
+    Busy,
+    /// The tab cannot run unattended: another agent, a CLI started by hand
+    /// in its terminal, or bypass permissions.
+    Unfit,
+    /// Its agent would start with no way to sign in (PRO-78).
+    SignInRequired,
+    /// The prompt could not be sent.
+    NotSent(anyhow::Error),
+}
+
+impl TargetError {
+    /// The category the server is told: one it already takes.
+    fn category(&self) -> &'static str {
+        match self {
+            // As for a run whose tab is removed while it runs: someone in
+            // the workspace closed it.
+            Self::Gone => CANCELED,
+            Self::Busy | Self::Unfit => AGENT_UNAVAILABLE,
+            Self::SignInRequired => CREDENTIAL_REQUIRED,
+            Self::NotSent(_) => AGENT_START_FAILED,
+        }
+    }
 }
 
 /// What one claim answered.
@@ -189,6 +236,10 @@ pub trait Agent: Send + Sync {
     /// Create the session and tab and send the prompt. Returns
     /// `(session id, tab id)`.
     fn start(&self, run: &Run, title: &str) -> Result<(String, String), StartError>;
+    /// Type the prompt into the tab `run` names, if it is there, idle and
+    /// fit to run unattended. Returns whether its agent was already running,
+    /// in which case the run leaves it running.
+    fn send_into(&self, run: &Run, session_id: &str, tab_id: &str) -> Result<bool, TargetError>;
     fn turn(&self, session_id: &str, tab_id: &str) -> Turn;
     /// Whether the tab's turn is stopped at a permission request.
     fn awaiting_approval(&self, _session_id: &str, _tab_id: &str) -> bool {
@@ -405,17 +456,26 @@ impl Runner {
             log::warn!("scheduled run {}: not started: {category}", run.run_id);
             return self.finish(failed(&run.run_id, category, None));
         }
-        let (session_id, tab_id) = match self.agent.start(run, &title_of(run)) {
-            Ok(ids) => ids,
-            Err(StartError::NotStarted(error)) => {
-                log::warn!("scheduled run {}: start the agent: {error:#}", run.run_id);
-                return self.finish(failed(&run.run_id, AGENT_START_FAILED, None));
-            }
-            Err(StartError::SendFailed { session_id, tab_id, error }) => {
-                log::warn!("scheduled run {}: send the prompt: {error:#}", run.run_id);
-                self.agent.stop(&session_id, &tab_id);
-                return self.finish(failed(&run.run_id, AGENT_START_FAILED, Some((session_id, tab_id))));
-            }
+        let (session_id, tab_id, kept_running) = match &run.target {
+            Some(target) => match self.agent.send_into(run, &target.session_id, &target.tab_id) {
+                Ok(running) => (target.session_id.clone(), target.tab_id.clone(), running),
+                Err(refusal) => {
+                    log::warn!("scheduled run {}: not sent into its tab: {refusal:?}", run.run_id);
+                    return self.finish(failed(&run.run_id, refusal.category(), None));
+                }
+            },
+            None => match self.agent.start(run, &title_of(run)) {
+                Ok((session_id, tab_id)) => (session_id, tab_id, false),
+                Err(StartError::NotStarted(error)) => {
+                    log::warn!("scheduled run {}: start the agent: {error:#}", run.run_id);
+                    return self.finish(failed(&run.run_id, AGENT_START_FAILED, None));
+                }
+                Err(StartError::SendFailed { session_id, tab_id, error }) => {
+                    log::warn!("scheduled run {}: send the prompt: {error:#}", run.run_id);
+                    self.agent.stop(&session_id, &tab_id);
+                    return self.finish(failed(&run.run_id, AGENT_START_FAILED, Some((session_id, tab_id))));
+                }
+            },
         };
         let ids = Some((session_id.clone(), tab_id.clone()));
         if let Err(error) = self.store.put(&Record::Started { run_id: run.run_id.clone(), session_id: session_id.clone(), tab_id: tab_id.clone() }) {
@@ -431,9 +491,10 @@ impl Runner {
         // Whatever ends the run, its agent process ends with it: a workspace
         // people keep up would otherwise collect one idle CLI per run. The
         // transcript and the resume state stay, so the tab can be continued.
-        // `stopped`: it is already gone.
+        // An agent that was running in the tab before the run is left as it
+        // was. `stopped`: it is already gone.
         let over = |stopped: bool, report: Report| {
-            if !stopped {
+            if !stopped && !kept_running {
                 self.agent.stop(&session_id, &tab_id);
             }
             self.finish(report)
@@ -447,7 +508,7 @@ impl Runner {
                     // or deleted, or it gave up waiting): the turn ends here.
                     Ok(Reported::Settled(state)) => {
                         log::info!("scheduled run {}: {state} on the server; ending its turn", run.run_id);
-                        if !self.end_turn(&session_id, &tab_id) {
+                        if !self.end_turn(&session_id, &tab_id) && !kept_running {
                             self.agent.stop(&session_id, &tab_id);
                         }
                         return self.store.clear();
@@ -694,6 +755,36 @@ impl Agent for ManagerAgent {
             agents.changed(Some(&tab.id), true);
         }
         Ok((entry.id, tab.id))
+    }
+
+    fn send_into(&self, run: &Run, session_id: &str, tab_id: &str) -> Result<bool, TargetError> {
+        let entry = crate::store::index::get(session_id).map_err(|_| TargetError::Gone)?;
+        let tab = entry.tab(tab_id).ok_or(TargetError::Gone)?;
+        // A mode someone asked for in the tab counts too: it applies at the
+        // agent's next start, which this prompt may be.
+        let modes = [Some(tab.permission_mode.as_str()), tab.requested_permission_mode.as_deref()];
+        if tab.harness != run.agent || tab.by_hand() || !modes.into_iter().flatten().all(|mode| MODES.contains(&mode)) {
+            return Err(TargetError::Unfit);
+        }
+        if self.manager.turn_open(session_id, tab_id) || self.awaiting_approval(session_id, tab_id) {
+            return Err(TargetError::Busy);
+        }
+        if self.manager.sign_in_required(session_id, tab_id, &tab.harness).is_some() {
+            return Err(TargetError::SignInRequired);
+        }
+        let running = self.manager.is_running(session_id, tab_id);
+        *self.watched.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((tab_id.to_string(), None));
+        if let Err(error) = self.manager.send(session_id, tab_id, run.prompt.clone(), Vec::new()) {
+            *self.watched.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            if !running {
+                self.stop(session_id, tab_id);
+            }
+            return Err(TargetError::NotSent(error));
+        }
+        if let Some(agents) = self.agents.upgrade() {
+            agents.changed(Some(tab_id), true);
+        }
+        Ok(running)
     }
 
     fn turn(&self, session_id: &str, tab_id: &str) -> Turn {
