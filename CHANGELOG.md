@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Automations
+
+- Use the shared session launch controls for agent, model, effort and permissions,
+  including refreshed model groups and notes. Automation choices stay separate
+  from session preferences, retain Default effort and the unattended bypass
+  warning, and flag unavailable saved models before saving. (#553)
+
 ### Computer use
 
 - Screen Recording **Grant…** opens System Settings with the helper drag tile

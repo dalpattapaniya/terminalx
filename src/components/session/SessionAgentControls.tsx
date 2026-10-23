@@ -23,7 +23,7 @@ import type { useSessionAgent } from "@/lib/useSessionAgent";
  * choices once a launch has begun.
  */
 export function SessionAgentControls({ selection, disabled = false }: { selection: ReturnType<typeof useSessionAgent>; disabled?: boolean }) {
-  const { harnesses, harness, here, models, refreshModels, model, modelId, effort, mode, selectHarness, selectModel, selectEffort, selectMode } = selection;
+  const { harnesses, harness, here, models, refreshModels, model, modelId, effort, mode, selectHarness, selectModel, selectEffort, selectMode, unavailableModel, allowDefaultEffort } = selection;
   const agentMenu = useRowMenu();
   const modelMenu = useRowMenu({ onOpenChange: (open) => open && void refreshModels() });
   const effortMenu = useRowMenu();
@@ -52,11 +52,11 @@ export function SessionAgentControls({ selection, disabled = false }: { selectio
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {harness && model && (
+      {harness && (model || unavailableModel || allowDefaultEffort) && (
         <DropdownMenu {...modelMenu.root}>
           <DropdownMenuTrigger asChild {...modelMenu.trigger}>
             <Button variant="secondary" size="sm" className={pill} title="Model" disabled={disabled}>
-              <span className="truncate">{modelOptionText(model, models)}</span>
+              <span className="truncate">{unavailableModel ? `Unavailable: ${unavailableModel}` : model ? modelOptionText(model, models) : "Agent default"}</span>
               <ChevronDown className="text-faint" />
             </Button>
           </DropdownMenuTrigger>
@@ -86,13 +86,14 @@ export function SessionAgentControls({ selection, disabled = false }: { selectio
         <DropdownMenu {...effortMenu.root}>
           <DropdownMenuTrigger asChild {...effortMenu.trigger}>
             <Button variant="secondary" size="sm" className={pill} title="Effort" disabled={disabled}>
-              <span className="truncate">{effort ? (EFFORT_LABEL[effort] ?? effort) : "Effort"}</span>
+              <span className="truncate">{effort ? (EFFORT_LABEL[effort] ?? effort) : allowDefaultEffort ? "Default" : "Effort"}</span>
               <ChevronDown className="text-faint" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start">
             <DropdownMenuLabel>Effort</DropdownMenuLabel>
             <DropdownMenuRadioGroup value={effort ?? ""} onValueChange={selectEffort}>
+              {allowDefaultEffort && <DropdownMenuRadioItem value="">Default</DropdownMenuRadioItem>}
               {model.efforts.map((e) => (
                 <DropdownMenuRadioItem key={e} value={e}>
                   {EFFORT_LABEL[e] ?? e}

@@ -38,19 +38,29 @@ vi.mock("@/lib/models", async (original) => ({
   ...(await original<typeof import("@/lib/models")>()),
   BYPASS_MODE: "bypassPermissions",
   DEFAULT_AUTOMATION_MODE: "bypassPermissions",
-  EFFORT_LABEL: {},
   PERMISSION_MODES: [
     { id: "manual", label: "Ask every time" },
     { id: "auto", label: "Auto" },
     { id: "bypassPermissions", label: "Bypass permissions" },
   ],
   bypassEffect: () => ({ flag: "--dangerously-skip-permissions", effect: "Claude Code stops asking about anything." }),
-  useModels: () => [{ id: "sonnet", label: "Sonnet", harness: "claude", isDefault: true, efforts: [], defaultEffort: null }],
+  refreshModels,
+  useModels: (harness?: string) => catalog.models.filter((m) => !harness || m.harness === harness),
 }));
 // The interactive-session preference is deliberately "auto" (and "manual" in
 // one test) so a leak from prefs.lastMode into a new automation is visible.
-const prefs = vi.hoisted(() => ({ lastProject: "/repo", lastAgent: "claude", lastModel: {} as Record<string, string>, lastMode: "auto" }));
+const { catalog, refreshModels, setPrefs } = vi.hoisted(() => ({
+  catalog: { models: [
+    { id: "sonnet", label: "Sonnet", harness: "claude", isDefault: true, efforts: ["low", "high"], defaultEffort: "high", alias: true },
+    { id: "claude-sonnet-4-6", label: "Sonnet 4.6", harness: "claude", isDefault: false, efforts: ["low", "high"], defaultEffort: "high", alias: false },
+    { id: "gpt-6-astra", label: "GPT-6 Astra", harness: "codex", isDefault: true, efforts: ["low", "medium"], defaultEffort: "medium", alias: false },
+  ] },
+  refreshModels: vi.fn(async () => {}),
+  setPrefs: vi.fn(),
+}));
+const prefs = vi.hoisted(() => ({ lastProject: "/repo", lastAgent: "claude", lastModel: {} as Record<string, string>, lastMode: "auto", lastEffort: {} as Record<string, string> }));
 vi.mock("@/lib/prefs", () => ({
+  setPrefs,
   usePrefs: () => prefs,
   getPrefs: () => prefs,
   subscribePrefs: () => () => {},
@@ -59,12 +69,13 @@ vi.mock("@/lib/sessions", () => ({
   selectSession,
   useSessionStore: () => ({
     projects: [{ path: "/repo", name: "Raccoon" }, { path: "/docs", name: "Docs", kind: "folder" }],
-    harnesses: [{ id: "claude", name: "Claude Code", available: true }],
+    harnesses: [{ id: "claude", name: "Claude Code", available: true }, { id: "codex", name: "Codex", available: true }],
     sessions: [{ id: "session-7", title: "Automation run 7", projectPath: "/repo", archived: false }],
   }),
 }));
 
 const { AutomationsView } = await import("./AutomationsView");
+const initialModels = structuredClone(catalog.models);
 
 function automation(id: string, name: string): Automation {
   return {
@@ -129,6 +140,7 @@ function run(overrides: Partial<AutomationRun> = {}): AutomationRun {
 }
 
 beforeEach(() => {
+  catalog.models = structuredClone(initialModels);
   automationStore.automations = [
     automation("automation-1", "Dependency audit"),
     { ...automation("automation-2", "Release notes"), projectPath: "/docs" },
@@ -136,6 +148,10 @@ beforeEach(() => {
   automationStore.runs = { "automation-1": [run()] };
   automationStore.loadingRuns = {};
   prefs.lastMode = "auto";
+  prefs.lastModel = {};
+  prefs.lastEffort = {};
+  refreshModels.mockClear();
+  setPrefs.mockClear();
   selectSession.mockReset();
   openUrl.mockReset();
   createAutomation.mockReset();
@@ -256,7 +272,7 @@ describe("automation workspace navigation", () => {
 });
 
 describe("automation permission mode", () => {
-  const permissions = () => screen.getByRole("combobox", { name: "Permissions" }) as HTMLSelectElement;
+  const permissions = () => screen.getByTitle("Permissions");
   const trigger = (name: string) => screen.getByRole("radio", { name });
   const bypassWarning = () => screen.queryByRole("note", { name: "Bypass permissions warning" });
 
@@ -266,7 +282,7 @@ describe("automation permission mode", () => {
     fireEvent.click(screen.getByRole("button", { name: "New automation" }));
     await screen.findByRole("heading", { name: "New automation" });
 
-    expect(permissions().value).toBe("bypassPermissions");
+    expect(permissions().textContent).toBe("Bypass permissions");
     expect(bypassWarning()).toBeTruthy();
     expect(bypassWarning()!.textContent).toContain("Claude Code stops asking about anything.");
 
@@ -284,24 +300,24 @@ describe("automation permission mode", () => {
 
     // The default survives the switch to GitHub issues (it used to reset to Auto).
     fireEvent.click(trigger("GitHub issues"));
-    expect(permissions().value).toBe("bypassPermissions");
+    expect(permissions().textContent).toBe("Bypass permissions");
     expect(bypassWarning()).toBeTruthy();
     expect(screen.getByText(/Issue titles and descriptions can be untrusted/).textContent).toContain("each run uses the Permissions mode chosen above");
     expect(screen.queryByText(/start in Auto permissions/)).toBeNull();
 
     // An explicit choice survives too, both ways, and the warning follows the mode.
-    fireEvent.change(permissions(), { target: { value: "manual" } });
+    await pick("Permissions", "Ask every time");
     expect(bypassWarning()).toBeNull();
     fireEvent.click(trigger("Schedule"));
-    expect(permissions().value).toBe("manual");
+    expect(permissions().textContent).toBe("Ask every time");
     fireEvent.click(trigger("GitHub issues"));
-    expect(permissions().value).toBe("manual");
+    expect(permissions().textContent).toBe("Ask every time");
     expect(bypassWarning()).toBeNull();
 
-    fireEvent.change(permissions(), { target: { value: "bypassPermissions" } });
+    await pick("Permissions", "Bypass permissions");
     expect(bypassWarning()).toBeTruthy();
     fireEvent.click(trigger("Schedule"));
-    expect(permissions().value).toBe("bypassPermissions");
+    expect(permissions().textContent).toBe("Bypass permissions");
   });
 
   it("preserves an explicitly configured non-bypass mode through edit, disable, re-enable and Run now", async () => {
@@ -312,7 +328,7 @@ describe("automation permission mode", () => {
     // Edit: the saved mode is shown, not the interactive default, and is saved back untouched.
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     await screen.findByRole("heading", { name: "Edit automation" });
-    expect(permissions().value).toBe("manual");
+    expect(permissions().textContent).toBe("Ask every time");
     expect(bypassWarning()).toBeNull();
     fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Dependency audit (manual)" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
@@ -340,7 +356,7 @@ describe("automation permission mode", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     await screen.findByRole("heading", { name: "Edit automation" });
-    expect(permissions().value).toBe("bypassPermissions");
+    expect(permissions().textContent).toBe("Bypass permissions");
     expect(bypassWarning()).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
@@ -362,4 +378,94 @@ it("offers existing-session automations without Git actions for folders", async 
   } finally {
     prefs.lastProject = "/repo";
   }
+});
+
+async function pick(title: string, name: string) {
+  fireEvent.click(screen.getByTitle(title));
+  fireEvent.click(await screen.findByRole(title === "Agent" ? "menuitem" : "menuitemradio", { name }));
+}
+
+describe("automation launch controls", () => {
+  async function edit() {
+    const view = render(<AutomationsView />);
+    fireEvent.click(screen.getByRole("button", { name: /Dependency audit/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await screen.findByRole("heading", { name: "Edit automation" });
+    return view;
+  }
+
+  it("uses a valid saved preference when models arrive after opening a new draft", async () => {
+    prefs.lastModel = { claude: "claude-sonnet-4-6" };
+    catalog.models = [];
+    const view = render(<AutomationsView />);
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Unsaved draft" } });
+    catalog.models = structuredClone(initialModels);
+    view.rerender(<AutomationsView />);
+    expect(screen.getByTitle("Model").textContent).toBe("Sonnet 4.6");
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Unsaved draft");
+    expect(setPrefs).not.toHaveBeenCalled();
+  });
+
+  it("keeps the draft when a refresh removes its model", async () => {
+    const view = await edit();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Unsaved draft" } });
+    catalog.models = catalog.models.filter((m) => m.id !== "sonnet");
+    view.rerender(<AutomationsView />);
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Unsaved draft");
+    expect(screen.getByTitle("Model").textContent).toBe("Unavailable: sonnet");
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("refreshes grouped, annotated models without resetting the edit and saves Default effort", async () => {
+    await edit();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Changed audit" } });
+    fireEvent.click(screen.getByTitle("Model"));
+    expect(refreshModels).toHaveBeenCalledOnce();
+    expect(await screen.findByText("Pinned version")).toBeTruthy();
+    expect(screen.getByRole("menuitemradio", { name: "Sonnetlatest" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Sonnet 4.6" }));
+    await pick("Effort", "High");
+    await pick("Effort", "Default");
+    await pick("Permissions", "Bypass permissions");
+    expect(screen.getByRole("note", { name: "Bypass permissions warning" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(updateAutomation).toHaveBeenCalledWith("automation-1", expect.objectContaining({
+      name: "Changed audit", model: "claude-sonnet-4-6", effort: null, mode: "bypassPermissions",
+    })));
+    expect(setPrefs).not.toHaveBeenCalled();
+    expect(prefs.lastMode).toBe("auto");
+  });
+
+  it.each(["retired-model", "gpt-6-astra"])("flags saved unavailable model %s until explicitly replaced", async (model) => {
+    automationStore.automations[0].model = model;
+    await edit();
+    expect(screen.getByTitle("Model").textContent).toBe(`Unavailable: ${model}`);
+    expect(screen.getByRole("alert").textContent).toContain("Model no longer available");
+    expect((screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+    await pick("Model", "Sonnetlatest");
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(updateAutomation).toHaveBeenCalledWith("automation-1", expect.objectContaining({ model: "sonnet" })));
+  });
+
+  it("validates retired preferences for a new automation and resets model and effort on agent switch", async () => {
+    prefs.lastModel = { claude: "retired", codex: "sonnet" };
+    prefs.lastEffort = { codex: "max" };
+    render(<AutomationsView />);
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    expect(screen.getByTitle("Model").textContent).toContain("Sonnet");
+    await pick("Effort", "High");
+    await pick("Agent", "Codex");
+    expect(screen.getByTitle("Model").textContent).toBe("GPT-6 Astra");
+    expect(screen.getByTitle("Effort").textContent).toBe("Default");
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Codex audit" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Prompt" }), { target: { value: "Audit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create automation" }));
+    await waitFor(() => expect(createAutomation).toHaveBeenCalledWith(expect.objectContaining({
+      harness: "codex", model: "gpt-6-astra", effort: null, mode: "bypassPermissions",
+    })));
+    expect(setPrefs).not.toHaveBeenCalled();
+    expect(prefs.lastModel).toEqual({ claude: "retired", codex: "sonnet" });
+  });
 });
