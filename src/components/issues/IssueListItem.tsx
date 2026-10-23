@@ -6,7 +6,21 @@ import { PipelineStatus } from "@/components/issues/IssuePipelinePanel";
 import { AvatarStack } from "@/components/issues/People";
 import { IssueWorkChip } from "@/components/issues/IssueWork";
 import type { IssueWorker } from "@/lib/issueWork";
+import { parseCloudWorkspaceKey } from "@/types/target";
 import type { IssuePipeline } from "@/types/issuePipeline";
+
+/** Match identity, not place: another session on this Mac still needs its chip. */
+function isPipelineAuthor(worker: IssueWorker, pipeline: IssuePipeline): boolean {
+  const author = pipeline.author.sessionId;
+  if (!worker.you) return false;
+  if (!pipeline.cloud) return worker.place === "this" && worker.sessionId === author;
+  if (worker.place !== "cloud" || !worker.cloud) return false;
+  const target = parseCloudWorkspaceKey(author);
+  if (!target?.sessionId) return false;
+  // Older publishers omit the organization; the opaque server claim key is
+  // for deduplication and is not a session identity.
+  return worker.claimSessionId === author || worker.claimSessionId === `cloud:${target.workspaceId}:${target.sessionId}`;
+}
 
 /** The compact issue rendering shared by the Issues view and trigger preview. */
 export function IssueListItem({
@@ -32,8 +46,8 @@ export function IssueListItem({
   onSelect?: () => void;
 }) {
   const assignees = issue.assignees ?? (issue.assignee ? [issue.assignee] : []);
-  // A pipeline already says what this Mac's session is doing.
-  const workers = pipeline ? work.filter((worker) => worker.place !== "this") : work;
+  // The pipeline already describes its author, wherever that session runs.
+  const workers = pipeline ? work.filter((worker) => !isPipelineAuthor(worker, pipeline)) : work;
   return (
     <button
       type="button"
