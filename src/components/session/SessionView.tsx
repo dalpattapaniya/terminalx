@@ -467,7 +467,7 @@ export function SessionView({
   useEffect(() => {
     const opening = openedOn.current !== session.id;
     openedOn.current = session.id;
-    if (!local || session.tabs.length) return;
+    if (!local || session.tabs.length || shownKind.current === "browser" || shownKind.current === "terminal") return;
     if (!opening && (!compact || shownKind.current)) return;
     // A compact window has no panel to open.
     if (!compact && !getPrefs().panelOpen) setPrefs({ panelOpen: true });

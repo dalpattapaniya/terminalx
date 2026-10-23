@@ -410,7 +410,9 @@ describe("cloud followers at launch", () => {
 describe("welcome routing", () => {
   it("shows the resting view without checkout panels and keeps the titlebar draggable", () => {
     sessionStore.view = "welcome";
+    shortcuts.clear();
     const { container } = render(<AppShell />);
+    expect(shortcuts.has("session.reopenTab")).toBe(true);
     expect(screen.getByTestId("welcome")).toBeTruthy();
     expect(screen.queryByTestId("new-session")).toBeNull();
     expect(screen.queryByTestId("right-panel")).toBeNull();

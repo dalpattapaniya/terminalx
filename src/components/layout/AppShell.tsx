@@ -6,6 +6,7 @@ import { WithTooltip } from "@/components/ui/tooltip";
 import type { SettingsTab } from "@/components/settings/SettingsPage";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { NewSessionView } from "@/components/session/NewSessionView";
+import { WelcomeTabActions } from "@/components/start/WelcomeTabActions";
 import { WelcomeScreen } from "@/components/start/WelcomeScreen";
 import { StartScreen } from "@/components/start/StartScreen";
 import { ProjectStartDialogHost } from "@/components/start/ProjectStartDialogs";
@@ -365,6 +366,7 @@ function UnselectedWorkspace({
         </header>
         <section className="@container/editor-host relative flex min-h-0 flex-1">
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {store.view === "welcome" && <WelcomeTabActions />}
             {store.view === "issues" ? (
               <IssuesView
                 onCreated={onCreated}

@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CloudWorkspaceListItem } from "@/lib/api";
 import type { AgentEvent, Payload } from "@/types/events";
 import type { SessionEntry } from "@/types/session";
+import { page as browserPage } from "@/test/tabsBackend";
+import { refreshBrowserPages } from "@/lib/browser";
 import { guardedApi } from "@/test/guardedApi";
 
 // PRO-86: the chat / terminal switch on local and cloud agent tabs. The cloud
@@ -50,6 +52,7 @@ vi.mock("@/components/terminal/TerminalView", () => ({
   ),
   createTerminal: () => mocks.createTerminal(),
 }));
+vi.mock("@/components/browser/BrowserView", () => ({ BrowserView: () => <div data-testid="browser-view" /> }));
 vi.mock("@/components/raccoon/Raccoon", () => ({ RaccoonRunner: () => null, RaccoonScene: () => null }));
 vi.mock("@/components/chat/Composer", async () => {
   const { useEffect } = await import("react");
@@ -419,6 +422,24 @@ describe("a local session's row of tabs under the title bar", () => {
     expect(tabs().map((item) => [item.getAttribute("aria-label"), item.getAttribute("aria-selected")])).toEqual([["Terminal 1", "true"]]);
     expect(screen.queryByRole("button", { name: "Continue in New Session…" })).toBeNull();
     expect(spawned()).toHaveLength(1);
+  });
+
+  it("does not open a shell when returning to a reopened browser-only workspace", async () => {
+    const session = local({ tabs: [], activeTab: null });
+    guard.handlers.browser_pages = () => [browserPage("reopened-page", session.cwd, 1)];
+    await refreshBrowserPages();
+    upsertSession(session);
+    selectSessionTab(session.id, { kind: "browser", id: "reopened-page" });
+    const view = render(wrap(<Local />));
+    try {
+      await settle();
+      expect(screen.getByTestId("browser-view")).toBeTruthy();
+      expect(spawned()).toHaveLength(0);
+    } finally {
+      view.unmount();
+      guard.handlers.browser_pages = () => [];
+      await refreshBrowserPages();
+    }
   });
 
   it("returns to welcome without spawning a shell when the last tab closes", async () => {

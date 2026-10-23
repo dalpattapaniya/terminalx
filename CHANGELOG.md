@@ -8,7 +8,9 @@
   build name, project/session actions and the current keyboard shortcuts.
   Share its layout with first-run open/clone/quick-start options and compact
   Issues and Skills empty detail panes. Explicit New session still opens the
-  form; closing, archiving or deleting the selection returns to welcome. (#445)
+  form; closing, archiving or deleting the selection returns to welcome.
+  Cloud archival respects later navigation, and Reopen closed tab still works
+  from welcome after closing the last tab, including Close all. (#445)
 
 ### Stats & Usage
 

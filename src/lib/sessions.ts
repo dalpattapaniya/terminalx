@@ -28,6 +28,8 @@ interface State {
   /** The folder New chat runs in; its sessions are chats, listed apart from projects. */
   chatsPath: string | null;
   selectedSessionId: string | null;
+  /** The workspace whose last tab closed, available to Reopen while at welcome. */
+  closedWorkspaceSessionId: string | null;
   /** Explicit navigation also reveals a destination that was collapsed. */
   navigationVersion: number;
   /** What the workspace shows when no session is selected. */
@@ -71,6 +73,7 @@ let state: State = {
   harnesses: [],
   chatsPath: null,
   selectedSessionId: null,
+  closedWorkspaceSessionId: null,
   navigationVersion: 0,
   view: "welcome",
   newIssueRequested: false,
@@ -99,6 +102,8 @@ function set(patch: Partial<State>) {
       next.view = "welcome";
     }
   }
+  if ((patch.view && patch.view !== "welcome") || patch.selectedSessionId || patch.selectedCloudWorkspace) next.closedWorkspaceSessionId = null;
+  if (patch.sessions && next.closedWorkspaceSessionId && !patch.sessions.some((session) => session.id === next.closedWorkspaceSessionId && !session.archived && !session.worktreeRemoved)) next.closedWorkspaceSessionId = null;
   // Clear the draft destination when navigating away, not in React cleanup
   // (Strict Mode also runs cleanup when a workspace first mounts).
   if ((patch.view && patch.view !== "new") || patch.selectedSessionId) next.newSessionPreset = null;
@@ -244,8 +249,8 @@ function focusProject(path: string | null, patch: Partial<State> = {}) {
 }
 
 /** Return to the resting screen without requesting a new session. */
-export function openWelcome() {
-  set({ selectedSessionId: null, view: "welcome", selectedAutomationId: null });
+export function openWelcome(closedWorkspaceSessionId: string | null = null) {
+  set({ selectedSessionId: null, view: "welcome", selectedAutomationId: null, closedWorkspaceSessionId });
 }
 
 export function selectSession(id: string | null) {

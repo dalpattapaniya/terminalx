@@ -267,7 +267,7 @@ export async function closeTabs(row: TabRow, closing: readonly PeerTab[], select
   for (const tab of ordered) {
     await endPeer(row.session.id, tab).catch((error) => console.error("closing a tab failed", error));
   }
-  if (getSessionStore().selectedSessionId === row.session.id && !fresh(row).tabs.length) openWelcome();
+  if (getSessionStore().selectedSessionId === row.session.id && !fresh(row).tabs.length) openWelcome(row.session.id);
 }
 
 // ---------------------------------------------------------------- reopening
@@ -329,6 +329,7 @@ export async function reopenClosedTab(row: TabRow): Promise<boolean> {
   const was = last.page;
   forgetClosed(was.key);
   const key = tabKey("browser", await openPage(row.session, was.page!.url));
+  if (getSessionStore().selectedSessionId !== row.session.id) selectSession(row.session.id);
   restorePlace(row, key, { ...was, key });
   return true;
 }

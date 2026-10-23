@@ -219,7 +219,7 @@ export async function closePeer(sessionId: string, tab: PeerTab, tabs: PeerTab[]
   }
   await endPeer(sessionId, tab);
   const current = getSessionStore().sessions.find((session) => session.id === sessionId);
-  if (current && getSessionStore().selectedSessionId === sessionId && !workspaceRow(current).tabs.length) openWelcome();
+  if (current && getSessionStore().selectedSessionId === sessionId && !workspaceRow(current).tabs.length) openWelcome(sessionId);
 }
 
 /** A page's label for the sidebar and tab strip: its title, else its host. */
