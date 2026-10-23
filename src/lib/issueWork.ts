@@ -268,17 +268,18 @@ export function cloudWorkers(input: CloudWorkInput, now = Date.now()): Map<strin
     if (pipeline?.place && (pipeline.place.orgId !== orgId || pipeline.place.workspaceId !== workspaceId)) continue;
     if (row && row.projectKey !== input.projectPath) continue;
     if (!row && pipeline?.projectPath !== input.projectPath && !candidate.started) continue;
-    // A pipeline can precede the session index. Once an observed author leaves
-    // the authoritative list, no pipeline-cache refresh can bring it back.
+    // A new author can precede its index entry briefly. Bound that grace by
+    // the actual start, never the workspace-wide pipeline-cache read time.
     const cached = org.sessions[workspaceId];
     const list = input.liveSessions(orgId, workspaceId) ?? cached?.sessions;
     const session = list?.find((session) => session.id === sessionId);
     const heardAt = Math.max(candidate.started?.at ?? 0, pipeline?.place?.readAt ?? 0);
     if (session?.archived || row?.archived) continue;
     if (!session && list && input.observed?.has(key)) continue;
-    const settling = !input.observed?.has(key) && now - heardAt < POLL_MS * 2;
-    if (!session && cached && cached.at > heardAt && !settling) continue;
-    if (!row && !session && now - heardAt >= RECENT_MS) continue;
+    const startedAt = candidate.started?.at ?? (Date.parse(pipeline?.created ?? "") || 0);
+    const settling = !input.observed?.has(key) && startedAt >= input.windowStartedAt && Math.abs(now - startedAt) < POLL_MS * 2;
+    if (!session && list && !settling) continue;
+    if (!row && !session && !settling) continue;
     const lastActive = Math.max(Date.parse(row?.modified ?? session?.modified ?? pipeline?.modified ?? "") || 0, candidate.started?.at ?? 0);
     // A freshly fetched workspace catalog does not make a saved tab state live.
     const runtimeEvidence = row && (row.connected || row.tabs.some((tab) => tab.from !== "cache") || (row.reportedAt !== null && now - row.reportedAt < RECENT_MS));

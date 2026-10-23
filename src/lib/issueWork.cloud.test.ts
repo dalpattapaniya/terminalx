@@ -97,6 +97,40 @@ describe("known cloud issue authors", () => {
     expect(workers(input, now + 10000)).toHaveLength(1);
   });
 
+  it("excludes an author deleted before Issues opens despite later workspace pipeline refreshes", () => {
+    const input = world();
+    // No prior projection or observed set: deletion happened with Issues closed.
+    input.sessions = [];
+    input.liveSessions = () => [];
+    input.catalog.orgs.org.sessions.ws = { sessions: [], at: now - 1000, capabilities: [] };
+    const deleted = { ...pipeline(), created: new Date(now - 60000).toISOString() };
+    for (const readAt of [now, now + 1000, now + 60000, now + 120000]) {
+      input.pipelines = [{ ...deleted, modified: new Date(readAt).toISOString(), place: { ...deleted.place!, readAt } }];
+      const found = workers(input, readAt);
+      expect(found).toEqual([]);
+      expect(mine(found)).toBe(false);
+      expect(taken(found)).toBe(false);
+      expect(workToWarnAbout(found)).toEqual([]);
+    }
+    input.liveSessions = () => null; // The same authoritative cached absence survives disconnect.
+    expect(workers(input, now + 120000)).toEqual([]);
+  });
+
+  it("bounds unseen pending authors by their start rather than shared pipeline refreshes", () => {
+    const input = world();
+    input.sessions = [];
+    input.liveSessions = () => [];
+    input.catalog.orgs.org.sessions.ws = { sessions: [], at: now - 1000, capabilities: [] };
+    input.pipelines = [pipeline()];
+    expect(workers(input)).toHaveLength(1); // A new author can precede its index entry.
+    for (const readAt of [now + 45000, now + 90000]) {
+      input.pipelines = [{ ...pipeline(), modified: new Date(readAt).toISOString(), place: { ...pipeline().place!, readAt } }];
+      expect(workers(input, readAt)).toEqual([]);
+    }
+    input.liveSessions = () => [session];
+    expect(workers(input, now + 90000)).toHaveLength(1);
+  });
+
   it("keeps a pending visible pipeline author until a newer session list removes it", () => {
     const input = world();
     input.sessions = [];

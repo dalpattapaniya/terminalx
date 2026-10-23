@@ -38,8 +38,9 @@
 - Count your known cloud issue authors immediately in work filters and duplicate-start
   warnings, deduplicate arriving account claims, and open an existing cloud author
   from the warning. Preserve live account evidence when deduplicating and keep
-  removed authors excluded across pipeline refreshes. Exclude reviewers and
-  stale sessions. (#572)
+  removed authors excluded across pipeline refreshes, even before Issues opens.
+  Bound pending-author grace by the actual start. Exclude reviewers and stale
+  sessions. (#572)
 
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
