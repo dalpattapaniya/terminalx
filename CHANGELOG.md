@@ -6,6 +6,9 @@
 
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)
+- A cloud issue that cannot start because an agent needs sign-in now offers
+  **Open Agent logins** for the failed request’s organization, even if you
+  switch projects while it starts. (#573)
 
 ### Computer use
 
