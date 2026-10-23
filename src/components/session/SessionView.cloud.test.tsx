@@ -328,6 +328,9 @@ class FakeRuntime implements WorkspaceTransport {
         return ok({ repositories: this.repositories });
       case "git.status":
         return ok({ repository: true, repo: params.repo, branch: "tx/login-fix", head: "abc", upstream: null, ahead: 0, behind: 0, defaultBranch: "main", aheadOfBase: 1, dirty: true, operation: null, conflicted: [], files: [] });
+      case "git.reviewRange":
+        return ok({ target: "main", base: "base-tree", head: "live-tree" });
+      case "git.changesBetween":
       case "git.workingChanges":
         return ok({ head: "abc", files: [{ path: `${String(params.repo)}/src/login.ts`, status: "modified", additions: 3, deletions: 1 }], truncated: false });
       case "git.log":
@@ -460,6 +463,8 @@ describe("the same SessionView for local and cloud sessions", () => {
     guard.handlers.session_share_status = () => ({ active: false, links: [], people: [], leases: [], notes: [], activity: [], queue: [] });
     guard.strict = false;
     guard.local = () => [];
+    guard.handlers.review_range = () => ({ target: "main", base: "base-tree", head: "live-tree" });
+    guard.handlers.changes_between = () => [];
     guard.handlers.work_status = () => ({ isRepo: true, dirty: false, branch: "main", ahead: 0, behind: 0 });
     const local: SessionEntry = {
       id: "local-1",
@@ -805,9 +810,9 @@ describe("the right panel of a cloud session", () => {
     const picker = (await screen.findByRole("combobox", { name: "Repository" })) as HTMLSelectElement;
     expect([...picker.options].map((option) => option.value)).toEqual(["api", "web"]);
     await waitFor(() => expect(runtime.methods("git.status").some((frame) => (frame.params as { repo: string }).repo === "api")).toBe(true));
-    fireEvent.click(await screen.findByRole("button", { name: "View all uncommitted changes" }));
+    expect(await screen.findByText("All changes · 1 file")).toBeTruthy();
     expect(await screen.findByRole("button", { name: /login\.ts/ })).toBeTruthy();
-    expect(runtime.methods("git.workingChanges").map((frame) => (frame.params as { repo: string }).repo)).toContain("api");
+    expect(runtime.methods("git.reviewRange").map((frame) => (frame.params as { repo: string }).repo)).toContain("api");
 
     fireEvent.change(screen.getByRole("combobox", { name: "Repository" }), { target: { value: "web" } });
     await waitFor(() => expect(runtime.methods("git.status").some((frame) => (frame.params as { repo: string }).repo === "web")).toBe(true));

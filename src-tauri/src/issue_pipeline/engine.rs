@@ -28,12 +28,6 @@ use super::{categories, prompts, store, MergeRecord, MergeRequest, MergedBy, Pip
 /// How long checks may stay unfinished before a person is asked to look.
 pub const CHECKS_WAIT_MINUTES: u32 = 60;
 
-/// How long a head must have been on the pull request before anything is
-/// concluded from its checks. CI lists a commit's checks a moment after the
-/// push; until it has, "no check is failing" and "there are no checks" say
-/// nothing about the commit.
-pub const HEAD_SETTLE_SECONDS: i64 = 90;
-
 /// How many times a pull request is read again while it still shows the head
 /// from before a push.
 const HEAD_CATCH_UP_TRIES: u32 = 5;
@@ -691,20 +685,14 @@ impl Step<'_> {
             security_areas: &self.p.security_areas,
             protected: if by_person { &[] } else { &protected },
             ignored_checks: &self.settings.ignored_checks,
+            allow_no_ci: self.settings.allow_no_ci,
         });
         self.p.stage = Stage::Merge;
         self.p.pr = Some(link.clone());
         if !matches!(decision, Gate::Wait(_)) {
             self.p.waiting_since = None;
         }
-        // The reviewed head only just reached GitHub: its checks may not be
-        // listed yet, and an empty list would read as nothing failing.
         let passes = matches!(decision, Gate::Merge { .. } | Gate::ReadyToMerge(_));
-        let age = self.p.review_requested_at.as_deref().and_then(|at| self.seconds_since(at));
-        if passes && age.is_some_and(|age| age < HEAD_SETTLE_SECONDS) {
-            self.settle(State::Waiting, None, format!("Giving checks a moment to be reported on {}.", short(&pr.head_sha)));
-            return Ok(());
-        }
         // A merge GitHub took for this head and has not made yet (a merge
         // queue) is waited for: not asked for again, and not reported as
         // "ready, automatic merge is off" when the switch was turned off

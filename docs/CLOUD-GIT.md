@@ -35,6 +35,7 @@ runtime.
 | `git.status` | participate | Porcelain files, `branch`, `upstream`, `ahead`/`behind`, `defaultBranch`, `aheadOfBase`, `conflicted` (unmerged paths), `operation` (`merge`/`rebase`/`cherry-pick` in progress). `{ repository: false }` when the workspace has none and no `repo` was named. |
 | `git.diff` | participate | Unified diff (≤ 768 KiB, `truncated`). |
 | `git.workingChanges` | participate | The desktop's `working_changes`: HEAD's tree and the changed files against it, untracked included (≤ 2000). |
+| `git.reviewRange` | participate | Stable `base` and live snapshot `head` tree ids for workspace review, including untracked files. `uncommitted: true` compares against HEAD (empty tree in an unborn repository); otherwise `target` selects the merge base with HEAD. Without a target, prefer origin/HEAD, then the default local branch. Returns the resolved target name; invalid targets fail. |
 | `git.changesBetween` | participate | Files changed between two tree ids (a commit's changes from `git.log`'s `tree`/`parent`). |
 | `git.fileContents` | participate | One file at tree `base` and at tree `head` or in the working tree; each side ≤ 384 KiB. A working-tree read never follows a link out of the workspace. |
 | `git.log` | participate | Commits (`from` a commit id), bodies ≤ 4 KiB. |

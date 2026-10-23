@@ -209,6 +209,9 @@ impl Rig {
             pending: HashMap::new(),
             queued: Vec::new(),
             turn_open: false,
+            turn_opener: None,
+            compact_completed: false,
+            compact_boundary_at: None,
             turn_started_at: None,
             turn_by_command: false,
             last_activity: now,
@@ -504,6 +507,267 @@ fn a_hung_agent_with_no_output_and_no_events_still_raises_the_warning() {
     assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
     assert_eq!(rig.status(), TabStatus::Waiting);
     assert_eq!(rig.banner(), Some(RecoveryKind::Timeout));
+}
+
+/// Synthetic Claude records exercise the actual tail, decoder, session pump and
+/// watcher. No provider process, real transcript or five-minute wait is needed.
+fn compact_records(trigger: &str) -> String {
+    format!("{}\n{}\n", json!({
+        "type": "system", "subtype": "compact_boundary", "uuid": "compact-boundary",
+        "timestamp": "2026-10-20T11:59:59.000Z",
+        "compactMetadata": { "trigger": trigger, "preTokens": 1000, "postTokens": 100 }
+    }), json!({
+        "type": "user", "uuid": "compact-summary", "isCompactSummary": true,
+        "isVisibleInTranscriptOnly": true,
+        "timestamp": "2026-10-20T12:00:00.000Z",
+        "message": { "role": "user", "content": "PRIVATE SYNTHETIC SUMMARY" }
+    }))
+}
+
+fn compact_prompt() -> String {
+    format!("{}\n", json!({ "type": "user", "uuid": "compact-command",
+        "timestamp": "2026-10-20T11:59:58.000Z",
+        "message": { "role": "user", "content": "<command-name>/compact</command-name><command-args></command-args>" }
+    }))
+}
+
+#[test]
+fn completed_compaction_never_becomes_a_stall() {
+    for scenario in ["manual", "automatic", "idle", "never_started"] {
+        // Exercise both one tail read and separate reads around the summary.
+        for split in [false, true] {
+            let rig = Rig::new();
+            if matches!(scenario, "manual" | "idle") {
+                rig.start_turn();
+                rig.end_turn_in_transcript();
+                rig.advance(PATIENCE.settle);
+                rig.tick();
+            }
+            let records = compact_records(if scenario == "manual" { "manual" } else { "auto" });
+            if scenario == "manual" {
+                rig.append(&compact_prompt());
+                if split {
+                    rig.append(&records);
+                    // Claude writes the command again after its summary.
+                    rig.append(&compact_prompt().replace("compact-command", "compact-command-repeated"));
+                } else {
+                    rig.append(&(records + &compact_prompt().replace("compact-command", "compact-command-repeated")));
+                }
+            } else {
+                if scenario == "automatic" {
+                    rig.start_turn();
+                }
+                rig.append(&records);
+                if scenario == "automatic" {
+                    rig.end_turn_in_transcript();
+                }
+            }
+            rig.advance(PATIENCE.stall + MOMENT);
+            rig.tick();
+            assert!(!rig.turn_open(), "{scenario}, split={split}");
+            assert_ne!(rig.status(), TabStatus::InProgress, "{scenario}");
+            assert_eq!(rig.recovery(), None, "{scenario}");
+            assert_eq!(rig.banner(), None, "{scenario}");
+            let summary = rig.events().into_iter().find(|e| matches!(e.payload, Payload::CompactionSummary { .. })).unwrap();
+            assert_eq!(summary.ts, "2026-10-20T12:00:00.000Z");
+        }
+    }
+}
+
+#[test]
+fn compaction_does_not_hide_a_real_hung_turn() {
+    for manual in [false, true] {
+        let rig = Rig::new();
+        rig.start_turn();
+        if manual { rig.append(&compact_prompt()); }
+        rig.append(&compact_records(if manual { "manual" } else { "auto" }));
+        rig.advance(PATIENCE.stall);
+        rig.tick();
+        assert!(rig.turn_open());
+        assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+    }
+}
+
+#[test]
+fn compact_after_a_command_or_unsettled_turn_completes() {
+    for before in ["command", "ended_same_read", "ended_previous_read"] {
+        let rig = Rig::new();
+        if before == "command" {
+            rig.append(&compact_prompt().replace("/compact", "/help"));
+            rig.append(&compact_prompt().replace("compact-command", "next-command"));
+        } else {
+            rig.start_turn();
+            if before == "ended_same_read" {
+                rig.append(&(first_turn().1 + &compact_prompt()));
+            } else {
+                rig.end_turn_in_transcript();
+                rig.append(&compact_prompt());
+            }
+        }
+        rig.append(&compact_records("manual"));
+        rig.advance(PATIENCE.stall + MOMENT);
+        rig.tick();
+        assert!(!rig.turn_open(), "{before}");
+        assert_eq!(rig.recovery(), None, "{before}");
+    }
+}
+
+#[test]
+fn a_repeated_compact_record_does_not_reopen_a_completed_command() {
+    let rig = Rig::new();
+    rig.append(&compact_prompt());
+    rig.append(&compact_records("manual"));
+    rig.advance(PATIENCE.settle);
+    rig.tick();
+    assert!(!rig.turn_open());
+    rig.append(&compact_prompt().replace("compact-command", "repeated-command"));
+    rig.advance(PATIENCE.stall + MOMENT);
+    rig.tick();
+    assert!(!rig.turn_open());
+    assert_eq!(rig.recovery(), None);
+}
+
+#[test]
+fn a_queued_compact_echo_preserves_command_classification() {
+    for completed in [false, true] {
+        let rig = Rig::new();
+        rig.start_turn();
+        let prompt = PromptText { shared_connection: None, author: None, agent: "/compact".into(), display: "/compact".into() };
+        let (sent, queued) = rig.manager.record_composer_prompt(
+            &mut rig.rt.lock().unwrap(), &prompt, vec![], rig._dir.path().to_str().unwrap(), None,
+        );
+        assert!(queued);
+        rig.end_turn_in_transcript();
+        rig.advance(PATIENCE.settle);
+        rig.tick();
+        assert!(!rig.turn_open());
+
+        rig.append(&compact_prompt());
+        assert!(rig.turn_open());
+        {
+            let rt = rig.rt.lock().unwrap();
+            assert!(rt.turn_by_command);
+            assert_eq!(rt.turn_opener, Some(("transcript_queued_prompt", "compact_command")));
+        }
+        assert!(rig.events().iter().any(|event| matches!(event.payload,
+            Payload::TurnStarted { prompt_seq: Some(seq), .. } if seq == sent.seq)));
+        if completed {
+            rig.append(&compact_records("manual"));
+            rig.append(&compact_prompt().replace("compact-command", "repeated-command"));
+        }
+        rig.advance(PATIENCE.stall + MOMENT);
+        rig.tick();
+        if completed {
+            assert!(!rig.turn_open());
+            assert_ne!(rig.status(), TabStatus::InProgress);
+            assert_eq!(rig.recovery(), None);
+            assert_eq!(rig.banner(), None);
+        } else {
+            assert!(rig.turn_open());
+            assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+        }
+    }
+}
+
+#[test]
+fn completed_compaction_does_not_consume_the_next_turns_end() {
+    let rig = Rig::new();
+    rig.append(&compact_prompt());
+    rig.append(&compact_records("manual"));
+    rig.advance(PATIENCE.settle);
+    rig.tick();
+    assert!(!rig.turn_open());
+    let (body, end) = first_turn();
+    rig.append(&(body + &end));
+    rig.advance(PATIENCE.stall + MOMENT);
+    rig.tick();
+    assert!(!rig.turn_open());
+    assert_eq!(rig.recovery(), None);
+}
+
+#[test]
+fn a_new_compact_request_needs_its_own_completion() {
+    for timestamp in [Some("2026-10-20T12:01:00.000Z"), None] {
+        let rig = Rig::new();
+        rig.append(&compact_prompt());
+        rig.append(&compact_records("manual"));
+        let mut next: serde_json::Value = serde_json::from_str(&compact_prompt()).unwrap();
+        next["uuid"] = json!("second-compact-command");
+        next["timestamp"] = json!(timestamp);
+        rig.append(&format!("{next}\n"));
+        rig.advance(PATIENCE.stall);
+        rig.tick();
+        assert!(rig.turn_open());
+        assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+    }
+}
+
+#[test]
+fn an_unfinished_compact_command_still_warns() {
+    let rig = Rig::new();
+    rig.append(&compact_prompt());
+    rig.advance(PATIENCE.stall);
+    rig.tick();
+    assert!(rig.turn_open());
+    assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+}
+
+#[test]
+fn real_work_after_manual_compaction_still_warns() {
+    for next in ["prompt", "tool"] {
+        let rig = Rig::new();
+        rig.append(&compact_prompt());
+        rig.append(&compact_records("manual"));
+        if next == "prompt" {
+            rig.start_turn();
+        } else {
+            rig.append(&format!("{}\n", json!({
+                "type": "assistant", "uuid": "tool-after-compact", "message": { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "synthetic-tool", "name": "Bash", "input": { "command": "synthetic command" } }
+                ] }
+            })));
+        }
+        rig.advance(PATIENCE.stall);
+        rig.tick();
+        assert!(rig.turn_open(), "{next}");
+        assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout), "{next}");
+    }
+}
+
+#[test]
+fn working_status_without_an_open_turn_is_not_stall_evidence() {
+    let rig = Rig::new();
+    rig.rt.lock().unwrap().status = TabStatus::InProgress;
+    rig.advance(PATIENCE.stall);
+    rig.tick();
+    assert_eq!(rig.recovery(), None);
+}
+
+#[test]
+fn stall_diagnostics_identify_the_opener_without_its_content() {
+    for source in ["transcript_user_message", "hook_user_prompt_submit", "hook"] {
+        let rig = Rig::new();
+        match source {
+            "transcript_user_message" => rig.append(&format!("{}\n", json!({
+                "type": "user", "uuid": "private-id", "message": { "role": "user", "content": "PRIVATE PROMPT" }
+            }))),
+            "hook_user_prompt_submit" => rig.hook("UserPromptSubmit", json!({ "prompt": "PRIVATE PROMPT" })),
+            _ => rig.hook("PreToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": "PRIVATE COMMAND" } })),
+        }
+        // Later work must not replace the event that opened this turn.
+        rig.hook("PostToolUse", json!({ "tool_name": "Bash" }));
+        rig.advance(PATIENCE.stall);
+        rig.tick();
+        assert_eq!(rig.recovery(), Some(RecoveryKind::Timeout));
+        let diagnostics = std::fs::read_to_string(rig.rt.lock().unwrap().diagnostics_path()).unwrap();
+        let stall = diagnostics.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|line| line["type"] == "session_stall").unwrap();
+        assert_eq!(stall["opener_source"], source);
+        assert_eq!(stall["opener_kind"], if source == "hook" { "pre_tool_use" } else { "prompt" });
+        assert_eq!(stall["quiet_ms"], 300_000);
+        assert!(!diagnostics.contains("PRIVATE"));
+        assert!(!diagnostics.contains("private-id"));
+    }
 }
 
 /// A silence warning is not a turn boundary: cloud idle suspension must

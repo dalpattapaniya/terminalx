@@ -13,6 +13,13 @@
   from welcome after closing the last tab, including Close all. Browser
   dictation checks explicitly enter New session from welcome. (#445)
 
+### Changes
+
+- Default workspace review to All changes against a displayed merge-base target,
+  including committed, uncommitted and untracked files. Remember repository-specific
+  scope and target choices, with Uncommitted and turn review available in the same
+  panel; keep local and cloud diffs and unavailable states consistent. (#465)
+
 ### Stats & Usage
 
 - Refresh usage for non-Git projects without blocking healthy locations, and
@@ -35,6 +42,11 @@
 
 ### Chats
 
+- Keep completed Claude compaction idle instead of raising a false stall
+  warning, including manual `/compact` queued behind a running turn. Record
+  privacy-safe turn-opener labels in stall diagnostics while retaining warnings
+  for real silent turns. (#523)
+
 - Show compact local message times with full dates available by keyboard or
   tap, across local, cloud and mobile chats. Keep source timestamps through
   transcript imports and the first text-chunk time through streaming; omit
@@ -46,6 +58,13 @@
 
 ### Issues
 
+- Require completed workflow and check-suite evidence on the reviewed commit
+  before an issue pipeline merges, including queued jobs and pending reruns.
+  Missing or unreadable validation no longer passes after a fixed delay.
+  Validation reads must agree on workflow attempts and child results, so a
+  rerun cannot use an older optional failure to hide a new required failure.
+  Repositories without CI must explicitly set `allowNoCi` in their project
+  pipeline settings; reported validation and branch protection still apply. (#609)
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
 

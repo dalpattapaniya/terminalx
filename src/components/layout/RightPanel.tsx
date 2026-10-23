@@ -119,7 +119,7 @@ export function RightPanel({
   }, [cwd, gitSource, branch, labelMode, refreshTick, isGit]);
 
   const resolvedBranch = branch === undefined ? (status?.branch ?? null) : branch;
-  const targetLabel = !isGit ? "Folder" : labelMode === "base" ? `base: ${status?.defaultBranch ?? "default"}` : labelMode === "branch" ? (resolvedBranch ?? "current branch") : null;
+  const targetLabel = !isGit ? "Folder" : tab === "changes" && labelMode === "base" ? null : labelMode === "base" ? `base: ${status?.defaultBranch ?? "default"}` : labelMode === "branch" ? (resolvedBranch ?? "current branch") : null;
 
   useShortcut("panel.changes", () => setTab("changes"));
   useShortcut("panel.repository", () => setTab("repo"));
