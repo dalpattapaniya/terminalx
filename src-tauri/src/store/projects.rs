@@ -92,6 +92,9 @@ pub struct IssuePipelineSettings {
     /// Checks that never hold a merge, by a part of their name. Only for
     /// checks branch protection does not require.
     pub ignored_checks: Vec<String>,
+    /// Explicit opt-in for repositories without CI. Never overrides reported
+    /// checks, pending workflows/suites, required checks or unreadable evidence.
+    pub allow_no_ci: bool,
 }
 
 pub const DEFAULT_REVIEW_ROUNDS: u32 = 3;
@@ -118,6 +121,7 @@ impl Default for IssuePipelineSettings {
             merge_method: "merge".into(),
             protected: ProtectedCategories::default(),
             ignored_checks: Vec::new(),
+            allow_no_ci: false,
         }
     }
 }
@@ -365,6 +369,8 @@ mod tests {
         // A partial or hand-edited block: what is readable is kept, the rest is the default.
         let partial: IssuePipelineSettings = serde_json::from_str(r#"{"autoMerge":true,"maxRounds":0,"mergeMethod":"force","protected":{"deploy":false,"paths":["db/"]}}"#).unwrap();
         assert!(partial.auto_merge && partial.enabled);
+        assert!(!partial.allow_no_ci);
+        assert!(serde_json::from_str::<IssuePipelineSettings>(r#"{"allowNoCi":true}"#).unwrap().allow_no_ci);
         assert_eq!((partial.max_rounds, partial.merge_method.as_str()), (3, "merge"));
         assert!(partial.protected.migrations && !partial.protected.deploy);
         assert_eq!(partial.protected.paths, ["db/"]);

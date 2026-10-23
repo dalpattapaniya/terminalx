@@ -76,9 +76,15 @@ head:
 - The checks on that commit have passed. Where branch protection names
   required checks, those are the ones that count; where it names none, every
   check reported on the commit counts, except ones the project lists as never
-  holding a merge. Nothing is concluded from a commit's checks in its first 90
-  seconds on the pull request: CI lists them a moment after the push, and
-  until then "nothing is failing" would be true of a commit CI has not seen.
+  holding a merge. Workflow runs and check suites for the exact head must
+  also finish, including queued runs and reruns whose jobs are not published
+  yet. Checks, statuses, workflows and suites are read with pagination;
+  unreadable or incomplete evidence cannot pass. A completed producer's
+  failure is still judged through the required/ignored policy when its
+  failing child checks explain it; an unexplained producer failure blocks.
+  Legacy status-only CI must name required checks in branch protection,
+  since individual statuses provide no producer completion signal.
+  Empty validation never becomes successful simply because time has passed.
 - GitHub says the branch merges without conflicts and branch protection does
   not block it.
 - The change is not in a category the project marks as always needing a
@@ -118,6 +124,14 @@ The switch can be turned off at any time. It is read again immediately before
 the merge is asked for, so turning it off stops a merge that had not yet been
 made. The one thing it cannot do is take back a merge GitHub has already
 accepted into a merge queue; the record says so when that is the case.
+
+A repository deliberately using no CI can set `issuePipeline.allowNoCi` to
+`true` in its stored project settings (`~/.raccoon/projects.json`, or the
+corresponding project settings under `TERMINALX_HOME`). The default is false.
+This only permits an empty check list after successful empty workflow and
+check-suite reads; it never bypasses required checks, reported validation,
+unreadable evidence, or any review/security/branch-protection gate. Existing
+projects therefore wait for positive validation unless explicitly configured.
 
 A project's settings are read at each decision. If they cannot be read (the
 project was removed, or its file is damaged), nothing is merged automatically.

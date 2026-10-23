@@ -105,13 +105,11 @@ pub(crate) fn parse_pr(v: &Value) -> PullRequest {
             a.iter()
                 .map(|c| {
                     let name = c["name"].as_str().or_else(|| c["context"].as_str()).unwrap_or("check").to_string();
-                    let state = c["conclusion"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| c["state"].as_str())
-                        .or_else(|| c["status"].as_str())
-                        .unwrap_or("pending")
-                        .to_ascii_lowercase();
+                    let state = match c["status"].as_str() {
+                        Some(status) if !status.eq_ignore_ascii_case("completed") => status,
+                        _ => c["conclusion"].as_str().filter(|s| !s.is_empty()).or_else(|| c["state"].as_str()).unwrap_or("pending"),
+                    }
+                    .to_ascii_lowercase();
                     PrCheck { name, state, url: c["detailsUrl"].as_str().or_else(|| c["targetUrl"].as_str()).map(String::from) }
                 })
                 .collect()
@@ -241,9 +239,9 @@ fn create_pr_with(cwd: &Path, title: &str, body: &str, base: Option<&str>, draft
     Ok(url)
 }
 
-/// The pull request as the issue pipeline's merge gate reads it: one reply,
-/// so the checks and the mergeability are those of `head_sha` and of no other
-/// commit.
+/// The pull request as the issue pipeline's merge gate reads it. Validation
+/// requests name `head_sha`, and a final head read invalidates that evidence
+/// if the branch moved while it was collected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrSnapshot {
@@ -264,8 +262,9 @@ pub struct PrSnapshot {
     #[serde(default)]
     pub review_decision: Option<String>,
     pub checks: Vec<PrCheck>,
-    /// The checks branch protection requires, by name. `None` when the base
-    /// branch requires none, and then every reported check counts.
+    /// Required checks reported by GitHub, by name. With none reported,
+    /// every check counts. GitHub's merge state also gates unpublished
+    /// requirements, which `gh pr checks --required` does not list.
     #[serde(default)]
     pub required_checks: Option<Vec<String>>,
     /// GitHub would not let this token read the commit's checks: a cloud
@@ -273,6 +272,10 @@ pub struct PrSnapshot {
     /// says nothing; no merge is concluded from it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub checks_unread: bool,
+    /// None means workflow/suite evidence has not been read. An empty list is
+    /// a successful read with no producers, not permission to assume no CI.
+    #[serde(default)]
+    pub validation: Option<Vec<PrCheck>>,
 }
 
 const SNAPSHOT_FIELDS: &str = "number,title,url,state,isDraft,baseRefName,headRefName,headRefOid,additions,deletions,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,body,author";
@@ -295,6 +298,7 @@ pub(crate) fn parse_snapshot(v: &Value) -> PrSnapshot {
         checks: pr.checks,
         required_checks: None,
         checks_unread: false,
+        validation: None,
     }
 }
 
@@ -323,7 +327,7 @@ fn run_output(cwd: &Path, args: &[&str]) -> Result<GhOutput> {
 /// different words when the commit has no checks of any kind.
 pub(crate) fn parse_required_checks(output: &GhOutput) -> Result<Option<Vec<String>>> {
     if let Ok(Value::Array(checks)) = serde_json::from_str::<Value>(output.stdout.trim()) {
-        let names: BTreeSet<String> = checks.iter().filter_map(|check| check["name"].as_str()).map(String::from).collect();
+        let names: BTreeSet<String> = checks.iter().map(|check| check["name"].as_str().filter(|name| !name.is_empty()).map(String::from).context("GitHub omitted a required check name")).collect::<Result<_>>()?;
         return Ok((!names.is_empty()).then(|| names.into_iter().collect()));
     }
     let said = |words: &str| output.stderr.contains(words) || output.stdout.contains(words);
@@ -380,7 +384,123 @@ fn pr_snapshot_with(
             snapshot.required_checks = parse_required_checks(&required)?;
         }
     }
+    if snapshot.state == "OPEN" && !snapshot.checks_unread {
+        let evidence = validation_with(cwd, &snapshot, &mut run);
+        match evidence {
+            Ok((validation, checks)) => {
+                snapshot.validation = Some(validation);
+                snapshot.checks = checks;
+            }
+            Err(error) if not_permitted(&format!("{error:#}")) => snapshot.checks_unread = true,
+            Err(error) => return Err(error),
+        }
+        // Every request above names the original SHA. Re-read the PR after
+        // collecting evidence so a changed head cannot inherit that evidence.
+        let current: Value = serde_json::from_str(&run(cwd, &["pr", "view", &n, "--json", "headRefOid"])?)?;
+        let head = current["headRefOid"].as_str().context("GitHub omitted the current head")?;
+        if head != snapshot.head_sha {
+            snapshot.head_sha = head.into();
+            snapshot.validation = None;
+        }
+    }
     Ok(snapshot)
+}
+
+/// Read all workflow runs and suites for this exact commit, including queued
+/// runs whose jobs have not appeared and suites from non-Actions providers.
+/// Pagination and total counts are checked: truncated evidence cannot pass.
+fn validation_with(cwd: &Path, pr: &PrSnapshot, run: &mut impl FnMut(&Path, &[&str]) -> Result<String>) -> Result<(Vec<PrCheck>, Vec<PrCheck>)> {
+    let (repo, _) = pr_url_parts(&pr.url).context("GitHub omitted the pull request repository")?;
+    let mut read = |path: &str, key: &str| -> Result<Vec<Value>> {
+        let pages: Vec<Value> = serde_json::from_str(&run(cwd, &["api", path, "--paginate", "--slurp"])?)?;
+        let total = pages.first().and_then(|page| page["total_count"].as_u64()).context("GitHub omitted validation count")?;
+        let mut records = Vec::new();
+        let mut ids = BTreeSet::new();
+        for page in &pages {
+            if page["total_count"].as_u64() != Some(total) {
+                bail!("GitHub validation changed during pagination; retry the snapshot");
+            }
+            for record in page[key].as_array().context("GitHub omitted validation records")? {
+                let id = record["id"].as_u64().context("GitHub omitted validation identity")?;
+                if !ids.insert(id) { bail!("GitHub repeated validation records during pagination; retry the snapshot"); }
+                records.push(record.clone());
+            }
+        }
+        if records.len() as u64 != total {
+            bail!("GitHub returned incomplete validation evidence ({}/{total})", records.len());
+        }
+        Ok(records)
+    };
+    // Read children first, then their producers. A rerun queued after the
+    // child read is still pending even if the old child conclusions pass.
+    let children = read(&format!("repos/{repo}/commits/{}/check-runs?filter=latest&per_page=100", pr.head_sha), "check_runs")?;
+    let statuses = read(&format!("repos/{repo}/commits/{}/status?per_page=100", pr.head_sha), "statuses")?;
+    let mut checks = Vec::new();
+    for child in &children {
+        if child["head_sha"].as_str() != Some(&pr.head_sha) { bail!("GitHub returned a check for a different commit"); }
+        checks.push(PrCheck {
+            name: child["name"].as_str().context("GitHub omitted a check name")?.into(),
+            state: validation_state(child)?.into(), url: None,
+        });
+    }
+    for status in statuses {
+        checks.push(PrCheck {
+            name: status["context"].as_str().context("GitHub omitted a status context")?.into(),
+            state: status["state"].as_str().context("GitHub omitted a status state")?.into(), url: None,
+        });
+    }
+    let mut validation = Vec::new();
+    let mut suites = BTreeSet::new();
+    let mut workflow_suites = Vec::new();
+    for (path, key) in [
+        (format!("repos/{repo}/actions/runs?head_sha={}&per_page=100", pr.head_sha), "workflow_runs"),
+        (format!("repos/{repo}/commits/{}/check-suites?per_page=100", pr.head_sha), "check_suites"),
+    ] {
+        for item in read(&path, key)? {
+            if item["head_sha"].as_str() != Some(&pr.head_sha) { bail!("GitHub returned validation for a different commit"); }
+            let id = item["id"].as_u64().context("GitHub omitted validation identity")?;
+            let mut state = validation_state(&item)?;
+            let suite = if key == "check_suites" { Some(id) } else { item["check_suite_id"].as_u64() };
+            if key == "check_suites" {
+                suites.insert(id);
+                let expected = item["latest_check_runs_count"].as_u64().context("GitHub omitted the suite's check count")?;
+                let observed = children.iter().filter(|child| child["check_suite"]["id"].as_u64() == Some(id)).count() as u64;
+                if observed != expected { state = "pending"; }
+            } else {
+                workflow_suites.push(suite.context("GitHub omitted the workflow's check suite")?);
+            }
+            // A completed producer's failure may be an optional child failure.
+            // Let the existing required/ignored policy judge those children.
+            // An unexplained failure (e.g. invalid workflow) still gates.
+            if failed_validation(state) && suite.is_some_and(|suite| children.iter().any(|child| child["check_suite"]["id"].as_u64() == Some(suite) && validation_state(child).is_ok_and(failed_validation))) {
+                state = "success";
+            }
+            let name = item["name"].as_str().or_else(|| item["app"]["slug"].as_str()).unwrap_or(key);
+            validation.push(PrCheck { name: format!("{name} ({key} #{id})"), state: state.into(), url: None });
+        }
+    }
+    // Missing suites are incomplete evidence even when another producer has
+    // already published successful checks.
+    for suite in workflow_suites.into_iter().chain(children.iter().map(|child| child["check_suite"]["id"].as_u64().unwrap_or(0))) {
+        if !suites.contains(&suite) {
+            validation.push(PrCheck { name: format!("check suite #{suite}"), state: "pending".into(), url: None });
+        }
+    }
+    Ok((validation, checks))
+}
+
+fn validation_state(item: &Value) -> Result<&str> {
+    let status = item["status"].as_str().context("GitHub omitted validation status")?;
+    // A rerun can retain its previous conclusion while queued.
+    Ok(match status {
+        "completed" => item["conclusion"].as_str().unwrap_or("pending"),
+        "queued" | "in_progress" | "pending" | "requested" | "waiting" => status,
+        _ => "pending",
+    })
+}
+
+fn failed_validation(state: &str) -> bool {
+    matches!(state, "failure" | "error" | "cancelled" | "timed_out" | "action_required" | "startup_failure" | "stale")
 }
 
 /// The open pull request whose head is `branch` in this repository (not a
@@ -489,7 +609,7 @@ fn outside_checkouts() -> PathBuf {
 /// [`pr_snapshot`] of a pull request in `repo` (`owner/name`).
 pub fn pr_snapshot_in(repo: &str, number: u64) -> Result<PrSnapshot> {
     let cwd = outside_checkouts();
-    pr_snapshot_with(&cwd, number, |cwd, args| run(cwd, &in_repo(args, repo)), |cwd, args| run_output(cwd, &in_repo(args, repo)))
+    pr_snapshot_with(&cwd, number, |cwd, args| if args.first() == Some(&"api") { run(cwd, args) } else { run(cwd, &in_repo(args, repo)) }, |cwd, args| run_output(cwd, &in_repo(args, repo)))
 }
 
 /// [`merge_pr_at`] of a pull request in `repo` (`owner/name`).
@@ -866,6 +986,112 @@ mod tests {
         assert!(parse_required_checks(&output(false, "", "")).is_err());
     }
 
+    fn validation_key(path: &str) -> &str {
+        if path.contains("actions/runs") { "workflow_runs" } else if path.contains("check-suites") { "check_suites" } else if path.contains("check-runs") { "check_runs" } else { "statuses" }
+    }
+
+    fn snapshot_validation(args: &[&str]) -> String {
+        let key = validation_key(args[1]);
+        if key == "check_runs" {
+            return serde_json::json!([{"total_count":2,"check_runs":[
+                {"id":1,"name":"build","head_sha":"1111111111111111111111111111111111111111","status":"completed","conclusion":"success"},
+                {"id":2,"name":"test","head_sha":"1111111111111111111111111111111111111111","status":"in_progress"}
+            ]}]).to_string();
+        }
+        serde_json::json!([{ "total_count": 0, key: [] }]).to_string()
+    }
+
+    #[test]
+    fn validation_reads_queued_reruns_all_providers_and_every_page_on_the_exact_head() {
+        let pr = parse_snapshot(&serde_json::from_str(OPEN_PR).unwrap());
+        let evidence = validation_with(Path::new("/repo"), &pr, &mut |_, args| {
+            assert!(args[1].contains(&pr.head_sha));
+            assert_eq!(&args[2..], ["--paginate", "--slurp"]);
+            let key = validation_key(args[1]);
+            if matches!(key, "check_runs" | "statuses") { return Ok(serde_json::json!([{"total_count":0,key:[]}]).to_string()); }
+            Ok(serde_json::json!([
+                {"total_count":2, key:[{"id":1,"head_sha":pr.head_sha,"status":"completed","conclusion":"success","check_suite_id":1,"latest_check_runs_count":0}]},
+                {"total_count":2, key:[{"id":2,"head_sha":pr.head_sha,"status":"queued","conclusion":"success","check_suite_id":2,"latest_check_runs_count":0}]}
+            ]).to_string())
+        }).unwrap();
+        assert_eq!(evidence.0.iter().map(|c| c.state.as_str()).collect::<Vec<_>>(), ["success", "queued", "success", "queued"]);
+        for response in [
+            "[]", "{}", r#"[{"total_count":1,"check_runs":[]}]"#, r#"[{"total_count":0}]"#,
+            r#"[{"total_count":2,"check_runs":[{"id":1},{"id":1}]}]"#,
+        ] {
+            assert!(validation_with(Path::new("/repo"), &pr, &mut |_, _| Ok(response.into())).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshots_gate_delayed_jobs_reruns_partial_suites_and_optional_failures() {
+        use crate::issue_pipeline::gate::{self, tests::merge_verdict, Facts, Gate};
+        for (status, conclusion, child_states, expected_count, ignored, passes) in [
+            ("queued", "", vec![], 0, false, false),
+            ("in_progress", "", vec!["success"], 1, false, false),
+            // A pending rerun retains the previous successful jobs/conclusion.
+            ("queued", "success", vec!["success", "success"], 2, false, false),
+            ("completed", "success", vec!["success"], 2, false, false),
+            ("completed", "success", vec!["success", "success"], 2, false, true),
+            ("completed", "failure", vec!["success", "failure"], 2, false, false),
+            ("completed", "failure", vec!["success", "failure"], 2, true, true),
+            // A failing producer without a failing child is not explained away.
+            ("completed", "failure", vec!["success"], 1, true, false),
+            ("something_new", "success", vec!["success"], 1, false, false),
+        ] {
+            let pr = pr_snapshot_with(Path::new("/repo"), 7, |_, args| {
+                if args[0] != "api" { return Ok(OPEN_PR.into()); }
+                let key = validation_key(args[1]);
+                let records = match key {
+                    "check_runs" => child_states.iter().enumerate().map(|(i, state)| serde_json::json!({
+                        "id": i + 1, "name":if i == 0 { "build" } else { "optional" }, "head_sha":"1111111111111111111111111111111111111111",
+                        "status":"completed", "conclusion":state, "check_suite":{"id":10}
+                    })).collect::<Vec<_>>(),
+                    "statuses" => vec![],
+                    _ => vec![serde_json::json!({"id":10,"check_suite_id":10,"name":"CI","head_sha":"1111111111111111111111111111111111111111",
+                        "status":status,"conclusion":conclusion,"latest_check_runs_count":expected_count})],
+                };
+                Ok(serde_json::json!([{"total_count":records.len(),key:records}]).to_string())
+            }, |_, _| Ok(output(true, "[]", ""))).unwrap();
+            let verdict = merge_verdict(&pr.head_sha);
+            let patterns = if ignored { vec!["optional".into()] } else { Vec::new() };
+            let result = gate::decide(&Facts { auto_merge:true, require_person:false, cloud:false, verdict:Some(&verdict), pr:&pr,
+                security_areas:&[], protected:&[], ignored_checks:&patterns, allow_no_ci:false });
+            assert_eq!(matches!(result, Gate::Merge { .. }), passes, "{status} {conclusion} {child_states:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn workflow_api_errors_and_unknown_payloads_never_become_validation() {
+        for message in ["Resource not accessible by integration", "HTTP 502: Bad Gateway"] {
+            let result = pr_snapshot_with(Path::new("/repo"), 7, |_, args| {
+                if args[0] == "api" && args[1].contains("actions/runs") { bail!("{message}"); }
+                Ok(if args[0] == "api" { snapshot_validation(args) } else { OPEN_PR.into() })
+            }, |_, _| Ok(output(true, "[]", "")));
+            if not_permitted(message) {
+                let pr = result.unwrap();
+                assert!(pr.checks_unread);
+                assert!(pr.validation.is_none());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        assert_eq!(validation_state(&serde_json::json!({"status":"success","conclusion":"success"})).unwrap(), "pending");
+        assert!(parse_required_checks(&output(true, r#"[{"name":null}]"#, "")).is_err());
+    }
+
+    #[test]
+    fn a_head_moving_during_evidence_collection_does_not_inherit_validation() {
+        let mut views = 0;
+        let pr = pr_snapshot_with(Path::new("/repo"), 7, |_, args| {
+            if args[0] == "api" { return Ok(snapshot_validation(args)); }
+            views += 1;
+            Ok(if views == 1 { OPEN_PR.into() } else { OPEN_PR.replace("1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222") })
+        }, |_, _| Ok(output(true, "[]", ""))).unwrap();
+        assert_eq!(pr.head_sha, "2222222222222222222222222222222222222222");
+        assert_eq!(pr.validation, None);
+    }
+
     #[test]
     fn a_snapshot_binds_the_checks_to_the_head_commit_and_asks_what_is_required() {
         let cwd = Path::new("/repo");
@@ -873,6 +1099,8 @@ mod tests {
             cwd,
             7,
             |_, args| {
+                if args[0] == "api" { return Ok(snapshot_validation(args)); }
+                if args[4] == "headRefOid" { return Ok(OPEN_PR.into()); }
                 assert_eq!(&args[..3], ["pr", "view", "7"]);
                 assert!(args[4].contains("headRefOid") && args[4].contains("mergeStateStatus") && args[4].contains("statusCheckRollup"));
                 Ok(OPEN_PR.into())
@@ -920,7 +1148,7 @@ mod tests {
         assert!(partly.checks_unread && partly.checks.is_empty());
         // Any other failure is a failure.
         assert!(pr_snapshot_with(cwd, 7, |_, _| bail!("HTTP 502: Bad Gateway"), |_, _| Ok(output(true, "[]", ""))).is_err());
-        assert!(!pr_snapshot_with(cwd, 7, |_, _| Ok(OPEN_PR.into()), |_, _| Ok(output(true, "[]", ""))).unwrap().checks_unread);
+        assert!(!pr_snapshot_with(cwd, 7, |_, args| Ok(if args[0] == "api" { snapshot_validation(args) } else { OPEN_PR.into() }), |_, _| Ok(output(true, "[]", ""))).unwrap().checks_unread);
     }
 
     #[test]

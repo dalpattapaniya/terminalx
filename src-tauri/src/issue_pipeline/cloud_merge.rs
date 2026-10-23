@@ -90,6 +90,7 @@ pub fn merge(github: &dyn Github, pipeline: &Pipeline, repository: &str, setting
         security_areas: &pipeline.security_areas,
         protected: &[],
         ignored_checks: &settings.ignored_checks,
+        allow_no_ci: settings.allow_no_ci,
     });
     let not_merged = |reason: StopReason| Ok(CloudMerge::NotMerged { reason: reason.describe() });
     match decision {
