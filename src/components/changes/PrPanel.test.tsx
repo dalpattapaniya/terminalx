@@ -276,7 +276,7 @@ it("updates a follow-up's state and offers settle only after current work is con
   let merged = false;
   mocks.invoke.mockImplementation(async (command: string) => {
     if (command === "gh_available") return true;
-    if (command === "pr_associations") return [association(mergedPr)];
+    if (command === "pr_associations") return [association(mergedPr), association(followup)];
     if (command === "work_status") return workStatus(followup.head, merged ? 0 : 1);
     if (command === "pr_list") return [{ ...followup, state: merged ? "MERGED" : "OPEN" }];
     if (command === "pr_details") return mergedPr;

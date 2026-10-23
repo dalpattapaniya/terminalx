@@ -21,14 +21,14 @@ describe("session PR transport", () => {
     const history = { ...a, state };
     const followup = { ...b, head: a.head };
     invoke.mockImplementation(async (command) => {
-      if (command === "pr_associations") return [reference(history)];
+      if (command === "pr_associations") return [reference(history), reference(followup)];
       if (command === "pr_list") return [history, followup, history];
       throw Error(command);
     });
-    const { rows } = await sessionPrs(localGitSource("/fixture"), "session", a.head, a.head);
+    const { rows } = await sessionPrs(localGitSource("/fixture"), "session", a.head);
     expect(rows.map((row) => row.pr?.number)).toEqual([2, 1]);
     expect(rows[1]?.pr?.state).toBe(state);
-    expect(invoke).toHaveBeenCalledWith("pr_associations", expect.objectContaining({ sessionId: "session", additions: expect.arrayContaining([reference(followup)]) }));
+    expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "session", additions: [] });
   });
 
   it("refreshes retained different-branch PRs by URL after reload, including identical numbers in another repository", async () => {
@@ -98,25 +98,26 @@ it("saves cloud creation immediately, before a later branch change or refresh", 
   expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [{ url: b.url, number: b.number, head: b.head, scope: { kind: "cloud", workspace: "workspace", repo: "repo/path" } }] });
 });
 
-it("backfills the session branch without importing another session’s live checkout PR", async () => {
-  invoke.mockImplementation(async (command, args) => {
-    if (command === "pr_associations") return [];
-    if (command === "pr_list") return args.branch === a.head ? [a] : [b];
+it.each([a.head, b.head])("does not import another session’s PR from checkout branch %s", async (branch) => {
+  invoke.mockImplementation(async (command) => {
+    if (command === "pr_associations") return [reference(a)];
+    if (command === "pr_list") return [{ ...b, head: branch }];
+    if (command === "pr_details") return a;
     throw Error(command);
   });
-  const { rows } = await sessionPrs(localGitSource("/fixture"), "author", b.head, a.head);
+  const { rows } = await sessionPrs(localGitSource("/fixture"), "author", branch);
   expect(rows.map((row) => [row.pr?.number, row.current])).toEqual([[1, false]]);
-  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [reference(a)] });
+  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionId: "author", additions: [] });
 });
 
 it("includes associations recorded concurrently with branch discovery", async () => {
-  invoke.mockImplementation(async (command, args) => {
-    if (command === "pr_associations") return args.additions.length ? [reference(a), reference(b)] : [reference(a)];
+  invoke.mockImplementation(async (command) => {
+    if (command === "pr_associations") return [reference(a), reference(b)];
     if (command === "pr_list") return [a];
     if (command === "pr_details") return b;
     throw Error(command);
   });
-  const { rows } = await sessionPrs(localGitSource("/fixture"), "author", a.head, a.head);
+  const { rows } = await sessionPrs(localGitSource("/fixture"), "author", a.head);
   expect(rows.map((row) => row.pr?.number)).toEqual([2, 1]);
 });
 
@@ -129,7 +130,7 @@ it("does not persist a superseded discovery into the previously selected session
     if (command === "pr_list") return delayed;
     throw Error(command);
   });
-  const request = sessionPrs(localGitSource("/fixture"), "previous-session", a.head, null, () => current);
+  const request = sessionPrs(localGitSource("/fixture"), "previous-session", a.head, () => current);
   current = false;
   finish([a]);
   expect((await request).rows).toEqual([]);

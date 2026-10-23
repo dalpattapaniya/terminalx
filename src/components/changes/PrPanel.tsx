@@ -100,7 +100,7 @@ export function PrPanel({
       : Promise.resolve(null);
     Promise.all([
       source.workStatus().then(async (workStatus) => {
-        const pullRequests = await sessionPrs(source, sessionId, workStatus.branch !== workStatus.defaultBranch ? workStatus.branch : null, branch !== workStatus.defaultBranch ? branch : null, () => !cancelled);
+        const pullRequests = await sessionPrs(source, sessionId, workStatus.branch !== workStatus.defaultBranch ? workStatus.branch : null, () => !cancelled);
         const needsLandedCheck = (workStatus.aheadOfBase ?? 0) > 0
           && pullRequests.rows.some((row) => row.current && row.pr?.state === "MERGED");
         const landedWork = !cancelled && needsLandedCheck && source.landed ? await source.landed() : null;
