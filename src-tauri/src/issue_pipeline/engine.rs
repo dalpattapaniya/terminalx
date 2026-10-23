@@ -329,7 +329,10 @@ impl Step<'_> {
 
     fn author_turn(&mut self, message: &str) -> Result<()> {
         let report = verdict::author_report(message);
-        if let Some(checks) = verdict::reported_checks(message).or(match &report { AuthorReport::Done { checks, .. } => Some(*checks), _ => None }) {
+        let checks = verdict::reported_checks(message).or(match &report { AuthorReport::Done { checks, .. } => Some(*checks), _ => None });
+        // Before a PR exists, the work stage already enforces its report.
+        // Pin later results without requiring a checkout just to say "none".
+        if let Some(checks) = checks.filter(|checks| self.p.pr.is_some() && *checks != LocalChecks::None) {
             let workspace = self.host.workspace(&self.cwd)?;
             let head = workspace.head;
             match checks {
