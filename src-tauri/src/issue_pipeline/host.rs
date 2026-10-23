@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use crate::github::{PinnedMerge, PrSnapshot};
 use crate::issues::LinearReviewMove;
 use crate::session::SessionManager;
-use crate::session_ops::{NewSession, NewTab};
+use crate::session_ops::NewTab;
 use crate::sink::EventSink;
 use crate::store::index::{self, IssueRef, SessionEntry};
 use crate::store::projects::IssuePipelineSettings;
@@ -188,34 +188,20 @@ impl Host for LocalHost {
         last_reply(&self.manager.load_events(&session.session_id, &session.tab_id).ok()?)
     }
 
-    /// A session of its own in the author's checkout, with the author's
-    /// agent and settings. It carries no issue reference: the issue page finds
-    /// it through the pipeline, and it must never be taken for the session
-    /// that is working on the issue.
+    /// An independent conversation in the owning session, with no fork or
+    /// transcript copied from the author. Existing reviewer references are
+    /// reused by the engine, including legacy separate sessions.
     fn open_reviewer(&self, pipeline: &Pipeline, author: &SessionEntry) -> Result<SessionRef> {
         let tab = author.tab(&pipeline.author.tab_id).context("the author's conversation is gone")?;
-        let title: String = format!("Review {} {}", pipeline.issue.identifier, pipeline.issue.title).chars().take(80).collect();
-        let entry = crate::session_ops::create_session_blocking(
-            &*self.sink,
-            NewSession {
-                project_path: author.project_path.clone(),
-                title: Some(title),
-                use_worktree: false,
-                base_ref: None,
-                worktree_name: None,
-                on_main: false,
-                issue: None,
-                automation: None,
-                cwd: Some(author.cwd.clone()),
-                tab: Some(NewTab { harness: tab.harness.clone(), model: tab.model.clone(), effort: tab.effort.clone(), permission_mode: Some(tab.permission_mode.clone()) }),
-            },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let tab = entry.tabs.first().context("the reviewer session has no tab")?;
+        let reviewer = self.manager.add_tab(&author.id, &NewTab {
+            harness: tab.harness.clone(), model: tab.model.clone(), effort: tab.effort.clone(), permission_mode: Some(tab.permission_mode.clone()),
+        })?;
+        crate::session_ops::rename_tab_entry(&author.id, &reviewer.id, Some("Reviewer".into())).map_err(anyhow::Error::msg)?;
+        self.sink.emit("session_updated", &index::get(&author.id)?);
         if let Place::CloudWorkspace { tab_added } = &self.place {
-            tab_added(&tab.id);
+            tab_added(&reviewer.id);
         }
-        Ok(SessionRef { session_id: entry.id.clone(), tab_id: tab.id.clone() })
+        Ok(SessionRef { session_id: author.id.clone(), tab_id: reviewer.id })
     }
 
     fn workspace(&self, cwd: &Path) -> Result<Workspace> {
@@ -298,6 +284,50 @@ impl Host for LocalHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewer_is_a_fresh_named_tab_owned_and_archived_with_the_author() {
+        let _home = crate::store::temp_home();
+        let mut author: SessionEntry = serde_json::from_value(serde_json::json!({
+            "id": "author", "projectPath": "/repo", "cwd": "/repo/worktree", "title": "Issue",
+            "created": "2026-10-12T00:00:00Z", "modified": "2026-10-12T00:00:00Z",
+            "tabs": [{"id": "t1", "harness": "claude", "model": "opus", "effort": "high",
+                "providerSessionId": "author-private-transcript", "created": "2026-10-12T00:00:00Z"}]
+        })).unwrap();
+        index::save(std::slice::from_ref(&author)).unwrap();
+        let pipeline: Pipeline = serde_json::from_str(include_str!("../fixtures/issue_pipeline.json")).unwrap();
+        let sink = Arc::new(crate::sink::BroadcastSink::new(16));
+        let manager = SessionManager::new(
+            sink.clone(), Arc::new(crate::sink::NoObserver), Arc::new(crate::harness::host::Host::new()),
+            Arc::new(crate::pty::Terminals::new()), Arc::new(Default::default()), Arc::new(Default::default()),
+            crate::hooks::prepare_control().unwrap(),
+        );
+        let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = added.clone();
+        let host = LocalHost::cloud_workspace(sink, manager, Arc::new(move |id| observed.lock().unwrap().push(id.to_string())));
+        let reviewer = host.open_reviewer(&pipeline, &author).unwrap();
+        assert_eq!(reviewer.session_id, author.id);
+        assert_ne!(reviewer.tab_id, "t1");
+        assert_eq!(index::load().unwrap().len(), 1);
+        let updated = index::get(&author.id).unwrap();
+        let tab = updated.tab(&reviewer.tab_id).unwrap();
+        assert_eq!(tab.title.as_deref(), Some("Reviewer"));
+        assert!(tab.follow.title_pinned);
+        assert_eq!((&tab.harness, &tab.model, &tab.effort, &tab.permission_mode),
+            (&author.tabs[0].harness, &author.tabs[0].model, &author.tabs[0].effort, &author.tabs[0].permission_mode));
+        assert!(tab.provider_session_id.is_none());
+        assert!(tab.fork_from.is_none());
+        assert!(tab.follow.history.is_empty());
+        assert_eq!(updated.tabs[0], author.tabs[0]);
+        assert_eq!(updated.cwd, author.cwd);
+        assert_eq!(added.lock().unwrap().as_slice(), std::slice::from_ref(&reviewer.tab_id));
+        // Archive only this synthetic owner; both conversations remain reachable.
+        author = crate::session_ops::update_session_meta(&author.id, &crate::session_ops::SessionPatch { archived: Some(true), ..Default::default() }).unwrap();
+        assert!(author.archived);
+        assert!(author.tab(&reviewer.tab_id).is_some());
+        assert!(author.tab("t1").is_some());
+        assert!(host.merge(Path::new("/unused"), 1, "merge", "head").unwrap_err().to_string().contains("does not merge"));
+    }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")

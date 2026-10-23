@@ -248,3 +248,24 @@ describe("a connection going away", () => {
     expect(getCloudAgents(scope).tabs.map((known) => [known.tabId, known.source])).toEqual([["s1-tab", "cache"]]);
   });
 });
+
+it("keeps message chronology through live notifications, stale snapshots and cached restart", async () => {
+  const { buildCloudSessions } = await import("@/lib/cloudSessions");
+  const held = await opened();
+  const at = (day: number) => `2026-10-${String(day).padStart(2, "0")}T00:00:00Z`;
+  const entries = [1, 2, 3].map((day) => ({ ...session(`s${day}`, `Synthetic ${day}`), created: at(day) }));
+  const ids = (live: RuntimeSession[]) => buildCloudSessions({ item: item(driver), live }).map((row) => row.sessionId);
+  held.pushSessions(entries);
+  expect(ids(liveCloudSessionList(ORG, WS)!)).toEqual(["s3", "s2", "s1"]);
+  held.pushSessions(entries.map((entry) => entry.id === "s1" ? { ...entry, lastMessageAt: at(4) } : entry));
+  expect(ids(liveCloudSessionList(ORG, WS)!)).toEqual(["s1", "s3", "s2"]);
+  held.pushSessions(entries.map((entry) => entry.id === "s2" ? { ...entry, lastMessageAt: at(5) } : entry));
+  expect(ids(liveCloudSessionList(ORG, WS)!)).toEqual(["s2", "s1", "s3"]);
+  held.pushSessions(entries.map((entry) => ({ ...entry, title: "Renamed", modified: at(9) })));
+  expect(ids(liveCloudSessionList(ORG, WS)!)).toEqual(["s2", "s1", "s3"]);
+  const cached = JSON.parse(JSON.stringify(catalog.getCloudCatalog().orgs[ORG].sessions[WS]));
+  closeCloudConnection({ orgId: ORG, workspaceId: WS });
+  expect(buildCloudSessions({ item: item(driver), cached }).map((row) => row.sessionId)).toEqual(["s2", "s1", "s3"]);
+  cached.sessions[2].pinned = true;
+  expect(buildCloudSessions({ item: item(driver), cached }).map((row) => row.sessionId)).toEqual(["s3", "s2", "s1"]);
+});

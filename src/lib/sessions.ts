@@ -1,3 +1,4 @@
+import { keepMessageTime } from "@/lib/messageActivity";
 import { useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -137,18 +138,33 @@ const workspaceRefreshVersions = new Map<string, number>();
 export async function bootSessions() {
   if (booted) return;
   booted = true;
+  // Backfill can publish while the first list is being read. Subscribe first,
+  // retaining only chronology until initialization supplies the session rows.
+  const initialMessageTimes = new Map<string, Pick<SessionEntry, "lastMessageAt">>();
+  try {
+    await listen<SessionEntry>("session_updated", (e) => {
+      if (state.loaded) upsertSession(e.payload);
+      else initialMessageTimes.set(e.payload.id, keepMessageTime(
+        { lastMessageAt: e.payload.lastMessageAt }, initialMessageTimes.get(e.payload.id),
+      ));
+    });
+  } catch {
+    /* outside a webview */
+  }
   // Projects and sessions are two file reads; the harness probe may shell out
   // to a login shell and take seconds, so it lands on its own.
   // How the tabs are arranged is read alongside the sessions and not waited for: a window must never
   // fail to list its sessions over it. Until it lands, tabs are in the order they were opened.
   void bootTabLayouts();
   const [projects, sessions] = await Promise.all([api.listProjects(), api.listSessions()]);
-  set({ loaded: true, projects: projects.projects, lastProject: projects.lastSelected, sessions });
+  set({ loaded: true, projects: projects.projects, lastProject: projects.lastSelected,
+    sessions: sessions.map((session) => keepMessageTime(session, initialMessageTimes.get(session.id))),
+  });
+  initialMessageTimes.clear();
   void api.listHarnesses().then((harnesses) => set({ harnesses })).catch(() => {});
   void api.chatsDir().then((chatsPath) => set({ chatsPath })).catch(() => {});
   try {
     await listen<SessionEntry>("session_created", (e) => upsertSession(e.payload));
-    await listen<SessionEntry>("session_updated", (e) => upsertSession(e.payload));
     await listen<string>("session_deleted", (e) => removeSessions([e.payload]));
     await listen<string>("workspaces_changed", (e) => void refreshWorkspaces(e.payload));
     // Another window added, removed or edited a project.
@@ -161,8 +177,9 @@ export async function bootSessions() {
 }
 
 export async function refreshSessions() {
-  const sessions = await api.listSessions();
+  const incoming = await api.listSessions();
   const before = state.sessions;
+  const sessions = incoming.map((session) => keepMessageTime(session, before.find((old) => old.id === session.id)));
   set({ sessions });
   // The list was replaced wholesale: what is no longer in it has no row to be closed from.
   const kept = new Map(sessions.map((session) => [session.id, session]));
@@ -181,6 +198,7 @@ export async function refreshSessions() {
 
 export function upsertSession(s: SessionEntry) {
   const i = state.sessions.findIndex((x) => x.id === s.id);
+  s = keepMessageTime(s, state.sessions[i]);
   // Its checkout was just removed: a shell left running there has no directory.
   if (s.worktreeRemoved && i >= 0 && !state.sessions[i].worktreeRemoved) void closeSessionShells(s.id);
   const sessions = i >= 0 ? state.sessions.map((x) => (x.id === s.id ? s : x)) : [...state.sessions, s];

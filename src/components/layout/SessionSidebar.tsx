@@ -30,6 +30,8 @@ import { CloudOrganizations, useHasCloudOrganizations } from "./CloudOrganizatio
 import { AgentMark } from "@/components/AgentMark";
 import { IssueLinkMenuItems } from "@/components/session/IssueLinkMenuItems";
 
+import { compareMessageActivity, conversationTime } from "@/lib/messageActivity";
+
 const canon = (path: string) => path.replace(/\/+$/, "");
 
 /** A conversation's name: its agent's title for it once there is one. */
@@ -38,7 +40,7 @@ export function conversationTitle(session: SessionEntry): string {
   return tab?.title?.trim() || session.title;
 }
 
-const byRecency = (a: SessionEntry, b: SessionEntry) => Number(b.pinned) - Number(a.pinned) || b.modified.localeCompare(a.modified);
+const byRecency = (a: SessionEntry, b: SessionEntry) => compareMessageActivity(a, b, a.id, b.id);
 
 /** Every live conversation as one list, pinned first, then newest; the open one stays even when archived. */
 export function orderConversations(sessions: SessionEntry[], selectedId: string | null): SessionEntry[] {
@@ -123,9 +125,11 @@ export function groupConversations(
       groups.set(key, { path: project.path, name: project.name, project, sessions: [], branches: {} });
     }
   }
-  // Newest activity first: a conversation's, or the project's being opened (a new project has only that).
-  const latest = (group: ConversationGroup) => group.sessions.reduce((max, session) => (session.modified > max ? session.modified : max), group.project?.lastOpened ?? "");
-  const ordered = [...groups.values()].sort((a, b) => Number(!!b.project?.pinned) - Number(!!a.project?.pinned) || latest(b).localeCompare(latest(a)));
+  // A populated group follows its messages; opening its project is not a message.
+  const latest = (group: ConversationGroup) => group.sessions.length
+    ? Math.max(...group.sessions.map((session) => Date.parse(conversationTime(session)) || 0))
+    : Date.parse(group.project?.lastOpened ?? "") || 0;
+  const ordered = [...groups.values()].sort((a, b) => Number(!!b.project?.pinned) - Number(!!a.project?.pinned) || latest(b) - latest(a) || a.path.localeCompare(b.path));
   return { groups: ordered, chats };
 }
 
@@ -722,7 +726,7 @@ function ConversationRow({
                 {mark}
                 {/* The row's state sits where the time does, at the end, so the row's own icon keeps its place; while working, the sign stands in for the time. */}
                 <StatusMark status={status} />
-                {status !== "in_progress" && <RowTime at={session.modified} />}
+                {status !== "in_progress" && <RowTime at={conversationTime(session)} />}
               </>
             ) : (
               <>
@@ -737,7 +741,7 @@ function ConversationRow({
                 <span className="truncate">{branch}</span>
               </span>
             ) : (
-              <RowTime at={session.modified} />
+              <RowTime at={conversationTime(session)} />
             )}
           </button>
           <RowActions>

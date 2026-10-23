@@ -27,6 +27,8 @@ import { useSidebarFilter } from "@/lib/sidebarFilter";
 import { DevelopmentSection } from "@/components/cloud/DevRuntime";
 import { CloudOrganizations } from "./CloudOrganizations";
 
+import { conversationTime } from "@/lib/messageActivity";
+
 const canon = (path: string) => path.replace(/\/+$/, "");
 
 /**
@@ -174,7 +176,7 @@ function ChatRow({
               <span className="flex items-center gap-1.5">
                 {session.pinned && <Pin className="size-3 shrink-0 text-faint" />}
                 <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{title}</span>
-                <span className={cn("shrink-0 text-[10px] tabular-nums text-faint", yieldsToRowActions)}>{relativeTime(session.modified)}</span>
+                <span className={cn("shrink-0 text-[10px] tabular-nums text-faint", yieldsToRowActions)}>{relativeTime(conversationTime(session))}</span>
               </span>
               <span className="flex items-center gap-2">
                 <span className={cn("flex min-w-0 flex-1 items-center gap-1 truncate text-[12px]", preview.tone === "waiting" ? "text-warning" : "text-faint")} data-testid="chat-preview">

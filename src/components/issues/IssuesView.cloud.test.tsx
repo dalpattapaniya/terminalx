@@ -44,7 +44,12 @@ const cloudProject = { key: PROJECT, orgId: "org-a", identity: "github.com/acme/
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("@/components/chat/Markdown", () => ({ Markdown: ({ text }: { text: string }) => <div>{text}</div> }));
-vi.mock("@/components/ui/tooltip", () => ({ WithTooltip: ({ children }: { children: ReactNode }) => children }));
+vi.mock("@/components/ui/tooltip", () => ({
+  WithTooltip: ({ children }: { children: ReactNode }) => children,
+  Tooltip: ({ children }: { children: ReactNode }) => children,
+  TooltipTrigger: ({ children }: { children: ReactNode }) => children,
+  TooltipContent: ({ children }: { children: ReactNode }) => children,
+}));
 vi.mock("@/lib/models", async (original) => ({
   ...(await original<typeof import("@/lib/models")>()),
   PERMISSION_MODES: [{ id: "bypassPermissions", label: "Bypass permissions", hint: "" }],
@@ -66,7 +71,24 @@ vi.mock("@/lib/sessions", () => ({
   upsertSession: vi.fn(),
   useSessionStore: () => sessionStore,
 }));
-vi.mock("@/lib/cloudDashboard", () => ({ openCloudSession }));
+const cloudWorkState = vi.hoisted(() => ({
+  account: { status: { state: "signed-in", identity: { email: "me@example.com", organizationId: "org-a" }, context: { account: "test" }, organizations: [{ id: "org-a", name: "Acme", role: "owner", cloud: { enabled: true, flags: {} } }] }, ready: true, busy: false },
+  catalog: { owner: "me@example.com", loaded: true, orgs: {} },
+  rows: [],
+  accountChanged: () => {},
+}));
+vi.mock("@/lib/account", async (original) => ({
+  ...(await original<typeof import("@/lib/account")>()),
+  getAccount: () => cloudWorkState.account,
+  useAccount: () => cloudWorkState.account,
+  subscribeAccount: (listener: () => void) => { cloudWorkState.accountChanged = listener; return () => {}; },
+}));
+vi.mock("@/lib/cloudCatalog", async (original) => ({
+  ...(await original<typeof import("@/lib/cloudCatalog")>()),
+  getCloudCatalog: () => cloudWorkState.catalog,
+  useCloudCatalog: () => cloudWorkState.catalog,
+}));
+vi.mock("@/lib/cloudDashboard", async (original) => ({ ...(await original<typeof import("@/lib/cloudDashboard")>()), useCloudDashboard: () => cloudWorkState.rows, openCloudSession }));
 vi.mock("@/lib/cloudModels", async (original) => ({ ...(await original<typeof import("@/lib/cloudModels")>()), useCloudModelClient: () => null }));
 vi.mock("@/components/session/CloudNewSession", async (original) => ({
   ...(await original<typeof import("@/components/session/CloudNewSession")>()),
@@ -98,6 +120,8 @@ const issue = {
 
 const calls = (command: string) => invoke.mock.calls.filter(([name]) => name === command).map(([, args]) => args as Record<string, unknown>);
 
+let accountNumber = 0;
+
 beforeEach(() => {
   invoke.mockReset().mockImplementation(async (command: string, args?: Record<string, unknown>) => {
     if (command === "linear_status") return { connected: false };
@@ -109,6 +133,10 @@ beforeEach(() => {
     if (command === "issue_comments") return { comments: [], nextCursor: null, total: 0 };
     return undefined;
   });
+  cloudWorkState.account.status.state = "signed-in";
+  cloudWorkState.account.status.context.account = `test-${++accountNumber}`;
+  cloudWorkState.accountChanged();
+  cloudWorkState.catalog.orgs = { "org-a": { source: "live", workspaces: [node.item], sessions: {} } };
   pipelineStore.pipelines = [];
   cloudStart.plan = { kind: "reuse" };
   cloudStart.outcome = { supported: true, pipeline: { id: "p1", cloud: true }, note: null };
@@ -197,6 +225,7 @@ describe("the Issues view for a cloud project", () => {
 
     cloudStart.outcome = { supported: true, pipeline: null, note: "This session runs on main itself." };
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start anyway" }));
     await waitFor(() => expect(screen.getByTestId("issue-start-note").textContent).toContain("runs on main itself"));
 
     cleanup();
@@ -204,6 +233,7 @@ describe("the Issues view for a cloud project", () => {
     cloudStart.startInWorkspace.mockClear();
     await openIssue();
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start anyway" }));
     const note = await screen.findByTestId("issue-start-note");
     expect(note.textContent).toContain("no workspace to start in");
     expect(cloudStart.startInWorkspace).not.toHaveBeenCalled();
@@ -280,4 +310,70 @@ describe("the Issues view for a cloud project", () => {
     fireEvent.contextMenu(await row());
     expect(await screen.findByText("Automations run in projects on this computer")).toBeTruthy();
   });
+});
+
+it("counts a successful cloud start before claims or lists arrive and opens it from the duplicate warning", async () => {
+  await openIssue();
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  await screen.findByText("You · in the cloud");
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open the existing session" }));
+  expect(openCloudSession).toHaveBeenCalledWith("cloud:org-a:ws-1:s1", undefined);
+  expect(cloudStart.startInWorkspace).toHaveBeenCalledTimes(1);
+  const choose = async (label: string) => {
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^Working: / }), { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+  };
+  await choose("Only mine");
+  expect(await row()).toBeTruthy();
+  await choose("Hide issues someone is working on");
+  await waitFor(() => expect(screen.queryByRole("button", { name: /#433.*Carry issue sessions on/ })).toBeNull());
+});
+
+it("does not retain a failed start as work or warn on its retry", async () => {
+  cloudStart.startInWorkspace.mockRejectedValueOnce(new Error("failed"));
+  await openIssue();
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  await waitFor(() => expect(cloudStart.startInWorkspace).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect((screen.getByRole("button", { name: "Start session" }) as HTMLButtonElement).disabled).toBe(false));
+  expect(screen.queryByText("You · in the cloud")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  await waitFor(() => expect(cloudStart.startInWorkspace).toHaveBeenCalledTimes(2));
+  expect(screen.queryByTestId("taken-issue-warning")).toBeNull();
+});
+
+it("keeps a successful start across view remounts but clears it on sign-out even with cached cloud data", async () => {
+  await openIssue();
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  await screen.findByText("You · in the cloud");
+  cleanup();
+  await openIssue();
+  expect(screen.getByText("You · in the cloud")).toBeTruthy();
+  cleanup();
+  act(() => {
+    cloudWorkState.account.status.state = "signed-out";
+    cloudWorkState.accountChanged();
+  });
+  await openIssue();
+  expect(screen.queryByText("You · in the cloud")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  expect(screen.queryByTestId("taken-issue-warning")).toBeNull();
+});
+
+
+it("removes an open duplicate warning when its account signs out", async () => {
+  const view = render(<IssuesView />);
+  fireEvent.click(await row());
+  await screen.findByText("Sessions stop at code.");
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  await screen.findByText("You · in the cloud");
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+  await screen.findByTestId("taken-issue-warning");
+  act(() => {
+    cloudWorkState.account.status.state = "signed-out";
+    cloudWorkState.accountChanged();
+  });
+  view.rerender(<IssuesView />);
+  expect(screen.queryByTestId("taken-issue-warning")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Open the existing session" })).toBeNull();
 });

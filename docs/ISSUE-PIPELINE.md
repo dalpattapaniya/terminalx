@@ -44,8 +44,8 @@ done with files left uncommitted, or a push that is refused; the pull request
 is tried again the next time the author reports done, or from **Try again** on
 the issue's page.
 
-The reviewer is a session of its own in the author's checkout. It is given the
-pull request, the issue, the commit and the base, and nothing the author said.
+The reviewer is an independent Reviewer tab in the author's session and checkout.
+It is given the pull request, the issue, the commit and the base, and nothing the author said.
 It is told to leave the checkout as it found it and to end with
 
 ````
@@ -197,14 +197,20 @@ terminalx sessions create --project cloud:<org>:github.com/<owner>/<name> \
 terminalx pipelines list [--project <project>] --json
 terminalx pipelines show <pipeline> [--project <project>] --json
 terminalx pipelines auto-merge <pipeline> on|off [--project <project>] --json
-terminalx pipelines stop|resume|advance|review|refresh <pipeline> [--project <project>] --json
+terminalx pipelines stop|resume|advance|review|merge|refresh <pipeline> [--project <project>] --json
 ```
 
 `<issue>` is `433`, `#433`, `ENG-42`, or the issue's URL; a GitHub URL must be
 for the project's own repository. `<pipeline>` is a pipeline id, the issue it
 is for, or the session working on it; when two projects each have a pipeline
 for the same issue number, `--project` says which. Merging by hand is done on
-the issue page, not here.
+the issue page. `pipelines merge` requests a gated merge with agent authority:
+it never overrides require-person, protected-category, security, local-check or
+CI holds. Cloud merges still require the desktop issue page and its GitHub sign-in.
+New reviewers are independent Reviewer tabs in the owning session, archived and
+removed with that session. Existing separate reviewers remain usable; no history
+is migrated or deleted. A changed head is reviewed again when both conversations
+are idle and the checkout is clean and matches the PR, within the round limit.
 
 A cloud project's issue starts in one of its workspaces (a stopped one only
 with `--wake`), never in a new one: a new machine starts with a plain prompt
@@ -235,7 +241,7 @@ cloud:… --issue`) goes through the same stages, run by the workspace's
 runtime (`terminalx-serve`) and not by this computer. It needs no desktop
 attached after the start: the runtime hears each turn end as the desktop
 does, pushes and opens the pull request with the workspace's own GitHub
-token, starts the reviewer session in the author's checkout, and watches the
+token, starts the Reviewer tab in the author's session, and watches the
 pull request's checks. While it pushes, opens a pull request or waits for
 checks it counts as running work, so the workspace is not suspended halfway.
 A wait counts for an hour from when it began and no longer, whether or not

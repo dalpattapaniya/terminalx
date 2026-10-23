@@ -443,8 +443,11 @@ export function cacheCloudSessions(orgId: string, workspaceId: string, sessions:
 }
 
 /** Read reviewer IDs from runtime records, including older saved catalogs. */
-export function pipelineReviewerIds(pipelines: RuntimeIssuePipeline[]): string[] {
-  return pipelines.flatMap((pipeline) => isObject(pipeline.reviewer) && typeof pipeline.reviewer.sessionId === "string" ? [pipeline.reviewer.sessionId] : []);
+export function pipelineReviewerIds(pipelines: RuntimeIssuePipeline[], known: readonly string[] = []): string[] {
+  const shared = new Set(pipelines.flatMap((pipeline) => isObject(pipeline.author) && isObject(pipeline.reviewer)
+    && pipeline.author.sessionId === pipeline.reviewer.sessionId ? [pipeline.author.sessionId] : []));
+  return [...known, ...pipelines.flatMap((pipeline) => isObject(pipeline.reviewer)
+    && typeof pipeline.reviewer.sessionId === "string" ? [pipeline.reviewer.sessionId] : [])].filter((id) => !shared.has(id));
 }
 
 /** Keep a workspace's issue pipelines with the catalog (#433), so its issues show them while it sleeps. */
@@ -453,11 +456,10 @@ export function cacheCloudPipelines(orgId: string, workspaceId: string, pipeline
   if (!current) return;
   const previous = current.pipelines?.[workspaceId];
   // Capture the full runtime list before trimming it, and migrate older caches.
-  const reviewerSessionIds = [...new Set([
-    ...(previous?.reviewerSessionIds ?? []),
-    ...knownReviewers,
-    ...pipelineReviewerIds([...(previous?.pipelines ?? []), ...pipelines]),
-  ])].sort();
+  const reviewerSessionIds = [...new Set(pipelineReviewerIds(
+    [...(previous?.pipelines ?? []), ...pipelines],
+    [...(previous?.reviewerSessionIds ?? []), ...knownReviewers],
+  ))].sort();
   // The issue view keeps only the newest 50 records; identities above are not history.
   pipelines = pipelines.slice(0, 50);
   if (JSON.stringify(previous?.pipelines) === JSON.stringify(pipelines) && JSON.stringify(previous?.reviewerSessionIds) === JSON.stringify(reviewerSessionIds)) return;
@@ -1053,7 +1055,7 @@ function parsePipelines(value: unknown, workspaces: ReadonlySet<string>): Record
     if (!workspaces.has(workspaceId) || !isObject(raw) || !Array.isArray(raw.pipelines)) continue;
     const pipelines = raw.pipelines.filter((pipeline): pipeline is RuntimeIssuePipeline => isObject(pipeline) && typeof pipeline.id === "string" && isObject(pipeline.issue));
     const reviewerSessionIds = Array.isArray(raw.reviewerSessionIds) ? raw.reviewerSessionIds.filter((id): id is string => typeof id === "string") : [];
-    out[workspaceId] = { pipelines, reviewerSessionIds, at: typeof raw.at === "number" ? raw.at : 0 };
+    out[workspaceId] = { pipelines, reviewerSessionIds: pipelineReviewerIds(pipelines, reviewerSessionIds), at: typeof raw.at === "number" ? raw.at : 0 };
   }
   return out;
 }

@@ -72,6 +72,10 @@ export interface CheckpointMeta {
 
 /** A decrypted checkpoint projection, schema 1. */
 export interface Projection {
+  sessionCreated?: string | null;
+  sessionLastMessageAt?: string | null;
+  created?: string;
+  lastMessageAt?: string | null;
   v: 1;
   sessionId: string;
   tabId: string;
