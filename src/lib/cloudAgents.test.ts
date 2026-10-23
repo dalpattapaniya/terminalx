@@ -183,6 +183,10 @@ describe("cloud agent tabs store", () => {
         truncated: true,
         followUps: [],
         updatedAt: 10,
+        created: "2026-10-01T00:00:00Z",
+        lastMessageAt: "2026-10-03T00:00:00Z",
+        sessionCreated: "2026-09-01T00:00:00Z",
+        sessionLastMessageAt: "2026-10-04T00:00:00Z",
       },
     };
     await loadCloudAgents(scope);
@@ -193,7 +197,10 @@ describe("cloud agent tabs store", () => {
     expect(backend.calls.at(-1)).toMatchObject({ cmd: "cloud_agent_checkpoint", args: { tabId: "t-1", afterEpoch: 7, afterVersion: 3 } });
     expect(getTabLog("s-1", "t-1").events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
     const tab = getCloudAgents(scope).tabs[0]!;
-    expect(tab.info).toMatchObject({ title: "Fix the build", status: "completed", process: "exited" });
+    expect(tab.info).toMatchObject({ title: "Fix the build", status: "completed", process: "exited",
+      created: "2026-10-01T00:00:00Z", lastMessageAt: "2026-10-03T00:00:00Z",
+      sessionCreated: "2026-09-01T00:00:00Z", sessionLastMessageAt: "2026-10-04T00:00:00Z",
+    });
     expect(tab.unread).toBe(true);
     expect(tab.checkpoint).toEqual({ epoch: 7, version: 5 });
     // The same checkpoint again is not newer: nothing changes.
@@ -734,4 +741,26 @@ describe("cloud agent tabs store", () => {
       expect(backend.calls.filter((call) => call.cmd === "cloud_agent_checkpoint").map((call) => call.args.tabId)).toEqual(["t-1"]);
     });
   });
+});
+
+it("uses verified checkpoint chronology even when its retained event tail is empty", async () => {
+  backend.cache["t-1"] = {
+    tab: tabInfo(), events: [], cursor: null, checkpoint: { epoch: 7, version: 1 },
+    unread: false, completed: false, updatedAt: 1,
+  };
+  backend.checkpoints["t-1"] = {
+    epoch: 7, version: 2,
+    projection: { ...tabInfo(), v: 1, events: [], truncated: true, updatedAt: 999,
+      created: "2026-10-01T00:00:00Z", lastMessageAt: "2026-10-04T00:00:00Z",
+      sessionCreated: "2026-09-01T00:00:00Z", sessionLastMessageAt: "2026-10-05T00:00:00Z",
+    },
+  };
+  await loadCloudAgents(scope);
+  expect(await refreshFromCheckpoint(scope, "t-1")).toBe(true);
+  expect(getCloudAgents(scope).tabs[0].info).toMatchObject({
+    created: "2026-10-01T00:00:00Z", lastMessageAt: "2026-10-04T00:00:00Z",
+    sessionCreated: "2026-09-01T00:00:00Z", sessionLastMessageAt: "2026-10-05T00:00:00Z",
+  });
+  await flushCloudAgentCache(scope);
+  expect(backend.cache["t-1"].tab.lastMessageAt).toBe("2026-10-04T00:00:00Z");
 });

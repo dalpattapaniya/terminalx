@@ -31,6 +31,12 @@
 
 ### Chats
 
+- Order session lists by verified user and assistant message time, retaining
+  pins and filters across local and cloud updates and restarts. Metadata
+  edits no longer bump conversations; older logs are indexed in background
+  batches without treating legacy import times as message times. Title backfill
+  preserves message ordering when the app restarts. (#599)
+
 - Keep completed Claude compaction idle instead of raising a false stall
   warning, including manual `/compact` queued behind a running turn. Record
   privacy-safe turn-opener labels in stall diagnostics while retaining warnings

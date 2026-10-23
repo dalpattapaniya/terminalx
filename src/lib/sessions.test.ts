@@ -311,3 +311,45 @@ describe("new chat", () => {
     await expect(sessions.startChat()).rejects.toThrow("Install and sign in to an agent");
   });
 });
+
+it("retains newer message time when delayed metadata events and refreshes arrive", async () => {
+  const latest = "2026-10-05T00:00:00Z";
+  mocks.listeners.get("session_updated")?.({ payload: { ...attached, lastMessageAt: latest } });
+  mocks.listeners.get("session_updated")?.({ payload: { ...attached, title: "Renamed", lastMessageAt: "2026-10-02T00:00:00Z" } });
+  expect(sessions.getSessionStore().sessions[0]).toMatchObject({ title: "Renamed", lastMessageAt: latest });
+  await sessions.refreshSessions();
+  expect(sessions.getSessionStore().sessions[0].lastMessageAt).toBe(latest);
+});
+
+it("subscribes before boot backfill and merges its newer time into a stale initial list", async () => {
+  vi.resetModules();
+  mocks.listeners.clear();
+  sessions = await import("./sessions");
+  let resolveList!: (entries: SessionEntry[]) => void;
+  const pending = new Promise<SessionEntry[]>((resolve) => { resolveList = resolve; });
+  const initial = { ...attached, lastMessageAt: "2026-10-02T00:00:00Z" };
+  const newer = { ...attached, lastMessageAt: "2026-10-05T00:00:00Z" };
+  mocks.invoke.mockImplementation(async (command: string) => {
+    if (command === "list_projects") return { projects: [{ path: projectPath, name: "Synthetic" }], lastSelected: projectPath };
+    if (command === "list_sessions") {
+      expect(mocks.listeners.has("session_updated")).toBe(true);
+      mocks.listeners.get("session_updated")!({ payload: newer });
+      // A delayed older backfill event must not displace the newest one.
+      mocks.listeners.get("session_updated")!({ payload: initial });
+      return pending;
+    }
+    if (command === "list_harnesses") return [];
+    if (command === "list_workspaces") return [main, worktree];
+    return undefined;
+  });
+  const boot = sessions.bootSessions();
+  await vi.waitFor(() => expect(mocks.listeners.has("session_updated")).toBe(true));
+  expect(sessions.getSessionStore()).toMatchObject({ loaded: false, sessions: [], selectedSessionId: null });
+  resolveList([initial]);
+  await boot;
+  expect(sessions.getSessionStore()).toMatchObject({ loaded: true, selectedSessionId: null });
+  expect(sessions.getSessionStore().sessions[0]).toEqual(newer);
+  // The same listener continues normal updates after initialization.
+  mocks.listeners.get("session_updated")!({ payload: { ...initial, title: "Synthetic rename" } });
+  expect(sessions.getSessionStore().sessions[0]).toMatchObject({ title: "Synthetic rename", lastMessageAt: newer.lastMessageAt });
+});
