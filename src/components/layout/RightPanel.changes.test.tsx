@@ -22,56 +22,58 @@ const events: AgentEvent[] = [
 
 beforeEach(() => {
   invoke.mockImplementation(async (command: string) => {
-    if (command === "changes_between") return [];
-    if (command === "working_changes") return ["head", [
+    const files = [
       { path: "src/modified.ts", status: "modified", additions: 2, deletions: 1 },
       { path: "fixtures/untracked.json", status: "added", additions: 1, deletions: 0 },
-    ]];
+    ];
+    if (command === "review_range") return { target: "main", base: "base", head: "live-snapshot" };
+    if (command === "changes_between") return files;
+    if (command === "working_changes") return ["head", files];
     if (command === "work_status") return { isRepo: true, dirty: true, branch: "fix/test", ahead: 0, behind: 0 };
     if (command === "log_commits") return [];
     throw new Error(`Unexpected command: ${command}`);
   });
 });
-afterEach(() => { cleanup(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); localStorage.clear(); vi.clearAllMocks(); });
 
-it("explains an empty status-only turn and opens all uncommitted files in Repo", async () => {
+it("shows workspace work after a status-only turn and opens Repo for committing", async () => {
   render(<RightPanel cwd={cwd} branch="fix/test" events={events} />);
 
-  expect(await screen.findByText("No files changed during the last turn.")).toBeTruthy();
-  expect(screen.getByText(/including untracked files/)).toBeTruthy();
+  expect(await screen.findByText("All changes · 2 files")).toBeTruthy();
+  expect(screen.getByText(/Against main/)).toBeTruthy();
   expect(invoke).not.toHaveBeenCalledWith("working_changes", expect.anything());
-  fireEvent.click(screen.getByRole("button", { name: "View all uncommitted changes" }));
+  fireEvent.click(screen.getByRole("button", { name: "Commit and history in Repo" }));
 
-  expect(await screen.findByRole("button", { name: /modified.ts/ })).toBeTruthy();
-  expect(screen.getByRole("button", { name: /untracked.json/ })).toBeTruthy();
+  await waitFor(() => expect(screen.getAllByRole("button", { name: /modified.ts/ })).toHaveLength(2));
+  expect(screen.getAllByRole("button", { name: /untracked.json/ })).toHaveLength(2);
   expect(screen.getByRole("radio", { name: /Uncommitted/ }).getAttribute("aria-checked")).toBe("true");
   expect(invoke).toHaveBeenCalledWith("working_changes", { cwd });
 
   // The shortcut must also return from History without losing a commit draft.
-  fireEvent.change(screen.getByRole("textbox"), { target: { value: "Keep my draft" } });
+  fireEvent.change(screen.getByPlaceholderText("Commit message (⌘⏎ to commit)"), { target: { value: "Keep my draft" } });
   fireEvent.click(screen.getByRole("radio", { name: "History" }));
   fireEvent.click(screen.getByRole("button", { name: "Changes" }));
-  fireEvent.click(screen.getByRole("button", { name: "View all uncommitted changes" }));
-  expect(await screen.findByRole("button", { name: /untracked.json/ })).toBeTruthy();
-  expect(screen.getByRole("textbox")).toHaveProperty("value", "Keep my draft");
+  fireEvent.click(screen.getByRole("button", { name: "Commit and history in Repo" }));
+  expect(screen.getAllByRole("button", { name: /untracked.json/ })).toHaveLength(2);
+  expect(screen.getByPlaceholderText("Commit message (⌘⏎ to commit)")).toHaveProperty("value", "Keep my draft");
 });
 
 it("offers workspace changes before there is a turn snapshot", async () => {
   render(<RightPanel cwd={cwd} branch="fix/test" />);
-  expect(screen.getByText("Send a prompt to see what a turn changes.")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "View all uncommitted changes" }));
+  expect(await screen.findByText("All changes · 2 files")).toBeTruthy();
   expect(await screen.findByRole("button", { name: /untracked.json/ })).toBeTruthy();
 });
 
 it("uses live-turn wording while an agent is running", async () => {
   render(<RightPanel cwd={cwd} branch="fix/test" events={events.slice(0, 1)} live />);
-  expect(await screen.findByText("No files changed during this turn yet.")).toBeTruthy();
-  await waitFor(() => expect(invoke).toHaveBeenCalledWith("changes_between", { cwd, base: "snapshot", head: null }));
+  fireEvent.change(screen.getByLabelText("Changes scope"), { target: { value: "turn" } });
+  expect(await screen.findByText("This turn · 2 files")).toBeTruthy();
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("changes_between", { cwd, base: "snapshot", head: "live-snapshot" }));
 });
 
 it("keeps the working-tree view scoped to the workspace", async () => {
   render(<RightPanel cwd={cwd} branch="fix/test" workingTree />);
-  expect(await screen.findByText("Working tree")).toBeTruthy();
+  expect(await screen.findByText("All changes · 2 files")).toBeTruthy();
   expect(screen.getByRole("button", { name: /untracked.json/ })).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "View all uncommitted changes" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Commit and history in Repo" })).toBeTruthy();
 });

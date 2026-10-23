@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { Columns2, Rows2 } from "@/icons";
-import { changeRange, useChanges, useGitWorkingChanges, type ChangeRange } from "@/lib/changes";
+import { changeRange, type ChangeRange } from "@/lib/changes";
 import { localGitSource, type GitSource } from "@/lib/gitSource";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/button";
@@ -10,120 +10,132 @@ import type { ChangedFile } from "@/types/session";
 import { DiffPane } from "./DiffPane";
 import { FileList, sumChanges } from "./FileList";
 
-/**
- * "What did this turn touch": the tree at send time against the tree when
- * the turn closed (or a live snapshot while it runs). Nothing opens by
- * default; the list is the answer and a diff above it would push it away.
- *
- * It reads through a GitSource: the local checkout at `cwd` unless `source`
- * names another (a cloud repository).
- */
-export function ChangesPanel({
-  cwd,
-  source: given,
-  events,
-  version,
-  baseRef,
-  active,
-  live,
-  workingTree = false,
-  onViewUncommitted,
-}: {
-  /** The local checkout; ignored when `source` is given. */
+type Scope = "all" | "uncommitted" | "turn";
+type Choice = { scope: Scope; target: string | null };
+const preferenceKey = (source: GitSource) => `changes-scope:${source.key}`;
+function readChoice(source: GitSource): Choice {
+  try {
+    const saved = JSON.parse(localStorage.getItem(preferenceKey(source)) ?? "null");
+    if (saved && ["all", "uncommitted", "turn"].includes(saved.scope)) {
+      return { scope: saved.scope, target: typeof saved.target === "string" ? saved.target : null };
+    }
+  } catch { /* Storage may be unavailable. */ }
+  return { scope: "all", target: null };
+}
+
+/** Review the accumulated workspace by default; turn snapshots are opt-in. */
+export function ChangesPanel(props: {
   cwd?: string;
-  /** Where to read Git; the local checkout at `cwd` when absent. */
   source?: GitSource;
   events: AgentEvent[];
-  /** Bumps when the log grows; the array itself is reused, so this drives the range. */
   version: number;
   baseRef?: string | null;
   active: boolean;
   live: boolean;
-  /** Show the checkout's uncommitted diff outside an agent turn. */
   workingTree?: boolean;
   onViewUncommitted: () => void;
 }) {
-  const source = useMemo(() => given ?? localGitSource(cwd ?? ""), [given, cwd]);
-  if (workingTree) return <WorkingTreeChanges source={source} active={active} />;
-  return <TurnChanges source={source} events={events} version={version} baseRef={baseRef} active={active} live={live} onViewUncommitted={onViewUncommitted} />;
+  const source = useMemo(() => props.source ?? localGitSource(props.cwd ?? ""), [props.source, props.cwd]);
+  return <ScopedChanges key={source.key} {...props} source={source} />;
 }
 
-function TurnChanges({
-  source,
-  events,
-  version,
-  baseRef,
-  active,
-  live,
-  onViewUncommitted,
-}: {
+function ScopedChanges({ source, events, version, active, live, workingTree, onViewUncommitted }: {
   source: GitSource;
   events: AgentEvent[];
   version: number;
-  baseRef?: string | null;
   active: boolean;
   live: boolean;
+  workingTree?: boolean;
   onViewUncommitted: () => void;
 }) {
-  const range = useMemo(() => changeRange(events, baseRef), [events, version, baseRef]);
+  const targetId = useId();
+  const [choice, setChoice] = useState(() => readChoice(source));
+  const turnRange = useMemo(() => {
+    let start = 0;
+    events.forEach((event, index) => {
+      if (event.payload.type === "user_message" && !event.payload.queued) start = index;
+    });
+    return changeRange(events.slice(start));
+  }, [events, version]);
+  const [draft, setDraft] = useState(choice.target ?? "");
   const [tick, setTick] = useState(0);
+  const [result, setResult] = useState<{ range: ChangeRange; target: string; files: ChangedFile[] } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const choose = (next: Choice) => {
+    setChoice(next);
+    setTick((t) => t + 1);
+    setResult(null);
+    setError(null);
+    setLoading(true);
+    try { localStorage.setItem(preferenceKey(source), JSON.stringify(next)); } catch { /* Optional persistence. */ }
+  };
   useEffect(() => {
-    if (!live || !active) return;
+    if (!active || loading) return;
     const id = window.setInterval(() => setTick((t) => t + 1), 4000);
-    return () => window.clearInterval(id);
-  }, [live, active]);
-  const { files, loading, error } = useChanges(source, range, active, tick);
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1">
-        <ChangesBody
-          source={source}
-          files={files}
-          loading={loading}
-          error={error}
-          range={range}
-          label={live ? "This turn, so far" : "Last turn"}
-          empty={
-            loading ? "Loading turn changes…"
-              : error ? "Could not load turn changes."
-                : live ? "No files changed during this turn yet."
-                  : "No files changed during the last turn."
-          }
-          noRange="Send a prompt to see what a turn changes."
-          refreshKey={tick}
-        />
-      </div>
-      <div className="shrink-0 space-y-2 border-t border-hairline px-3 py-3">
-        <p className="text-xs text-muted-foreground">Repo shows all uncommitted workspace changes, including untracked files.</p>
-        <Button variant="secondary" size="sm" onClick={onViewUncommitted}>
-          View all uncommitted changes
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-function WorkingTreeChanges({ source, active }: { source: GitSource; active: boolean }) {
-  const [tick, setTick] = useState(0);
+    const refresh = () => setTick((t) => t + 1);
+    window.addEventListener("focus", refresh);
+    return () => { window.clearInterval(id); window.removeEventListener("focus", refresh); };
+  }, [active, loading]);
   useEffect(() => {
     if (!active) return;
-    const id = window.setInterval(() => setTick((value) => value + 1), 4000);
-    return () => window.clearInterval(id);
-  }, [active]);
-  const { head, files, loading, error } = useGitWorkingChanges(source, active, tick);
-  const range = head ? { base: head, head: null } : null;
+    let cancelled = false;
+    setLoading(true);
+    const read = async () => {
+      let range: ChangeRange;
+      let target: string;
+      if (choice.scope === "turn") {
+        const turn = turnRange;
+        if (!turn || (!live && !turn.head) || workingTree) {
+          setResult(null);
+          setError("No turn snapshots are available. Choose All changes to review the workspace.");
+          return;
+        }
+        range = turn.head ? turn : { base: turn.base, head: (await source.reviewRange(null, true)).head };
+        target = `Turn snapshot ${range.base.slice(0, 7)}`;
+      } else {
+        const review = await source.reviewRange(choice.target, choice.scope === "uncommitted");
+        range = review;
+        target = review.target;
+      }
+      const files = await source.changesBetween(range.base, range.head);
+      if (!cancelled) { setResult({ range, target, files }); setError(null); }
+    };
+    void read().catch((e) => {
+      if (!cancelled) { setResult(null); setError(source.errorMessage(e)); }
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [source, choice.scope, choice.target, choice.scope === "turn" ? turnRange?.base : null, choice.scope === "turn" ? turnRange?.head : null, active, tick, workingTree, live]);
+  const label = choice.scope === "all" ? "All changes" : choice.scope === "uncommitted" ? "Uncommitted changes" : live ? "This turn" : "Last turn";
   return (
-    <ChangesBody
-      source={source}
-      files={files}
-      loading={loading}
-      error={source.cloud && error ? source.errorMessage(error) : null}
-      range={range}
-      label="Working tree"
-      empty="Working tree is clean."
-      noRange="Reading working tree…"
-      refreshKey={tick}
-    />
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="shrink-0 space-y-2 border-b border-hairline px-3 py-2 text-xs">
+        <label className="flex items-center gap-2">Scope
+          <select aria-label="Changes scope" className="min-w-0 flex-1 rounded bg-well p-1" value={choice.scope} onChange={(e) => choose({ ...choice, scope: e.target.value as Scope })}>
+            <option value="all">All changes</option>
+            <option value="uncommitted">Uncommitted changes</option>
+            <option value="turn">{live ? "This turn" : "Last turn"}</option>
+          </select>
+        </label>
+        {choice.scope === "all" && <form className="flex items-center gap-2" onSubmit={(e) => { e.preventDefault(); choose({ ...choice, target: draft.trim() || null }); }}>
+          <label htmlFor={targetId}>Target</label>
+          <input id={targetId} aria-label="Comparison target" className="min-w-0 flex-1 rounded bg-well p-1 font-mono" value={draft} placeholder={result?.target ?? "Automatic base branch"} onChange={(e) => setDraft(e.target.value)} />
+          <Button type="submit" variant="secondary" size="sm">Apply</Button>
+        </form>}
+        <p className="break-words text-muted-foreground">{result
+          ? choice.scope === "all" ? `Against ${result.target} · merge-base tree ${result.range.base.slice(0, 7)}`
+            : choice.scope === "uncommitted" ? `Against HEAD · tree ${result.range.base.slice(0, 7)}` : result.target
+          : choice.scope === "all" ? `Target: ${choice.target ?? "automatic base branch"}` : choice.scope === "uncommitted" ? "Against HEAD" : "Turn snapshots"}</p>
+      </div>
+      <div className="min-h-0 flex-1">
+        <ChangesBody key={`${choice.scope}:${choice.target}`} source={source} files={result?.files ?? []} loading={loading} error={error} range={result?.range ?? null}
+          label={label} empty={loading ? "Loading changes…" : error ? "Changes unavailable." : "No changes in this scope."}
+          noRange={loading ? "Loading changes…" : "Changes unavailable."} />
+      </div>
+      <div className="shrink-0 border-t border-hairline px-3 py-2">
+        <Button variant="ghost" size="sm" onClick={onViewUncommitted}>Commit and history in Repo</Button>
+      </div>
+    </div>
   );
 }
 
@@ -136,7 +148,6 @@ function ChangesBody({
   label,
   empty,
   noRange,
-  refreshKey,
 }: {
   source: GitSource;
   files: ChangedFile[];
@@ -146,36 +157,39 @@ function ChangesBody({
   label: string;
   empty: string;
   noRange: string;
-  refreshKey: number;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [mode, setMode] = useState<"unified" | "split">("unified");
   const [pair, setPair] = useState<{ path: string; before: string; after: string } | null>(null);
+  const [pairError, setPairError] = useState<string | null>(null);
   const current = files.find((f) => f.path === selected) ?? null;
 
   useEffect(() => {
     if (!current || !range) {
       setPair(null);
+      setPairError(null);
       return;
     }
     let cancelled = false;
-    source
-      .fileContentsAt(current.path, range.base, range.head)
-      .then((r) => !cancelled && setPair({ path: current.path, before: r.before ?? "", after: r.after ?? "" }))
-      .catch(() => {});
-    return () => {
-      cancelled = true;
+    setPair(null);
+    setPairError(null);
+    const read = async () => {
+      const next = await source.fileContentsAt(current.path, range.base, range.head);
+      const before = current.oldPath ? (await source.fileContentsAt(current.oldPath, range.base, range.head)).before : next.before;
+      if (!cancelled) setPair({ path: current.path, before: before ?? "", after: next.after ?? "" });
     };
-  }, [source, current?.path, range?.base, range?.head, refreshKey]);
+    void read().catch((e) => { if (!cancelled) setPairError(source.errorMessage(e)); });
+    return () => { cancelled = true; };
+  }, [source, current?.path, current?.oldPath, range?.base, range?.head]);
 
   const totals = sumChanges(files);
 
-  if (!range) return <div className="px-3 py-4 text-xs text-muted-foreground">{noRange}</div>;
+  if (!range) return <div role={error ? "alert" : "status"} className="px-3 py-4 text-xs text-muted-foreground">{error ?? noRange}</div>;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
-        <span>{label}</span>
+      <div className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
+        <span>{label} · {files.length} {files.length === 1 ? "file" : "files"}</span>
         <span className="font-mono tabular-nums">
           {totals.additions > 0 && <span className="text-add">+{totals.additions}</span>}{" "}
           {totals.deletions > 0 && <span className="text-destructive">−{totals.deletions}</span>}
@@ -198,6 +212,8 @@ function ChangesBody({
       <div className={cn("shrink-0 overflow-y-auto scrollbar-thin", pair ? "max-h-[40%] border-b border-hairline" : "flex-1")}>
         <FileList files={files} selected={selected} onSelect={(p) => setSelected((s) => (s === p ? null : p))} empty={empty} />
       </div>
+      {pairError && <div role="alert" className="px-3 py-2 text-xs text-destructive">{pairError}</div>}
+      {current && !pair && !pairError && <div role="status" className="px-3 py-2 text-xs">Loading file diff…</div>}
       {pair && (
         <div className="min-h-0 flex-1">
           <DiffPane path={pair.path} before={pair.before} after={pair.after} mode={mode} />

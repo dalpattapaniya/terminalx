@@ -193,7 +193,11 @@ export class RemoteGit {
     return this.read("git.workingChanges");
   }
 
-  changesBetween(base: string, head: string | null): Promise<{ files: RemoteChangedFile[] }> {
+  reviewRange(target: string | null, uncommitted: boolean): Promise<{ target: string; base: string; head: string }> {
+    return this.read("git.reviewRange", { target, uncommitted });
+  }
+
+  changesBetween(base: string, head: string | null): Promise<{ files: RemoteChangedFile[]; truncated?: boolean }> {
     return this.read("git.changesBetween", head ? { base, head } : { base });
   }
 
