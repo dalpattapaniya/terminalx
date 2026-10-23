@@ -375,3 +375,35 @@ fn a_cloud_session_settled_while_linear_could_not_say_its_teams_is_linked_once_i
     claims.link_pass(&mut linker, &trackers);
     assert_eq!(found(&claims).as_deref(), Some("ENG-42"));
 }
+
+#[test]
+fn existing_reviewers_are_unlinked_and_never_published_even_after_the_pipeline_stops() {
+    let _home = crate::store::temp_home();
+    let project = tempfile::tempdir().unwrap();
+    let author = linked_session(project.path());
+    let mut reviewer = author.clone();
+    reviewer.id = "reviewer-1".into();
+    reviewer.issue_work.link = Some(IssueLinkSource::Branch);
+    index::save(&[author.clone(), reviewer.clone()]).unwrap();
+    let mut pipeline: crate::issue_pipeline::Pipeline = serde_json::from_str(include_str!("../fixtures/issue_pipeline.json")).unwrap();
+    pipeline.author.session_id = author.id.clone();
+    pipeline.stopped = true;
+    crate::issue_pipeline::store::insert(&pipeline).unwrap();
+    let (base, requests) = serve(r#"{"claims":1,"refreshAfterSeconds":120}"#);
+    let claims = service(&base);
+    let mut linker = Linker::default();
+    // Publishing before the next linking pass must also exclude the stale link.
+    assert!(claims.publish(&linker));
+    let sent = body(&requests.lock().unwrap()[0]);
+    assert_eq!(sent["claims"].as_array().unwrap().len(), 1);
+    assert_eq!(sent["claims"][0]["sessionId"], author.id);
+    claims.link_pass(&mut linker, &Trackers::default());
+    let cleaned = index::get(&reviewer.id).unwrap();
+    assert!(cleaned.issue.is_none());
+    assert!(cleaned.issue_work.link.is_none());
+    assert_eq!(cleaned.modified, reviewer.modified);
+    assert!(cleaned.issue_work.unlinked.contains(&reviewer.issue.unwrap().url));
+    assert_eq!(index::get(&author.id).unwrap().issue, author.issue);
+    claims.link_pass(&mut linker, &Trackers::default());
+    assert!(index::get(&reviewer.id).unwrap().issue.is_none());
+}

@@ -140,3 +140,8 @@ pub fn for_session(session_id: &str) -> Result<Option<Pipeline>> {
 pub fn takes_part(session_id: &str, tab_id: &str) -> bool {
     for_session(session_id).ok().flatten().is_some_and(|pipeline| pipeline.role_of(session_id, tab_id).is_some())
 }
+
+/// Reviewers never own issue work, including after their pipeline stops.
+pub fn reviewer_sessions() -> Result<std::collections::HashSet<String>> {
+    Ok(list()?.into_iter().filter_map(|pipeline| pipeline.reviewer.map(|reviewer| reviewer.session_id)).collect())
+}

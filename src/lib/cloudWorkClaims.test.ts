@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { CloudDashboardSession } from "@/lib/cloudDashboard";
+import stored from "../../src-tauri/src/fixtures/issue_pipeline.json";
+import type { IssuePipeline } from "@/types/issuePipeline";
+import { cloudPipelineView } from "@/lib/cloudPipelines";
 import { cloudWorkSessions } from "@/lib/cloudWorkClaims";
 
 function session(patch: Partial<CloudDashboardSession> = {}): CloudDashboardSession {
@@ -53,4 +56,39 @@ describe("the cloud sessions handed to the work status publisher", () => {
     const handed = cloudWorkSessions([session({ branch: null }), session({ sessionId: "c2", stopped: true, repository: "gitlab.example.com/a/b" })], () => null);
     expect(handed.map((each) => [each.sessionId, each.status, each.repository])).toEqual([["c2", "idle", null]]);
   });
+});
+
+// Pipeline session IDs are qualified by workspace before the hand-over.
+it.each([false, true])("excludes a cloud reviewer (stopped: %s), retaining authors and same IDs in other workspaces", (stopped) => {
+  const pipeline = cloudPipelineView({ ...stored, stopped } as never, { orgId: "org", workspaceId: "ws", identity: "github.com/Acme/Widgets", readAt: 1 });
+  const cloud = (sessionId: string, workspaceId = "ws") => session({ sessionId, workspaceId, key: `cloud:org:${workspaceId}:${sessionId}` });
+  const handed = cloudWorkSessions([cloud("author"), cloud("reviewer-1"), cloud("ordinary"), cloud("reviewer-1", "other")], () => "me", [pipeline]);
+  expect(handed.map((each) => [each.workspaceId, each.sessionId])).toEqual([["ws", "author"], ["ws", "ordinary"], ["other", "reviewer-1"]]);
+});
+
+it("withdraws a reviewer when pipeline identity arrives after the session list", async () => {
+  vi.resetModules();
+  vi.useFakeTimers();
+  let pipelines: IssuePipeline[] = [];
+  let changed = () => {};
+  const setCloud = vi.fn().mockResolvedValue(undefined);
+  vi.doMock("@/lib/api", () => ({ workStatus: { setCloud } }));
+  vi.doMock("@/lib/cloudPipelines", () => ({ getCloudPipelines: () => pipelines, subscribeCloudPipelines: (listener: () => void) => { changed = listener; } }));
+  vi.doMock("@/lib/cloudDashboard", () => ({ getCloudDashboard: () => [session()], subscribeCloudDashboard: vi.fn(), cloudSessionMark: () => "in_progress" }));
+  try {
+    const { bootCloudWorkClaims } = await import("@/lib/cloudWorkClaims");
+    bootCloudWorkClaims();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(setCloud.mock.calls[0][0]).toHaveLength(1);
+    pipelines = [{ ...stored, reviewer: { sessionId: "cloud:org:ws:c1", tabId: "t" } } as IssuePipeline];
+    changed();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(setCloud).toHaveBeenLastCalledWith([]);
+  } finally {
+    vi.useRealTimers();
+    vi.doUnmock("@/lib/api");
+    vi.doUnmock("@/lib/cloudPipelines");
+    vi.doUnmock("@/lib/cloudDashboard");
+    vi.resetModules();
+  }
 });
