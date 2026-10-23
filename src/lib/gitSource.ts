@@ -30,8 +30,8 @@ export interface GitSource {
   changesBetween(base: string, head: string | null): Promise<ChangedFile[]>;
   fileContentsAt(path: string, base: string, head: string | null): Promise<{ before: string | null; after: string | null }>;
   workStatus(): Promise<SourceStatus>;
-  landed?(): Promise<Pick<import("@/types/session").Landed, "safe" | "head" | "branch">>;
-  prAssociations?(sessionId: string): Promise<PrAssociation[]>;
+  landed?(): Promise<Pick<import("@/types/session").Landed, "safe" | "head" | "branch"> | null>;
+  prAssociations?(sessionId: string): Promise<{ associations: PrAssociation[]; discoveryOnly?: boolean }>;
   logCommits(from: string | null, limit: number): Promise<CommitInfo[]>;
   branches(): Promise<BranchInfo[]>;
   /** Resolves to a notice worth showing (e.g. what a reconciled push found), or null. */
@@ -140,7 +140,13 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     }),
     fileContentsAt: (path, base, head) => remote.fileContents(path, base, head),
     workStatus: statusOf,
-    landed: input.canWrite ? () => remote.prLanded() : undefined,
+    landed: input.canWrite ? async () => {
+      try { return await remote.prLanded(); }
+      catch (error) {
+        if (error instanceof WorkspaceRpcError && error.code === "method_not_found") return null;
+        throw error;
+      }
+    } : undefined,
     logCommits: (from, limit) => remote.log(limit, from),
     branches: () => remote.branches().then((answer) => answer.branches),
     commit: async (message) => {
@@ -161,11 +167,18 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     prAssociations: async (sessionId) => {
       const parsed = parseCloudWorkspaceKey(sessionId);
       if (!parsed?.sessionId || cloudWorkspaceKey(parsed.orgId, parsed.workspaceId) !== input.workspaceKey) throw new Error("This session belongs to a different cloud workspace.");
-      const { associations } = await remote.prAssociations(parsed.sessionId);
-      return gh.associations(sessionId, associations.map((entry) => ({
+      let response;
+      try { response = await remote.prAssociations(parsed.sessionId); }
+      catch (error) {
+        if (!(error instanceof WorkspaceRpcError) || error.code !== "method_not_found") throw error;
+        // Older git/1 runtimes can list branch PRs but cannot prove session
+        // ownership. Show those transiently, never persist them as associations.
+        return { associations: await gh.associations(sessionId), discoveryOnly: true };
+      }
+      return { associations: await gh.associations(sessionId, response.associations.map((entry) => ({
         url: entry.url, number: entry.number, head: entry.head,
         scope: { kind: "cloud", workspace: input.workspaceKey, repo: entry.repo ?? "" },
-      })));
+      }))) };
     },
     prScope: { kind: "cloud", workspace: input.workspaceKey, repo: remote.repo },
     prAccess: (association) => {

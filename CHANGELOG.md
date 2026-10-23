@@ -17,7 +17,8 @@
   PRs created or adopted by the issue pipeline and successful CLI creation
   recorded in session tool journals, including heredoc and Markdown PR bodies.
   Read cloud agent/pipeline associations and landed-work verification from the
-  runtime, retaining each repository locator. Avoid importing another session’s checkout
+  runtime, retaining each repository locator. Enforce workspace session visibility
+  and retain cached history and transient branch results on older runtimes. Avoid importing another session’s checkout
   PRs and recognize squash/rebase-landed work. Refresh each saved PR by its
   repository identity, keep open PRs above history, and prevent older merged
   work from offering cleanup while follow-ups or unmerged work remain. (#463)

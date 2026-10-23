@@ -1,5 +1,5 @@
 import { RemoteGit } from "@terminalx/portable/workspaceGit";
-import type { WorkspaceRpcClient } from "@terminalx/portable/workspace";
+import { WorkspaceRpcError, type WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import { cloudGitSource } from "@/lib/gitSource";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -350,4 +350,21 @@ it.each(["squash", "rebase"])("uses runtime landed evidence for a cloud panel-cr
   safe = false; // New follow-up work after the rewritten merge.
   fireEvent.click(screen.getByRole("button", { name: "Refresh pull requests" }));
   await screen.findByRole("button", { name: "Create pull request" });
+});
+
+
+it("keeps a merged cloud PR visible without offering creation when landed verification is unsupported", async () => {
+  mocks.invoke.mockResolvedValue([{ url: mergedPr.url, number: mergedPr.number, head: mergedPr.head, scope: { kind: "cloud", workspace: "cloud:org:workspace", repo: "app" } }]);
+  const call = vi.fn(async (method: string) => {
+    if (method === "git.status") return workStatus(mergedPr.head, 3);
+    if (method === "git.prs") return { prs: [mergedPr] };
+    if (method === "git.prAssociations") return { associations: [] };
+    throw new WorkspaceRpcError("method_not_found", "old runtime", method);
+  });
+  const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({ call } as unknown as WorkspaceRpcClient, "app"), canWrite: true, author: async () => null });
+  render(<PrPanel source={source} sessionId="cloud:org:workspace:author" branch={mergedPr.head} active busy={false} />);
+  await screen.findByText(mergedPr.title);
+  expect(call).toHaveBeenCalledWith("git.prLanded", { repo: "app" });
+  expect(screen.queryByRole("button", { name: "Create pull request" })).toBeNull();
+  expect(screen.queryByText(/Could not refresh/)).toBeNull();
 });

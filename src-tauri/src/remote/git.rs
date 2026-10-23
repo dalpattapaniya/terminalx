@@ -896,7 +896,9 @@ impl WorkspaceGit {
         let entry = crate::store::index::get(session).map_err(|_| RpcError::not_found("session not found"))?;
         // The runtime may host more than one workspace. Never expose another
         // workspace's journal or pipeline evidence through this connection.
-        if ![&entry.project_path, &entry.cwd].iter().any(|path| std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(&self.root))) {
+        // Match WorkspaceRpc::workspace_sessions exactly: a checkout location
+        // does not grant visibility into its owning project.
+        if entry.project_path != self.root.to_string_lossy() {
             return Err(RpcError::not_found("session is not in this workspace"));
         }
         let associations = crate::pr_associations::for_session(session, vec![])

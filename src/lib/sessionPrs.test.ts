@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RemoteGit } from "@terminalx/portable/workspaceGit";
-import type { WorkspaceRpcClient } from "@terminalx/portable/workspace";
+import { WorkspaceRpcError, type WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import type { PrAssociation, PullRequest } from "@/lib/api";
 import { cloudGitSource, localGitSource } from "@/lib/gitSource";
 import { sessionPrs } from "./sessionPrs";
@@ -173,4 +173,38 @@ it("recovers runtime agent and pipeline PRs on a fresh desktop, retaining each c
 it("does not offer a fetching landed check to a read-only cloud viewer", () => {
   const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({} as WorkspaceRpcClient, "app"), canWrite: false, author: async () => null });
   expect(source.landed).toBeUndefined();
+});
+
+
+it("keeps legacy runtime branch discovery and cached history without adopting branch PRs", async () => {
+  const sessionId = "cloud:org:workspace:author";
+  const cached = { ...reference(a), scope: { kind: "cloud", workspace: "cloud:org:workspace", repo: "history" } };
+  invoke.mockResolvedValue([cached]);
+  const call = vi.fn(async (method: string, params: { repo: string }) => {
+    if (method === "git.prAssociations" || method === "git.prLanded") throw new WorkspaceRpcError("method_not_found", "old runtime", method);
+    if (method === "git.prs") return { prs: params.repo === "history" ? [a] : [b] };
+    throw Error(method);
+  });
+  const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({ call } as unknown as WorkspaceRpcClient, "app"), canWrite: true, author: async () => null });
+  for (let refresh = 0; refresh < 2; refresh++) {
+    const result = await sessionPrs(source, sessionId, b.head);
+    expect(result.rows.map((row) => row.pr?.number)).toEqual([2, 1]);
+    expect(result.rows[0]?.association).toBeUndefined();
+    expect(result.rows[1]?.association).toEqual(cached);
+    expect(result.error).toContain("Update the workspace runtime");
+    expect(await source.landed!()).toBeNull();
+  }
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(invoke).toHaveBeenCalledWith("pr_associations", { sessionKey: sessionId, additions: [] });
+});
+
+it.each(["permission_denied", "capability_not_granted", "network_error", "internal_error"])("does not downgrade %s to legacy runtime support", async (code) => {
+  const call = vi.fn(async (method: string) => {
+    if (method === "git.prs") return { prs: [b] };
+    throw new WorkspaceRpcError(code, "failure", method);
+  });
+  const source = cloudGitSource({ workspaceKey: "cloud:org:workspace", remote: new RemoteGit({ call } as unknown as WorkspaceRpcClient, "app"), canWrite: true, author: async () => null });
+  await expect(sessionPrs(source, "cloud:org:workspace:author", b.head)).rejects.toMatchObject({ code });
+  await expect(source.landed!()).rejects.toMatchObject({ code });
+  expect(invoke).not.toHaveBeenCalled();
 });

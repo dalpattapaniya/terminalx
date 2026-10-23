@@ -22,14 +22,14 @@ export async function sessionPrs(source: GitSource, sessionId: string | undefine
   if (!isCurrent()) return { rows: [] };
   // Read after discovery to include creation evidence recorded while it was
   // in flight. The native registry also recovers durable session tool results.
-  const associations = sessionId ? await (source.prAssociations ? source.prAssociations(sessionId) : gh.associations(sessionId)) : [];
+  const { associations, discoveryOnly } = sessionId ? await (source.prAssociations ? source.prAssociations(sessionId) : gh.associations(sessionId).then((associations) => ({ associations, discoveryOnly: false }))) : { associations: [], discoveryOnly: false };
   if (!isCurrent()) return { rows: [] };
   const rows = new Map<string, SessionPr>();
   for (const association of associations) rows.set(prIdentity(association.url), { identity: prIdentity(association.url), association, current: false });
   for (const pr of discovery.prs) {
     const identity = prIdentity(pr.url);
     // Neither a live nor a saved branch proves ownership in a shared checkout.
-    if (sessionId && !rows.has(identity)) continue;
+    if (sessionId && !discoveryOnly && !rows.has(identity)) continue;
     rows.set(identity, { identity, pr, association: rows.get(identity)?.association, current: true });
   }
   await Promise.all([...rows.values()].filter((row) => !row.pr).map(async (row) => {
@@ -42,5 +42,5 @@ export async function sessionPrs(source: GitSource, sessionId: string | undefine
       row.error = source.errorMessage(error);
     }
   }));
-  return { error: discovery.error, rows: [...rows.values()].sort((a, b) => Number(b.pr?.state === "OPEN") - Number(a.pr?.state === "OPEN") || (b.pr?.number ?? 0) - (a.pr?.number ?? 0)) };
+  return { error: discovery.error ?? (discoveryOnly ? "Update the workspace runtime to verify complete session PR history. Branch PRs are shown without being associated with this session." : undefined), rows: [...rows.values()].sort((a, b) => Number(b.pr?.state === "OPEN") - Number(a.pr?.state === "OPEN") || (b.pr?.number ?? 0) - (a.pr?.number ?? 0)) };
 }

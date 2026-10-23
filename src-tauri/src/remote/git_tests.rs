@@ -530,7 +530,16 @@ fn session_pr_evidence_is_read_from_the_runtime_and_routed_by_repository() {
     let session = |id: &str, path: &Path| serde_json::from_value::<crate::store::index::SessionEntry>(json!({
         "id": id, "projectPath": path, "cwd": path, "title": "fixture", "created": "", "modified": ""
     })).unwrap();
-    crate::store::index::save(&[session("author", &f.root), session("unrelated", &f.root), session("outside", &f.base)]).unwrap();
+    let mut foreign_checkout = session("foreign-checkout", &f.base);
+    foreign_checkout.cwd = repo.to_string_lossy().into_owned();
+    crate::store::index::save(&[session("author", &f.root), session("unrelated", &f.root), session("outside", &f.base), foreign_checkout, session("nested", &repo)]).unwrap();
+    // Denial must happen before recovery creates/reads the association registry.
+    let registry = crate::store::root().unwrap().join("session-pr-associations.json");
+    assert!(!registry.exists());
+    for id in ["foreign-checkout", "nested"] {
+        assert_eq!(f.code("git.prAssociations", json!({"sessionId":id})), "not_found");
+        assert!(!registry.exists());
+    }
     let journal = crate::store::log_path("author", "tab").unwrap();
     for (seq, payload) in [
         json!({"type":"tool_call_started", "callId":"create", "name":"Bash", "toolType":"shell", "input":{"command":"gh pr create --body-file - <<'EOF'\nUse `code`.\nEOF"}}),
