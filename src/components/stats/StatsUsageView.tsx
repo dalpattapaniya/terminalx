@@ -73,6 +73,7 @@ export function StatsUsageView() {
               <ActivityContents activity={activity} />
             </>}
             {snapshot && error && <p className="mt-4 text-xs text-muted-foreground">Saved usage — could not refresh; values may be out of date.</p>}
+            {snapshot && loading && <p className="mt-4 text-xs text-muted-foreground">Saved usage — refresh in progress; values may be out of date.</p>}
             {snapshot && <StatsContents snapshot={snapshot} />}
           </section>
         )}
@@ -116,8 +117,9 @@ function ActivityContents({ activity }: { activity: AppStats }) {
 }
 
 function StatsContents({ snapshot }: { snapshot: StatsUsageSnapshot }) {
-  const heatmap = useMemo(() => heatmapDays(snapshot.daily, new Date(snapshot.updatedAt)), [snapshot.daily, snapshot.updatedAt]);
+  const heatmap = useMemo(() => heatmapDays(snapshot.daily, snapshot.rangeEnd ? new Date(`${snapshot.rangeEnd}T12:00:00`) : new Date(snapshot.updatedAt), 30), [snapshot.daily, snapshot.updatedAt, snapshot.rangeEnd]);
   const best = heatmap.reduce((winner, day) => day.totalTokens > winner.totalTokens ? day : winner, heatmap[0]);
+  const incompleteScope = !!snapshot.discoveryWarnings?.length;
   const enabled = snapshot.providers.filter((provider) => provider.enabled);
   const withData = enabled.filter((provider) => provider.hasData).length;
   const sessions = enabled.reduce((total, provider) => total + provider.sessions, 0);
@@ -142,22 +144,28 @@ function StatsContents({ snapshot }: { snapshot: StatsUsageSnapshot }) {
           <div className="flex items-start gap-3">
             <div>
               <h3 id="usage-overview-heading" className="text-sm font-semibold">Usage Overview</h3>
-              <p className="mt-0.5 text-xs text-muted-foreground">Latest 30 local calendar dates, including today · Known TerminalX projects and worktrees · Updated {formatTimestamp(snapshot.updatedAt)}</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">Latest 30 local calendar dates as of the saved refresh · Known TerminalX projects and worktrees, including non-Git folders · Last successful refresh {formatTimestamp(snapshot.updatedAt)}</p>
             </div>
           </div>
 
+          <p className="mt-2 text-xs text-muted-foreground">{formatDate(snapshot.rangeStart ?? heatmap[0].day)} – {formatDate(snapshot.rangeEnd ?? heatmap.at(-1)!.day)} · Local transcripts and previously recorded usage; deleting history does not erase recorded totals or refund provider usage. Unrecorded deleted history cannot be recovered.</p>
+          {!!snapshot.discoveryWarnings?.length && <div role="alert" className="mt-3 text-sm text-destructive">
+            <p>Incomplete location coverage — some worktrees could not be discovered. Available locations were refreshed.</p>
+            {snapshot.discoveryWarnings.map((warning) => <p key={warning}>{warning}</p>)}
+          </div>}
           <div className="mt-4 grid gap-3 @min-[540px]:grid-cols-2 @min-[940px]:grid-cols-4">
             <MetricCard compact icon={<Sparkles />} value={formatTokens(snapshot.totalTokens)} label="Total tokens" />
             <MetricCard
               compact
               icon={<CircleDollarSign />}
               value={formatCost(snapshot.estimatedCostUsd)}
-              label={`Estimated cost${snapshot.hasPartialCost ? "*" : ""}`}
+              label={snapshot.hasPartialCost || incompleteScope ? "Partial estimated cost" : "Estimated cost"}
             />
             <MetricCard compact icon={<CalendarDays />} value={snapshot.activeDays.toLocaleString()} label="Active days" />
             <MetricCard compact icon={<Database />} value={snapshot.cacheShare == null ? "—" : `${Math.round(snapshot.cacheShare * 100)}%`} label="Cache share" />
           </div>
 
+          {snapshot.hasPartialCost && <p className="mt-2 text-xs text-muted-foreground">Partial estimate: usage with unknown model prices, unsupported service tiers, or missing request detail is omitted from dollars, but included in tokens.</p>}
           <div className="mt-4 grid gap-3 @min-[780px]:grid-cols-[1.45fr_1fr]">
             <DailyIntensity days={heatmap} bestDay={best?.totalTokens ? best.day : null} />
             <TokenMix snapshot={snapshot} />
@@ -176,11 +184,11 @@ function StatsContents({ snapshot }: { snapshot: StatsUsageSnapshot }) {
           </div>
           <div className="grid gap-3 @min-[760px]:grid-cols-2">
             {snapshot.providers.map((provider) => (
-              <ProviderCard key={provider.id} provider={provider} allTokens={snapshot.totalTokens} />
+              <ProviderCard key={provider.id} provider={provider} allTokens={snapshot.totalTokens} incompleteScope={incompleteScope} />
             ))}
           </div>
           <p className="mt-4 text-[11px] leading-relaxed text-faint">
-            * Costs are estimates from the included per-token model price table. Subscription billing, discounts, and taxes are not included.
+            Costs use the included standard API price table, not provider bills. Subscription billing, discounts, taxes, and unrecorded pricing modifiers are not included. Legacy Claude cache writes without duration detail assume five minutes.
           </p>
         </section>
     </>
@@ -209,7 +217,7 @@ function DailyIntensity({ days, bestDay }: { days: ReturnType<typeof heatmapDays
         </div>
         {bestDay && <span className="ml-auto shrink-0 rounded-full bg-well px-2 py-0.5 text-[11px] hairline">Best: {shortDate(bestDay)}</span>}
       </div>
-      <div className="mt-4 grid grid-flow-col grid-rows-2 gap-1.5" aria-label="Token activity over the last 42 days">
+      <div className="mt-4 grid grid-flow-col grid-rows-2 gap-1.5" aria-label="Token activity over the 30-day reporting range">
         {days.map((day) => (
           <span
             key={day.day}
@@ -264,7 +272,7 @@ function TokenMix({ snapshot }: { snapshot: StatsUsageSnapshot }) {
   );
 }
 
-function ProviderCard({ provider, allTokens }: { provider: ProviderUsage; allTokens: number }) {
+function ProviderCard({ provider, allTokens, incompleteScope }: { provider: ProviderUsage; allTokens: number; incompleteScope: boolean }) {
   const share = allTokens ? provider.totalTokens / allTokens : 0;
   return (
     <article className={cn("rounded-xl bg-background/30 p-4 hairline", !provider.enabled && "opacity-55")}>
@@ -282,8 +290,9 @@ function ProviderCard({ provider, allTokens }: { provider: ProviderUsage; allTok
       <div className="mt-4 grid grid-cols-3 gap-3 text-xs">
         <Detail value={formatTokens(provider.totalTokens)} label="tokens" />
         <Detail value={provider.sessions.toLocaleString()} label={`sessions · ${provider.activityCount.toLocaleString()} ${provider.activityLabel}`} />
-        <Detail value={formatCost(provider.estimatedCostUsd)} label={`estimated${provider.hasPartialCost ? "*" : ""}`} />
+        <Detail value={formatCost(provider.estimatedCostUsd)} label={provider.hasPartialCost || incompleteScope ? "partial estimate" : "estimated"} />
       </div>
+      {provider.hasPartialCost && <p className="mt-2 text-xs text-muted-foreground">Some usage has no supported price or request detail; its cost is unknown and excluded{provider.unpricedModels?.length ? `: ${provider.unpricedModels.join(", ")}` : ""}.</p>}
       <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-veil-raised">
         <div className="h-full rounded-full bg-foreground/75" style={{ width: `${Math.min(100, share * 100)}%` }} />
       </div>

@@ -9,6 +9,18 @@
   scope and target choices, with Uncommitted and turn review available in the same
   panel; keep local and cloud diffs and unavailable states consistent. (#465)
 
+### Stats & Usage
+
+- Refresh usage for non-Git projects without blocking healthy locations, and
+  show incomplete worktree discovery, saved refresh time, reporting scope, and
+  omitted pricing explicitly. Read configured provider homes and Codex archives;
+  reconcile whitespace, streamed copies, model switches and counter resets.
+  Price individual requests, include Astra's published rates and Claude's
+  one-hour cache writes, and retain recorded usage after transcript or worktree
+  removal without keeping prompt contents. Zero-valued counter resets update
+  the baseline; retained legacy records with unavailable pricing detail stay
+  explicitly unpriced after cache migration. (#602)
+
 ### Automations
 
 - Use the shared session launch controls for agent, model, effort and permissions,
@@ -29,6 +41,9 @@
   available. Transient failures still offer retry. (#601)
 
 ### Issues
+
+- Pipeline rows omit only their own author from the work chip, keeping other
+  sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
 
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)
