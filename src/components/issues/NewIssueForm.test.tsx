@@ -45,7 +45,7 @@ vi.mock("@/lib/sessions", () => ({
 }));
 
 const { IssuesView } = await import("./IssuesView");
-const { applyTemplate, createInput } = await import("./NewIssueForm");
+const { NewIssueForm, applyTemplate, createInput } = await import("./NewIssueForm");
 
 let mock: IssueOpsMock;
 let gate: { release: () => void; promise: Promise<void> } | null;
@@ -116,6 +116,18 @@ const menu = async (name: string | RegExp) => {
 };
 
 describe("NewIssueForm", () => {
+  it("loads and applies templates using a cloud repository key", async () => {
+    const projectPath = "cloud:org-a:github.com/acme/widgets";
+    clearIssueDraft(projectPath, "github");
+    render(<NewIssueForm projectPath={projectPath} provider="github" repo="acme/widgets" teams={[]} defaultTeamId={null} onProviderChange={vi.fn()} onCreated={vi.fn()} onClose={vi.fn()} />);
+    await menu("Template: None");
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Bug report/ }));
+    expect(invoke).toHaveBeenCalledWith("issue_templates", { projectPath });
+    expect((screen.getByRole("textbox", { name: "Description" }) as HTMLTextAreaElement).value).toContain("**Steps to reproduce**");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Labels: bug" })).toBeTruthy());
+    clearIssueDraft(projectPath, "github");
+  });
+
   it("creates a GitHub issue from a template with every field, then has it open in the list", async () => {
     const form = await openForm("github");
     expect(within(form).getByText("acme/widgets")).toBeTruthy();

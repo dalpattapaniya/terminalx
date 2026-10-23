@@ -3402,10 +3402,12 @@ pub async fn issue_create(project_path: String, provider: crate::issue_ops::Prov
     issue_op(project_path, provider, move |target| crate::issue_ops::create(target, &input)).await
 }
 
-/// The project's Markdown issue templates (`.github/ISSUE_TEMPLATE/*.md`), from its checkout.
+/// The project's Markdown issue templates (`.github/ISSUE_TEMPLATE/*.md`), from its checkout or cloud repository.
 #[tauri::command]
-pub async fn issue_templates(project_path: String) -> CmdResult<Vec<crate::issue_ops::templates::IssueTemplate>> {
-    tauri::async_runtime::spawn_blocking(move || crate::issue_ops::templates::list(Path::new(&project_path))).await.map_err(err)
+pub async fn issue_templates(project_path: String) -> IssueOpResult<Vec<crate::issue_ops::templates::IssueTemplate>> {
+    tauri::async_runtime::spawn_blocking(move || crate::issue_ops::templates::load(Path::new(&project_path)))
+        .await
+        .map_err(|_| crate::issue_ops::IssueOpError::new(crate::issue_ops::IssueOpErrorKind::Other, crate::issue_ops::Provider::Github))?
 }
 
 #[tauri::command]

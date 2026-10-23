@@ -1,12 +1,16 @@
 //! A GitHub repository's Markdown issue templates
-//! (`.github/ISSUE_TEMPLATE/*.md`), read from the project's checkout. The
+//! (`.github/ISSUE_TEMPLATE/*.md`), read from the project's checkout or GitHub repository. The
 //! new-issue form offers them and fills the description from the chosen one,
 //! as the website's "New issue" does. YAML issue forms (`*.yml`) are not
 //! Markdown and are left out.
 
 use std::path::Path;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+
+use super::{github, IssueOpError, IssueOpErrorKind, OpResult, Provider};
 use serde_yaml::Value;
 
 /// Templates bigger than this are not read: a template is a page of prompts, not a document.
@@ -28,6 +32,66 @@ pub struct IssueTemplate {
     pub assignees: Vec<String>,
     /// The Markdown under the front matter.
     pub body: String,
+}
+
+/// Cloud repositories use the reader's local `gh`; local projects keep their checkout templates.
+pub fn load(project: &Path) -> OpResult<Vec<IssueTemplate>> {
+    let Some(repo) = crate::issues::cloud_project_repo(project) else { return Ok(list(project)) };
+    let cwd = crate::issues::gh_dir(project);
+    list_repository(&mut |method, path, body| github::gh_api(&cwd, method, path, body), &repo)
+}
+
+fn list_repository(api: &mut github::Api, repo: &str) -> OpResult<Vec<IssueTemplate>> {
+    let folder = format!("repos/{repo}/contents/.github/ISSUE_TEMPLATE");
+    let reply = match api("GET", &folder, None) {
+        Ok(reply) => reply,
+        Err(error) if error.kind == IssueOpErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let entries = reply.as_array().ok_or_else(|| IssueOpError::new(IssueOpErrorKind::Other, Provider::Github))?;
+    let mut templates = Vec::new();
+    for entry in entries {
+        let Some(file) = entry["name"].as_str() else { continue };
+        // Build our own endpoint, never follow a repository-supplied URL or path.
+        if file.contains(['/', '\\']) || !Path::new(file).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")) || !small_file(entry) {
+            continue;
+        }
+        let encoded: String = url::form_urlencoded::byte_serialize(file.as_bytes()).collect::<String>().replace('+', "%20");
+        let content = match api("GET", &format!("{folder}/{encoded}"), None) {
+            Ok(content) => content,
+            Err(error) if error.kind == IssueOpErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(text) = decode_content(&content) {
+            templates.push(parse(file, &text));
+        }
+    }
+    templates.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(templates)
+}
+
+fn small_file(value: &JsonValue) -> bool {
+    value["type"].as_str() == Some("file")
+        && value.get("submodule_git_url").is_none_or(JsonValue::is_null)
+        && value["size"].as_u64().is_some_and(|size| size <= MAX_TEMPLATE_BYTES)
+}
+
+fn decode_content(value: &JsonValue) -> Option<String> {
+    if !small_file(value) || value["encoding"].as_str()? != "base64" {
+        return None;
+    }
+    let content = value["content"].as_str()?;
+    // GitHub wraps base64 in newlines. Bound both its representation and decoded bytes,
+    // even when the repository metadata understates the size.
+    if content.len() > (MAX_TEMPLATE_BYTES as usize).div_ceil(3) * 4 * 2 {
+        return None;
+    }
+    let encoded: String = content.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    if bytes.len() as u64 > MAX_TEMPLATE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// The templates in `<project>/.github/ISSUE_TEMPLATE`, by file name. None
@@ -114,6 +178,108 @@ fn names(value: Option<&Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content(bytes: &[u8]) -> JsonValue {
+        serde_json::json!({"type": "file", "size": bytes.len(), "encoding": "base64", "content": base64::engine::general_purpose::STANDARD.encode(bytes)})
+    }
+
+    #[test]
+    fn repository_templates_use_scoped_gets_and_the_existing_parser() {
+        // The checked-in Markdown is also exercised by the local loader below.
+        let bug = include_str!("../../../.github/ISSUE_TEMPLATE/bug_report.md");
+        let entries = serde_json::json!([
+            {"name": "z space?#.MD", "type": "file", "size": 4, "url": "https://untrusted.invalid/", "path": "../elsewhere"},
+            {"name": "bug_report.md", "type": "file", "size": bug.len()},
+            {"name": "form.yml", "type": "file", "size": 1},
+            {"name": "large.md", "type": "file", "size": MAX_TEMPLATE_BYTES + 1},
+            {"name": "link.md", "type": "symlink", "size": 1},
+            {"name": "directory.md", "type": "dir", "size": 1},
+            {"name": "module.md", "type": "file", "size": 1, "submodule_git_url": "https://untrusted.invalid/"},
+            {"name": "../escape.md", "type": "file", "size": 1}
+        ]);
+        let folder = "repos/acme/widgets/contents/.github/ISSUE_TEMPLATE";
+        let mut paths = Vec::new();
+        let templates = list_repository(&mut |method, path, body| {
+            assert_eq!(method, "GET");
+            assert!(body.is_none());
+            paths.push(path.to_owned());
+            match path.strip_prefix(folder).unwrap() {
+                "" => Ok(entries.clone()),
+                "/z%20space%3F%23.MD" => Ok(content(b"Text")),
+                "/bug_report.md" => Ok(content(bug.as_bytes())),
+                other => panic!("Unexpected request: {other}"),
+            }
+        }, "acme/widgets").unwrap();
+        assert_eq!(paths.len(), 3);
+        assert_eq!(templates, vec![parse("bug_report.md", bug), parse("z space?#.MD", "Text")]);
+    }
+
+    #[test]
+    fn repository_content_rechecks_size_type_encoding_and_utf8() {
+        let mut wrapped = content(b"Body");
+        wrapped["content"] = "Qm9k\neQ==\n".into();
+        assert_eq!(decode_content(&wrapped).as_deref(), Some("Body"));
+        assert!(decode_content(&content(&vec![b'a'; MAX_TEMPLATE_BYTES as usize])).is_some());
+        let mut oversized = content(&vec![b'a'; MAX_TEMPLATE_BYTES as usize + 1]);
+        assert!(decode_content(&oversized).is_none());
+        oversized["size"] = 1.into();
+        assert!(decode_content(&oversized).is_none());
+        assert!(decode_content(&content(&[255])).is_none());
+        for (key, value) in [("encoding", "none"), ("type", "symlink"), ("content", "!invalid!")] {
+            let mut invalid = content(b"Body");
+            invalid[key] = value.into();
+            assert!(decode_content(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn missing_templates_are_empty_but_transport_errors_remain_errors() {
+        for kind in [IssueOpErrorKind::NotFound, IssueOpErrorKind::NotSignedIn, IssueOpErrorKind::Forbidden, IssueOpErrorKind::Network] {
+            let result = list_repository(&mut |_, _, _| Err(IssueOpError::new(kind, Provider::Github)), "acme/widgets");
+            if kind == IssueOpErrorKind::NotFound {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert_eq!(result.unwrap_err().kind, kind);
+            }
+        }
+        assert!(list_repository(&mut |_, _, _| Ok(JsonValue::Null), "acme/widgets").is_err());
+    }
+
+    #[test]
+    fn missing_or_unreadable_files_are_skipped_but_fetch_failures_propagate() {
+        let entries = serde_json::json!([
+            {"name": "gone.md", "type": "file", "size": 1},
+            {"name": "invalid.md", "type": "file", "size": 1},
+            {"name": "plain.md", "type": "file", "size": 4}
+        ]);
+        for kind in [IssueOpErrorKind::NotFound, IssueOpErrorKind::Network] {
+            let result = list_repository(&mut |_, path, _| {
+                if path.ends_with("/gone.md") {
+                    Err(IssueOpError::new(kind, Provider::Github))
+                } else if path.ends_with("/invalid.md") {
+                    Ok(content(&[255]))
+                } else if path.ends_with("/plain.md") {
+                    Ok(content(b"Body"))
+                } else {
+                    Ok(entries.clone())
+                }
+            }, "acme/widgets");
+            if kind == IssueOpErrorKind::NotFound {
+                assert_eq!(result.unwrap(), vec![parse("plain.md", "Body")]);
+            } else {
+                assert_eq!(result.unwrap_err().kind, kind);
+            }
+        }
+    }
+
+    #[test]
+    fn load_keeps_local_checkouts_and_invalid_cloud_keys_off_the_api() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        assert_eq!(load(root).unwrap(), list(root));
+        for key in ["cloud:org:blank/scratch", "cloud:org:ws:session", "cloud:org:github.com/../repo", "cloud:org:github.com/acme/repo/extra"] {
+            assert!(load(Path::new(key)).unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn reads_the_front_matter_and_the_body() {
