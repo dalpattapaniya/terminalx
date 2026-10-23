@@ -45,7 +45,8 @@
   from the warning. Preserve live account evidence when deduplicating and keep
   removed authors excluded across pipeline refreshes, even before Issues opens.
   Bound pending-author grace by the actual start. Exclude reviewers and stale
-  sessions. (#572)
+  sessions. Verify signed-in claims and sign-out cleanup in the WebKit work-chip
+  scenario. (#572)
 
 - Require completed workflow and check-suite evidence on the reviewed commit
   before an issue pipeline merges, including queued jobs and pending reruns.
