@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { classifyRecovery } from "@/lib/recovery";
 import { RecoveryBanner } from "./RecoveryBanner";
 import { askDetail } from "@/components/chat/AskCards";
 import type { PendingAsk } from "@/lib/transcript";
@@ -45,15 +46,28 @@ describe("session recovery UI smoke", () => {
     runtime.connect();
     function CloudRecovery() {
       const { models, refresh } = usePickerModels([alias], true, client, "claude");
-      return <RecoveryBanner {...p} kind="capacity" models={models} onOpenModels={refresh} />;
+      return <RecoveryBanner {...p} kind="usage_limit" models={models} onOpenModels={refresh} />;
     }
     render(<CloudRecovery />);
     expect(await screen.findByRole("option", { name: "Opus (latest · Opus 4.6)" })).toBeTruthy();
+    expect(screen.queryByText(/Retry/i)).toBeNull();
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "claude-opus-4-6" } });
     expect(p.onRetry).toHaveBeenCalledWith("claude-opus-4-6");
     act(() => runtime.emit({ state: "suspended" }));
     expect(screen.getByRole("option", { name: "Opus (latest)" })).toBeTruthy();
     expect(screen.queryByRole("option", { name: "Opus 4.6" })).toBeNull();
+  });
+
+  it.each([
+    ["usage_limit_reached", false],
+    ["insufficient_quota", false],
+    ["You've hit your weekly limit", false],
+    ["429 Too many requests", true],
+    ["529 overloaded", true],
+    ["Network connection lost", true],
+  ])("offers retry only for recoverable synthetic error: %s", (message, retryable) => {
+    render(<RecoveryBanner {...props()} kind={classifyRecovery(message)} />);
+    expect(screen.queryByRole("button", { name: /retry/i, hidden: true }) !== null).toBe(retryable);
   });
 
   it("keeps keyboard decisions on the focused permission button", () => {
@@ -82,6 +96,7 @@ describe("session recovery UI smoke", () => {
     const resetsAt = Date.now() + 23 * 3_600_000 + 5 * 60_000;
     render(<RecoveryBanner {...p} kind="usage_limit" limit={{ status: "rejected", resetsAt, window: "seven_day" }} models={[{ id: "other", label: "Other model" } as ModelInfo]} />);
     expect(screen.getByText("Usage limit reached")).toBeTruthy();
+    expect(screen.queryByText(/Retry/i)).toBeNull();
     expect(screen.getByText(/plan's usage limit is reached/)).toBeTruthy();
     const reset = screen.getByTestId("usage-limit-reset").textContent!;
     expect(reset).toMatch(/^Weekly limit · resets .+ \(in 23h [45]m\)$/);
@@ -92,6 +107,9 @@ describe("session recovery UI smoke", () => {
     cleanup();
     render(<RecoveryBanner {...p} kind="usage_limit" limit={{ status: "rejected" }} />);
     expect(screen.queryByTestId("usage-limit-reset")).toBeNull();
+    expect(screen.queryByText(/Retry/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
+    expect(p.onStop).toHaveBeenCalledOnce();
   });
 
   it.each(["timeout", "disconnected"] as const)("distinguishes unknown %s outcomes from exit", kind => {

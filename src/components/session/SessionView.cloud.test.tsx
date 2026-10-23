@@ -440,6 +440,22 @@ async function openConnected(authority: "manage" | "participate" = "manage") {
 }
 
 describe("the same SessionView for local and cloud sessions", () => {
+  it("restores cloud usage exhaustion without retry when reopening the session", async () => {
+    const message = "Model allowance exhausted · resets at 11pm";
+    runtime.events = [
+      ev({ type: "rate_limited", status: "rejected", window: "seven_day", resetsAt: Date.now() + 3_600_000, message }),
+      ev({ type: "recovery", kind: "usage_limit" }),
+    ];
+    await openConnected();
+    expect(await screen.findByText(message)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /retry/i, hidden: true })).toBeNull();
+    cleanup();
+    render(wrap(<CloudHarness />));
+    expect(await screen.findByText(message)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /retry/i, hidden: true })).toBeNull();
+    expect(guard.violations).toEqual([]);
+  });
+
   it("renders a local session and a cloud session with one component", async () => {
     guard.handlers.session_share_status = () => ({ active: false, links: [], people: [], leases: [], notes: [], activity: [], queue: [] });
     guard.strict = false;
