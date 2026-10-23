@@ -100,7 +100,9 @@ try {
       await group.focus();
       await page.keyboard.press(selected === 'Source' ? 'ArrowRight' : 'ArrowLeft');
       // Select explicitly for the first iteration too, then let the thumb finish sliding.
-      await toolbar.getByRole('radio', { name: selected, exact: true }).click();
+      // At scrolling widths WebKit's overlay scrollbar can cover the radio's
+      // center between pointer-down and pointer-up. Click its uncovered top edge.
+      await toolbar.getByRole('radio', { name: selected, exact: true }).click({ position: { x: 5, y: 5 } });
       await group.getByRole('radio', { name: selected, exact: true, checked: true }).waitFor({ state: 'attached', timeout: 3000 });
       await page.waitForTimeout(180);
       const result = await toolbar.evaluate((toolbar) => {
