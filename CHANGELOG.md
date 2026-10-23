@@ -35,6 +35,9 @@
 
 ### Issues
 
+- Pipeline rows omit only their own author from the work chip, keeping other
+  sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
+
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)
 - Pipeline reviewers no longer count as another session working on the issue,
