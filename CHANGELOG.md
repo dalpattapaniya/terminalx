@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Issues
+
+- A cloud issue that cannot start because an agent needs sign-in now offers
+  **Open Agent logins** for the failed request’s organization, even if you
+  switch projects while it starts. (#573)
+
 ### Command line
 
 - Cloud session creation normalizes saved and explicit permission modes just
