@@ -71,7 +71,7 @@ export function RecoveryBanner({ placement = "top", kind, limit = null, waiting,
       ? <PermissionCard ask={ask} busy={busy || answering} blockedReason={answerBlockedReason} showDetail={askDetail} onAnswer={option => onPermission(ask.requestId, option)} />
       : <QuestionCard ask={ask} busy={busy || answering} blockedReason={answerBlockedReason} onAnswer={answers => onQuestions(ask.requestId, answers)} />}</div>)}
     <div className="mt-2 flex flex-wrap gap-2">
-      {kind && kind !== "permission_expired" && kind !== "delivery_unconfirmed" && !asks.length && <Button size="sm" disabled={busy} onClick={() => onRetry()}>Retry safely</Button>}
+      {kind && kind !== "usage_limit" && kind !== "permission_expired" && kind !== "delivery_unconfirmed" && !asks.length && <Button size="sm" disabled={busy} onClick={() => onRetry()}>Retry safely</Button>}
       {offerModels && <select onFocus={onOpenModels} onPointerDown={onOpenModels} aria-label="Choose another model" disabled={busy} value="" onChange={e => onRetry(e.target.value)} className="rounded border border-hairline bg-background px-2">
         <option value="" disabled>Choose another model</option>
         {models.map(model => <option key={model.id} value={model.id}>{modelOptionText(model, models)}</option>)}

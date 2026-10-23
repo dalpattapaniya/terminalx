@@ -213,6 +213,8 @@ enum Verified {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pass {
     pub links: Vec<(String, IssueRef, IssueLinkSource)>,
+    /// Reviewer links left by earlier versions, including archived sessions.
+    pub unlinks: Vec<String>,
 }
 
 /// The linker's memory between passes. It lives as long as the app.
@@ -361,13 +363,19 @@ impl Linker {
     /// One pass over the index: the pull requests that are due, and a link
     /// for each recent unlinked session whose branch, pull request or first
     /// prompt names an issue.
-    pub fn pass(&mut self, lookup: &dyn Lookup, sessions: &[SessionEntry]) -> Pass {
+    pub fn pass(&mut self, lookup: &dyn Lookup, sessions: &[SessionEntry], reviewers: &HashSet<String>) -> Pass {
         self.checked.retain(|id, _| sessions.iter().any(|session| &session.id == id));
         self.pulls.retain(|id, _| sessions.iter().any(|session| &session.id == id));
         self.pull_requests(lookup, sessions);
         let mut pass = Pass::default();
         let mut asked: Option<Option<BTreeSet<String>>> = None;
         for session in sessions {
+            if reviewers.contains(&session.id) {
+                if session.issue.is_some() {
+                    pass.unlinks.push(session.id.clone());
+                }
+                continue;
+            }
             if session.issue.is_some() || session.archived || session.is_quick() || !recent(session) {
                 continue;
             }
@@ -560,12 +568,30 @@ mod tests {
         let fake = Fake { issues: vec![issue("github", "441", "#441")], ..Default::default() };
         let mut linker = Linker::default();
         let sessions = [session("s1", Some("raccoon/441-work")), session("s2", Some("raccoon/999-none"))];
-        let pass = linker.pass(&fake, &sessions);
+        let pass = linker.pass(&fake, &sessions, &HashSet::new());
         assert_eq!(pass.links, vec![("s1".to_string(), issue("github", "441", "#441"), IssueLinkSource::Branch)]);
         let asked = fake.asked.borrow().len();
         // The same names are not looked at again.
-        assert!(linker.pass(&fake, &sessions).links.iter().all(|(id, ..)| id == "s1"));
+        assert!(linker.pass(&fake, &sessions, &HashSet::new()).links.iter().all(|(id, ..)| id == "s1"));
         assert!(fake.asked.borrow()[asked..].iter().all(|asked| !asked.starts_with("gh:")), "{:?}", fake.asked.borrow());
+    }
+
+    #[test]
+    fn reviewers_are_not_linked_from_branches_pulls_or_prompts_and_old_links_are_removed() {
+        let pull = BranchPull { state: PullRequestState::Open, title: String::new(), body: String::new(), closes: vec![("acme/widgets".into(), 441)] };
+        let fake = Fake { issues: vec![issue("github", "441", "#441")], pulls: HashMap::from([("review".into(), pull)]), prompt: Some("Fixes #441".into()), ..Default::default() };
+        let mut author = session("author", Some("raccoon/441-work"));
+        author.issue = Some(issue("github", "441", "#441"));
+        let mut old = session("old-reviewer", Some("raccoon/441-work"));
+        old.issue = author.issue.clone();
+        old.issue_work.link = Some(IssueLinkSource::Branch);
+        old.archived = true;
+        let sessions = [author, session("reviewer", Some("raccoon/441-work")), old, session("prompt-reviewer", None), session("pull-reviewer", Some("review")), session("ordinary", Some("raccoon/441-work"))];
+        let reviewers = HashSet::from(["reviewer".into(), "old-reviewer".into(), "prompt-reviewer".into(), "pull-reviewer".into()]);
+        let pass = Linker::default().pass(&fake, &sessions, &reviewers);
+        assert_eq!(pass.links, vec![("ordinary".into(), issue("github", "441", "#441"), IssueLinkSource::Branch)]);
+        assert_eq!(pass.unlinks, vec!["old-reviewer"]);
+        assert_eq!(fake.prompts_read.get(), 0);
     }
 
     /// Let every failed lookup's wait run out, as if [`RETRY_FAILED`] had passed.
@@ -585,15 +611,15 @@ mod tests {
         fake.offline.set(true);
         let mut linker = Linker::default();
         let sessions = [session("s1", Some("raccoon/441-work")), session("s2", Some("raccoon/other"))];
-        assert_eq!(linker.pass(&fake, &sessions).links, vec![]);
+        assert_eq!(linker.pass(&fake, &sessions, &HashSet::new()).links, vec![]);
         let asked = fake.asked.borrow().len();
         // Within the wait, nobody is asked again.
-        assert_eq!(linker.pass(&fake, &sessions).links, vec![]);
+        assert_eq!(linker.pass(&fake, &sessions, &HashSet::new()).links, vec![]);
         assert_eq!(fake.asked.borrow().len(), asked);
         // Back online, after the wait: the branch and the prompt are looked at again.
         fake.offline.set(false);
         age_failures(&mut linker);
-        assert_eq!(linker.pass(&fake, &sessions).links, vec![
+        assert_eq!(linker.pass(&fake, &sessions, &HashSet::new()).links, vec![
             ("s1".to_string(), issue("github", "441", "#441"), IssueLinkSource::Branch),
             ("s2".to_string(), issue("linear", "uuid-42", "ENG-42"), IssueLinkSource::Prompt),
         ]);
@@ -606,18 +632,18 @@ mod tests {
         fake.no_teams.set(true);
         let mut linker = Linker::default();
         let sessions = [session("s1", Some("me/eng-42-login")), session("s2", Some("raccoon/other"))];
-        assert_eq!(linker.pass(&fake, &sessions).links, vec![]);
+        assert_eq!(linker.pass(&fake, &sessions, &HashSet::new()).links, vec![]);
         assert_eq!((fake.prompts_read.get(), fake.teams_asked.get()), (2, 1));
         // Pass after pass, no first request is read again and Linear is not asked again within the hour.
         for _ in 0..5 {
             age_failures(&mut linker);
-            assert_eq!(linker.pass(&fake, &sessions).links, vec![]);
+            assert_eq!(linker.pass(&fake, &sessions, &HashSet::new()).links, vec![]);
         }
         assert_eq!((fake.prompts_read.get(), fake.teams_asked.get()), (2, 1));
         // Once Linear answers, both are looked at again: the branch, and the prompt as it was read.
         fake.no_teams.set(false);
         linker.age_teams();
-        assert_eq!(linker.pass(&fake, &sessions).links, vec![
+        assert_eq!(linker.pass(&fake, &sessions, &HashSet::new()).links, vec![
             ("s1".to_string(), issue("linear", "uuid-42", "ENG-42"), IssueLinkSource::Branch),
             ("s2".to_string(), issue("linear", "uuid-42", "ENG-42"), IssueLinkSource::Prompt),
         ]);
@@ -648,7 +674,7 @@ mod tests {
         let fake = Fake { issues: vec![issue("github", "441", "#441")], ..Default::default() };
         let mut unlinked = session("s1", Some("441-work"));
         unlinked.issue_work.unlinked.push("https://github.com/acme/widgets/issues/441".into());
-        assert_eq!(Linker::default().pass(&fake, &[unlinked]).links, vec![]);
+        assert_eq!(Linker::default().pass(&fake, &[unlinked], &HashSet::new()).links, vec![]);
     }
 
     #[test]
@@ -657,7 +683,7 @@ mod tests {
         pulls.insert("raccoon/login".to_string(), BranchPull { state: PullRequestState::Open, title: "Login".into(), body: String::new(), closes: vec![("acme/widgets".into(), 12)] });
         let fake = Fake { issues: vec![issue("github", "12", "#12"), issue("linear", "uuid-42", "ENG-42")], pulls, prompt: Some("Please fix ENG-42".into()), ..Default::default() };
         let mut linker = Linker::default();
-        let pass = linker.pass(&fake, &[session("s1", Some("raccoon/login")), session("s2", Some("raccoon/other"))]);
+        let pass = linker.pass(&fake, &[session("s1", Some("raccoon/login")), session("s2", Some("raccoon/other"))], &HashSet::new());
         assert_eq!(pass.links, vec![
             ("s1".to_string(), issue("github", "12", "#12"), IssueLinkSource::PullRequest),
             ("s2".to_string(), issue("linear", "uuid-42", "ENG-42"), IssueLinkSource::Prompt),
@@ -676,7 +702,7 @@ mod tests {
         let mut linked = session("s1", Some("441-work"));
         linked.issue = Some(issue("github", "441", "#441"));
         let mut linker = Linker::default();
-        assert_eq!(linker.pass(&fake, &[linked]).links, vec![]);
+        assert_eq!(linker.pass(&fake, &[linked], &HashSet::new()).links, vec![]);
         assert_eq!(linker.pull_request("s1"), Some(PullRequestState::Merged));
         assert!(fake.asked.borrow().iter().all(|asked| asked.starts_with("pulls:")));
     }
