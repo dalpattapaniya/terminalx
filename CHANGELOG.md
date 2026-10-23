@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Issue pipelines
+
+- Keep independent reviews in a named Reviewer tab in the issue session, reuse
+  it for later rounds, and review changed heads again when the checkout is
+  current and idle. Route author review/merge requests through the pipeline;
+  `pipelines merge` preserves person-only, security and check gates. Keep shared
+  cloud authors in work claims, and retain commit-specific local-check failures
+  until the author reports those checks passing. (#568)
+
 ### Changes
 
 - Default workspace review to All changes against a displayed merge-base target,
