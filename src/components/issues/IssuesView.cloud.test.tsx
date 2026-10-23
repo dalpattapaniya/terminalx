@@ -1,7 +1,9 @@
 import "@testing-library/dom";
 import type { ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CreateRefused } from "@/lib/cloudCreate";
+import { forgetAgentLoginsRequest, takeAgentLoginsRequest, takeOrganizationRequest } from "@/lib/settingsLinks";
 import { setPrefs } from "@/lib/prefs";
 import type { ModelInfo } from "@/lib/api";
 import type { CloudIssueOutcome, CloudSessionRequest } from "@/lib/cloudNewSession";
@@ -66,9 +68,12 @@ vi.mock("@/lib/sessions", () => ({
 }));
 vi.mock("@/lib/cloudDashboard", () => ({ openCloudSession }));
 vi.mock("@/lib/cloudModels", async (original) => ({ ...(await original<typeof import("@/lib/cloudModels")>()), useCloudModelClient: () => null }));
-vi.mock("@/components/session/CloudNewSession", () => ({
-  cloudStartError: (error: unknown) => String(error),
-  useCloudProjectChoices: () => [{ orgId: "org-a", orgName: "Acme", mayStart: true, projects: [cloudProject] }],
+vi.mock("@/components/session/CloudNewSession", async (original) => ({
+  ...(await original<typeof import("@/components/session/CloudNewSession")>()),
+  useCloudProjectChoices: () => [
+    { orgId: "org-a", orgName: "Acme", mayStart: true, projects: [cloudProject] },
+    { orgId: "org-b", orgName: "Other", mayStart: true, projects: [{ ...cloudProject, key: "cloud:org-b:github.com/other/api", orgId: "org-b", fullName: "other/api" }] },
+  ],
 }));
 vi.mock("@/lib/cloudNewSession", () => ({
   planCloudStart: () => (cloudStart.plan.kind === "create" ? { kind: "create" } : { kind: cloudStart.plan.kind, node }),
@@ -118,6 +123,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  takeOrganizationRequest();
+  forgetAgentLoginsRequest();
   setPrefs({ issueCloudProject: null });
 });
 
@@ -202,6 +209,42 @@ describe("the Issues view for a cloud project", () => {
     expect(cloudStart.startInWorkspace).not.toHaveBeenCalled();
     fireEvent.click(within(note).getByRole("button", { name: "New session…" }));
     expect(startCloudSessionIn).toHaveBeenCalledWith(PROJECT);
+  });
+
+  it("offers the failed organization's Agent logins and clears recovery on retry", async () => {
+    cloudStart.startInWorkspace.mockRejectedValueOnce(new CreateRefused("cloud_workspace_agent_credential_required", "claude"));
+    await openIssue();
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open Agent logins" }));
+    expect(takeOrganizationRequest()).toBe("org-a");
+    expect(takeAgentLoginsRequest("org-a")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    await waitFor(() => expect(cloudStart.startInWorkspace).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "Open Agent logins" })).toBeNull();
+  });
+
+  it("keeps a pending failure's organization after switching cloud projects", async () => {
+    let rejectStart!: (error: unknown) => void;
+    cloudStart.startInWorkspace.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectStart = reject; }));
+    await openIssue();
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    await waitFor(() => expect(cloudStart.startInWorkspace).toHaveBeenCalledTimes(1));
+    press(screen.getByRole("button", { name: "acme/api" }));
+    fireEvent.click(await screen.findByText("other/api"));
+    await waitFor(() => expect(calls("issues_list").at(-1)).toMatchObject({ projectPath: "cloud:org-b:github.com/other/api" }));
+    await act(async () => rejectStart(new CreateRefused("cloud_workspace_agent_credential_required", "claude")));
+    fireEvent.click(await screen.findByRole("button", { name: "Open Agent logins" }));
+    expect(takeOrganizationRequest()).toBe("org-a");
+    expect(takeAgentLoginsRequest("org-b")).toBe(false);
+    expect(takeAgentLoginsRequest("org-a")).toBe(true);
+  });
+
+  it("does not offer Agent logins for unrelated start failures", async () => {
+    cloudStart.startInWorkspace.mockRejectedValueOnce(new Error("Workspace disconnected"));
+    await openIssue();
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    expect(await screen.findByText("Workspace disconnected")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open Agent logins" })).toBeNull();
   });
 
   it("starts nothing in a repository that is no longer selected for cloud workspaces", async () => {

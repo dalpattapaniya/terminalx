@@ -8,6 +8,9 @@
   locally or in cloud workspaces, even after their pipeline history is trimmed.
   Existing local reviewer links are removed. New cloud connections read reviewer
   identities separately from the runtime’s limited pipeline list. (#570)
+- A cloud issue that cannot start because an agent needs sign-in now offers
+  **Open Agent logins** for the failed request’s organization, even if you
+  switch projects while it starts. (#573)
 
 ### Computer use
 
