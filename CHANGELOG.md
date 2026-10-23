@@ -10,7 +10,8 @@
   Issues and Skills empty detail panes. Explicit New session still opens the
   form; closing, archiving or deleting the selection returns to welcome.
   Cloud archival respects later navigation, and Reopen closed tab still works
-  from welcome after closing the last tab, including Close all. (#445)
+  from welcome after closing the last tab, including Close all. Browser
+  dictation checks explicitly enter New session from welcome. (#445)
 
 ### Stats & Usage
 
