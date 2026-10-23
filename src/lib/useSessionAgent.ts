@@ -22,6 +22,12 @@ export interface LaunchSettings {
 export interface ControlledLaunch {
   value: LaunchSettings;
   onChange: (next: LaunchSettings) => void;
+  /** Keep unknown saved models visible until the reader replaces them. */
+  preserveUnavailableModel?: boolean;
+  /** Offer null explicitly instead of displaying the model's default effort. */
+  allowDefaultEffort?: boolean;
+  /** The surface supplies a persistent unattended-run warning. */
+  bypassWarning?: boolean;
 }
 
 /** What New Session would launch with now: where a controlled form starts. */
@@ -88,16 +94,19 @@ export function useSessionAgent(harnesses: HarnessInfo[], here = true, modelClie
   latest.current = controlled;
   const chosen = controlled?.value;
   const harness = harnesses.find((h) => h.id === (chosen ? chosen.harness : prefs.lastAgent)) ?? harnesses[0] ?? null;
-  const listed = useModels(harness?.id);
+  const catalog = useModels(controlled?.preserveUnavailableModel ? undefined : harness?.id);
+  const listed = controlled?.preserveUnavailableModel ? catalog.filter((m) => m.harness === harness?.id) : catalog;
   const picker = usePickerModels(listed, !here, modelClient, harness?.id);
   const models = harness ? picker.models : [];
   const savedModel = harness ? (chosen ? chosen.model : prefs.lastModel[harness.id]) : undefined;
   // A retired model, another provider's id, or a local pin unavailable in the
   // cloud must never reach the launch payload. Keep prefs intact while loading.
-  const model = models.find((m) => m.id === savedModel) ?? models.find((m) => m.isDefault) ?? models[0] ?? null;
+  const unavailableModel = controlled?.preserveUnavailableModel && savedModel && !models.some((m) => m.id === savedModel) ? savedModel : null;
+  const model = unavailableModel ? null : models.find((m) => m.id === savedModel) ?? models.find((m) => m.isDefault) ?? models[0] ?? null;
   const savedEffort = harness ? (chosen ? chosen.effort : prefs.lastEffort[harness.id]) : undefined;
   const effort = savedEffort && model?.efforts.includes(savedEffort)
     ? savedEffort
+    : controlled?.allowDefaultEffort ? null
     : model?.defaultEffort && model.efforts.includes(model.defaultEffort)
       ? model.defaultEffort
       : model?.efforts[0] ?? null;
@@ -115,14 +124,25 @@ export function useSessionAgent(harnesses: HarnessInfo[], here = true, modelClie
     models,
     refreshModels: picker.refresh,
     model,
-    modelId: model?.id ?? "",
+    modelId: unavailableModel ?? model?.id ?? "",
+    unavailableModel,
+    allowDefaultEffort: controlled?.allowDefaultEffort ?? false,
     effort,
     mode,
     // Like New Session, only explicit choices are persisted, per provider.
     selectHarness: (id: string) => {
       if (!controlled) setPrefs({ lastAgent: id });
       // Another agent starts on its own saved model and effort, as it would on New Session.
-      else if (id !== harness?.id) change({ harness: id, model: prefs.lastModel[id] ?? "", effort: prefs.lastEffort[id] ?? null });
+      else if (id !== harness?.id) {
+        if (!controlled.preserveUnavailableModel) {
+          change({ harness: id, model: prefs.lastModel[id] ?? "", effort: prefs.lastEffort[id] ?? null });
+          return;
+        }
+        const available = catalog.filter((m) => m.harness === id);
+        const next = available.find((m) => m.id === prefs.lastModel[id]) ?? available.find((m) => m.isDefault) ?? available[0];
+        const saved = prefs.lastEffort[id];
+        change({ harness: id, model: next?.id ?? "", effort: saved && next?.efforts.includes(saved) ? saved : null });
+      }
     },
     selectModel: (id: string) => {
       const next = models.find((m) => m.id === id);
@@ -132,11 +152,15 @@ export function useSessionAgent(harnesses: HarnessInfo[], here = true, modelClie
       else change({ model: id, effort: chosen?.effort && next.efforts.includes(chosen.effort) ? chosen.effort : null });
     },
     selectEffort: (value: string) => {
+      if (controlled?.allowDefaultEffort && value === "") {
+        change({ effort: null });
+        return;
+      }
       if (!harness || !model?.efforts.includes(value)) return;
       if (!controlled) setPrefs({ lastEffort: { ...prefs.lastEffort, [harness.id]: value } });
       else change({ effort: value });
     },
-    // Bypass is confirmed once, whichever surface picks it.
-    selectMode: (id: string) => chooseMode(harness?.id ?? "", id, (picked) => (latest.current ? change({ permissionMode: picked }) : setPrefs({ lastMode: picked }))),
+    // Bypass is confirmed once unless the controlled surface supplies its own warning.
+    selectMode: (id: string) => controlled?.bypassWarning ? change({ permissionMode: id }) : chooseMode(harness?.id ?? "", id, (picked) => (latest.current ? change({ permissionMode: picked }) : setPrefs({ lastMode: picked }))),
   };
 }

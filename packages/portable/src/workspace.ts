@@ -54,10 +54,11 @@ export const WORKSPACE_PROTOCOL = "terminalx-workspace-rpc/1";
  *   never merges and holds no Linear key: the desktop merges with its
  *   reader's own `gh` and moves a Linear issue to review with their key, and
  *   says so. `session.create` takes an issue only where it is granted.
+ * `pipeline/2` adds paginated persistent reviewer identities (`pipeline.reviewers`).
  * An older runtime grants none of them; check `hasCapability` before offering
  * the matching action.
  */
-export const WORKSPACE_CAPABILITIES = ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "session/3", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1", "cleanup/1", "workspace/1", "workspace/2", "pipeline/1"] as const;
+export const WORKSPACE_CAPABILITIES = ["pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "session/3", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1", "mirror/1", "cleanup/1", "workspace/1", "workspace/2", "pipeline/1", "pipeline/2"] as const;
 export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number];
 
 /**
@@ -65,6 +66,11 @@ export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number];
  * needs any version of the namespace it is named after.
  */
 export const METHOD_CAPABILITIES: Readonly<Record<string, WorkspaceCapability>> = {
+  "pipeline.list": "pipeline/1",
+  "pipeline.act": "pipeline/1",
+  "pipeline.noteMerge": "pipeline/1",
+  "pipeline.noteTracker": "pipeline/1",
+  "pipeline.reviewers": "pipeline/2",
   "session.update": "session/2",
   "session.addTab": "session/2",
   "session.delete": "session/2",
@@ -1160,6 +1166,19 @@ export class WorkspaceRpcClient {
   async listPipelines(): Promise<RuntimeIssuePipeline[]> {
     const result = await this.call<{ pipelines?: RuntimeIssuePipeline[] }>("pipeline.list");
     return result.pipelines ?? [];
+  }
+
+  /** `pipeline/2`: all persistent reviewer IDs in this workspace, including evicted history. */
+  async listPipelineReviewers(): Promise<string[]> {
+    const ids: string[] = [];
+    let after: string | null = null;
+    do {
+      const page: { sessionIds: string[]; next: string | null } = await this.call("pipeline.reviewers", after ? { after } : {});
+      ids.push(...page.sessionIds);
+      if (page.next && after && page.next <= after) throw new Error("Reviewer pagination did not advance");
+      after = page.next;
+    } while (after);
+    return ids;
   }
 
   /** `pipeline/1`: stop, resume, carry on, review again or look again. Never a merge: a runtime makes none. */

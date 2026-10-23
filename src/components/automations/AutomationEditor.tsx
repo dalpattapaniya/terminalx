@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft } from "@/icons";
+import { SessionAgentControls } from "@/components/session/SessionAgentControls";
+import { useSessionAgent } from "@/lib/useSessionAgent";
 import { AgentMark } from "@/components/AgentMark";
 import { Button } from "@/components/ui/button";
 import { Segmented, Switch } from "@/components/ui/controls";
 import { IssueListItem } from "@/components/issues/IssueListItem";
 import { automationsApi, errorMessage, issues as issuesApi, type Issue } from "@/lib/api";
 import { createAutomation, updateAutomation } from "@/lib/automations";
-import { BYPASS_MODE, DEFAULT_AUTOMATION_MODE, EFFORT_LABEL, PERMISSION_MODES, bypassEffect, modelOptionText, useModels } from "@/lib/models";
+import { BYPASS_MODE, DEFAULT_AUTOMATION_MODE, bypassEffect, useModels } from "@/lib/models";
 import { usePrefs } from "@/lib/prefs";
 import { usePromptTextProps } from "@/lib/autocorrect";
 import { useSessionStore } from "@/lib/sessions";
@@ -129,7 +131,7 @@ export function AutomationEditor({
   const firstHarness = store.harnesses.find((harness) => harness.id === prefs.lastAgent && harness.available) ?? store.harnesses.find((harness) => harness.available) ?? null;
   const allModels = useModels();
   const defaultModel = firstHarness
-    ? (prefs.lastModel[firstHarness.id] ?? allModels.find((model) => model.harness === firstHarness.id && model.isDefault)?.id ?? "")
+    ? (allModels.find((model) => model.harness === firstHarness.id && model.id === prefs.lastModel[firstHarness.id])?.id ?? allModels.find((model) => model.harness === firstHarness.id && model.isDefault)?.id ?? "")
     : "";
   const [input, setInput] = useState(() => initialInput(automation, firstProject?.path ?? "", firstHarness?.id ?? "", defaultModel, prefill));
   const [saving, setSaving] = useState(false);
@@ -144,9 +146,20 @@ export function AutomationEditor({
       setInput(initialInput(automation, firstProject?.path ?? "", firstHarness?.id ?? "", defaultModel, prefill));
       setError(null);
     }
-  }, [open, automation, prefill, firstProject?.path, firstHarness?.id, defaultModel]);
+    // Refreshing the model catalog must not reset an in-progress edit.
+  }, [open, automation, prefill]);
 
-  const models = useMemo(() => allModels.filter((model) => model.harness === input.harness), [allModels, input.harness]);
+  useEffect(() => {
+    // Agent discovery and the catalog may arrive after the editor opens.
+    // Seed only empty new selections, without discarding other draft fields.
+    if (!open || automation || !firstHarness) return;
+    if (!input.harness) {
+      setInput((current) => current.harness ? current : { ...current, harness: firstHarness.id, model: defaultModel });
+    } else if (!input.model && input.harness === firstHarness.id && defaultModel) {
+      setInput((current) => ({ ...current, model: defaultModel }));
+    }
+  }, [open, automation, input.model, input.harness, firstHarness?.id, defaultModel]);
+
   const sessions = useMemo(
     () => store.sessions.filter((session) => !session.archived && session.projectPath === input.projectPath),
     [store.sessions, input.projectPath],
@@ -158,6 +171,13 @@ export function AutomationEditor({
     }
   }, [isGit, input.workspace, input.issueTrigger]);
   const patch = (next: Partial<AutomationInput>) => setInput((current) => ({ ...current, ...next }));
+  const selection = useSessionAgent(store.harnesses, true, null, {
+    value: { harness: input.harness, model: input.model, effort: input.effort ?? null, permissionMode: input.mode },
+    onChange: (next) => patch({ harness: next.harness, model: next.model, effort: next.effort, mode: next.permissionMode }),
+    preserveUnavailableModel: true,
+    allowDefaultEffort: true,
+    bypassWarning: true,
+  });
   const patchSchedule = (next: Partial<AutomationSchedule>) => setInput((current) => ({ ...current, schedule: { ...current.schedule, ...next } }));
   const patchIssueTrigger = (next: Partial<AutomationIssueTrigger>) => setInput((current) => ({
     ...current,
@@ -217,12 +237,6 @@ export function AutomationEditor({
     else patch({ issueTrigger: defaultIssueTrigger(), workspace: "newWorktree", sessionId: null, reuseSession: false });
   };
 
-  const setHarness = (harness: string) => {
-    const availableModels = allModels.filter((model) => model.harness === harness);
-    const model = prefs.lastModel[harness] ?? availableModels.find((value) => value.isDefault)?.id ?? availableModels[0]?.id ?? "";
-    patch({ harness, model, effort: availableModels.find((value) => value.id === model)?.defaultEffort ?? null });
-  };
-
   const setScheduleKind = (kind: ScheduleKind) => {
     if (kind === "cron") patchSchedule({ kind, preset: undefined, cron: input.schedule.cron ?? "*/5 * * * *" });
     else patchSchedule({ kind, preset: input.schedule.preset ?? "weekdays", cron: undefined });
@@ -238,10 +252,12 @@ export function AutomationEditor({
   };
 
   const save = async () => {
+    if (!canSave) return;
     setSaving(true);
     setError(null);
     try {
-      const saved = automation ? await updateAutomation(automation.id, input) : await createAutomation(input);
+      const validated = { ...input, model: selection.modelId, effort: selection.effort };
+      const saved = automation ? await updateAutomation(automation.id, validated) : await createAutomation(validated);
       onSaved(saved);
       onOpenChange(false);
     } catch (cause) {
@@ -255,6 +271,8 @@ export function AutomationEditor({
     && !!input.prompt.trim()
     && !!input.projectPath
     && !!input.harness
+    && selection.harness?.id === input.harness
+    && !selection.unavailableModel
     && (input.workspace === "newWorktree" || !!input.sessionId)
     && (!input.issueTrigger || (!!input.issueTrigger.repo.trim() && !!input.issueTrigger.query.trim()));
 
@@ -302,32 +320,14 @@ export function AutomationEditor({
             />
           </label>
 
-          <label className={LABEL}>
-            Agent
-            <select value={input.harness} onChange={(event) => setHarness(event.target.value)} className={INPUT}>
-              {store.harnesses.map((harness) => <option key={harness.id} value={harness.id} disabled={!harness.available}>{harness.name}{harness.available ? "" : " — unavailable"}</option>)}
-            </select>
-          </label>
-          <label className={LABEL}>
-            Model
-            <select value={input.model} onChange={(event) => patch({ model: event.target.value, effort: models.find((model) => model.id === event.target.value)?.defaultEffort ?? null })} className={INPUT}>
-              {models.length === 0 && <option value="">Agent default</option>}
-              {models.map((model) => <option key={model.id} value={model.id}>{modelOptionText(model, models)}</option>)}
-            </select>
-          </label>
-          <label className={LABEL}>
-            Effort
-            <select value={input.effort ?? ""} onChange={(event) => patch({ effort: event.target.value || null })} className={INPUT}>
-              <option value="">Default</option>
-              {(models.find((model) => model.id === input.model)?.efforts ?? []).map((effort) => <option key={effort} value={effort}>{EFFORT_LABEL[effort] ?? effort}</option>)}
-            </select>
-          </label>
-          <label className={LABEL}>
-            Permissions
-            <select value={input.mode} onChange={(event) => patch({ mode: event.target.value })} className={INPUT}>
-              {PERMISSION_MODES.map((mode) => <option key={mode.id} value={mode.id}>{mode.label}</option>)}
-            </select>
-          </label>
+          <div className="col-span-2 flex flex-wrap gap-2">
+            <SessionAgentControls selection={selection} disabled={saving} />
+          </div>
+          {selection.unavailableModel && (
+            <div role="alert" className={WARNING_NOTE}>
+              Model no longer available: {selection.unavailableModel}. Pick another model before saving.
+            </div>
+          )}
           {input.mode === BYPASS_MODE && (
             <div role="note" aria-label="Bypass permissions warning" className={WARNING_NOTE}>
               <span className="font-medium text-foreground">Runs bypass permissions.</span> {bypassEffect(input.harness).effect} Unattended runs never pause for approval; pick another mode above if this automation should ask.

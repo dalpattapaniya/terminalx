@@ -78,6 +78,21 @@ describe("TabView recovery lifecycle", () => {
     expect(getDraft(session.tabs[0].id)).toBe("Keep this unsent prompt");
   });
 
+  it.each(["terminal", "chat"])("keeps usage exhaustion without retry after reopening the local %s view", view => {
+    mocks.views.views[session.tabs[0].id] = view;
+    const mounted = render(<Harness />);
+    emit({ type: "rate_limited", status: "rejected", window: "seven_day", resetsAt: Date.now() + 3_600_000 });
+    emit({ type: "recovery", kind: "usage_limit" });
+    expect(screen.getByText("Usage limit reached")).toBeTruthy();
+    expect(screen.queryByText(/Retry/i)).toBeNull();
+    mounted.unmount();
+    render(<Harness />);
+    expect(screen.getByText("Usage limit reached")).toBeTruthy();
+    expect(screen.getByTestId("usage-limit-reset").textContent).toContain("Weekly limit");
+    expect(screen.queryByText(/Retry/i)).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop session" })).toBeTruthy();
+  });
+
   it("updates the actual sidebar, terminal header and dashboard count on capacity, then settles Stop", async () => {
     render(<Harness />);
     await screen.findByText("Terminal view · Working");
@@ -107,9 +122,10 @@ describe("TabView recovery lifecycle", () => {
     expect(getDraft(session.tabs[0].id)).toBe("Keep this unsent prompt");
   });
 
-  it("switches an available model after stop and resumes the existing conversation", async () => {
+  it.each(["capacity", "usage_limit"] as const)("switches an available model after %s and resumes the existing conversation", async kind => {
     render(<Harness />);
-    emit({ type: "recovery", kind: "capacity" });
+    emit({ type: "recovery", kind });
+    if (kind === "usage_limit") expect(screen.queryByText(/Retry/i)).toBeNull();
     await screen.findByRole("option", { name: "Available model" });
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "available" } });
     await waitFor(() => expect(mocks.invoke.mock.calls.some(([c]) => c === "send_message")).toBe(true));

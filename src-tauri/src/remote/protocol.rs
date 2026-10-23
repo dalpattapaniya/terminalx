@@ -62,9 +62,10 @@ pub const PROTOCOL: &str = "terminalx-workspace-rpc/1";
 ///   desktop that does moves a Linear issue to review and says so with
 ///   `pipeline.noteTracker`. It also lets `session.create` take an issue, which
 ///   an older runtime would ignore: a client sends one only once this is granted.
-pub const CAPABILITIES: [&str; 21] = [
+/// - `pipeline/2`: paginated persistent reviewer identities, independent of pipeline history.
+pub const CAPABILITIES: [&str; 22] = [
     "pty/1", "pty/2", "fs/1", "git/1", "session/1", "session/2", "session/3", "keys/1", "lifecycle/1", "agents/1", "collab/1", "agent-pty/1", "composer/1", "composer/2", "composer/3", "ports/1",
-    "mirror/1", "cleanup/1", "workspace/1", "workspace/2", "pipeline/1",
+    "mirror/1", "cleanup/1", "workspace/1", "workspace/2", "pipeline/1", "pipeline/2",
 ];
 
 /// The namespace that lets a connection address an agent tab's own terminal
@@ -214,6 +215,7 @@ pub const METHODS: &[Method] = &[
     method("workspace.restoreRemoved", "workspace/2", Manage, true),
     // An issue's pipeline: reading it is reading the sessions it names;
     // steering it is the manager's, as starting the sessions was.
+    method("pipeline.reviewers", "pipeline/2", Participate, false),
     method("pipeline.list", "pipeline/1", Participate, false),
     method("pipeline.act", "pipeline/1", Manage, true),
     method("pipeline.noteMerge", "pipeline/1", Manage, true),
@@ -258,7 +260,7 @@ pub fn namespace_prefixes(capability: &str) -> &'static [&'static str] {
         "mirror/1" => &["mirror."],
         "cleanup/1" => &["cleanup."],
         "workspace/1" | "workspace/2" => &["workspace."],
-        "pipeline/1" => &["pipeline."],
+        "pipeline/1" | "pipeline/2" => &["pipeline."],
         // `composer/N` adds what an agent tab's composer asks of its session.
         "composer/1" => &["session.commands"],
         "composer/2" => &["session.files"],

@@ -2,10 +2,28 @@
 
 ## Unreleased
 
+### Automations
+
+- Use the shared session launch controls for agent, model, effort and permissions,
+  including refreshed model groups and notes. Automation choices stay separate
+  from session preferences, retain Default effort and the unattended bypass
+  warning, and flag unavailable saved models before saving. Agent discovery
+  and model loading fill empty launch settings without clearing a draft. (#553)
+
+### Chats
+
+- Hide Retry safely when a model or provider usage allowance is exhausted in
+  session recovery, keeping reset information and alternative-model selection
+  available. Transient failures still offer retry. (#601)
+
 ### Issues
 
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)
+- Pipeline reviewers no longer count as another session working on the issue,
+  locally or in cloud workspaces, even after their pipeline history is trimmed.
+  Existing local reviewer links are removed. New cloud connections read reviewer
+  identities separately from the runtime’s limited pipeline list. (#570)
 - A cloud issue that cannot start because an agent needs sign-in now offers
   **Open Agent logins** for the failed request’s organization, even if you
   switch projects while it starts. (#573)

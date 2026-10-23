@@ -222,7 +222,15 @@ impl WorkClaims {
     /// Link what the linker finds, and find the issues of the cloud sessions.
     fn link_pass(&self, linker: &mut Linker, lookup: &dyn Lookup) {
         let sessions = index::load().unwrap_or_default();
-        for (session_id, issue, source) in linker.pass(lookup, &sessions).links {
+        let Ok(reviewers) = crate::issue_pipeline::store::reviewer_sessions() else { return };
+        let pass = linker.pass(lookup, &sessions, &reviewers);
+        for session_id in pass.unlinks {
+            match unlink_issue(&session_id) {
+                Ok(session) => self.announce(&session),
+                Err(error) => log::warn!("unlink a pipeline reviewer: {error:#}"),
+            }
+        }
+        for (session_id, issue, source) in pass.links {
             match write_link(&session_id, issue, source) {
                 Ok(Some(session)) => self.announce(&session),
                 Ok(None) => {}
@@ -282,6 +290,8 @@ impl WorkClaims {
         let Some(device_id) = self.device_id() else { return true };
         let label = crate::pairing::PairingManager::host_name(&context.user_id);
         let sessions = index::load().unwrap_or_default();
+        let Ok(reviewers) = crate::issue_pipeline::store::reviewer_sessions() else { return false };
+        let sessions: Vec<_> = sessions.into_iter().filter(|session| !reviewers.contains(&session.id)).collect();
         let settings = crate::store::settings::load();
         let now = chrono::Utc::now();
         let cloud: Vec<(CloudSession, IssueRef)> = {
