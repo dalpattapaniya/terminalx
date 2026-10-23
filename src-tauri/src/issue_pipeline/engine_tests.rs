@@ -1945,3 +1945,58 @@ fn a_missing_reviewer_can_be_replaced_when_the_head_moves() {
     assert_eq!(again.reviewer.unwrap().session_id, "author");
     assert_eq!(run.host.world().sessions.len(), 1);
 }
+
+
+#[test]
+fn a_changed_heads_failed_local_checks_survive_polling_and_require_a_pass_for_that_head() {
+    for status in ["done", "blocked"] {
+        let run = Run::start(&github_issue(), false);
+        run.to_gate();
+        run.host.commit(C2);
+        run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+        let failed = run.author(&format!("```terminalx-status\n{{\"status\":\"{status}\",\"checks\":\"failed\"}}\n```"));
+        assert_eq!(failed.reason, Some(StopReason::LocalChecksFailed));
+        assert_eq!(store::get(&run.id).unwrap().failed_local_checks, [C2]);
+        assert_eq!(run.poll().reason, Some(StopReason::LocalChecksFailed));
+        assert_eq!(act(&run.host, &run.id, Action::Review).unwrap().reason, Some(StopReason::LocalChecksFailed));
+        assert_eq!(run.pipeline().round, 1);
+        assert!(engine::act_from_agent(&run.host, &run.id, Action::Merge).is_err());
+        // A different head's passing report cannot clear the failed commit.
+        run.host.commit(C3);
+        run.author(&done("Checks pass on a different commit."));
+        run.host.commit(C2);
+        assert_eq!(run.poll().reason, Some(StopReason::LocalChecksFailed));
+        run.author("```terminalx-status\n{\"status\":\"done\",\"checks\":\"none\"}\n```");
+        assert_eq!(run.pipeline().failed_local_checks, [C2]);
+        run.host.world().workspace.dirty.push("uncommitted-fix.rs".into());
+        run.author(&done("Only the uncommitted tree passes."));
+        assert_eq!(run.pipeline().failed_local_checks, [C2]);
+        run.host.world().workspace.dirty.clear();
+        let reviewing = run.author(&done("The failing check now passes on this commit."));
+        assert_eq!((reviewing.stage, reviewing.round), (Stage::Review, 2));
+        assert!(reviewing.failed_local_checks.is_empty());
+        run.reviewer(&reviewed(C2, "merge", "[]"));
+        assert_eq!(engine::act_from_agent(&run.host, &run.id, Action::Merge).unwrap().state, State::Merged);
+    }
+}
+
+#[test]
+fn a_clean_verdict_cannot_override_a_local_failure_reported_during_review() {
+    let run = Run::start(&github_issue(), false);
+    run.to_gate();
+    run.host.commit(C2);
+    run.host.world().pr.as_mut().unwrap().head_sha = C2.into();
+    assert_eq!(run.poll().stage, Stage::Review);
+    run.author("```terminalx-status\n{\"status\":\"done\",\"checks\":\"failed\"}\n```");
+    assert_eq!(run.reviewer(&reviewed(C2, "merge", "[]")).reason, Some(StopReason::LocalChecksFailed));
+    assert!(set_auto_merge(&run.host, &run.id, true).unwrap().merged.is_none());
+    // Even a stale Ready state cannot let either caller bypass the stored failure.
+    for person in [false, true] {
+        let mut stale = run.pipeline();
+        stale.state = State::ReadyToMerge;
+        store::commit(&mut stale).unwrap();
+        let blocked = if person { act(&run.host, &run.id, Action::Merge) } else { engine::act_from_agent(&run.host, &run.id, Action::Merge) }.unwrap();
+        assert_eq!(blocked.reason, Some(StopReason::LocalChecksFailed));
+    }
+    assert!(run.merges().is_empty());
+}

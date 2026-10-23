@@ -374,3 +374,26 @@ it("learns reviewers omitted by the runtime list on first connection and reconne
   const sessions = ["unlisted-reviewer", "replaced-reviewer", "author"].map((sessionId) => ({ key: `cloud:${ORG}:ws-1:${sessionId}`, orgId: ORG, workspaceId: "ws-1", sessionId, branch: "raccoon/433-carry", stopped: true }));
   expect(cloudWorkSessions(sessions as never, () => "me", cloudReviewerSessions()).map((session) => session.sessionId)).toEqual(["author"]);
 });
+
+
+it("keeps shared-session reviewers in cloud work claims across caching and reload", async () => {
+  const shared = raw({ reviewer: { sessionId: "s1", tabId: "reviewer" } });
+  const current = catalog.getCloudCatalog();
+  // Repair an ID saved by the previous shared-tab implementation as well.
+  current.orgs[ORG].pipelines = { "ws-1": { pipelines: [shared], reviewerSessionIds: ["s1", "legacy-reviewer"], at: 1 } };
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:s1`)).toBe(false);
+  catalog.cacheCloudPipelines(ORG, "ws-1", [shared], 2, ["s1", "legacy-reviewer"]);
+  const saved = catalog.serializeCatalog(catalog.getCloudCatalog());
+  const parsed = catalog.parseCatalog(JSON.parse(JSON.stringify(saved)))!;
+  const reviewers = cloudReviewerSessions({ ...current, ...parsed });
+  expect(reviewers.has(`cloud:${ORG}:ws-1:s1`)).toBe(false);
+  expect(reviewers.has(`cloud:${ORG}:ws-1:legacy-reviewer`)).toBe(true);
+  const { cloudWorkSessions } = await import("@/lib/cloudWorkClaims");
+  const sessions = ["s1", "legacy-reviewer"].map((sessionId) => ({ key: `cloud:${ORG}:ws-1:${sessionId}`, orgId: ORG, workspaceId: "ws-1", sessionId, branch: "raccoon/433-carry", stopped: false, tabs: [] }));
+  expect(cloudWorkSessions(sessions as never, () => "me", reviewers).map((session) => session.sessionId)).toEqual(["s1"]);
+  catalog.cacheCloudPipelines(ORG, "ws-1", []);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:s1`)).toBe(false);
+  // Loading the contaminated older catalog repairs it even before a refresh.
+  const older = catalog.parseCatalog(JSON.parse(JSON.stringify(catalog.serializeCatalog(current))))!;
+  expect(cloudReviewerSessions({ ...current, ...older }).has(`cloud:${ORG}:ws-1:s1`)).toBe(false);
+});

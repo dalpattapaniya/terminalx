@@ -79,6 +79,9 @@ pub fn merge(github: &dyn Github, pipeline: &Pipeline, repository: &str, setting
     if pr.state == "OPEN" && pr.head != pipeline.branch {
         return Ok(CloudMerge::NotMerged { reason: format!("Pull request #{number} is from {}, not from {}, the branch this issue's pipeline opened it from.", pr.head, pipeline.branch) });
     }
+    if pr.state == "OPEN" && pipeline.failed_local_checks.iter().any(|failed| super::gate::same_commit(failed, &pr.head_sha)) {
+        return Ok(CloudMerge::NotMerged { reason: StopReason::LocalChecksFailed.describe() });
+    }
     // As for a person pressing Merge on this computer: everything that makes
     // a merge wrong applies, none of the holds that wait for a person.
     let decision = gate::decide(&Facts {
@@ -179,6 +182,7 @@ mod tests {
             review_requested_at: None,
             findings_sent_round: 0,
             verdict: Some(merge_verdict(HEAD)),
+            failed_local_checks: Vec::new(),
             security_areas: Vec::new(),
             summary: None,
             reminded: false,
@@ -194,6 +198,15 @@ mod tests {
 
     fn settings() -> IssuePipelineSettings {
         IssuePipelineSettings { merge_method: "squash".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn desktop_authority_cannot_override_known_local_check_failures() {
+        let github = FakeGithub::new(clean_pr());
+        let mut pipeline = ready();
+        pipeline.failed_local_checks = vec![HEAD.into()];
+        assert_eq!(merge(&github, &pipeline, "acme/widgets", &settings()).unwrap(), CloudMerge::NotMerged { reason: StopReason::LocalChecksFailed.describe() });
+        assert!(github.merges.lock().unwrap().is_empty());
     }
 
     #[test]

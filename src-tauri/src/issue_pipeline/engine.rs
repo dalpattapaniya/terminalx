@@ -329,6 +329,23 @@ impl Step<'_> {
 
     fn author_turn(&mut self, message: &str) -> Result<()> {
         let report = verdict::author_report(message);
+        if let Some(checks) = verdict::reported_checks(message).or(match &report { AuthorReport::Done { checks, .. } => Some(*checks), _ => None }) {
+            let workspace = self.host.workspace(&self.cwd)?;
+            let head = workspace.head;
+            match checks {
+                LocalChecks::Failed => {
+                    if !self.p.failed_local_checks.iter().any(|failed| same_commit(failed, &head)) {
+                        self.p.failed_local_checks.push(head);
+                    }
+                }
+                LocalChecks::Passed if matches!(&report, AuthorReport::Done { .. }) && workspace.dirty.is_empty() && workspace.branch.as_deref() == Some(self.p.branch.as_str()) => self.p.failed_local_checks.retain(|failed| !same_commit(failed, &head)),
+                LocalChecks::Passed | LocalChecks::None => {}
+            }
+        }
+        if self.p.stage == Stage::Merge && self.p.state != State::Merged {
+            return self.evaluate(Merger::Pipeline);
+        }
+
         // A pull request that could not be opened (uncommitted files, a
         // refused push) is tried again when the author next says it is done:
         // that is usually the turn in which it put the cause right.
@@ -556,6 +573,10 @@ impl Step<'_> {
         if !same_commit(&workspace.head, &pr.head_sha) {
             bail!("The workspace is at {} and the pull request is at {}. Push or pull so they match, then review again.", short(&workspace.head), short(&pr.head_sha));
         }
+        if self.local_checks_failed(&pr.head_sha) {
+            self.needs_you(StopReason::LocalChecksFailed);
+            return Ok(());
+        }
         if self.p.round >= self.p.max_rounds {
             if !by_person {
                 let blocking: Vec<_> = self.p.verdict.iter().flat_map(|verdict| verdict.blocking()).collect();
@@ -667,6 +688,10 @@ impl Step<'_> {
         self.evaluate_snapshot(pr, merger)
     }
 
+    fn local_checks_failed(&self, head: &str) -> bool {
+        self.p.failed_local_checks.iter().any(|failed| same_commit(failed, head))
+    }
+
     fn ready_for_review(&self, head: &str) -> Result<bool> {
         let idle = |tab: &crate::store::index::TabEntry| matches!(tab.status, crate::store::index::TabStatus::Idle | crate::store::index::TabStatus::Completed);
         let author_idle = self.host.session(&self.p.author.session_id).is_ok_and(|session| session.tab(&self.p.author.tab_id).is_some_and(idle));
@@ -684,6 +709,11 @@ impl Step<'_> {
     }
 
     fn evaluate_snapshot(&mut self, pr: PrSnapshot, merger: Merger) -> Result<()> {
+        if pr.state == "OPEN" && self.local_checks_failed(&pr.head_sha) {
+            self.needs_you(StopReason::LocalChecksFailed);
+            return Ok(());
+        }
+
         // A changed head gets another independent review only when the
         // checkout is current and neither conversation is active. Otherwise
         // the gate keeps its actionable head-moved reason for the next poll.
@@ -980,6 +1010,7 @@ pub fn start(host: &dyn Host, session_id: &str, tab_id: &str, auto_merge: Option
         review_requested_at: None,
         findings_sent_round: 0,
         verdict: None,
+        failed_local_checks: Vec::new(),
         security_areas: Vec::new(),
         summary: None,
         reminded: false,
