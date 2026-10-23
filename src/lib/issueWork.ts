@@ -268,13 +268,14 @@ export function cloudWorkers(input: CloudWorkInput, now = Date.now()): Map<strin
     if (pipeline?.place && (pipeline.place.orgId !== orgId || pipeline.place.workspaceId !== workspaceId)) continue;
     if (row && row.projectKey !== input.projectPath) continue;
     if (!row && pipeline?.projectPath !== input.projectPath && !candidate.started) continue;
-    // A pipeline can precede the session index. Once a newer list removes it,
-    // its saved pipeline must not resurrect a deleted or archived author.
+    // A pipeline can precede the session index. Once an observed author leaves
+    // the authoritative list, no pipeline-cache refresh can bring it back.
     const cached = org.sessions[workspaceId];
     const list = input.liveSessions(orgId, workspaceId) ?? cached?.sessions;
     const session = list?.find((session) => session.id === sessionId);
     const heardAt = Math.max(candidate.started?.at ?? 0, pipeline?.place?.readAt ?? 0);
     if (session?.archived || row?.archived) continue;
+    if (!session && list && input.observed?.has(key)) continue;
     const settling = !input.observed?.has(key) && now - heardAt < POLL_MS * 2;
     if (!session && cached && cached.at > heardAt && !settling) continue;
     if (!row && !session && now - heardAt >= RECENT_MS) continue;
@@ -343,8 +344,24 @@ export function workersByIssue(issues: Issue[], sessions: SessionEntry[], remote
   for (const issue of issues) {
     if (issueClosed(issue)) continue;
     const key = workKeyOf(issue);
-    const ownCloud = cloud.get(key) ?? [];
-    const claims = (remote.get(key) ?? []).filter((worker) => !worker.you || worker.place !== "cloud" || !(worker.claimSessionId && ownCloud.some((own) => own.claimSessionId === worker.claimSessionId || own.legacyCloudClaimId === worker.claimSessionId)));
+    const ownCloud = [...(cloud.get(key) ?? [])];
+    const claims: IssueWorker[] = [];
+    for (const worker of remote.get(key) ?? []) {
+      const index = worker.you && worker.place === "cloud" && worker.claimSessionId
+        ? ownCloud.findIndex((own) => own.claimSessionId === worker.claimSessionId || own.legacyCloudClaimId === worker.claimSessionId)
+        : -1;
+      if (index < 0) {
+        claims.push(worker);
+        continue;
+      }
+      const own = ownCloud[index];
+      // Faded evidence cannot negate live work. Within the same phase, the
+      // latest activity wins; keep the window's scoped identity and navigation.
+      const latest = worker.phase !== own.phase
+        ? worker.phase === "now" ? worker : own
+        : worker.lastActive >= own.lastActive ? worker : own;
+      ownCloud[index] = { ...own, state: latest.state, phase: latest.phase, since: latest.since, lastActive: latest.lastActive };
+    }
     const workers = sortWorkers([...localWorkers(sessions, issue, now), ...ownCloud, ...claims]);
     if (workers.length) out.set(key, workers);
   }

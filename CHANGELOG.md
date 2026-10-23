@@ -37,7 +37,9 @@
 
 - Count your known cloud issue authors immediately in work filters and duplicate-start
   warnings, deduplicate arriving account claims, and open an existing cloud author
-  from the warning. Exclude reviewers and stale or removed sessions. (#572)
+  from the warning. Preserve live account evidence when deduplicating and keep
+  removed authors excluded across pipeline refreshes. Exclude reviewers and
+  stale sessions. (#572)
 
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)

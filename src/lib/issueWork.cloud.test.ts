@@ -42,6 +42,61 @@ describe("known cloud issue authors", () => {
     expect(unavailableText({ ...answer, available: false }, true)).toContain("this Mac and your known cloud sessions");
   });
 
+  it.each(["cloud:ws:author", key])("keeps live account evidence and cloud navigation when deduplicating %s", (sessionId) => {
+    const input = world();
+    input.pipelines = [pipeline()];
+    input.sessions = input.sessions.map((row) => ({ ...row, connected: false, fresh: false, reportedAt: null }));
+    const cloud = cloudWorkers(input, now);
+    expect(taken(cloud.get(workKeyOf(issue)))).toBe(false);
+    const answer: WorkClaimsAnswer = { available: true, now, liveForSeconds: 300, claims: [{ key: "opaque", scope: "github.com/acme/api", issue, person: { you: true, name: "Me" }, cloud: true, sessionId, title: "Fix", state: "working", live: true, since: now - 1000, lastActiveAt: now + 1000, refreshedAt: now + 1000 }] };
+    const found = workersByIssue([issue], [], remoteWorkers(answer, now, now), now, cloud).get(workKeyOf(issue));
+    expect(found).toHaveLength(1);
+    expect(found![0]).toMatchObject({ state: "working", phase: "now", lastActive: now + 1000, sessionId: null, cloudSession: { key, tabId: "a" } });
+    expect(mine(found)).toBe(true);
+    expect(taken(found)).toBe(true);
+    expect(workToWarnAbout(found)).toHaveLength(1);
+    expect(taken(cloud.get(workKeyOf(issue)))).toBe(false); // Merging leaves the source projection untouched.
+
+    // A live claim still matters when its last activity predates the faded cache.
+    answer.claims[0].lastActiveAt = now - 1000;
+    expect(taken(workersByIssue([issue], [], remoteWorkers(answer, now, now), now, cloud).get(workKeyOf(issue)))).toBe(true);
+    // Conversely, an offline claim cannot erase live window evidence.
+    answer.claims[0].live = false;
+    answer.claims[0].lastActiveAt = now + 1000;
+    const live = cloudWorkers(world(), now);
+    expect(taken(workersByIssue([issue], [], remoteWorkers(answer, now, now), now, live).get(workKeyOf(issue)))).toBe(true);
+    // When both sources are live, preserve the newer window state.
+    answer.claims[0].live = true;
+    answer.claims[0].lastActiveAt = now - 1000;
+    expect(workersByIssue([issue], [], remoteWorkers(answer, now, now), now, live).get(workKeyOf(issue))![0].state).toBe("idle");
+  });
+
+  it("does not resurrect an observed deleted author when the workspace pipeline cache advances", () => {
+    const input = world();
+    input.pipelines = [pipeline()];
+    input.observed = new Set([key]);
+    expect(workers(input)).toHaveLength(1);
+    // The live list overrides even a stale dashboard row and cached session.
+    input.liveSessions = () => [];
+    expect(workers(input)).toEqual([]);
+    input.sessions = [];
+    input.catalog.orgs.org.sessions.ws = { sessions: [], at: now + 1, capabilities: [] };
+    for (const readAt of [now + 2, now + 1000, now + 10000]) {
+      input.pipelines = [{ ...pipeline(), place: { ...pipeline().place!, readAt } }];
+      // Pipeline updates elsewhere advance readAt, but identical empty lists
+      // retain their original cache timestamp.
+      const found = workers(input, readAt);
+      expect(found).toEqual([]);
+      expect(mine(found)).toBe(false);
+      expect(taken(found)).toBe(false);
+      expect(workToWarnAbout(found)).toEqual([]);
+    }
+    input.liveSessions = () => null; // The last authoritative list still says gone after disconnect.
+    expect(workers(input, now + 10000)).toEqual([]);
+    input.liveSessions = () => [session]; // Only actual session evidence can restore the author.
+    expect(workers(input, now + 10000)).toHaveLength(1);
+  });
+
   it("keeps a pending visible pipeline author until a newer session list removes it", () => {
     const input = world();
     input.sessions = [];
