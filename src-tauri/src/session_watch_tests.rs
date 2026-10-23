@@ -172,6 +172,8 @@ impl Rig {
                 CliKind::Codex => "codex".into(),
             },
             seq: 0,
+            source_timestamp: None,
+            message_times: HashMap::new(),
             status: TabStatus::Idle,
             child: None,
             child_pid: None,
@@ -1694,4 +1696,45 @@ fn a_held_prompt_sent_now_is_typed_again_once_the_interrupted_turn_ends_and_the_
         "both records stay; their echoes are awaited afresh, in the order they are typed: the chosen one as a prompt of its own, the other still queued"
     );
     assert!(p.resend_after_abort.is_none());
+}
+
+#[test]
+fn message_timestamps_preserve_source_and_first_stream_chunk_on_disk() {
+    let rig = Rig::new();
+    let mut rt = rig.rt.lock().unwrap();
+    let block = BlockRef { message_id: "synthetic-message".into(), index: 0 };
+    let first = rig.manager.publish(&mut rt, Payload::Delta(Delta::TextDelta { block: block.clone(), text: "Hello".into() }), None);
+    rt.source_timestamp = Some("2026-10-22T23:59:00Z".into());
+    let next = rig.manager.publish(&mut rt, Payload::Delta(Delta::TextDelta { block: block.clone(), text: " world".into() }), None);
+    let committed = rig.manager.publish(&mut rt, Payload::AssistantText { block: Some(block), text: "Hello world".into() }, None);
+    assert_eq!(first.ts, next.ts);
+    assert_eq!(first.ts, committed.ts);
+    assert_eq!(first.message_ts.as_deref(), Some(first.ts.as_str()));
+    assert_eq!(first.message_ts, next.message_ts);
+    assert_eq!(first.message_ts, committed.message_ts);
+    let source = rig.manager.publish(&mut rt, Payload::AssistantText { block: None, text: "Source record".into() }, None);
+    assert_eq!(source.ts, "2026-10-22T23:59:00Z");
+    rt.source_timestamp = Some(String::new());
+    let unknown = rig.manager.publish(&mut rt, Payload::AssistantText { block: None, text: "Undated history".into() }, None);
+    assert!(unknown.ts.is_empty());
+    assert!(unknown.message_ts.is_none());
+    let saved: Vec<AgentEvent> = store::read_lines(&rt.log_path).unwrap();
+    assert_eq!(saved, vec![committed, source, unknown]);
+}
+
+#[test]
+fn transcript_message_timestamps_survive_tailing() {
+    let rig = Rig::new();
+    rig.append(
+        r#"{"type":"assistant","timestamp":"2026-10-22T23:59:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Synthetic dated message"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Synthetic undated message"}]}}
+"#,
+    );
+    rig.manager.pump(&rig.rt, &rig.tail);
+    let messages: Vec<_> = rig.events().into_iter().filter(|ev| matches!(ev.payload, Payload::AssistantText { .. })).collect();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].ts, "2026-10-22T23:59:00Z");
+    assert_eq!(messages[1].ts, "");
+    assert_eq!(messages[0].message_ts.as_deref(), Some("2026-10-22T23:59:00Z"));
+    assert!(messages[1].message_ts.is_none());
 }

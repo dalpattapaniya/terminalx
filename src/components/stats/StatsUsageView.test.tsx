@@ -50,6 +50,27 @@ beforeEach(() => {
 afterEach(() => { cleanup(); statsUsageStore.dispose(); });
 
 describe("StatsUsageView", () => {
+  it("shows partial pricing and incomplete discovery next to retained usage", async () => {
+    const partial = saved({ snapshot: {
+      ...snapshot, hasPartialCost: true, estimatedCostUsd: null,
+      discoveryWarnings: ["Fixture worktree discovery failed"],
+      providers: snapshot.providers.map((provider) => provider.id === "codex" ? {
+        ...provider, hasPartialCost: true, estimatedCostUsd: null, unpricedModels: ["unmapped-model"],
+      } : provider),
+    } });
+    vi.mocked(api.statsUsageSnapshot).mockResolvedValue(partial);
+    vi.mocked(api.statsUsageRefresh).mockResolvedValue(partial);
+    render(<StatsUsageView />);
+    expect(await screen.findByText("Partial estimated cost")).toBeTruthy();
+    expect(screen.getByText(/Partial estimate: usage with unknown model prices/)).toBeTruthy();
+    expect(screen.getByText(/cost is unknown and excluded: unmapped-model/)).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("Incomplete location coverage");
+    expect(screen.getAllByText("n/a").length).toBeGreaterThan(0);
+    expect(screen.queryByText("$0.00")).toBeNull();
+    expect(screen.getByText(/Last successful refresh/)).toBeTruthy();
+    expect(screen.getByText(/Local transcripts and previously recorded usage/)).toBeTruthy();
+  });
+
   it("renders a persisted snapshot before a delayed refresh finishes, without dimming", async () => {
     const refresh = deferred<StatsUsageState>();
     vi.mocked(api.statsUsageRefresh).mockReturnValue(refresh.promise);
@@ -68,11 +89,11 @@ describe("StatsUsageView", () => {
     vi.mocked(api.statsUsageRefresh).mockReturnValue(refresh.promise);
     const first = render(<StatsUsageView />);
     await screen.findByText("12.7B");
-    const oldTimestamp = screen.getByText(/ · Updated /).textContent;
+    const oldTimestamp = screen.getByText(/ · Last successful refresh /).textContent;
     first.unmount();
     const second = render(<StatsUsageView />);
     expect(screen.getByText("12.7B")).toBeTruthy();
-    expect(screen.getByText(/ · Updated /).textContent).toBe(oldTimestamp);
+    expect(screen.getByText(/ · Last successful refresh /).textContent).toBe(oldTimestamp);
     expect(api.statsUsageRefresh).toHaveBeenCalledTimes(1);
     second.unmount();
     const updated = {
@@ -88,14 +109,14 @@ describe("StatsUsageView", () => {
     expect(screen.getByText("42K")).toBeTruthy();
     expect(screen.getByText("99")).toBeTruthy();
     expect(screen.getByText("2 sessions")).toBeTruthy();
-    expect(screen.getByText(/ · Updated /).textContent).not.toBe(oldTimestamp);
+    expect(screen.getByText(/ · Last successful refresh /).textContent).not.toBe(oldTimestamp);
   });
 
   it.each(["refresh", "read", "persist"])("retains saved data and its timestamp after a %s failure, with Retry", async (failure) => {
     render(<StatsUsageView />);
     await screen.findByText("12.7B");
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe(""));
-    const timestamp = screen.getByText(/ · Updated /).textContent;
+    const timestamp = screen.getByText(/ · Last successful refresh /).textContent;
     if (failure === "read") vi.mocked(api.statsUsageSnapshot).mockRejectedValueOnce(new Error("read failed"));
     else if (failure === "refresh") vi.mocked(api.statsUsageRefresh).mockRejectedValueOnce(new Error("scan failed"));
     else vi.mocked(api.statsUsageRefresh).mockResolvedValueOnce(saved({ error: "persist failed" }));
@@ -103,7 +124,7 @@ describe("StatsUsageView", () => {
     await screen.findByRole("alert");
     expect(screen.getByText("12.7B")).toBeTruthy();
     expect(screen.getByText(/Saved usage — could not refresh/)).toBeTruthy();
-    expect(screen.getByText(/ · Updated /).textContent).toBe(timestamp);
+    expect(screen.getByText(/ · Last successful refresh /).textContent).toBe(timestamp);
     expect(screen.getByRole("status").textContent).toBe("");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());

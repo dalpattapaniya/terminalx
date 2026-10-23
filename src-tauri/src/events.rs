@@ -21,6 +21,10 @@ pub struct AgentEvent {
     pub harness: String,
     pub seq: u64,
     pub ts: String,
+    /// Verified source/send time (first text chunk for streams). Legacy `ts`
+    /// may be an import time, so consumers must not use it as a message time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_ts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentRef>,
     pub payload: Payload,
@@ -454,6 +458,24 @@ impl Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_event_time_is_not_promoted_to_message_time_on_reload() {
+        let legacy = serde_json::json!({
+            "id": "synthetic-import", "sessionId": "s", "tabId": "t", "harness": "claude",
+            "seq": 1, "ts": "2026-10-23T12:00:00Z",
+            "payload": { "type": "assistant_text", "text": "Synthetic historical reply" }
+        });
+        let event: AgentEvent = serde_json::from_value(legacy).unwrap();
+        assert!(event.message_ts.is_none());
+        let saved = serde_json::to_value(&event).unwrap();
+        assert_eq!(saved["ts"], "2026-10-23T12:00:00Z");
+        assert!(saved.get("messageTs").is_none());
+        let mut verified = event;
+        verified.message_ts = Some("2026-10-21T23:59:00Z".into());
+        let saved = serde_json::to_string(&verified).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&saved).unwrap(), verified);
+    }
 
     #[test]
     fn payload_is_internally_tagged_snake_case() {

@@ -2,7 +2,7 @@ import type { Token } from "marked";
 import type { Turn, WorkItem } from "@terminalx/portable/transcript";
 import { markdownBlocks, textChunks } from "./markdown-blocks";
 
-export type TurnRow = { key: string; startsTurn: boolean } & (
+export type TurnRow = { key: string; startsTurn: boolean; ts?: string } & (
   | { kind: "prompt"; text: string }
   | { kind: "markdown"; token: Token }
   | { kind: "work"; item: WorkItem }
@@ -13,20 +13,20 @@ export type TurnRow = { key: string; startsTurn: boolean } & (
 // tool completion, reconnects, and insertion of earlier turns.
 export function turnRows(turn: Turn): TurnRow[] {
   const rows: TurnRow[] = [];
-  const addMarkdown = (key: string, text: string) => {
-    for (const [index, token] of markdownBlocks(text).entries()) rows.push({ key: `${key}:${index}`, kind: "markdown", token, startsTurn: false });
+  const addMarkdown = (key: string, text: string, ts?: string) => {
+    for (const [index, token] of markdownBlocks(text).entries()) rows.push({ key: `${key}:${index}`, kind: "markdown", token, startsTurn: false, ts: index === 0 ? ts : undefined });
   };
   if (turn.prompt) {
     const chunks = turn.prompt.text ? textChunks(turn.prompt.text) : [""];
-    for (const [index, text] of chunks.entries()) rows.push({ key: `prompt:${turn.prompt.seq}:${index}`, kind: "prompt", text, startsTurn: false });
+    for (const [index, text] of chunks.entries()) rows.push({ key: `prompt:${turn.prompt.seq}:${index}`, kind: "prompt", text, startsTurn: false, ts: index === 0 ? turn.prompt.messageTs : undefined });
   }
   for (const item of turn.work) {
-    if (item.kind === "text") addMarkdown(item.key, item.text);
+    if (item.kind === "text") addMarkdown(item.key, item.text, item.messageTs);
     // A message the agent took mid-turn is the reader's, drawn like the prompt.
     else if (item.kind === "message") {
-      for (const [index, text] of (item.text ? textChunks(item.text) : [""]).entries()) rows.push({ key: `${item.key}:${index}`, kind: "prompt", text, startsTurn: false });
+      for (const [index, text] of (item.text ? textChunks(item.text) : [""]).entries()) rows.push({ key: `${item.key}:${index}`, kind: "prompt", text, startsTurn: false, ts: index === 0 ? item.messageTs : undefined });
     } else if ("text" in item) {
-      for (const [index, text] of textChunks(item.text).entries()) rows.push({ key: `${item.key}:${index}`, kind: "work", item: { ...item, text }, startsTurn: false });
+      for (const [index, text] of textChunks(item.text).entries()) rows.push({ key: `${item.key}:${index}`, kind: "work", item: { ...item, text, ...((item.kind === "queued") ? { messageTs: index === 0 ? item.messageTs : undefined } : {}) }, startsTurn: false });
     } else rows.push({ key: item.key, kind: "work", item, startsTurn: false });
   }
   if (turn.finalText) addMarkdown(`final:${turn.key}`, turn.finalText);

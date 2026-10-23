@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Stats & Usage
+
+- Refresh usage for non-Git projects without blocking healthy locations, and
+  show incomplete worktree discovery, saved refresh time, reporting scope, and
+  omitted pricing explicitly. Read configured provider homes and Codex archives;
+  reconcile whitespace, streamed copies, model switches and counter resets.
+  Price individual requests, include Astra's published rates and Claude's
+  one-hour cache writes, and retain recorded usage after transcript or worktree
+  removal without keeping prompt contents. Zero-valued counter resets update
+  the baseline; retained legacy records with unavailable pricing detail stay
+  explicitly unpriced after cache migration. (#602)
+
 ### Automations
 
 - Use the shared session launch controls for agent, model, effort and permissions,
@@ -12,6 +24,11 @@
 
 ### Chats
 
+- Show compact local message times with full dates available by keyboard or
+  tap, across local, cloud and mobile chats. Keep source timestamps through
+  transcript imports and the first text-chunk time through streaming; omit
+  missing or invalid historical times, including legacy records whose saved
+  timestamp may be their import time. (#600)
 - Hide Retry safely when a model or provider usage allowance is exhausted in
   session recovery, keeping reset information and alternative-model selection
   available. Transient failures still offer retry. (#601)
@@ -20,6 +37,9 @@
 
 - Keep cloud sessions openable when their first prompt fails, with the error
   in their transcript, and stop their issue pipeline and partial agent launch. (#577)
+- Pipeline rows omit only their own author from the work chip, keeping other
+  sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
+
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)
 - Pipeline reviewers no longer count as another session working on the issue,
