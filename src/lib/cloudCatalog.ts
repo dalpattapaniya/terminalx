@@ -448,13 +448,14 @@ export function pipelineReviewerIds(pipelines: RuntimeIssuePipeline[]): string[]
 }
 
 /** Keep a workspace's issue pipelines with the catalog (#433), so its issues show them while it sleeps. */
-export function cacheCloudPipelines(orgId: string, workspaceId: string, pipelines: RuntimeIssuePipeline[], now = Date.now()) {
+export function cacheCloudPipelines(orgId: string, workspaceId: string, pipelines: RuntimeIssuePipeline[], now = Date.now(), knownReviewers: readonly string[] = []) {
   const current = state.orgs[orgId];
   if (!current) return;
   const previous = current.pipelines?.[workspaceId];
   // Capture the full runtime list before trimming it, and migrate older caches.
   const reviewerSessionIds = [...new Set([
     ...(previous?.reviewerSessionIds ?? []),
+    ...knownReviewers,
     ...pipelineReviewerIds([...(previous?.pipelines ?? []), ...pipelines]),
   ])].sort();
   // The issue view keeps only the newest 50 records; identities above are not history.

@@ -118,9 +118,9 @@ function stored(target: CloudTarget): RuntimeIssuePipeline[] {
   return getCloudCatalog().orgs[target.orgId]?.pipelines?.[target.workspaceId]?.pipelines ?? [];
 }
 
-/** What the runtime listed: the whole of what it carries. */
-function takeList(target: CloudTarget, pipelines: RuntimeIssuePipeline[]) {
-  cacheCloudPipelines(target.orgId, target.workspaceId, [...pipelines].map(kept).sort(newestFirst));
+/** The runtime’s bounded history and separately read persistent reviewer identities. */
+function takeList(target: CloudTarget, pipelines: RuntimeIssuePipeline[], reviewers: string[] = []) {
+  cacheCloudPipelines(target.orgId, target.workspaceId, [...pipelines].map(kept).sort(newestFirst), Date.now(), reviewers);
 }
 
 /** One pipeline as the runtime wrote it. A change of state that comes to rest is news. */
@@ -197,9 +197,9 @@ function onConnected(target: CloudTarget, client: WorkspaceRpcClient) {
   let open = true;
   void (async () => {
     await noteUnnoted(target, client);
-    const listed = await client.listPipelines();
+    const [listed, reviewers] = await Promise.all([client.listPipelines(), client.hasCapability("pipeline/2") ? client.listPipelineReviewers() : Promise.resolve([])]);
     if (!open) return;
-    takeList(target, listed);
+    takeList(target, listed, reviewers);
     for (const pipeline of listed) void moveLinearToReview(target, client, pipeline);
   })().catch(() => undefined);
   const stop = client.onPipeline((pipeline) => {

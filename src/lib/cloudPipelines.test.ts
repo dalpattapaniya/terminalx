@@ -109,7 +109,7 @@ interface FakeRuntime {
   listed: RuntimeIssuePipeline[];
 }
 
-function runtime(options: { capable?: boolean; role?: string } = {}): FakeRuntime {
+function runtime(options: { capable?: boolean; role?: string; reviewers?: string[] } = {}): FakeRuntime {
   const calls: string[] = [];
   let announce: (pipeline: RuntimeIssuePipeline) => void = () => undefined;
   const fake: FakeRuntime = {
@@ -118,7 +118,8 @@ function runtime(options: { capable?: boolean; role?: string } = {}): FakeRuntim
     announce: (pipeline) => announce(pipeline),
     client: {
       connection: { state: "connected", authority: options.role === "none" || options.role === "viewer" ? "participate" : "manage", capabilities: [], runtimeGeneration: 1, you: options.role ? { userId: "u", role: options.role, canApprove: false, listed: true } : undefined },
-      hasCapability: (capability: string) => capability === "pipeline/1" && options.capable !== false,
+      hasCapability: (capability: string) => (capability === "pipeline/1" || (capability === "pipeline/2" && options.reviewers !== undefined)) && options.capable !== false,
+      listPipelineReviewers: async () => options.reviewers ?? [],
       listPipelines: async () => {
         calls.push("list");
         return fake.listed;
@@ -358,4 +359,18 @@ it("migrates reviewer identity from an older cloud catalog before evicting its p
   catalog.cacheCloudPipelines(ORG, "ws-1", []);
   expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:s2`)).toBe(true);
   expect(getCloudPipelines()).toHaveLength(0);
+});
+
+it("learns reviewers omitted by the runtime list on first connection and reconnect", async () => {
+  const fake = runtime({ reviewers: ["unlisted-reviewer", "replaced-reviewer"] });
+  fake.listed = [raw({ reviewer: null })];
+  await connect(fake);
+  expect(getCloudPipelines().every((pipeline) => !pipeline.reviewer)).toBe(true);
+  expect(cloudReviewerSessions().has(`cloud:${ORG}:ws-1:unlisted-reviewer`)).toBe(true);
+  catalog.dropCachedCloudPipelines(ORG, "ws-1");
+  expect(cloudReviewerSessions().size).toBe(0);
+  await connect(fake);
+  const { cloudWorkSessions } = await import("@/lib/cloudWorkClaims");
+  const sessions = ["unlisted-reviewer", "replaced-reviewer", "author"].map((sessionId) => ({ key: `cloud:${ORG}:ws-1:${sessionId}`, orgId: ORG, workspaceId: "ws-1", sessionId, branch: "raccoon/433-carry", stopped: true }));
+  expect(cloudWorkSessions(sessions as never, () => "me", cloudReviewerSessions()).map((session) => session.sessionId)).toEqual(["author"]);
 });
