@@ -54,3 +54,15 @@ describe("the warning before starting on a taken issue", () => {
     expect(onCancel).toHaveBeenCalled();
   });
 });
+
+it("opens only an own cloud navigation target, never a claim or teammate as a local session", () => {
+  const onOpen = vi.fn();
+  const onOpenCloud = vi.fn();
+  const cloudSession = { key: "cloud:org:workspace:author", tabId: "author-tab" };
+  const { rerender } = render(<TakenIssueDialog workers={[worker({ place: "cloud", you: true, cloudSession })]} onStart={() => {}} onCancel={() => {}} onOpen={onOpen} onOpenCloud={onOpenCloud} />);
+  fireEvent.click(screen.getByRole("button", { name: "Open the existing session" }));
+  expect(onOpenCloud).toHaveBeenCalledWith(cloudSession.key, cloudSession.tabId);
+  expect(onOpen).not.toHaveBeenCalled();
+  rerender(<TakenIssueDialog workers={[worker({ place: "team", cloudSession })]} onStart={() => {}} onCancel={() => {}} onOpen={onOpen} onOpenCloud={onOpenCloud} />);
+  expect(screen.queryByRole("button", { name: "Open the existing session" })).toBeNull();
+});

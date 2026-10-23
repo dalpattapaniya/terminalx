@@ -252,12 +252,12 @@ export function IssuesView({
     [store.sessions, pipelines, projectPath],
   );
   // Who works on each listed issue: this Mac's sessions, the reader's other machines, teammates.
-  const work = useIssueWork(projectPath, provider, list, store.sessions, tick);
+  const work = useIssueWork(projectPath, provider, list, store.sessions, tick, pipelines);
   const workOf = (issue: Issue) => work.byIssue.get(workKeyOf(issue));
   // The issue just created here stays listed while it is pinned, whoever works on it (PRO-99).
   const pinnedKey = created.current ? writeKey(created.current.issue) : null;
   const shownList = workFilter === "all" ? list : list.filter((issue) => writeKey(issue) === pinnedKey || (workFilter === "free" ? !taken(workOf(issue)) : mine(workOf(issue))));
-  const workNote = unavailableText(work.answer);
+  const workNote = unavailableText(work.answer, work.hasCloud);
   // Issues with a pipeline here that the list does not hold: closed by their
   // merge, or outside the search. They stay below it, so the record of what
   // happened to them can still be read on their page.
@@ -450,7 +450,7 @@ export function IssuesView({
           return;
         }
         const body = (issue as Partial<IssueDetails>).description ?? issue.body ?? null;
-        await startInWorkspace(
+        const startedKey = await startInWorkspace(
           plan,
           {
             agent: harness.id,
@@ -470,6 +470,7 @@ export function IssuesView({
           },
           { onIssue: (outcome) => setStartNote(cloudIssueNote(outcome)) },
         );
+        work.recordCloudStart(startedKey, issue);
         return;
       }
       const s = await api.createSession({
@@ -1046,12 +1047,16 @@ export function IssuesView({
       </div>
       {takenBy && (
         <TakenIssueDialog
-          workers={takenBy}
+          workers={workToWarnAbout(selected ? workOf(selected) : undefined)}
           now={work.now}
           onStart={() => void start(true)}
           onOpen={(sessionId) => {
             setTakenBy(null);
             selectSession(sessionId);
+          }}
+          onOpenCloud={(key, tabId) => {
+            setTakenBy(null);
+            openCloudSession(key, tabId);
           }}
           onCancel={() => setTakenBy(null)}
         />

@@ -47,6 +47,14 @@
 
 ### Issues
 
+- Count your known cloud issue authors immediately in work filters and duplicate-start
+  warnings, deduplicate arriving account claims, and open an existing cloud author
+  from the warning. Preserve live account evidence when deduplicating and keep
+  removed authors excluded across pipeline refreshes, even before Issues opens.
+  Bound pending-author grace by the actual start. Exclude reviewers and stale
+  sessions. Verify signed-in claims and sign-out cleanup in the WebKit work-chip
+  scenario. (#572)
+
 - Keep cloud sessions openable when their first prompt fails, with the error
   in their transcript, and stop their issue pipeline and partial agent launch. (#577)
 - Require completed workflow and check-suite evidence on the reviewed commit
@@ -56,6 +64,7 @@
   rerun cannot use an older optional failure to hide a new required failure.
   Repositories without CI must explicitly set `allowNoCi` in their project
   pipeline settings; reported validation and branch protection still apply. (#609)
+
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
 

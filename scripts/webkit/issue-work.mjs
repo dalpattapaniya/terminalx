@@ -38,6 +38,8 @@ try {
           state: "working", cloud: false, live: true, since: now - 90 * 60000, lastActiveAt: now - 2 * 60000, refreshedAt: now - 10000, ...patch,
         });
         Object.assign(answers, {
+          // Account claims require a signed-in reader, even on a local project.
+          account_status: { state: "signed-in", identity: { name: "Me", email: "me@example.com", organization: null, organizationId: null }, organizations: [], expiresAt: null, lastError: null },
           list_harnesses: [{ id: "claude", name: "Claude Code", available: true }],
           gh_available: true, github_repo: "demo/project", linear_status: { connected: true }, linear_teams: [],
           issues_list: issues, issue_details: ({ id }) => issues.find((each) => each.id === id),
@@ -136,6 +138,18 @@ try {
         "it fits the window, its buttons over nothing": warning.inWindow && !warning.overlaps && !warning.scrolls,
       }, warning);
       if (shots) await page.screenshot({ path: join(shots, `issue-work-warning-${mode}-${width}.png`) });
+      await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+      await page.evaluate(() => {
+        const signedOut = { state: "signed-out", identity: null, expiresAt: null, lastError: null };
+        window.__PW_STUB__.answers.account_status = signedOut;
+        // Leave the old claims response in place: sign-out must hide it anyway.
+        window.__PW_STUB__.emit("account_status", signedOut);
+      });
+      await page.getByTestId("issue-work-panel").waitFor({ state: "hidden" });
+      const remaining = await page.getByTestId("issue-work-chip").allTextContents();
+      failed += report(`${mode}, ${width}px`, {
+        "sign-out removes account claims and preserves this Mac's work": remaining.length === 1 && remaining[0] === "You · this Mac",
+      }, remaining);
       await page.close();
     }
   }
