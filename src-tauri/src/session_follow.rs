@@ -595,7 +595,8 @@ impl SessionManager {
             _ => return,
         };
         let mut records = tail.drain_records();
-        let prompts: Vec<usize> = records.iter().enumerate().filter(|(_, (payloads, _))| payloads.iter().any(|payload| matches!(payload, Payload::UserMessage { .. }))).map(|(at, _)| at).collect();
+        let prompts: Vec<usize> =
+            records.iter().enumerate().filter(|(_, (payloads, _, _))| payloads.iter().any(|payload| matches!(payload, Payload::UserMessage { .. }))).map(|(at, _)| at).collect();
         // Still the first read until there is something to sort.
         let wait = |first: First| {
             if let Engine::Cli(CliTab { by_hand: Some(by), .. }) = &mut rt_arc.lock().unwrap().engine {
@@ -622,8 +623,8 @@ impl SessionManager {
             let busy = live.is_empty() && self.follow.locator().glance(&agent).activity == Some(Activity::Busy);
             self.import(rt_arc, records, live.is_empty(), busy);
         }
-        for (payloads, mark) in live {
-            self.pump_read(rt_arc, payloads, mark);
+        for (payloads, mark, ts) in live {
+            self.pump_read(rt_arc, vec![(payloads, mark, ts)]);
         }
     }
 
@@ -644,7 +645,8 @@ impl SessionManager {
             if !matches!(&rt.engine, Engine::Cli(p) if p.by_hand.is_some()) {
                 return;
             }
-            for (payloads, mark) in records.by_ref().take(IMPORT_BATCH) {
+            for (payloads, mark, ts) in records.by_ref().take(IMPORT_BATCH) {
+                rt.source_timestamp = Some(ts);
                 for payload in payloads {
                     match payload {
                         Payload::ProviderSettings { signal } => self.provider_settings(&mut rt, signal),
@@ -676,6 +678,7 @@ impl SessionManager {
                     self.publish(&mut rt, ended(if mark == tui::TurnMark::Aborted { TurnStatus::Aborted } else { TurnStatus::Ok }), None);
                     open = false;
                 }
+                rt.source_timestamp = None;
             }
         }
         if !open {

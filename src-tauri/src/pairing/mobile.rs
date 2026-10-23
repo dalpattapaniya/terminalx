@@ -1447,6 +1447,7 @@ mod tests {
             harness: "codex".into(),
             seq,
             ts: "2026-09-03T00:00:00Z".into(),
+            message_ts: Some("2026-09-02T23:59:00Z".into()),
             subagent: None,
             payload,
         }

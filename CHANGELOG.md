@@ -12,6 +12,11 @@
 
 ### Chats
 
+- Show compact local message times with full dates available by keyboard or
+  tap, across local, cloud and mobile chats. Keep source timestamps through
+  transcript imports and the first text-chunk time through streaming; omit
+  missing or invalid historical times, including legacy records whose saved
+  timestamp may be their import time. (#600)
 - Hide Retry safely when a model or provider usage allowance is exhausted in
   session recovery, keeping reset information and alternative-model selection
   available. Transient failures still offer retry. (#601)
@@ -26,6 +31,8 @@
   Repositories without CI must explicitly set `allowNoCi` in their project
   pipeline settings; reported validation and branch protection still apply. (#609)
 
+- Offer a cloud repository’s Markdown issue templates in the new-issue form,
+  read through your own GitHub CLI login without a local checkout. (#575)
 - Pipeline reviewers no longer count as another session working on the issue,
   locally or in cloud workspaces, even after their pipeline history is trimmed.
   Existing local reviewer links are removed. New cloud connections read reviewer
