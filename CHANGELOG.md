@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Development
+
+- Give the permission-probe identity regression more time to start its helper
+  on loaded Macs, while keeping the app's five-second timeout and helper
+  cleanup unchanged. (#579)
+
 ### Command line
 
 - Cloud session creation normalizes saved and explicit permission modes just
