@@ -35,6 +35,13 @@
 
 ### Issues
 
+- Require completed workflow and check-suite evidence on the reviewed commit
+  before an issue pipeline merges, including queued jobs and pending reruns.
+  Missing or unreadable validation no longer passes after a fixed delay.
+  Validation reads must agree on workflow attempts and child results, so a
+  rerun cannot use an older optional failure to hide a new required failure.
+  Repositories without CI must explicitly set `allowNoCi` in their project
+  pipeline settings; reported validation and branch protection still apply. (#609)
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
 

@@ -126,4 +126,6 @@ export interface IssuePipelineSettings {
   protected: { migrations: boolean; deploy: boolean; security: boolean; paths: string[] };
   /** Checks that never hold a merge, by a part of their name. */
   ignoredChecks: string[];
+  /** Explicit opt-in for repositories without CI; does not bypass reported validation. */
+  allowNoCi?: boolean;
 }
