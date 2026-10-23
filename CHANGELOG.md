@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Command line
+
+- Cloud session creation normalizes saved and explicit permission modes just
+  like the session picker, so older spellings such as `default` no longer
+  cause issue sessions to be refused by the workspace runtime. (#574)
+
 ## 0.2.17
 
 ### Chats
