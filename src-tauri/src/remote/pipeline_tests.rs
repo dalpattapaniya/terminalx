@@ -15,8 +15,9 @@ use crate::session::SessionManager;
 use crate::sink::BroadcastSink;
 
 struct Fixture {
-    _home: crate::store::TempHome,
+    // Fields drop in declaration order, after Drop kills the processes.
     _claude: crate::harness::claude::pty::TestProgram,
+    _home: crate::store::TempHome,
     _dir: tempfile::TempDir,
     root: PathBuf,
     rpc: Arc<WorkspaceRpc>,
@@ -37,7 +38,7 @@ fn git(cwd: &Path, args: &[&str]) {
 /// An agent that answers nothing and never ends: a turn that is still running.
 fn quiet_agent(dir: &Path) -> String {
     let path = dir.join("agent");
-    std::fs::write(&path, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.ran\"\nexec sleep 600\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -74,7 +75,7 @@ fn fixture() -> Fixture {
     );
     let rpc = WorkspaceRpc::new(&root, 7, sink, terminals.clone(), Some(manager.clone())).unwrap();
     let agent = quiet_agent(&base);
-    let claude = crate::harness::claude::pty::launch_program_for_tests(PathBuf::from(&agent));
+    let claude = crate::harness::claude::pty::claude_program_for_tests(PathBuf::from(&agent));
     rpc.set_offered_for_tests(
         crate::harness::catalog()
             .into_iter()
@@ -88,7 +89,30 @@ fn fixture() -> Fixture {
     let ops = crate::cloud_agents::ManagerOps { manager, root: root.to_string_lossy().into_owned() };
     let agents = crate::cloud_agents::CloudAgents::open(&base.join("agents"), Arc::new(ops), None, None, 7).unwrap();
     rpc.set_agents(agents);
-    Fixture { _home: home, _claude: claude, _dir: dir, root, rpc, terminals }
+    Fixture { _claude: claude, _home: home, _dir: dir, root, rpc, terminals }
+}
+
+impl Fixture {
+    async fn assert_claude_launched(&self, created: &Value) {
+        let session = crate::store::index::get(created["sessionId"].as_str().unwrap()).unwrap();
+        let provider_id = session.tabs[0].provider_session_id.as_deref().expect("Claude conversation id");
+        let marker = self._dir.path().join("agent.ran");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(args) = std::fs::read_to_string(&marker) {
+                let args: Vec<_> = args.lines().collect();
+                if args.windows(2).any(|pair| pair == ["--session-id", provider_id]) {
+                    std::fs::remove_file(&marker).unwrap();
+                    break;
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline, "stand-in Claude did not record --session-id {provider_id}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let home = PathBuf::from(crate::store::state_home_env().unwrap());
+        let config: Value = serde_json::from_slice(&std::fs::read(home.join("test-user-home/.claude.json")).unwrap()).unwrap();
+        assert_eq!(config["projects"][&session.cwd]["hasTrustDialogAccepted"], true);
+    }
 }
 
 async fn call(rpc: &Arc<WorkspaceRpc>, peer: &Arc<Peer>, method: &str, params: Value) -> Result<Value, (String, String)> {
@@ -145,6 +169,7 @@ async fn a_session_started_from_an_issue_is_carried_on_by_the_runtime_and_read_a
     )
     .await
     .unwrap();
+    f.assert_claude_launched(&created).await;
     // The session carries the issue, in a worktree named after it.
     assert_eq!(created["session"]["issue"]["identifier"], "#433");
     assert_eq!(created["session"]["worktreeName"], "433-carry-issue-sessions-on");

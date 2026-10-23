@@ -100,7 +100,7 @@ fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The program a test's sessions launch as Claude Code (`launch_program_for_tests`).
+/// The program a test's sessions launch as Claude Code (`claude_program_for_tests`).
 #[cfg(test)]
 static TEST_PROGRAM: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
@@ -113,7 +113,7 @@ pub(crate) struct TestProgram {
 }
 
 #[cfg(test)]
-pub(crate) fn launch_program_for_tests(program: std::path::PathBuf) -> TestProgram {
+pub(crate) fn claude_program_for_tests(program: std::path::PathBuf) -> TestProgram {
     static TURNS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let turn = TURNS.lock().unwrap_or_else(|e| e.into_inner());
     *TEST_PROGRAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(program);
