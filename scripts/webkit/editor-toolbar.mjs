@@ -101,6 +101,7 @@ try {
       await page.keyboard.press(selected === 'Source' ? 'ArrowRight' : 'ArrowLeft');
       // Select explicitly for the first iteration too, then let the thumb finish sliding.
       await toolbar.getByRole('radio', { name: selected, exact: true }).click();
+      await group.getByRole('radio', { name: selected, exact: true, checked: true }).waitFor({ state: 'attached', timeout: 3000 });
       await page.waitForTimeout(180);
       const result = await toolbar.evaluate((toolbar) => {
         const box = el => el.getBoundingClientRect();
@@ -139,7 +140,9 @@ try {
       if (width >= 180) assert(result.scrollWidth <= result.clientWidth + 1, `unexpected overflow at ${width}`);
       await group.focus();
       await page.keyboard.press('ArrowRight');
-      assert.equal(await toolbar.getByRole('radio', { name: selected === 'Preview' ? 'Source' : 'Preview', exact: true }).getAttribute('aria-checked'), 'true');
+      // Key delivery can finish before React commits the selection in WebKit.
+      // Wait for the expected state; a missing keyboard update must still fail.
+      await group.getByRole('radio', { name: selected === 'Preview' ? 'Source' : 'Preview', exact: true, checked: true }).waitFor({ state: 'attached', timeout: 3000 });
       // WebKit on macOS uses Option-Tab to include buttons in keyboard navigation.
       await page.keyboard.press('Alt+Tab');
       assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')), 'Reveal in Finder');
