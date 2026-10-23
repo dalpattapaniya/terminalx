@@ -250,6 +250,7 @@ pub struct Streamer {
     skip: HashSet<String>,
     marker: Option<Marker>,
     /// The last mark read and not yet taken.
+    #[cfg(test)]
     mark: Option<TurnMark>,
 }
 
@@ -259,7 +260,15 @@ impl Streamer {
     /// names records already logged elsewhere, which is how a fork's copy of
     /// its parent is left out.
     pub fn skipping(offset: u64, decode: Decoder, skip: HashSet<String>) -> Self {
-        Self { offset, partial: Vec::new(), decode, skip, marker: None, mark: None }
+        Self {
+            offset,
+            partial: Vec::new(),
+            decode,
+            skip,
+            marker: None,
+            #[cfg(test)]
+            mark: None,
+        }
     }
 
     /// Also read each record for what it says about the turn.
@@ -269,6 +278,7 @@ impl Streamer {
     }
 
     /// The last mark read since the previous call.
+    #[cfg(test)]
     pub fn take_mark(&mut self) -> Option<TurnMark> {
         self.mark.take()
     }
@@ -288,9 +298,10 @@ impl Streamer {
 
     /// Feed the bytes read after `offset()`. Complete lines are decoded; the
     /// tail after the last newline is kept for the next chunk.
+    #[cfg(test)]
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Payload> {
         let mut out = Vec::new();
-        for (payloads, mark) in self.push_records(chunk) {
+        for (payloads, mark, _) in self.push_records(chunk) {
             out.extend(payloads);
             if mark.is_some() {
                 self.mark = mark;
@@ -320,7 +331,14 @@ impl Streamer {
                         }
                     };
                     if !out.is_empty() || mark.is_some() {
-                        records.push((out, mark));
+                        // Both supported transcript formats use an RFC3339 timestamp.
+                        // Missing historical time stays unknown, never the import time.
+                        let ts = serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|record| record["timestamp"].as_str().map(str::to_owned))
+                            .filter(|ts| chrono::DateTime::parse_from_rfc3339(ts).is_ok())
+                            .unwrap_or_default();
+                        records.push((out, mark, ts));
                     }
                 }
             }
@@ -329,8 +347,8 @@ impl Streamer {
     }
 }
 
-/// One transcript record: its payloads, and its word about the turn.
-pub type Record = (Vec<Payload>, Option<TurnMark>);
+/// One transcript record: its payloads, turn mark, and source time (empty if unknown).
+pub type Record = (Vec<Payload>, Option<TurnMark>, String);
 
 /// How long a `Stop` hook waits for the transcript to catch up with the reply
 /// the hook is already holding. Well inside the hook's own 10 s.
@@ -380,7 +398,7 @@ impl Tail {
         Self { path: Mutex::new(path), stream: Mutex::new(Streamer::at(offset, decode)), decode, marker: None }
     }
 
-    /// Also report what the records say about the turn; see [`Self::drain_marked`].
+    /// Also report what the records say about the turn; see [`Self::drain_records`].
     pub fn marking(mut self, marker: Marker) -> Self {
         self.marker = Some(marker);
         self.stream.get_mut().unwrap().marker = self.marker;
@@ -430,6 +448,7 @@ impl Tail {
     /// [`TurnMark`] among it. The two come from one read, so a caller that
     /// applies the payloads and then records the mark never records an end
     /// ahead of the reply that came before it.
+    #[cfg(test)]
     pub fn drain_marked(&self) -> (Vec<Payload>, Option<TurnMark>) {
         let path = self.following();
         let mut stream = self.stream.lock().unwrap();
@@ -438,7 +457,7 @@ impl Tail {
         (payloads, stream.take_mark())
     }
 
-    /// [`Self::drain_marked`], record by record.
+    /// Read appended payloads, turn marks and source timestamps, record by record.
     pub fn drain_records(&self) -> Vec<Record> {
         let path = self.following();
         let mut stream = self.stream.lock().unwrap();
@@ -765,6 +784,13 @@ mod tests {
         let mut t = TurnTail::default();
         t.anticipate("demo");
         assert!(!t.observe(" demo "));
+    }
+
+    #[test]
+    fn records_keep_source_timestamps_and_never_invent_missing_history() {
+        let mut stream = Streamer::at(0, echo);
+        let records = stream.push_records(b"{\"timestamp\":\"2026-10-22T23:59:00Z\"}\n{\"timestamp\":\"invalid\"}\n{}\n");
+        assert_eq!(records.iter().map(|(_, _, ts)| ts.as_str()).collect::<Vec<_>>(), ["2026-10-22T23:59:00Z", "", ""]);
     }
 
     #[test]

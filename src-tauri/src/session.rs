@@ -456,6 +456,10 @@ pub struct TabRuntime {
     pub tab_id: String,
     pub harness: String,
     pub seq: u64,
+    /// Set only while applying a source transcript record; empty means unknown.
+    source_timestamp: Option<String>,
+    /// First text chunk per block, retained until its committed event is saved.
+    message_times: HashMap<String, String>,
     pub status: TabStatus,
     pub child: Option<Arc<LiveChild>>,
     pub child_pid: Option<u32>,
@@ -924,6 +928,8 @@ impl SessionManager {
                 pending: HashMap::new(),
                 queued: Vec::new(),
                 turn_open: false,
+                source_timestamp: None,
+                message_times: HashMap::new(),
                 turn_started_at: None,
                 turn_by_command: false,
                 last_activity: Instant::now(),
@@ -951,13 +957,27 @@ impl SessionManager {
             recovery::sanitize(&mut payload);
         }
         rt.seq += 1;
+        let mut ts = rt.source_timestamp.clone().unwrap_or_else(index::now);
+        let block_key = |block: &BlockRef| format!("{}:{}:{}", subagent.as_ref().map_or("", |agent| agent.id.as_str()), block.message_id, block.index);
+        match &payload {
+            Payload::Delta(Delta::TextDelta { block, .. }) => {
+                ts = rt.message_times.entry(block_key(block)).or_insert(ts).clone();
+            }
+            Payload::AssistantText { block: Some(block), .. } => {
+                if let Some(first) = rt.message_times.remove(&block_key(block)) {
+                    ts = first;
+                }
+            }
+            Payload::TurnCompleted { .. } | Payload::UserMessage { queued: false, .. } if subagent.is_none() => rt.message_times.clear(),
+            _ => {}
+        }
         let ev = AgentEvent {
             id: uuid::Uuid::now_v7().to_string(),
             session_id: rt.session_id.clone(),
             tab_id: rt.tab_id.clone(),
             harness: rt.harness.clone(),
             seq: rt.seq,
-            ts: index::now(),
+            ts,
             subagent,
             payload,
         };
@@ -2753,13 +2773,14 @@ impl SessionManager {
         if matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.by_hand.is_some()) {
             return self.pump_by_hand(rt_arc, tail);
         }
-        let (payloads, mark) = tail.drain_marked();
-        self.pump_read(rt_arc, payloads, mark);
+        self.pump_read(rt_arc, tail.drain_records());
     }
 
     /// One read of the transcript: its payloads, and what it last said about
     /// the turn.
-    fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, payloads: Vec<Payload>, mark: Option<tui::TurnMark>) {
+    fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, records: Vec<tui::Record>) {
+        let mark = records.iter().rev().find_map(|(_, mark, _)| *mark);
+        let payloads: Vec<_> = records.into_iter().flat_map(|(payloads, _, ts)| payloads.into_iter().map(move |payload| (payload, ts.clone()))).collect();
         if payloads.is_empty() && mark.is_none() {
             return;
         }
@@ -2774,7 +2795,8 @@ impl SessionManager {
             _ => Vec::new(),
         };
         self.queued_prompts_unsent(&mut rt, &unsent);
-        for payload in payloads {
+        for (payload, ts) in payloads {
+            rt.source_timestamp = Some(ts);
             // A prompt sent from the composer was published when it was sent;
             // the transcript's copy of it would be the same message twice.
             // Anything else the transcript calls a prompt was typed into the
@@ -2885,6 +2907,7 @@ impl SessionManager {
             }
             self.apply(&mut rt, payload, None);
         }
+        rt.source_timestamp = None;
         // No hook closes the turn of a CLI the reader started by hand (#437),
         // so the transcript's own word that it ended is taken at once. It is
         // read after the payloads, so the turn's reply is in it.

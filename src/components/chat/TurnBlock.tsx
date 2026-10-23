@@ -7,6 +7,7 @@ import { cn } from "@/lib/cn";
 import { formatDuration } from "@/lib/time";
 import type { Turn, WorkItem } from "@/lib/transcript";
 import type { StreamBlock } from "@/lib/agentEvents";
+import { MessageTime } from "./MessageTime";
 import { Markdown } from "./Markdown";
 import { LinkedText } from "./LinkedText";
 import { ToolCallRow, ToolGroupRow } from "./ToolCallRow";
@@ -87,7 +88,7 @@ export const TurnBlock = memo(function TurnBlock({
         </div>
       )}
       {streamText.map((s) => (
-        <Markdown key={`${s.ref.messageId}:${s.ref.index}`} text={s.text} streaming className="mb-3" linkContext={linkContext} />
+        <div key={`${s.ref.messageId}:${s.ref.index}`} className="mb-3"><Markdown text={s.text} streaming linkContext={linkContext} /><MessageTime ts={s.ts} /></div>
       ))}
 
       {working && !streamText.length && !streamThinking.length && !streamingTool && (
@@ -157,7 +158,7 @@ export function previewFromPartialJson(partial: string): string {
 function WorkRow({ item, cwd, linkContext, onSendQueuedNow }: { item: WorkItem; cwd?: string; linkContext?: { sessionId: string; cwd: string }; onSendQueuedNow?: (seq: number) => void }) {
   switch (item.kind) {
     case "text":
-      return <Markdown text={item.text} className="mb-3" linkContext={linkContext} />;
+      return <div className="mb-3"><Markdown text={item.text} linkContext={linkContext} /><MessageTime ts={item.ts} /></div>;
     case "reasoning":
       return <ReasoningRow text={item.text} linkContext={linkContext} />;
     case "tool":
@@ -171,7 +172,7 @@ function WorkRow({ item, cwd, linkContext, onSendQueuedNow }: { item: WorkItem; 
         <div className="my-3 flex items-center gap-2 rounded-lg border border-dashed border-hairline-strong px-3 py-2 text-[13px] text-muted-foreground" data-testid="queued-message">
           <Clock className="size-3.5 shrink-0" />
           {item.author && <span data-user-id={item.author.userId}>{item.author.displayName}:</span>}
-          <span className="min-w-0 flex-1 whitespace-pre-wrap select-text"><LinkedText text={item.text} context={linkContext} /></span>
+          <div className="min-w-0 flex-1 whitespace-pre-wrap select-text"><LinkedText text={item.text} context={linkContext} /><MessageTime ts={item.ts} /></div>
           {onSendQueuedNow && (
             <WithTooltip label="Interrupt the agent and send this now">
               <Button size="xs" variant="outline" className="shrink-0" onClick={() => onSendQueuedNow(item.seq)}>
@@ -223,7 +224,7 @@ function ReaderMessage({
   linkContext,
   className,
 }: {
-  message: { author?: { userId: string; displayName: string }; text: string; images?: { url: string; name?: string }[] };
+  message: { ts?: string; author?: { userId: string; displayName: string }; text: string; images?: { url: string; name?: string }[] };
   cwd?: string;
   linkContext?: { sessionId: string; cwd: string };
   className: string;
@@ -253,7 +254,8 @@ function ReaderMessage({
           </div>
         ) : null}
         {message.author && <div className="mb-1 text-xs text-muted-foreground" data-user-id={message.author.userId}>{message.author.displayName}</div>}
-        <LinkedText text={message.text} context={linkContext} />
+        <div><LinkedText text={message.text} context={linkContext} /></div>
+        <MessageTime ts={message.ts} />
       </div>
     </div>
   );

@@ -389,7 +389,7 @@ describe("a message sent while the agent worked", () => {
       </TooltipProvider>,
     );
     expect(screen.getAllByTestId("queued-message").map((card) => card.textContent)).toEqual([expect.stringContaining("taken long ago"), expect.stringContaining("waiting now")]);
-    expect(screen.getAllByTestId("reader-message").map((bubble) => bubble.textContent)).toEqual(["go", "next"]);
+    expect(screen.getAllByTestId("reader-message").map((bubble) => bubble.textContent)).toEqual([expect.stringContaining("go"), expect.stringContaining("next")]);
     // One Send now, on the message behind the running turn.
     fireEvent.click(screen.getByRole("button", { name: "Send now" }));
     expect(sendNow).toHaveBeenCalledWith(6);

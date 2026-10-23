@@ -20,6 +20,7 @@ export interface StreamBlock {
   text: string;
   partialJson: string;
   done: boolean;
+  ts?: string;
   toolName?: string;
   toolId?: string;
 }
@@ -98,6 +99,7 @@ export function applyEvent(ev: AgentEvent) {
       }
       case "text_delta":
         if (!b) log.stream.push((b = { ref: p.block, kind: "text", text: "", partialJson: "", done: false }));
+        b.ts ??= ev.ts;
         b.text += p.text;
         break;
       case "thinking_delta":
@@ -137,7 +139,7 @@ export function applyEvent(ev: AgentEvent) {
   if (p.type === "tool_call_started") {
     log.stream = log.stream.filter((s) => !(s.kind === "tool_use" && (s.toolId === p.callId || s.done)));
   }
-  if (p.type === "turn_completed" || p.type === "user_message") {
+  if (p.type === "turn_completed" || (p.type === "user_message" && !p.queued)) {
     log.stream = [];
   }
   log.events.push(ev);
@@ -189,8 +191,8 @@ export function mergeTabEvents(sessionId: string, tabId: string, events: AgentEv
     log.events = [...byId.values()]
       .filter((ev) => !(transient(ev) && savedSeqs.has(ev.seq)))
       .sort((a, b) => a.seq - b.seq);
-    const last = log.events[log.events.length - 1]?.payload.type;
-    if (last === "turn_completed" || last === "user_message") log.stream = [];
+    const last = log.events[log.events.length - 1]?.payload;
+    if (last?.type === "turn_completed" || (last?.type === "user_message" && !last.queued)) log.stream = [];
   }
   log.loaded = true;
   touch(k, true);

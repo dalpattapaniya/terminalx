@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Chats
+
+- Show compact local message times with full dates available by keyboard or
+  tap, across local, cloud and mobile chats. Keep source timestamps through
+  transcript imports and the first text-chunk time through streaming; omit
+  missing or invalid historical times. (#600)
+
 ### Computer use
 
 - Screen Recording **Grant…** opens System Settings with the helper drag tile
