@@ -467,6 +467,10 @@ pub fn upgrade_note(legacy: Option<&LegacyHelperCleanup>) -> String {
 }
 
 pub fn status(helper: Option<&super::ResolvedHelper>) -> Result<PermissionStatusResult, ComputerError> {
+    status_with_timeout(helper, Duration::from_secs(5))
+}
+
+fn status_with_timeout(helper: Option<&super::ResolvedHelper>, timeout: Duration) -> Result<PermissionStatusResult, ComputerError> {
     if !cfg!(target_os = "macos") {
         return Ok(PermissionStatusResult {
             platform: platform(),
@@ -493,7 +497,7 @@ pub fn status(helper: Option<&super::ResolvedHelper>) -> Result<PermissionStatus
             Some(app),
         ));
     }
-    let raw = read_status_via_helper(helper)?;
+    let raw = read_status_via_helper(helper, timeout)?;
     let state = |id: PermissionId| PermissionState {
         id,
         status: raw
@@ -525,7 +529,7 @@ fn unavailable(reason: String, app: Option<&Path>) -> PermissionStatusResult {
 /// identity, suspended until its code is confirmed to be the bundled
 /// helper's, so a swapped copy cannot answer "granted".
 #[cfg(unix)]
-fn read_status_via_helper(helper: &super::ResolvedHelper) -> Result<std::collections::HashMap<String, String>, ComputerError> {
+fn read_status_via_helper(helper: &super::ResolvedHelper, timeout: Duration) -> Result<std::collections::HashMap<String, String>, ComputerError> {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -555,7 +559,7 @@ fn read_status_via_helper(helper: &super::ResolvedHelper) -> Result<std::collect
         let _ = std::fs::File::from(read).take(64 * 1024).read_to_string(&mut text);
         let _ = sender.send(text);
     });
-    let outcome = match receiver.recv_timeout(Duration::from_secs(5)) {
+    let outcome = match receiver.recv_timeout(timeout) {
         Ok(text) => serde_json::from_str(text.trim())
             .map_err(|e| ComputerError::accessibility(format!("Could not read permission status: {e}"))),
         Err(_) => Err(ComputerError::accessibility("Timed out checking permissions")),
@@ -566,7 +570,7 @@ fn read_status_via_helper(helper: &super::ResolvedHelper) -> Result<std::collect
 }
 
 #[cfg(not(unix))]
-fn read_status_via_helper(_helper: &super::ResolvedHelper) -> Result<std::collections::HashMap<String, String>, ComputerError> {
+fn read_status_via_helper(_helper: &super::ResolvedHelper, _timeout: Duration) -> Result<std::collections::HashMap<String, String>, ComputerError> {
     Err(ComputerError::accessibility("Could not check permissions on this platform"))
 }
 
@@ -854,14 +858,41 @@ mod tests {
     fn a_status_probe_that_is_not_the_bundled_helper_is_never_believed() {
         let dir = tempfile::tempdir().unwrap();
         let refused = lying_helper(&dir.path().join("refused"), std::sync::Arc::new(|_| Err("swapped".into())));
-        let error = status(Some(&refused)).unwrap_err();
+        // This tests code identity, not startup speed on a loaded test machine.
+        let timeout = Duration::from_secs(60);
+        let error = status_with_timeout(Some(&refused), timeout).unwrap_err();
         assert!(error.message.contains("swapped"), "{}", error.message);
         assert!(open_setup(Some(&refused), Some(PermissionId::Screenshots)).is_err());
 
         // The same probe, accepted, is read from its own stdout.
         let accepted = lying_helper(&dir.path().join("accepted"), std::sync::Arc::new(|_| Ok(())));
-        let result = status(Some(&accepted)).unwrap();
+        let result = status_with_timeout(Some(&accepted), timeout).unwrap();
         assert!(result.permissions.iter().all(|p| p.status == "granted"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_status_probe_timeout_reaps_the_helper() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        use super::super::code_identity::Peer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::sync::Arc::new(AtomicI32::new(0));
+        let checked_pid = pid.clone();
+        let helper = lying_helper(dir.path(), std::sync::Arc::new(move |peer| {
+            let Peer::Pid(pid) = peer else { panic!("expected the suspended helper's pid") };
+            checked_pid.store(pid, Ordering::SeqCst);
+            Ok(())
+        }));
+        // Keep stdout open without spawning descendants or relying on startup speed.
+        std::fs::write(helper.executable().unwrap(), "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        let error = status_with_timeout(Some(&helper), Duration::ZERO).unwrap_err();
+        assert_eq!(error.message, "Timed out checking permissions");
+        let pid = pid.load(Ordering::SeqCst);
+        assert!(pid > 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 
     #[test]
