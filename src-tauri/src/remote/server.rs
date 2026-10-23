@@ -2269,6 +2269,7 @@ impl WorkspaceRpc {
 
     /// Every session of this workspace, whoever asks.
     fn workspace_sessions(&self) -> Result<Vec<SessionEntry>, RpcError> {
+        crate::store::message_activity::backfill(self.sink.clone());
         let root = self.root.to_string_lossy();
         Ok(index::load().map_err(RpcError::internal)?.into_iter().filter(|session| session.project_path == root).collect())
     }
@@ -2396,15 +2397,49 @@ impl WorkspaceRpc {
                 Err(error) => pipeline_note = json!(format!("{error:#}")),
             }
         }
+        let mut start_error = None;
         let outcome = match prompt {
-            Some(prompt) => Some(manager.send(&entry.id, &tab.id, prompt, Vec::new()).map_err(RpcError::internal)?),
+            Some(prompt) => match manager.send(&entry.id, &tab.id, prompt, Vec::new()) {
+                Ok(outcome) => Some(outcome),
+                Err(error) => {
+                    start_error = Some(self.session_start_failed(manager, &entry.id, &tab.id, &mut pipeline, error));
+                    None
+                }
+            },
             None => None,
         };
         let info = self.agents.get().and_then(|agents| {
             agents.changed(Some(&tab.id), true);
             agents.tab(&tab.id)
         });
-        Ok(json!({ "sessionId": entry.id, "tabId": tab.id, "session": entry, "outcome": outcome, "tab": info, "pipeline": pipeline, "pipelineNote": pipeline_note }))
+        Ok(json!({ "sessionId": entry.id, "tabId": tab.id, "session": entry, "outcome": outcome, "tab": info, "pipeline": pipeline, "pipelineNote": pipeline_note, "startError": start_error }))
+    }
+
+    fn session_start_failed(&self, manager: &SessionManager, session_id: &str, tab_id: &str, pipeline: &mut Value, error: anyhow::Error) -> String {
+        // Creation succeeded, but delivery may have partially launched
+        // the agent or written work. Keep the session discoverable;
+        // never delete its checkout on a failed first send.
+        let mut message = format!("The session was created, but its first prompt could not be sent: {error:#}");
+        if let Some(id) = pipeline["id"].as_str() {
+            let stopped = self.pipeline_host().map_err(|error| anyhow::anyhow!(error.message)).and_then(|host| {
+                crate::issue_pipeline::engine::turn_failed(&host, session_id, tab_id, &message);
+                crate::issue_pipeline::engine::act(&host, id, crate::issue_pipeline::engine::Action::Stop)
+            });
+            match stopped {
+                Ok(stopped) => *pipeline = pipeline_on_the_wire(json!(stopped)),
+                Err(error) => message.push_str(&format!(" Pipeline cleanup failed: {error:#}. Stop it before retrying.")),
+            }
+        }
+        if let Err(error) = manager.stop(session_id, tab_id) {
+            message.push_str(&format!(" Agent cleanup failed: {error:#}. Retry Stop before resuming."));
+        }
+        // Older clients open the returned tab and replay its transcript.
+        // A runtime status preserves cleanup details; agent error events
+        // are reduced to a recovery category by the session manager.
+        if let Err(error) = manager.publish_external(session_id, tab_id, crate::events::Payload::Status { text: message.clone() }) {
+            message.push_str(&format!(" Could not record the start failure: {error:#}."));
+        }
+        message
     }
 
     /// `pipeline/1`: a desktop moved the pipeline's Linear issue to review

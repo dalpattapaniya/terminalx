@@ -34,7 +34,7 @@ struct PipelineFile {
 
 impl PipelineFile {
     fn reviewer_sessions(&self) -> BTreeSet<String> {
-        self.reviewers.iter().cloned().chain(self.pipelines.iter().filter_map(|pipeline| pipeline.reviewer.as_ref().map(|reviewer| reviewer.session_id.clone()))).collect()
+        self.reviewers.iter().cloned().chain(self.pipelines.iter().filter_map(|pipeline| pipeline.reviewer.as_ref().filter(|reviewer| reviewer.session_id != pipeline.author.session_id).map(|reviewer| reviewer.session_id.clone()))).collect()
     }
 }
 
@@ -75,7 +75,7 @@ fn write(pipelines: Vec<Pipeline>) -> Result<()> {
     // Read before replacing the history: insert may already have trimmed it,
     // and commit may have replaced a reviewer whose tab was deleted.
     let mut reviewers = crate::store::read_json::<PipelineFile>(&file_path()?)?.unwrap_or_default().reviewer_sessions();
-    reviewers.extend(pipelines.iter().filter_map(|pipeline| pipeline.reviewer.as_ref().map(|reviewer| reviewer.session_id.clone())));
+    reviewers.extend(pipelines.iter().filter_map(|pipeline| pipeline.reviewer.as_ref().filter(|reviewer| reviewer.session_id != pipeline.author.session_id).map(|reviewer| reviewer.session_id.clone())));
     crate::store::write_json(&file_path()?, &PipelineFile { pipelines, reviewers })?;
     Ok(())
 }

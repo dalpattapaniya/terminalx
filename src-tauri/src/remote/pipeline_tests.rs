@@ -279,3 +279,95 @@ async fn the_list_of_pipelines_fits_one_frame_newest_first() {
     assert_eq!(pipelines[0]["id"], "p059");
     assert!(pipelines.iter().all(|pipeline| pipeline.get("issueBody").is_none()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_first_prompt_returns_an_openable_session_and_stops_only_its_pipeline() {
+    let f = fixture();
+    let (peer, _events) = peer(&f.rpc, "desktop", Authority::Manage, &["session/1", "pipeline/1"]).await;
+    let existing = call(&f.rpc, &peer, "session.create", json!({
+        "clientRequestId": "existing-start", "agent": "claude", "useWorktree": true, "issue": issue(),
+    })).await.unwrap();
+    f.assert_claude_launched(&existing).await;
+    assert!(existing["startError"].is_null());
+    // Admit a stand-in harness with no engine: the real manager.send path
+    // fails synchronously, without depending on a shell exit or installed CLI.
+    let mut failing = crate::harness::catalog().into_iter().find(|harness| harness.id == "claude").unwrap();
+    failing.id = "test-failing-agent".into();
+    failing.available = true;
+    f.rpc.set_offered_for_tests(vec![failing]);
+    let user_file = f.root.join("uncommitted.txt");
+    std::fs::write(&user_file, "keep my work").unwrap();
+    for (n, params) in [
+        json!({ "useWorktree": true, "issue": issue() }), // implicit pipeline brief
+        json!({ "useWorktree": true, "issue": issue(), "prompt": "Work on this" }),
+        json!({ "issue": issue(), "prompt": "Work on this" }), // pipeline start refused on main
+        json!({ "issue": issue(), "pipeline": false, "prompt": "Work on this" }),
+        json!({ "prompt": "Work on this" }),
+    ].into_iter().enumerate() {
+        let mut params = params;
+        params["agent"] = json!("test-failing-agent");
+        params["clientRequestId"] = json!(format!("failed-start-{n}"));
+        let created = call(&f.rpc, &peer, "session.create", params.clone()).await.unwrap();
+        let message = created["startError"].as_str().unwrap();
+        assert!(message.contains("first prompt could not be sent"), "{message}");
+        assert!(created["outcome"].is_null());
+        let session_id = created["sessionId"].as_str().unwrap();
+        let tab_id = created["tabId"].as_str().unwrap();
+        let session = crate::store::index::get(session_id).unwrap();
+        assert!(Path::new(&session.cwd).is_dir());
+        assert_eq!(created["tab"]["sessionId"], session_id);
+        let events = f.rpc.manager().unwrap().load_events(session_id, tab_id).unwrap();
+        assert!(events.iter().any(|event| matches!(&event.payload, crate::events::Payload::Status { text: recorded } if recorded == message)));
+        if n < 2 {
+            let pipeline = crate::issue_pipeline::store::for_session(session_id).unwrap().unwrap();
+            assert!(pipeline.stopped);
+            assert_eq!(pipeline.state, crate::issue_pipeline::State::Stopped);
+            assert_eq!(created["pipeline"]["state"], "stopped");
+            assert!(serde_json::to_string(&pipeline).unwrap().contains("first prompt could not be sent"));
+        } else {
+            assert!(created["pipeline"].is_null());
+            if n == 2 {
+                assert!(created["pipelineNote"].as_str().unwrap().contains("no branch"));
+            }
+        }
+        // The mutation receipt keeps retries from creating another session.
+        assert_eq!(call(&f.rpc, &peer, "session.create", params).await.unwrap(), created);
+    }
+    let existing_pipeline = crate::issue_pipeline::store::get(existing["pipeline"]["id"].as_str().unwrap()).unwrap();
+    assert!(!existing_pipeline.stopped);
+    assert_eq!(existing_pipeline.state, crate::issue_pipeline::State::Working);
+    assert_eq!(std::fs::read_to_string(user_file).unwrap(), "keep my work");
+    // Without a prompt or a pipeline there is nothing to launch, even now.
+    let empty = call(&f.rpc, &peer, "session.create", json!({
+        "clientRequestId": "empty-start", "agent": "test-failing-agent", "prompt": "  ", "pipeline": false,
+    })).await.unwrap();
+    assert!(empty["startError"].is_null() && empty["outcome"].is_null());
+    assert_eq!(crate::store::index::load().unwrap().len(), 7);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_start_cleanup_reports_storage_failure_without_losing_the_session() {
+    let f = fixture();
+    let (peer, _events) = peer(&f.rpc, "desktop", Authority::Manage, &["session/1", "pipeline/1"]).await;
+    let created = call(&f.rpc, &peer, "session.create", json!({
+        "clientRequestId": "cleanup-start", "agent": "claude", "useWorktree": true, "issue": issue(),
+    })).await.unwrap();
+    f.assert_claude_launched(&created).await;
+    let session_id = created["sessionId"].as_str().unwrap();
+    let tab_id = created["tabId"].as_str().unwrap();
+    let mut pipeline = created["pipeline"].clone();
+    // An unreadable pipeline store must not mask the launch error or skip
+    // stopping the partially launched process and recording its failure.
+    let path = crate::store::root().unwrap().join("issue-pipelines.json");
+    let saved = std::fs::read(&path).unwrap();
+    std::fs::write(&path, "broken JSON").unwrap();
+    let manager = f.rpc.manager().unwrap();
+    let message = f.rpc.session_start_failed(manager, session_id, tab_id, &mut pipeline, anyhow::anyhow!("injected delivery failure"));
+    std::fs::write(path, saved).unwrap();
+    assert!(message.contains("injected delivery failure"));
+    assert!(message.contains("Pipeline cleanup failed"));
+    assert!(crate::store::index::get(session_id).is_ok());
+    assert!(f.terminals.panes().is_empty());
+    assert!(manager.load_events(session_id, tab_id).unwrap().iter().any(|event| matches!(&event.payload,
+        crate::events::Payload::Status { text: recorded } if recorded == &message)));
+}

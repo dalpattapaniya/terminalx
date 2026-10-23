@@ -1,3 +1,4 @@
+import { compareMessageActivity, newestMessageTime, keepMessageTime } from "@/lib/messageActivity";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type { RuntimeSession, RuntimeSessionPatch, WorkspaceRpcClient } from "@terminalx/portable/workspace";
 import type { CloudWorkspaceListItem } from "@/lib/api";
@@ -50,6 +51,7 @@ export interface CloudSessionRow {
   worktreeName: string | null;
   created: string;
   modified: string;
+  lastMessageAt?: string | null;
   pinned: boolean;
   archived: boolean;
   tabs: CloudSessionTab[];
@@ -87,6 +89,9 @@ const connected = new Map<string, { target: CloudTarget; client: WorkspaceRpcCli
 
 function takeLive(target: CloudTarget, sessions: RuntimeSession[], capabilities: string[], manage: boolean) {
   if (locked.has(cloudWorkspaceKey(target.orgId, target.workspaceId))) return;
+  const previous = live.get(cloudWorkspaceKey(target.orgId, target.workspaceId))?.sessions
+    ?? getCloudCatalog().orgs[target.orgId]?.sessions[target.workspaceId]?.sessions ?? [];
+  sessions = sessions.map((session) => keepMessageTime(session, previous.find((old) => old.id === session.id)));
   live.set(cloudWorkspaceKey(target.orgId, target.workspaceId), { sessions, capabilities, manage });
   cacheCloudSessions(target.orgId, target.workspaceId, sessions, capabilities);
   publish();
@@ -278,6 +283,7 @@ export function buildCloudSessions(input: {
       worktreeName: session.worktreeName ?? null,
       created: session.created,
       modified: session.modified,
+      lastMessageAt: newestMessageTime(session.lastMessageAt, ...session.tabs.flatMap((tab) => [agentTabs.get(tab.id)?.info.lastMessageAt, agentTabs.get(tab.id)?.info.sessionLastMessageAt])),
       pinned: session.pinned,
       archived: session.archived,
       tabs: session.tabs.map((tab, index) => tabOf(tab.id, { harness: tab.harness, title: tab.title, status: tab.status }, { title: session.title, first: index === 0 })),
@@ -301,8 +307,9 @@ export function buildCloudSessions(input: {
           title: tab.info.title || name,
           branch: null,
           worktreeName: null,
-          created: tab.info.created || iso(item.workspace.createdAt),
+          created: tab.info.sessionCreated || tab.info.created || iso(item.workspace.createdAt),
           modified: tab.info.modified || iso(item.workspace.updatedAt),
+          lastMessageAt: tab.info.lastMessageAt,
           pinned: false,
           archived: false,
           tabs: [],
@@ -310,6 +317,8 @@ export function buildCloudSessions(input: {
         };
         rows.set(sessionId, row);
       }
+      row.lastMessageAt = newestMessageTime(row.lastMessageAt, tab.info.lastMessageAt, tab.info.sessionLastMessageAt);
+      if (tab.info.sessionCreated) row.created = tab.info.sessionCreated;
       if (!row.tabs.some((known) => known.tabId === tab.tabId)) row.tabs.push(tabOf(tab.tabId, { harness: tab.info.harness, status: tab.info.status }));
     }
   }
@@ -335,7 +344,7 @@ export function buildCloudSessions(input: {
 
   return [...rows.values()]
     .filter((row) => row.archived === !!input.showArchived || row.key === input.selectedKey)
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.modified.localeCompare(a.modified));
+    .sort((a, b) => compareMessageActivity(a, b, a.sessionId, b.sessionId));
 }
 
 /**

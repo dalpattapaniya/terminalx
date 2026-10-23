@@ -9,6 +9,7 @@
 #[cfg(feature = "desktop")]
 pub mod automations;
 pub mod activity;
+pub mod message_activity;
 pub mod index;
 pub mod conversation_titles;
 pub mod projects;

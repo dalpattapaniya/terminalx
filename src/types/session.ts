@@ -25,6 +25,8 @@ export interface TabEntry {
   status: TabStatus;
   created: string;
   modified: string;
+  /** Latest verified user/assistant message time; absent for unverified history. */
+  lastMessageAt?: string | null;
   contextUsed?: number | null;
   contextMax?: number | null;
   /** A cloud tab whose conversation has not been read yet: the chat says it is loading, not that it is empty. */
@@ -118,6 +120,8 @@ export interface SessionEntry {
   title: string;
   created: string;
   modified: string;
+  /** Latest verified user/assistant message time; absent for unverified history. */
+  lastMessageAt?: string | null;
   archived: boolean;
   pinned: boolean;
   tabs: TabEntry[];

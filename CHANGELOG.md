@@ -15,6 +15,15 @@
   toolbar checks click clear of WebKit’s overlay scrollbar while retaining
   selection, keyboard and layout assertions. (#445)
 
+### Issue pipelines
+
+- Keep independent reviews in a named Reviewer tab in the issue session, reuse
+  it for later rounds, and review changed heads again when the checkout is
+  current and idle. Route author review/merge requests through the pipeline;
+  `pipelines merge` preserves person-only, security and check gates. Keep shared
+  cloud authors in work claims, and retain commit-specific local-check failures
+  until the author reports those checks passing. (#568)
+
 ### Changes
 
 - Default workspace review to All changes against a displayed merge-base target,
@@ -44,6 +53,12 @@
 
 ### Chats
 
+- Order session lists by verified user and assistant message time, retaining
+  pins and filters across local and cloud updates and restarts. Metadata
+  edits no longer bump conversations; older logs are indexed in background
+  batches without treating legacy import times as message times. Title backfill
+  preserves message ordering when the app restarts. (#599)
+
 - Keep completed Claude compaction idle instead of raising a false stall
   warning, including manual `/compact` queued behind a running turn. Record
   privacy-safe turn-opener labels in stall diagnostics while retaining warnings
@@ -60,6 +75,16 @@
 
 ### Issues
 
+- Count your known cloud issue authors immediately in work filters and duplicate-start
+  warnings, deduplicate arriving account claims, and open an existing cloud author
+  from the warning. Preserve live account evidence when deduplicating and keep
+  removed authors excluded across pipeline refreshes, even before Issues opens.
+  Bound pending-author grace by the actual start. Exclude reviewers and stale
+  sessions. Verify signed-in claims and sign-out cleanup in the WebKit work-chip
+  scenario. (#572)
+
+- Keep cloud sessions openable when their first prompt fails, with the error
+  in their transcript, and stop their issue pipeline and partial agent launch. (#577)
 - Require completed workflow and check-suite evidence on the reviewed commit
   before an issue pipeline merges, including queued jobs and pending reruns.
   Missing or unreadable validation no longer passes after a fixed delay.
@@ -67,6 +92,7 @@
   rerun cannot use an older optional failure to hide a new required failure.
   Repositories without CI must explicitly set `allowNoCi` in their project
   pipeline settings; reported validation and branch protection still apply. (#609)
+
 - Pipeline rows omit only their own author from the work chip, keeping other
   sessions on this Mac and elsewhere visible for cloud and local pipelines. (#571)
 
