@@ -429,12 +429,62 @@ fn validation_with(cwd: &Path, pr: &PrSnapshot, run: &mut impl FnMut(&Path, &[&s
         if records.len() as u64 != total {
             bail!("GitHub returned incomplete validation evidence ({}/{total})", records.len());
         }
+        records.sort_by_key(|record| record["id"].as_u64());
         Ok(records)
     };
-    // Read children first, then their producers. A rerun queued after the
-    // child read is still pending even if the old child conclusions pass.
-    let children = read(&format!("repos/{repo}/commits/{}/check-runs?filter=latest&per_page=100", pr.head_sha), "check_runs")?;
-    let statuses = read(&format!("repos/{repo}/commits/{}/status?per_page=100", pr.head_sha), "statuses")?;
+    let workflow_path = format!("repos/{repo}/actions/runs?head_sha={}&per_page=100", pr.head_sha);
+    let suite_path = format!("repos/{repo}/commits/{}/check-suites?per_page=100", pr.head_sha);
+    let child_path = format!("repos/{repo}/commits/{}/check-runs?filter=latest&per_page=100", pr.head_sha);
+    let status_path = format!("repos/{repo}/commits/{}/status?per_page=100", pr.head_sha);
+    // Bracket the child reads with producer reads. A rerun can finish between
+    // requests with the same SHA, suite ID, count and aggregate conclusion.
+    // Actions' attempt identity must therefore be present and unchanged too.
+    let workflows = read(&workflow_path, "workflow_runs")?;
+    for workflow in &workflows {
+        workflow["run_attempt"].as_u64().filter(|attempt| *attempt > 0).context("GitHub omitted the workflow attempt")?;
+    }
+    let suite_records = read(&suite_path, "check_suites")?;
+    let children = read(&child_path, "check_runs")?;
+    let statuses = read(&status_path, "statuses")?;
+    let mut attempt_consistent = true;
+    let mut unexplained_workflows = BTreeSet::new();
+    let mut explained_suites = BTreeSet::new();
+    // Repeated latest-check reads can consistently lag behind a finished
+    // rerun. Only jobs from the explicit Actions attempt may explain its
+    // failed aggregate, and every such job must agree with its check run.
+    for workflow in &workflows {
+        if workflow["status"].as_str() != Some("completed") || !failed_validation(validation_state(workflow)?) { continue; }
+        let id = workflow["id"].as_u64().context("GitHub omitted workflow identity")?;
+        let attempt = workflow["run_attempt"].as_u64().context("GitHub omitted the workflow attempt")?;
+        let jobs = read(&format!("repos/{repo}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"), "jobs")?;
+        if !jobs.iter().any(|job| validation_state(job).is_ok_and(failed_validation)) {
+            unexplained_workflows.insert(id);
+        } else if let Some(suite) = workflow["check_suite_id"].as_u64() {
+            explained_suites.insert(suite);
+        }
+        for job in jobs {
+            let check_id = job["check_run_url"].as_str().and_then(|url| url.rsplit('/').next()).and_then(|id| id.parse::<u64>().ok());
+            let matching_child = children.iter().find(|child| check_id.is_some() && child["id"].as_u64() == check_id);
+            if job["run_id"].as_u64() != Some(id) || job["head_sha"].as_str() != Some(&pr.head_sha)
+                || job.get("run_attempt").is_some_and(|value| value.as_u64() != Some(attempt))
+                || !matching_child.is_some_and(|child| child["check_suite"]["id"] == workflow["check_suite_id"]
+                    && child["name"] == job["name"] && child["status"] == job["status"] && child["conclusion"] == job["conclusion"]) {
+                attempt_consistent = false;
+            }
+        }
+    }
+    let workflows_after = read(&workflow_path, "workflow_runs")?;
+    let suites_after = read(&suite_path, "check_suites")?;
+    // Suites from other providers have no attempt number. Re-read the child
+    // identities and results as well, so in-place changes cannot be used to
+    // explain away a producer failure with an older optional job failure.
+    let children_after = read(&child_path, "check_runs")?;
+    let statuses_after = read(&status_path, "statuses")?;
+    if !attempt_consistent || workflows != workflows_after || suite_records != suites_after || children != children_after || statuses != statuses_after {
+        // A normal race is pending, not a successful validation or a terminal
+        // error. The pipeline's next poll collects a fresh complete snapshot.
+        return Ok((vec![PrCheck { name: "validation changed during collection; waiting for a consistent attempt".into(), state: "pending".into(), url: None }], Vec::new()));
+    }
     let mut checks = Vec::new();
     for child in &children {
         if child["head_sha"].as_str() != Some(&pr.head_sha) { bail!("GitHub returned a check for a different commit"); }
@@ -452,11 +502,8 @@ fn validation_with(cwd: &Path, pr: &PrSnapshot, run: &mut impl FnMut(&Path, &[&s
     let mut validation = Vec::new();
     let mut suites = BTreeSet::new();
     let mut workflow_suites = Vec::new();
-    for (path, key) in [
-        (format!("repos/{repo}/actions/runs?head_sha={}&per_page=100", pr.head_sha), "workflow_runs"),
-        (format!("repos/{repo}/commits/{}/check-suites?per_page=100", pr.head_sha), "check_suites"),
-    ] {
-        for item in read(&path, key)? {
+    for (records, key) in [(workflows, "workflow_runs"), (suite_records, "check_suites")] {
+        for item in records {
             if item["head_sha"].as_str() != Some(&pr.head_sha) { bail!("GitHub returned validation for a different commit"); }
             let id = item["id"].as_u64().context("GitHub omitted validation identity")?;
             let mut state = validation_state(&item)?;
@@ -469,10 +516,12 @@ fn validation_with(cwd: &Path, pr: &PrSnapshot, run: &mut impl FnMut(&Path, &[&s
             } else {
                 workflow_suites.push(suite.context("GitHub omitted the workflow's check suite")?);
             }
-            // A completed producer's failure may be an optional child failure.
-            // Let the existing required/ignored policy judge those children.
-            // An unexplained failure (e.g. invalid workflow) still gates.
-            if failed_validation(state) && suite.is_some_and(|suite| children.iter().any(|child| child["check_suite"]["id"].as_u64() == Some(suite) && validation_state(child).is_ok_and(failed_validation))) {
+            // Only verified jobs from the consistent Actions attempt may
+            // explain an aggregate failure as an optional child failure.
+            // Other providers have no verifiable attempt membership here;
+            // their failed aggregates remain blocking, even if a child is ignored.
+            let explained = if key == "workflow_runs" { !unexplained_workflows.contains(&id) } else { explained_suites.contains(&id) };
+            if failed_validation(state) && explained && suite.is_some_and(|suite| children.iter().any(|child| child["check_suite"]["id"].as_u64() == Some(suite) && validation_state(child).is_ok_and(failed_validation))) {
                 state = "success";
             }
             let name = item["name"].as_str().or_else(|| item["app"]["slug"].as_str()).unwrap_or(key);
@@ -987,7 +1036,7 @@ mod tests {
     }
 
     fn validation_key(path: &str) -> &str {
-        if path.contains("actions/runs") { "workflow_runs" } else if path.contains("check-suites") { "check_suites" } else if path.contains("check-runs") { "check_runs" } else { "statuses" }
+        if path.contains("/attempts/") { "jobs" } else if path.contains("actions/runs") { "workflow_runs" } else if path.contains("check-suites") { "check_suites" } else if path.contains("check-runs") { "check_runs" } else { "statuses" }
     }
 
     fn snapshot_validation(args: &[&str]) -> String {
@@ -1010,8 +1059,8 @@ mod tests {
             let key = validation_key(args[1]);
             if matches!(key, "check_runs" | "statuses") { return Ok(serde_json::json!([{"total_count":0,key:[]}]).to_string()); }
             Ok(serde_json::json!([
-                {"total_count":2, key:[{"id":1,"head_sha":pr.head_sha,"status":"completed","conclusion":"success","check_suite_id":1,"latest_check_runs_count":0}]},
-                {"total_count":2, key:[{"id":2,"head_sha":pr.head_sha,"status":"queued","conclusion":"success","check_suite_id":2,"latest_check_runs_count":0}]}
+                {"total_count":2, key:[{"id":1,"head_sha":pr.head_sha,"status":"completed","conclusion":"success","check_suite_id":1,"run_attempt":1,"latest_check_runs_count":0}]},
+                {"total_count":2, key:[{"id":2,"head_sha":pr.head_sha,"status":"queued","conclusion":"success","check_suite_id":2,"run_attempt":1,"latest_check_runs_count":0}]}
             ]).to_string())
         }).unwrap();
         assert_eq!(evidence.0.iter().map(|c| c.state.as_str()).collect::<Vec<_>>(), ["success", "queued", "success", "queued"]);
@@ -1047,8 +1096,13 @@ mod tests {
                         "id": i + 1, "name":if i == 0 { "build" } else { "optional" }, "head_sha":"1111111111111111111111111111111111111111",
                         "status":"completed", "conclusion":state, "check_suite":{"id":10}
                     })).collect::<Vec<_>>(),
+                    "jobs" => child_states.iter().enumerate().map(|(i, state)| serde_json::json!({
+                        "id":i+1,"run_id":10,"name":if i == 0 { "build" } else { "optional" },
+                        "head_sha":"1111111111111111111111111111111111111111","status":"completed","conclusion":state,
+                        "check_run_url":format!("https://api.github.com/repos/acme/widgets/check-runs/{}", i+1)
+                    })).collect(),
                     "statuses" => vec![],
-                    _ => vec![serde_json::json!({"id":10,"check_suite_id":10,"name":"CI","head_sha":"1111111111111111111111111111111111111111",
+                    _ => vec![serde_json::json!({"id":10,"check_suite_id":10,"run_attempt":1,"name":"CI","head_sha":"1111111111111111111111111111111111111111",
                         "status":status,"conclusion":conclusion,"latest_check_runs_count":expected_count})],
                 };
                 Ok(serde_json::json!([{"total_count":records.len(),key:records}]).to_string())
@@ -1058,6 +1112,58 @@ mod tests {
             let result = gate::decide(&Facts { auto_merge:true, require_person:false, cloud:false, verdict:Some(&verdict), pr:&pr,
                 security_areas:&[], protected:&[], ignored_checks:&patterns, allow_no_ci:false });
             assert_eq!(matches!(result, Gate::Merge { .. }), passes, "{status} {conclusion} {child_states:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_completed_rerun_cannot_use_an_old_optional_failure_to_mask_a_new_build_failure() {
+        use crate::issue_pipeline::gate::{self, tests::merge_verdict, Facts, Gate, StopReason, Wait};
+        // Both attempts have the same head, suite, child count and failed
+        // aggregate. Only the attempt identity and/or child results change.
+        for change in ["attempt", "children", "both", "lag_ids", "lag_results", "unverifiable_provider"] {
+            for retry in [false, true] {
+                let mut workflow_reads = 0;
+                let mut child_reads = 0;
+                let pr = pr_snapshot_with(Path::new("/repo"), 7, |_, args| {
+                    if args[0] != "api" { return Ok(OPEN_PR.into()); }
+                    let key = validation_key(args[1]);
+                    let records = match key {
+                        "workflow_runs" => {
+                            workflow_reads += 1;
+                            let attempt = if retry || change.starts_with("lag_") || (workflow_reads > 1 && change != "children") { 2 } else { 1 };
+                            if change == "unverifiable_provider" { vec![] } else { vec![serde_json::json!({"id":10,"check_suite_id":10,"run_attempt":attempt,"name":"CI",
+                                "head_sha":"1111111111111111111111111111111111111111","status":"completed","conclusion":"failure"})] }
+                        }
+                        "check_suites" => vec![serde_json::json!({"id":10,"latest_check_runs_count":2,
+                            "head_sha":"1111111111111111111111111111111111111111","status":"completed","conclusion":"failure"})],
+                        "check_runs" => {
+                            child_reads += 1;
+                            let build = if retry || (child_reads > 1 && matches!(change, "children" | "both")) { "failure" } else { "success" };
+                            ["build", "optional"].iter().enumerate().map(|(i, name)| serde_json::json!({
+                                "id":i+1,"name":name,"head_sha":"1111111111111111111111111111111111111111",
+                                "check_suite":{"id":10},"status":"completed","conclusion":if i == 0 { build } else { "failure" }
+                            })).collect()
+                        }
+                        "jobs" => ["build", "optional"].iter().enumerate().map(|(i, name)| serde_json::json!({
+                            "id":i+1,"run_id":10,"name":name,"head_sha":"1111111111111111111111111111111111111111",
+                            "status":"completed","conclusion":if i == 0 && !retry && !change.starts_with("lag_") { "success" } else { "failure" },
+                            "check_run_url":format!("https://api.github.com/repos/acme/widgets/check-runs/{}", if change == "lag_ids" && !retry { i+101 } else { i+1 })
+                        })).collect(),
+                        _ => vec![],
+                    };
+                    Ok(serde_json::json!([{"total_count":records.len(),key:records}]).to_string())
+                }, |_, _| Ok(output(true, "[]", ""))).unwrap();
+                let verdict = merge_verdict(&pr.head_sha);
+                let result = gate::decide(&Facts { auto_merge:true, require_person:false, cloud:false, verdict:Some(&verdict), pr:&pr,
+                    security_areas:&[], protected:&[], ignored_checks:&["optional".into()], allow_no_ci:false });
+                if retry {
+                    assert_eq!(result, Gate::NeedsYou(StopReason::ChecksFailed { names: vec!["build".into()] }), "{change}");
+                } else if change == "unverifiable_provider" {
+                    assert!(matches!(result, Gate::NeedsYou(StopReason::ChecksFailed { .. })), "{result:?}");
+                } else {
+                    assert!(matches!(result, Gate::Wait(Wait::Checks(_))), "{change}: {result:?}");
+                }
+            }
         }
     }
 

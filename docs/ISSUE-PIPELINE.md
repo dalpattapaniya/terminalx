@@ -80,8 +80,12 @@ head:
   also finish, including queued runs and reruns whose jobs are not published
   yet. Checks, statuses, workflows and suites are read with pagination;
   unreadable or incomplete evidence cannot pass. A completed producer's
-  failure is still judged through the required/ignored policy when its
-  failing child checks explain it; an unexplained producer failure blocks.
+  failure is judged through the required/ignored policy only when jobs from
+  that exact Actions run attempt match the child check IDs and results.
+  Failed producers without verifiable attempt membership remain blocking.
+  Producer reads bracket child collection, and workflow attempt identities,
+  producer records and repeated child/status reads must agree. A change
+  during collection stays pending until a fresh, consistent snapshot is read.
   Legacy status-only CI must name required checks in branch protection,
   since individual statuses provide no producer completion signal.
   Empty validation never becomes successful simply because time has passed.
