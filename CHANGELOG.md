@@ -30,6 +30,11 @@
   batches without treating legacy import times as message times. Title backfill
   preserves message ordering when the app restarts. (#599)
 
+- Keep completed Claude compaction idle instead of raising a false stall
+  warning, including manual `/compact` queued behind a running turn. Record
+  privacy-safe turn-opener labels in stall diagnostics while retaining warnings
+  for real silent turns. (#523)
+
 - Show compact local message times with full dates available by keyboard or
   tap, across local, cloud and mobile chats. Keep source timestamps through
   transcript imports and the first text-chunk time through streaming; omit
