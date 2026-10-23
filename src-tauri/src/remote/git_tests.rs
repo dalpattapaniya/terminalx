@@ -487,3 +487,25 @@ fn a_forks_pull_request_from_a_branch_of_the_same_name_is_not_this_branchs() {
     let created = f.call("git.prCreate", json!({ "repo": "app", "title": "Mine" })).unwrap();
     assert_eq!((created["created"].clone(), created["pr"]["number"].clone()), (json!(true), json!(2)));
 }
+
+#[test]
+fn workspace_review_range_includes_committed_modified_and_untracked() {
+    let f = fixture();
+    let remote = f.remote("origin");
+    let repo = f.clone(&remote, "app");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    std::fs::write(repo.join("A"), "committed\n").unwrap();
+    git(&repo, &["add", "A"]);
+    git(&repo, &["commit", "-qm", "A"]);
+    std::fs::write(repo.join("README.md"), "modified\n").unwrap();
+    std::fs::write(repo.join("C"), "untracked\n").unwrap();
+    for (uncommitted, count) in [(false, 3), (true, 2)] {
+        let range = f.call("git.reviewRange", json!({ "repo": "app", "uncommitted": uncommitted })).unwrap();
+        assert_eq!(range["target"], if uncommitted { "HEAD" } else { "origin/main" });
+        let files = f.call("git.changesBetween", json!({ "repo": "app", "base": range["base"], "head": range["head"] })).unwrap();
+        assert_eq!(files["files"].as_array().unwrap().len(), count);
+        let contents = f.call("git.fileContents", json!({ "repo": "app", "path": "C", "base": range["base"], "head": range["head"] })).unwrap();
+        assert_eq!(contents["after"], "untracked\n");
+    }
+    assert!(f.call("git.reviewRange", json!({ "repo": "app", "target": "missing" })).is_err());
+}
