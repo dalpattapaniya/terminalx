@@ -118,9 +118,8 @@ pub async fn account_sign_out(
     state.pairing.sign_out().await;
     // Withdrawn while the token still works: this Mac's issues stop showing as worked on.
     let claims = state.work_claims.clone();
-    let _ = tauri::async_runtime::spawn_blocking(move || claims.sign_out()).await;
     let account = state.account.clone();
-    tauri::async_runtime::spawn_blocking(move || account.sign_out(&app)).await.map_err(err)
+    tauri::async_runtime::spawn_blocking(move || claims.sign_out(|| account.sign_out(&app))).await.map_err(err)
 }
 
 #[tauri::command]

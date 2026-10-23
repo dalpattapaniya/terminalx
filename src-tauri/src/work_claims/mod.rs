@@ -103,6 +103,10 @@ struct CloudIssue {
 struct State {
     nudged: bool,
     stopped: bool,
+    /// Include queued sign-outs so one completion cannot reopen another’s fence.
+    signing_out: usize,
+    /// Account generation left by the most recent completed sign-out.
+    blocked_generation: Option<u64>,
     /// The cloud sessions the window last handed over.
     cloud: Vec<CloudSession>,
     /// The issue each cloud session's branch names, by its claim id, with the
@@ -123,6 +127,8 @@ pub struct WorkClaims {
     device: Mutex<Option<String>>,
     client: Client,
     sign_out_client: Client,
+    /// Held only across the bounded publish request, or withdrawal and sign-out.
+    publish_gate: Mutex<()>,
     state: Mutex<State>,
     wake: Condvar,
     app: OnceLock<AppHandle>,
@@ -145,6 +151,7 @@ impl WorkClaims {
             device: Mutex::new(None),
             client: Client::new(base.clone(), REQUEST_TIMEOUT),
             sign_out_client: Client::new(base, SIGN_OUT_TIMEOUT),
+            publish_gate: Mutex::new(()),
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             app: OnceLock::new(),
@@ -308,8 +315,14 @@ impl WorkClaims {
         let inputs = Inputs { now, share_with_team: settings.work_status.share_with_team, remote: &remote, pull_request: &pull_request };
         let claims = claims::claims(&sessions, &cloud, &inputs);
         let shape: Vec<(Claim, i64)> = claims.iter().map(|claim| claim.shape(now)).collect();
+        // Preparation above can read disk/git. Do not make sign-out wait for it.
+        // A queued publisher never waits behind sign-out with a stale token.
+        let Ok(_publish) = self.publish_gate.try_lock() else { return false };
         {
             let state = self.state.lock().unwrap();
+            if state.signing_out != 0 || state.blocked_generation == Some(context.generation) || self.account.scope_if_same_account(&context).is_none() {
+                return true;
+            }
             let unchanged = state.sent.as_ref().is_some_and(|sent| sent.user_id == context.user_id && sent.device_id == device_id && sent.label == label && sent.shape == shape && sent.at.elapsed() < sent.refresh_after);
             if unchanged && state.retry_at.is_none() {
                 return true;
@@ -345,15 +358,27 @@ impl WorkClaims {
         true
     }
 
-    /// Withdraw this Mac's claims before the account's token goes.
-    pub fn sign_out(&self) {
-        let sent = self.state.lock().unwrap().sent.take();
-        let (Some(sent), Some(context)) = (sent, self.account.context()) else { return };
-        if sent.user_id == context.user_id {
-            if let Err(error) = self.sign_out_client.withdraw(&context.access_token, &sent.device_id) {
+    /// Fence publishers before draining the one bounded request already in flight.
+    /// Keep the fence through account sign-out, including token refresh and failure.
+    pub fn sign_out<T>(&self, end_session: impl FnOnce() -> T) -> T {
+        self.state.lock().unwrap().signing_out += 1;
+        let _publish = self.publish_gate.lock().unwrap();
+        // `sent` may be empty after an unanswered first PUT or an app restart.
+        if let (Some(context), Some(device)) = (self.account.context(), self.device_id()) {
+            if let Err(error) = self.sign_out_client.withdraw(&context.access_token, &device) {
                 log::info!("withdraw work status at sign-out: {}", error.code);
             }
         }
+        let result = end_session();
+        let mut state = self.state.lock().unwrap();
+        state.signing_out -= 1;
+        // Refresh keeps the generation; only a subsequent sign-in can resume.
+        state.blocked_generation = Some(self.account.current_generation());
+        state.sent = None;
+        state.last_put = None;
+        state.failures = 0;
+        state.retry_at = None;
+        result
     }
 
     /// Hand over the cloud sessions the window knows about.
