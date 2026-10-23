@@ -151,7 +151,7 @@ describe("the Issues view for a cloud project", () => {
   });
 
   it("starts an issue in the project's workspace, in a worktree named after it, carried on by the runtime", async () => {
-    setPrefs({ cloudIssuePipelines: { [PROJECT]: { enabled: true, autoMerge: true, requirePerson: false, maxRounds: 2, mergeMethod: "squash", protected: { migrations: true, deploy: true, security: true, paths: [] }, ignoredChecks: [] } } });
+    setPrefs({ lastMode: "default", cloudIssuePipelines: { [PROJECT]: { enabled: true, autoMerge: true, requirePerson: false, maxRounds: 2, mergeMethod: "squash", protected: { migrations: true, deploy: true, security: true, paths: [] }, ignoredChecks: [] } } });
     await openIssue();
     // No worktree switch and no merge switch: the issue gets a worktree, and a person merges.
     expect(screen.queryByRole("switch", { name: "Start issue in a new worktree" })).toBeNull();
@@ -165,6 +165,7 @@ describe("the Issues view for a cloud project", () => {
     expect(plan.kind).toBe("reuse");
     expect(request).toMatchObject({
       agent: "claude",
+      mode: "manual",
       useWorktree: true,
       title: "#433 Carry issue sessions on",
       issue: {
