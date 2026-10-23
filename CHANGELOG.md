@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Stats & Usage
+
+- Refresh usage for non-Git projects without blocking healthy locations, and
+  show incomplete worktree discovery, saved refresh time, reporting scope, and
+  omitted pricing explicitly. Read configured provider homes and Codex archives;
+  reconcile whitespace, streamed copies, model switches and counter resets.
+  Price individual requests, include Astra's published rates and Claude's
+  one-hour cache writes, and retain recorded usage after transcript or worktree
+  removal without keeping prompt contents. (#602)
+
 ### Issues
 
 - A cloud issue that cannot start because an agent needs sign-in now offers

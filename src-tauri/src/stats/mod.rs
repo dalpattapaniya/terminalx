@@ -6,6 +6,8 @@
 //! metadata read on later visits.
 
 mod pricing;
+#[cfg(test)]
+mod reconciliation;
 mod saved;
 pub use saved::{StatsUsageState, StatsUsageStore};
 
@@ -20,7 +22,7 @@ use chrono::{DateTime, Days, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const CACHE_SCHEMA: u32 = 3;
+const CACHE_SCHEMA: u32 = 4;
 const CACHE_FILE: &str = "stats-usage-cache.json";
 const OVERVIEW_DAYS: u64 = 30;
 
@@ -40,6 +42,10 @@ pub struct StatsUsageSnapshot {
     pub daily: Vec<UsageDay>,
     pub providers: Vec<ProviderUsage>,
     pub updated_at: i64,
+    #[serde(default)]
+    pub discovery_warnings: Vec<String>,
+    pub range_start: String,
+    pub range_end: String,
 }
 
 pub use crate::store::activity::Summary as AppStats;
@@ -68,6 +74,8 @@ pub struct ProviderUsage {
     pub activity_label: String,
     pub estimated_cost_usd: Option<f64>,
     pub has_partial_cost: bool,
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,6 +102,10 @@ struct UsageEvent {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    #[serde(default)]
+    cache_write_hour_tokens: u64,
+    #[serde(default)]
+    unpriced: bool,
     cache_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
@@ -114,6 +126,8 @@ struct CachedFile {
 struct ScanCache {
     schema_version: u32,
     files: Vec<CachedFile>,
+    #[serde(default)]
+    scope_paths: Vec<PathBuf>,
 }
 
 impl Default for ScanCache {
@@ -121,6 +135,7 @@ impl Default for ScanCache {
         Self {
             schema_version: CACHE_SCHEMA,
             files: Vec::new(),
+            scope_paths: Vec::new(),
         }
     }
 }
@@ -141,16 +156,16 @@ fn scan_snapshot_with(
     inputs: impl FnOnce() -> Result<(AppStats, UsageScope)>,
 ) -> Result<StatsUsageSnapshot> {
     let cache_path = store_root.join(CACHE_FILE);
-    let previous = match crate::store::read_json::<ScanCache>(&cache_path) {
-        Ok(Some(cache)) if cache.schema_version == CACHE_SCHEMA => cache,
-        Ok(_) => ScanCache::default(),
-        Err(error) => {
-            log::warn!("read stats usage cache: {error:#}");
-            ScanCache::default()
-        }
-    };
+    let previous = crate::store::read_json::<ScanCache>(&cache_path)
+        .context("read recorded usage accounting")?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        matches!(previous.schema_version, 3 | CACHE_SCHEMA),
+        "Unsupported recorded usage schema; retained accounting was not replaced"
+    );
 
     let files = sources()?;
+    let reparse = previous.schema_version != CACHE_SCHEMA;
     let mut previous_by_path: HashMap<PathBuf, CachedFile> = previous
         .files
         .into_iter()
@@ -168,22 +183,46 @@ fn scan_snapshot_with(
         };
         let modified_nanos = modified_nanos(&metadata)?;
         let size = metadata.len();
-        if let Some(cached) = previous_by_path.remove(&path).filter(|cached| {
-            cached.provider == provider
+        let prior = previous_by_path.remove(&path);
+        if prior.as_ref().is_some_and(|cached| {
+            !reparse
+                && cached.provider == provider
                 && cached.modified_nanos == modified_nanos
                 && cached.size == size
         }) {
-            current.push(cached);
+            current.push(prior.expect("checked above"));
             continue;
         }
         match parse_file(&path, provider) {
-            Ok(events) => current.push(CachedFile {
-                path,
-                provider,
-                modified_nanos,
-                size,
-                events,
-            }),
+            Ok(mut events) => {
+                // A resumed/replaced file may contain only the recent suffix.
+                // Keep previously observed events without replaying copies.
+                if let Some(prior) = prior.filter(|prior| prior.provider == provider) {
+                    let mut seen = events
+                        .iter()
+                        .enumerate()
+                        .map(|(index, event)| (projection_key(event), index))
+                        .collect::<HashMap<_, _>>();
+                    for event in prior.events {
+                        let key = projection_key(&event);
+                        if let Some(index) = seen.get(&key).copied() {
+                            if !reparse && events[index].total_tokens < event.total_tokens {
+                                events[index] = event;
+                            }
+                        } else {
+                            seen.insert(key, events.len());
+                            events.push(event);
+                        }
+                    }
+                }
+                current.push(CachedFile {
+                    path,
+                    provider,
+                    modified_nanos,
+                    size,
+                    events,
+                });
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("scan usage transcript {}", path.display()))
@@ -191,16 +230,42 @@ fn scan_snapshot_with(
         }
     }
 
+    // Retain only the compact accounting projection when a provider removes or
+    // archives a transcript (#464). No prompt content is stored here. Discovery
+    // errors above still fail the refresh; they are never treated as deletions.
+    // Reappearing paths merge with their old projection; copied archives dedupe by
+    // event identity during aggregation.
+    current.extend(previous_by_path.into_values());
     current.sort_by(|left, right| lexical_path_cmp(&left.path, &right.path));
-    let (app, scope) = inputs()?;
+    let (app, mut scope) = inputs()?;
+    scope
+        .roots
+        .extend(UsageScope::from_paths(previous.scope_paths).roots);
+    let scope_paths = scope
+        .roots
+        .iter()
+        .map(|root| PathBuf::from(&root.match_path))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let snapshot = aggregate(&current, app, &scope, &overview_cutoff(Local::now()));
     let cache = ScanCache {
         schema_version: CACHE_SCHEMA,
         files: current,
+        scope_paths,
     };
     let bytes = serde_json::to_vec(&cache)?;
     crate::store::write_atomic(&cache_path, &bytes).context("write stats scan cache")?;
     Ok(snapshot)
+}
+
+fn projection_key(event: &UsageEvent) -> String {
+    event.event_key.clone().unwrap_or_else(|| {
+        format!(
+            "{}|{}|{:?}|{:?}",
+            event.session_id, event.timestamp, event.model, event.cwd
+        )
+    })
 }
 
 fn modified_nanos(metadata: &fs::Metadata) -> Result<u64> {
@@ -214,13 +279,32 @@ fn modified_nanos(metadata: &fs::Metadata) -> Result<u64> {
 fn discover_sources(store_root: &Path) -> Result<Vec<(PathBuf, Provider)>> {
     let home = dirs::home_dir().context("no home directory")?;
     let predecessor_root = predecessor_data_root();
-    discover_sources_at(&home, store_root, predecessor_root.as_deref())
+    discover_sources_with_homes(
+        &home,
+        store_root,
+        predecessor_root.as_deref(),
+        std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .as_deref(),
+        std::env::var_os("CODEX_HOME").map(PathBuf::from).as_deref(),
+    )
 }
 
+#[cfg(test)]
 fn discover_sources_at(
     home: &Path,
     store_root: &Path,
     predecessor_root: Option<&Path>,
+) -> Result<Vec<(PathBuf, Provider)>> {
+    discover_sources_with_homes(home, store_root, predecessor_root, None, None)
+}
+
+fn discover_sources_with_homes(
+    home: &Path,
+    store_root: &Path,
+    predecessor_root: Option<&Path>,
+    claude_home: Option<&Path>,
+    codex_home: Option<&Path>,
 ) -> Result<Vec<(PathBuf, Provider)>> {
     let mut roots = vec![
         (home.join(".claude/projects"), Provider::Claude),
@@ -228,6 +312,13 @@ fn discover_sources_at(
         (home.join(".codex/sessions"), Provider::Codex),
         (store_root.join("codex/sessions"), Provider::Codex),
     ];
+    if let Some(home) = claude_home {
+        roots.push((home.join("projects"), Provider::Claude));
+        roots.push((home.join("transcripts"), Provider::Claude));
+    }
+    if let Some(home) = codex_home {
+        roots.push((home.join("sessions"), Provider::Codex));
+    }
     add_managed_codex_roots(store_root, &mut roots)?;
     if let Some(root) = predecessor_root {
         roots.push((
@@ -236,6 +327,16 @@ fn discover_sources_at(
         ));
         add_managed_codex_roots(root, &mut roots)?;
     }
+    // Codex moves archived rollouts beside sessions; both are usage sources.
+    let archives = roots
+        .iter()
+        .filter(|(_, provider)| *provider == Provider::Codex)
+        .filter_map(|(path, provider)| {
+            path.parent()
+                .map(|parent| (parent.join("archived_sessions"), *provider))
+        })
+        .collect::<Vec<_>>();
+    roots.extend(archives);
     let mut files = Vec::new();
     let mut seen = HashSet::new();
     for (root, provider) in roots {
@@ -384,6 +485,17 @@ fn parse_claude(path: &Path) -> Result<Vec<UsageEvent>> {
             output_tokens: output,
             cache_read_tokens: cache_read,
             cache_write_tokens: cache_write,
+            cache_write_hour_tokens: number(&usage["cache_creation"]["ephemeral_1h_input_tokens"])
+                .min(cache_write),
+            unpriced: nonstandard_tier(usage)
+                || nonstandard_tier(&record["message"])
+                || nonstandard_tier(&record)
+                || (usage["cache_creation"].is_object()
+                    && number(&usage["cache_creation"]["ephemeral_5m_input_tokens"])
+                        .saturating_add(number(
+                            &usage["cache_creation"]["ephemeral_1h_input_tokens"],
+                        ))
+                        != cache_write),
             cache_tokens: cache_read.saturating_add(cache_write),
             reasoning_tokens: 0,
             total_tokens: input
@@ -399,6 +511,10 @@ fn parse_claude(path: &Path) -> Result<Vec<UsageEvent>> {
                 prior.output_tokens = prior.output_tokens.max(event.output_tokens);
                 prior.cache_read_tokens = prior.cache_read_tokens.max(event.cache_read_tokens);
                 prior.cache_write_tokens = prior.cache_write_tokens.max(event.cache_write_tokens);
+                prior.cache_write_hour_tokens = prior
+                    .cache_write_hour_tokens
+                    .max(event.cache_write_hour_tokens);
+                prior.unpriced |= event.unpriced;
                 prior.cache_tokens = prior
                     .cache_read_tokens
                     .saturating_add(prior.cache_write_tokens);
@@ -487,27 +603,8 @@ fn monotonic(current: RawUsage, previous: RawUsage) -> bool {
         && current.reasoning >= previous.reasoning
 }
 
-fn magnitude(usage: RawUsage) -> u128 {
-    usage.input as u128
-        + usage.cached_input as u128
-        + usage.output as u128
-        + usage.reasoning as u128
-}
-
-fn stale_regression(current: RawUsage, previous: RawUsage, last: RawUsage) -> bool {
-    let current_total = magnitude(current);
-    let previous_total = magnitude(previous);
-    let last_total = magnitude(last);
-    previous_total > 0
-        && current_total > 0
-        && last_total > 0
-        && (current_total.saturating_mul(100) >= previous_total.saturating_mul(98)
-            || current_total.saturating_add(last_total.saturating_mul(2)) >= previous_total)
-}
-
 enum Delta {
     Event(RawUsage, Option<RawUsage>),
-    Baseline(RawUsage),
 }
 
 fn codex_delta(
@@ -517,10 +614,10 @@ fn codex_delta(
 ) -> Option<Delta> {
     match (total, last, previous) {
         (Some(total), Some(last), Some(previous)) => {
-            if same_counts(total, previous)
-                || (!monotonic(total, previous) && stale_regression(total, previous, last))
-            {
+            if same_counts(total, previous) {
                 None
+            } else if monotonic(total, previous) {
+                Some(Delta::Event(subtract(total, previous), Some(total)))
             } else {
                 Some(Delta::Event(last, Some(total)))
             }
@@ -528,7 +625,7 @@ fn codex_delta(
         (Some(total), Some(last), None) => Some(Delta::Event(last, Some(total))),
         (Some(total), None, Some(previous)) if same_counts(total, previous) => None,
         (Some(total), None, Some(previous)) if !monotonic(total, previous) => {
-            Some(Delta::Baseline(total))
+            Some(Delta::Event(total, Some(total)))
         }
         (Some(total), None, Some(previous)) => {
             Some(Delta::Event(subtract(total, previous), Some(total)))
@@ -571,15 +668,16 @@ fn parse_codex(path: &Path) -> Result<Vec<UsageEvent>> {
     let mut session_cwd: Option<String> = None;
     let mut current_cwd: Option<String> = None;
     let mut current_model: Option<String> = None;
+    let mut unpriced_tier = false;
     let mut previous_totals: Option<RawUsage> = None;
+    let mut seen_records = HashSet::new();
     let mut events = Vec::new();
 
     for line in BufReader::new(file).lines() {
         let line = line.with_context(|| format!("read usage transcript {}", path.display()))?;
-        let interesting = line.contains("\"type\":\"session_meta\"")
-            || line.contains("\"type\":\"turn_context\"")
-            || (line.contains("\"type\":\"event_msg\"")
-                && line.contains("\"type\":\"token_count\""));
+        let interesting = line.contains("session_meta")
+            || line.contains("turn_context")
+            || line.contains("token_count");
         if !interesting {
             continue;
         }
@@ -605,6 +703,7 @@ fn parse_codex(path: &Path) -> Result<Vec<UsageEvent>> {
                 }
             }
             Some("turn_context") => {
+                unpriced_tier = nonstandard_tier(payload);
                 if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
                     current_cwd = Some(cwd.to_string());
                 }
@@ -626,16 +725,16 @@ fn parse_codex(path: &Path) -> Result<Vec<UsageEvent>> {
                 };
                 let total = info.get("total_token_usage").and_then(raw_usage);
                 let last = info.get("last_token_usage").and_then(raw_usage);
+                let event_key =
+                    format!("{}|{}|{}", timestamp, usage_tuple(total), usage_tuple(last));
+                // Replayed records must not rewind the cumulative baseline.
+                if !seen_records.insert(event_key.clone()) {
+                    continue;
+                }
                 let Some(resolved) = codex_delta(total, last, previous_totals) else {
                     continue;
                 };
-                let (mut delta, next) = match resolved {
-                    Delta::Baseline(next) => {
-                        previous_totals = Some(next);
-                        continue;
-                    }
-                    Delta::Event(delta, next) => (delta, next),
-                };
+                let Delta::Event(mut delta, next) = resolved;
                 delta.cached_input = delta.cached_input.min(delta.input);
                 if delta.input == 0
                     && delta.cached_input == 0
@@ -658,25 +757,41 @@ fn parse_codex(path: &Path) -> Result<Vec<UsageEvent>> {
                     model: model.clone(),
                     cwd,
                     project,
-                    event_key: Some(format!(
-                        "{}|{}|{}",
-                        timestamp,
-                        usage_tuple(total),
-                        usage_tuple(last)
-                    )),
+                    event_key: Some(event_key),
                     new_input_tokens: delta.input.saturating_sub(delta.cached_input),
                     output_tokens: delta.output,
                     cache_read_tokens: delta.cached_input,
                     cache_write_tokens: 0,
+                    cache_write_hour_tokens: 0,
+                    unpriced: unpriced_tier
+                        || nonstandard_tier(payload)
+                        || nonstandard_tier(&payload["info"])
+                        || last.is_none_or(|last| !same_counts(last, delta))
+                        || number(
+                            &payload["info"]["last_token_usage"]["cache_creation_input_tokens"],
+                        ) > 0
+                        || number(&payload["info"]["last_token_usage"]["cache_write_tokens"]) > 0,
                     cache_tokens: delta.cached_input,
                     reasoning_tokens: delta.reasoning,
-                    total_tokens: delta.total,
+                    total_tokens: delta.input.saturating_add(delta.output),
                 });
             }
             _ => {}
         }
     }
     Ok(events)
+}
+
+// Unknown/fast/flex tiers must not silently receive standard prices.
+fn nonstandard_tier(value: &Value) -> bool {
+    value
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .is_some_and(|tier| !matches!(tier, "default" | "standard" | "auto"))
+        || value
+            .get("speed")
+            .and_then(Value::as_str)
+            .is_some_and(|speed| speed != "standard")
 }
 
 fn number(value: &Value) -> u64 {
@@ -722,6 +837,7 @@ fn project_label(cwd: Option<&str>) -> String {
 #[derive(Debug, Default)]
 struct UsageScope {
     roots: Vec<UsageScopeRoot>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -752,7 +868,10 @@ impl UsageScope {
             })
             .collect::<Vec<_>>();
         roots.sort_by_key(|root| std::cmp::Reverse(root.match_path.len()));
-        Self { roots }
+        Self {
+            roots,
+            warnings: Vec::new(),
+        }
     }
 
     fn contains(&self, cwd: Option<&str>) -> bool {
@@ -800,23 +919,46 @@ struct UsageScopeRow {
     worktree_id: Option<String>,
 }
 
-fn usage_scope() -> Result<UsageScope> {
+fn project_usage_scope(projects: impl IntoIterator<Item = PathBuf>) -> UsageScope {
     let mut paths = Vec::new();
-    let (projects, _) = crate::store::projects::list()?;
-    for project in projects {
-        let root = PathBuf::from(&project.path);
+    let mut warnings = Vec::new();
+    for root in projects {
         paths.push(root.clone());
-        match crate::git::list_worktrees(&root) {
+        // Inspect existence separately: permission errors are not missing paths.
+        let result = match root.try_exists() {
+            Ok(false) => continue,
+            Err(error) => Err(error.into()),
+            Ok(true) => crate::git::list_worktrees(&root),
+        };
+        match result {
             Ok(worktrees) => {
-                paths.extend(worktrees.into_iter().map(|(path, _)| PathBuf::from(path)));
+                paths.extend(worktrees.into_iter().map(|(path, _)| PathBuf::from(path)))
             }
-            Err(_) if !root.try_exists()? => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("list usage worktrees for {}", root.display()))
-            }
+            // git::run fixes LC_ALL=C. Only this specific diagnostic describes
+            // a valid ordinary directory, not a broken repository or I/O error.
+            Err(error)
+                if error.to_string().contains(
+                    "fatal: not a git repository (or any of the parent directories): .git",
+                ) => {}
+            Err(error) => warnings.push(format!(
+                "Could not discover worktrees for {}: {error:#}",
+                root.display()
+            )),
         }
     }
+    let mut scope = UsageScope::from_paths(paths);
+    scope.warnings = warnings;
+    scope
+}
+
+fn usage_scope() -> Result<UsageScope> {
+    let (projects, _) = crate::store::projects::list()?;
+    let mut scope = project_usage_scope(
+        projects
+            .into_iter()
+            .map(|project| PathBuf::from(project.path)),
+    );
+    let mut paths = Vec::new();
     paths.extend(
         crate::store::index::load()?
             .into_iter()
@@ -827,7 +969,8 @@ fn usage_scope() -> Result<UsageScope> {
             read_usage_scope_cache(&root.join(name), &mut paths)?;
         }
     }
-    Ok(UsageScope::from_paths(paths))
+    scope.roots.extend(UsageScope::from_paths(paths).roots);
+    Ok(scope)
 }
 
 fn read_usage_scope_cache(path: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
@@ -865,23 +1008,6 @@ struct SessionEligibility {
 }
 
 #[derive(Default)]
-struct CostBucket {
-    new_input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-}
-
-impl CostBucket {
-    fn add(&mut self, event: &UsageEvent) {
-        self.new_input = self.new_input.saturating_add(event.new_input_tokens);
-        self.output = self.output.saturating_add(event.output_tokens);
-        self.cache_read = self.cache_read.saturating_add(event.cache_read_tokens);
-        self.cache_write = self.cache_write.saturating_add(event.cache_write_tokens);
-    }
-}
-
-#[derive(Default)]
 struct ProviderAccumulator {
     sessions: usize,
     activity_count: usize,
@@ -893,6 +1019,7 @@ struct ProviderAccumulator {
     cost: f64,
     has_cost: bool,
     partial_cost: bool,
+    unpriced_models: std::collections::BTreeSet<String>,
     model_tokens: BTreeMap<String, u64>,
     project_tokens: BTreeMap<String, u64>,
 }
@@ -919,13 +1046,17 @@ impl ProviderAccumulator {
         *project_total = project_total.saturating_add(model_weight);
     }
 
-    fn add_cost(&mut self, cost: Option<f64>) {
+    fn add_cost(&mut self, cost: Option<f64>, model: Option<&str>) {
         match cost {
             Some(cost) => {
                 self.cost += cost;
                 self.has_cost = true;
             }
-            None => self.partial_cost = true,
+            None => {
+                self.partial_cost = true;
+                self.unpriced_models
+                    .insert(model.unwrap_or("Unknown model").into());
+            }
         }
     }
 
@@ -943,6 +1074,7 @@ impl ProviderAccumulator {
             activity_label: activity_label.into(),
             estimated_cost_usd: self.has_cost.then_some(self.cost),
             has_partial_cost: self.partial_cost,
+            unpriced_models: self.unpriced_models.into_iter().collect(),
         }
     }
 }
@@ -960,25 +1092,35 @@ fn aggregate(
     scope: &UsageScope,
     cutoff: &str,
 ) -> StatsUsageSnapshot {
+    let range_end = chrono::NaiveDate::parse_from_str(cutoff, "%Y-%m-%d")
+        .expect("overview cutoff is a calendar date")
+        .checked_add_days(Days::new(OVERVIEW_DAYS - 1))
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
     let mut claude = ProviderAccumulator::default();
     let mut codex = ProviderAccumulator::default();
-    let mut seen = HashSet::<(Provider, String)>::new();
-    let mut events = Vec::new();
+    let mut seen = HashMap::<(Provider, String), usize>::new();
+    let mut events: Vec<&UsageEvent> = Vec::new();
     for file in files {
         for event in &file.events {
-            if event
-                .event_key
-                .as_ref()
-                .is_some_and(|key| !seen.insert((event.provider, key.clone())))
-            {
+            let key = (event.provider, projection_key(event));
+            if let Some(index) = seen.get(&key).copied() {
+                if event.total_tokens > events[index].total_tokens {
+                    events[index] = event;
+                }
                 continue;
             }
+            seen.insert(key, events.len());
             events.push(event);
         }
     }
 
     let mut sessions = HashMap::<(Provider, String), SessionEligibility>::new();
     for event in &events {
+        if event.day > range_end {
+            continue;
+        }
         let session = sessions
             .entry((event.provider, event.session_id.clone()))
             .or_default();
@@ -989,7 +1131,10 @@ fn aggregate(
         }
     }
     for ((provider, _), session) in sessions {
-        if session.has_scoped_location && session.last_day.as_str() >= cutoff {
+        if session.has_scoped_location
+            && session.last_day.as_str() >= cutoff
+            && session.last_day <= range_end
+        {
             match provider {
                 Provider::Claude => claude.sessions += 1,
                 Provider::Codex => codex.sessions += 1,
@@ -1002,28 +1147,44 @@ fn aggregate(
     let mut output_tokens = 0_u64;
     let mut cache_tokens = 0_u64;
     let mut reasoning_tokens = 0_u64;
-    let mut cost_buckets =
-        BTreeMap::<(Provider, String, Option<String>, String), CostBucket>::new();
+
     for event in events {
-        if event.day.as_str() < cutoff {
+        if event.day.as_str() < cutoff || event.day > range_end {
             continue;
         }
-        let Some(location) = scope.attribution(event.cwd.as_deref()) else {
+        let Some(_) = scope.attribution(event.cwd.as_deref()) else {
             continue;
         };
         match event.provider {
             Provider::Claude => claude.add(event),
             Provider::Codex => codex.add(event),
         }
-        cost_buckets
-            .entry((
-                event.provider,
-                event.day.clone(),
-                event.model.clone(),
-                location.into(),
-            ))
-            .or_default()
-            .add(event);
+        let cost = if event.unpriced {
+            None
+        } else {
+            match event.provider {
+                Provider::Claude => pricing::claude_request_cost(
+                    event.model.as_deref(),
+                    event.new_input_tokens,
+                    event.output_tokens,
+                    event.cache_read_tokens,
+                    event.cache_write_tokens,
+                    event.cache_write_hour_tokens,
+                ),
+                Provider::Codex => pricing::codex_cost(
+                    event.model.as_deref(),
+                    event
+                        .new_input_tokens
+                        .saturating_add(event.cache_read_tokens),
+                    event.cache_read_tokens,
+                    event.output_tokens,
+                ),
+            }
+        };
+        match event.provider {
+            Provider::Claude => claude.add_cost(cost, event.model.as_deref()),
+            Provider::Codex => codex.add_cost(cost, event.model.as_deref()),
+        }
         new_input_tokens = new_input_tokens.saturating_add(event.new_input_tokens);
         output_tokens = output_tokens.saturating_add(event.output_tokens);
         cache_tokens = cache_tokens.saturating_add(event.cache_tokens);
@@ -1040,28 +1201,6 @@ fn aggregate(
             Provider::Codex => {
                 day.codex_tokens = day.codex_tokens.saturating_add(event.total_tokens)
             }
-        }
-    }
-
-    for ((provider, _, model, _), bucket) in cost_buckets {
-        let cost = match provider {
-            Provider::Claude => pricing::claude_cost(
-                model.as_deref(),
-                bucket.new_input,
-                bucket.output,
-                bucket.cache_read,
-                bucket.cache_write,
-            ),
-            Provider::Codex => pricing::codex_cost(
-                model.as_deref(),
-                bucket.new_input.saturating_add(bucket.cache_read),
-                bucket.cache_read,
-                bucket.output,
-            ),
-        };
-        match provider {
-            Provider::Claude => claude.add_cost(cost),
-            Provider::Codex => codex.add_cost(cost),
         }
     }
 
@@ -1098,6 +1237,9 @@ fn aggregate(
         daily: daily.into_values().collect(),
         providers,
         updated_at: now_ms(),
+        discovery_warnings: scope.warnings.clone(),
+        range_start: cutoff.into(),
+        range_end,
     }
 }
 
@@ -1115,6 +1257,7 @@ fn off_provider(id: &str, label: &str) -> ProviderUsage {
         activity_label: "events".into(),
         estimated_cost_usd: None,
         has_partial_cost: false,
+        unpriced_models: Vec::new(),
     }
 }
 
@@ -1144,10 +1287,14 @@ mod tests {
             "id": "s", "projectPath": "/repo", "cwd": "/repo", "title": "Blank",
             "created": "2026-09-01T00:00:00Z", "modified": "2026-09-01T00:00:00Z",
             "tabs": [{"id": "t", "harness": "claude", "created": "2026-09-01T00:00:00Z"}]
-        })).unwrap();
+        }))
+        .unwrap();
         crate::store::index::save(&[session]).unwrap();
         let stats = app_stats().unwrap();
-        assert_eq!(stats.agents_spawned, 0, "a retained blank tab is not a live work start");
+        assert_eq!(
+            stats.agents_spawned, 0,
+            "a retained blank tab is not a live work start"
+        );
         assert_eq!(stats.tracking_since, None);
     }
 
@@ -1174,6 +1321,8 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: total_tokens,
             cache_write_tokens: 0,
+            cache_write_hour_tokens: 0,
+            unpriced: false,
             cache_tokens: total_tokens,
             reasoning_tokens: 0,
             total_tokens,
@@ -1239,7 +1388,7 @@ mod tests {
         assert_eq!(snapshot.output_tokens, 34);
         assert_eq!(snapshot.cache_tokens, 103);
         assert_eq!(snapshot.reasoning_tokens, 10);
-        assert!((snapshot.estimated_cost_usd.unwrap() - 0.001_153_75).abs() < 0.000_000_01);
+        assert!((snapshot.estimated_cost_usd.unwrap() - 0.000_875_75).abs() < 0.000_000_01);
     }
 
     #[test]
@@ -1293,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn pricing_tiers_apply_to_each_daily_model_location_bucket() {
+    fn pricing_thresholds_apply_to_each_request_not_daily_buckets() {
         let scope = UsageScope::from_paths([PathBuf::from("/work/repo")]);
         let files = [cached(vec![
             test_event(Provider::Codex, "one", "2026-09-03", "/work/repo", 200_000),
@@ -1306,7 +1455,7 @@ mod tests {
             ),
         ])];
         let snapshot = aggregate(&files, AppStats::default(), &scope, "2026-08-05");
-        assert!((snapshot.estimated_cost_usd.unwrap() - 0.264).abs() < 0.000_001);
+        assert!((snapshot.estimated_cost_usd.unwrap() - 0.16).abs() < 0.000_001);
     }
 
     #[test]
@@ -1462,6 +1611,8 @@ mod tests {
             output_tokens: 5,
             cache_read_tokens: 80,
             cache_write_tokens: 0,
+            cache_write_hour_tokens: 0,
+            unpriced: false,
             cache_tokens: 80,
             reasoning_tokens: 2,
             total_tokens: 105,
@@ -1537,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn app_read_failure_does_not_publish_a_scan_cache_and_confirmed_removal_invalidates() {
+    fn app_read_failure_does_not_publish_a_scan_cache_and_removal_preserves_accounting() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("claude.jsonl");
         fs::copy(
@@ -1571,6 +1722,7 @@ mod tests {
         let after: ScanCache = crate::store::read_json(&dir.path().join(CACHE_FILE))
             .unwrap()
             .unwrap();
-        assert!(after.files.is_empty());
+        assert_eq!(after.files.len(), 1);
+        assert_eq!(after.files[0].events.len(), before.files[0].events.len());
     }
 }

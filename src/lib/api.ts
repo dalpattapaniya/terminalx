@@ -163,6 +163,7 @@ export interface ProviderUsage {
   activityLabel: string;
   estimatedCostUsd: number | null;
   hasPartialCost: boolean;
+  unpricedModels?: string[];
 }
 
 export interface StatsUsageSnapshot {
@@ -179,6 +180,9 @@ export interface StatsUsageSnapshot {
   daily: UsageDay[];
   providers: ProviderUsage[];
   updatedAt: number;
+  discoveryWarnings?: string[];
+  rangeStart?: string;
+  rangeEnd?: string;
 }
 
 export interface StatsUsageState {
