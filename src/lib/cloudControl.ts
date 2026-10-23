@@ -735,11 +735,14 @@ async function sessionsCreate(params: Params) {
   if (!project.selected) throw forbidden("This repository is no longer selected for cloud workspaces in its organization.");
   const prefs = getPrefs();
   const agent = text(params, "agent") ?? "claude";
+  const explicitMode = typeof params.mode === "string";
+  const mode = pickerMode(explicitMode ? (text(params, "mode") ?? "") : prefs.lastMode)?.id;
+  if (explicitMode && !mode) throw invalid(`Unknown permission mode ${params.mode}.`);
   const request: CloudSessionRequest = {
     agent,
     model: text(params, "model") ?? prefs.lastModel[agent] ?? "",
     effort: text(params, "effort") ?? prefs.lastEffort[agent] ?? null,
-    mode: pickerMode(typeof params.mode === "string" ? params.mode : prefs.lastMode)?.id ?? DEFAULT_PERMISSION_MODE,
+    mode: mode ?? DEFAULT_PERMISSION_MODE,
     prompt,
     useWorktree: params.useWorktree !== false,
   };

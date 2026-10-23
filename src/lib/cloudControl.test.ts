@@ -482,7 +482,7 @@ describe("creating a session", () => {
       ["bypass", "bypassPermissions"],
       ["", "bypassPermissions"],
       ["   ", "bypassPermissions"],
-      ["unknown", "bypassPermissions"],
+      ...(source === "saved" ? [["unknown", "bypassPermissions"]] : []),
       ["plan", "plan"],
       ["manual", "manual"],
       ["auto", "auto"],
@@ -504,6 +504,23 @@ describe("creating a session", () => {
         setPrefs({ lastMode: previousMode });
       }
     });
+  });
+
+  it.each(["unknown", "manuaI"])("rejects unknown explicit mode %j before starting anything", async (mode) => {
+    const { getPrefs, setPrefs } = await import("@/lib/prefs");
+    const previousMode = getPrefs().lastMode;
+    setPrefs({ lastMode: "manual" });
+    try {
+      expect(await refusal("sessions.create", { project: PROJECT, prompt: "fix the login", mode })).toMatchObject({
+        code: "invalid_arguments",
+        message: `Unknown permission mode ${mode}.`,
+      });
+      expect(newSession.startInWorkspace).not.toHaveBeenCalled();
+      expect(newSession.prepareCloudCreate).not.toHaveBeenCalled();
+      expect(newSession.confirmCloudCreate).not.toHaveBeenCalled();
+    } finally {
+      setPrefs({ lastMode: previousMode });
+    }
   });
 
   it("adds it to the project's running workspace, without moving the window's selection", async () => {
