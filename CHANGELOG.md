@@ -18,6 +18,8 @@
 
 ### Issues
 
+- Offer a cloud repository’s Markdown issue templates in the new-issue form,
+  read through your own GitHub CLI login without a local checkout. (#575)
 - Pipeline reviewers no longer count as another session working on the issue,
   locally or in cloud workspaces, even after their pipeline history is trimmed.
   Existing local reviewer links are removed. New cloud connections read reviewer
