@@ -46,6 +46,8 @@ export interface IssueWorker {
   lastActive: number;
   /** The session on this Mac, which can be opened. */
   sessionId: string | null;
+  /** The reader's remote claim identity; never used to open a local session. */
+  claimSessionId?: string | null;
   /** How this Mac's session got its link, when not started on the issue. */
   link: IssueLinkSource | null;
 }
@@ -184,6 +186,7 @@ function remoteWorker(claim: WorkClaim, offset: number, now: number): IssueWorke
     since: claim.since + offset,
     lastActive,
     sessionId: null,
+    claimSessionId: you ? claim.sessionId ?? null : null,
     link: null,
   };
 }

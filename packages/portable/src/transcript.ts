@@ -27,11 +27,11 @@ const COMPACTION_SUMMARY_OPENING = "This session is being continued from a previ
 export type WorkItem =
   | { kind: "tool"; call: ToolCall; key: string }
   | { kind: "tool_group"; name: string; calls: ToolCall[]; key: string }
-  | { kind: "text"; text: string; key: string; seq: number }
+  | { kind: "text"; text: string; key: string; seq: number; messageTs?: string }
   | { kind: "reasoning"; text: string; key: string; seq: number }
-  | { kind: "queued"; author?: { userId: string; displayName: string }; text: string; key: string; seq: number; ts?: string; images?: { url: string; name?: string }[] }
+  | { kind: "queued"; author?: { userId: string; displayName: string }; text: string; key: string; seq: number; ts?: string; messageTs?: string; images?: { url: string; name?: string }[] }
   /** A queued message the agent took mid-turn (#551): the reader's own words, where the agent read them. */
-  | { kind: "message"; author?: { userId: string; displayName: string }; text: string; key: string; seq: number; ts?: string; images?: { url: string; name?: string }[] }
+  | { kind: "message"; author?: { userId: string; displayName: string }; text: string; key: string; seq: number; ts?: string; messageTs?: string; images?: { url: string; name?: string }[] }
   | { kind: "status"; text: string; key: string; seq: number }
   | { kind: "error"; text: string; key: string; seq: number }
   | { kind: "compaction"; preTokens?: number; postTokens?: number; summary?: string; key: string; seq: number }
@@ -44,7 +44,7 @@ export interface Turn {
   seq: number;
   /** Time of the event that opened this turn, even without a prompt or completion. */
   ts: string;
-  prompt?: { author?: { userId: string; displayName: string }; text: string; images?: { url: string; name?: string }[]; ts: string; seq: number };
+  prompt?: { author?: { userId: string; displayName: string }; text: string; images?: { url: string; name?: string }[]; ts: string; messageTs?: string; seq: number };
   work: WorkItem[];
   finalText?: string;
   completed?: { status: string; durationMs?: number; ts: string; head?: string };
@@ -141,7 +141,7 @@ function takeMessage(turns: Turn[], seq: number): { prompt: NonNullable<Turn["pr
   const found = pullQueued(turns, seq);
   if (!found) return undefined;
   const { item, turn } = found;
-  return { prompt: { author: item.author, text: item.text, images: item.images, ts: item.ts ?? turn.completed?.ts ?? "", seq: item.seq }, from: turn };
+  return { prompt: { author: item.author, text: item.text, images: item.images, ts: item.ts ?? "", messageTs: item.messageTs, seq: item.seq }, from: turn };
 }
 
 /**
@@ -219,7 +219,7 @@ export function buildTranscript(events: AgentEvent[], live: boolean): Transcript
         // nothing yet: a turn the agent started itself is heard of before its
         // first record (#540), and the message is not that turn's prompt.
         if (payload.queued) {
-          ensureTurn(event).work.push({ kind: "queued", author: payload.author, text, key: `q${event.seq}`, seq: event.seq, ts: event.ts, images: payload.images });
+          ensureTurn(event).work.push({ kind: "queued", author: payload.author, text, key: `q${event.seq}`, seq: event.seq, ts: event.ts, messageTs: event.messageTs, images: payload.images });
           break;
         }
         for (const call of calls.values()) if (!call.result) call.abandoned = true;
@@ -227,7 +227,7 @@ export function buildTranscript(events: AgentEvent[], live: boolean): Transcript
           key: `t${event.seq}`,
           seq: event.seq,
           ts: event.ts,
-          prompt: { author: payload.author, text, images: payload.images, ts: event.ts, seq: event.seq },
+          prompt: { author: payload.author, text, images: payload.images, ts: event.ts, messageTs: event.messageTs, seq: event.seq },
           work: [],
           toolCount: 0,
           editedFiles: 0,
@@ -290,7 +290,7 @@ export function buildTranscript(events: AgentEvent[], live: boolean): Transcript
       }
       case "assistant_text": {
         const turn = ensureTurn(event);
-        if (payload.text.trim()) turn.work.push({ kind: "text", text: payload.text, key: `a${event.seq}`, seq: event.seq });
+        if (payload.text.trim()) turn.work.push({ kind: "text", text: payload.text, key: `a${event.seq}`, seq: event.seq, messageTs: event.messageTs });
         modelRequestOpen = false;
         break;
       }
@@ -339,7 +339,7 @@ export function buildTranscript(events: AgentEvent[], live: boolean): Transcript
         const lastText = [...turn.work].reverse().find((item) => item.kind === "text");
         if (payload.finalText && (!lastText || (lastText.kind === "text" && lastText.text.trim() !== payload.finalText.trim()))) {
           if (payload.status !== "ok") turn.finalText = payload.finalText;
-          else if (!lastText) turn.work.push({ kind: "text", text: payload.finalText, key: `f${event.seq}`, seq: event.seq });
+          else if (!lastText) turn.work.push({ kind: "text", text: payload.finalText, key: `f${event.seq}`, seq: event.seq, messageTs: event.messageTs });
         }
         if (payload.usage) {
           if (payload.usage.contextUsed != null) contextUsed = payload.usage.contextUsed;
@@ -545,4 +545,16 @@ export function callTarget(call: ToolCall): string | undefined {
     if (typeof value === "string" && value) return value;
   }
   return undefined;
+}
+
+/** Local display of an authoritative event time. Unzoned/invalid legacy values are unknown. */
+export function messageTime(ts?: string, locales?: string, timeZone?: string): { short: string; full: string; iso: string } | undefined {
+  if (!ts || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(ts)) return undefined;
+  const date = new Date(ts);
+  if (!Number.isFinite(date.getTime())) return undefined;
+  return {
+    short: new Intl.DateTimeFormat(locales, { timeStyle: "short", timeZone }).format(date),
+    full: new Intl.DateTimeFormat(locales, { dateStyle: "full", timeStyle: "long", timeZone }).format(date),
+    iso: date.toISOString(),
+  };
 }

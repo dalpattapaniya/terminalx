@@ -9,13 +9,17 @@ use std::sync::{Arc, Mutex};
 const DISPLAY_FILE: &str = "stats-usage-snapshot.json";
 // Bump whenever provider aggregation, attribution, or pricing changes.
 // App activity is read independently from its durable ledger on every response.
-const DISPLAY_SCHEMA: u32 = 1;
+const DISPLAY_SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Scope {
     root: PathBuf,
     home: PathBuf,
     predecessor: Option<PathBuf>,
+    #[serde(default)]
+    claude_home: Option<PathBuf>,
+    #[serde(default)]
+    codex_home: Option<PathBuf>,
 }
 
 impl Scope {
@@ -24,6 +28,8 @@ impl Scope {
             root: std::fs::canonicalize(crate::store::root()?)?,
             home: dirs::home_dir().context("no home directory")?,
             predecessor: super::predecessor_data_root(),
+            claude_home: std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+            codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
         })
     }
 
@@ -288,6 +294,8 @@ mod tests {
             root: root.into(),
             home: root.join("home"),
             predecessor: None,
+            claude_home: None,
+            codex_home: None,
         }
     }
     fn snapshot(tokens: u64) -> StatsUsageSnapshot {
