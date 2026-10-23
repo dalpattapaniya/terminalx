@@ -1215,10 +1215,6 @@ private func permissionStatusSnapshotSettled() -> PermissionStatusSnapshot {
     )
 }
 
-private func requestScreenCaptureAccess() -> Bool {
-    CGRequestScreenCaptureAccess()
-}
-
 private func openAccessibilitySettings() {
     openSystemSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
 }
@@ -3240,7 +3236,7 @@ private final class PermissionWindowController: NSWindowController {
     }
 
     func openPermission(_ permission: PermissionKind) {
-        permission.requestAndOpenSettings()
+        permission.openSettings()
         showDragAssistant(for: permission)
     }
 
@@ -3338,12 +3334,13 @@ private enum PermissionKind: CaseIterable {
         }
     }
 
-    func requestAndOpenSettings() {
+    func openSettings() {
         switch self {
         case .accessibility:
             openAccessibilitySettings()
         case .screenshots:
-            _ = requestScreenCaptureAccess()
+            // The helper drag tile adds the row. Requesting capture access here
+            // would also show a macOS prompt over the settings we are opening.
             openScreenRecordingSettings()
         }
     }
@@ -3438,7 +3435,7 @@ private final class PermissionView: NSView {
         } else {
             for permission in missingPermissions {
                 stack.addArrangedSubview(permissionRow(permission: permission) { [weak self] in
-                    permission.requestAndOpenSettings()
+                    permission.openSettings()
                     self?.showDragAssistant(permission)
                 })
             }
