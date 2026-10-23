@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Issues
+
+- Offer a cloud repository’s Markdown issue templates in the new-issue form,
+  read through your own GitHub CLI login without a local checkout. (#575)
+
 ### Computer use
 
 - Screen Recording **Grant…** opens System Settings with the helper drag tile

@@ -72,6 +72,7 @@ const ISSUE_COMMANDS = new Set([
   "issue_set_title",
   "issue_set_description",
   "issue_create",
+  "issue_templates",
   // Who works on the issues listed (#441): the claims are read by the issues' repository.
   "work_claims_list",
 ]);
