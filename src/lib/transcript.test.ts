@@ -317,6 +317,55 @@ describe("buildTranscript", () => {
     expect(t.turns[0].work.map((w) => w.kind)).toEqual(["text"]);
   });
 
+  it.each(["/model x", "/effort high"])("separates scheduled work from unfinished %s (#566)", (command) => {
+    const started = ev({ type: "turn_started", startedBy: "Scheduled check" });
+    const events = [ev({ type: "user_message", text: command, queued: false }), ev({ type: "status", text: "Setting changed" }), started, toolStart("scheduled", "Bash")];
+    const active = buildTranscript(events, true);
+    expect(active.turns).toHaveLength(2);
+    expect(active.turns[0].live).toBe(false);
+    expect(active.turns[1].prompt).toBeUndefined();
+    expect(active.workingSince).toBe(Date.parse(started.ts));
+    events.push(toolDone("scheduled"), ev({ type: "assistant_text", text: "Scheduled report" }), ev({ type: "turn_completed", status: "ok", authFailed: false, durationMs: 12000 }));
+    const { turns } = buildTranscript(events, false);
+    expect(turns[0].work.map((w) => w.kind)).toEqual(["status"]);
+    expect(turns[0].completed).toBeUndefined();
+    expect(turns[1].work.map((w) => w.kind)).toEqual(["status", "tool", "text"]);
+    expect(turns[1].completed?.durationMs).toBe(12000);
+  });
+
+  it("moves waiting prompts off a bare command and preserves their take order (#566)", () => {
+    const first = ev({ type: "user_message", text: "first", queued: true });
+    const second = ev({ type: "user_message", text: "second", queued: true });
+    const events = [ev({ type: "user_message", text: "/model x", queued: false }), first, second, ev({ type: "turn_started", startedBy: "Scheduled check", initiatingPrompt: "Check the job" })];
+    let t = buildTranscript(events, true);
+    expect(t.turns[0].work).toEqual([]);
+    expect(t.turns[1].work.map((w) => w.kind)).toEqual(["queued", "queued", "status"]);
+    expect(t.turns[1].work[2]).toMatchObject({ initiatingPrompt: "Check the job" });
+    events.push(ev({ type: "turn_completed", status: "ok", authFailed: false }), ev({ type: "turn_started", promptSeq: first.seq }));
+    t = buildTranscript(events, true);
+    expect(t.turns.map((turn) => turn.prompt?.text)).toEqual(["/model x", undefined, "first"]);
+    expect(t.turns[2].work).toMatchObject([{ kind: "queued", text: "second" }]);
+  });
+
+  it("does not treat a multiline reader prompt as a bare command (#566)", () => {
+    const { turns } = buildTranscript([ev({ type: "user_message", text: "/review\n", queued: false }), ev({ type: "turn_started", startedBy: "A background task reported in" })], true);
+    expect(turns).toHaveLength(1);
+  });
+
+  it("keeps a slash command with a pending model request in its running turn (#566)", () => {
+    const { turns } = buildTranscript([ev({ type: "user_message", text: "/review", queued: false }), ev({ type: "model_request_started" }), ev({ type: "turn_started", startedBy: "A background task reported in" })], true);
+    expect(turns).toHaveLength(1);
+    expect(turns[0].prompt?.text).toBe("/review");
+  });
+
+  it("keeps a notification within genuinely running slash-command work (#566)", () => {
+    const events = [ev({ type: "user_message", text: "/review", queued: false }), toolStart("review", "Read"), ev({ type: "turn_started", startedBy: "A background task reported in" }), toolDone("review")];
+    const { turns } = buildTranscript(events, true);
+    expect(turns).toHaveLength(1);
+    expect(turns[0].toolCount).toBe(1);
+    expect(turns[0].work[0]).toMatchObject({ kind: "tool", call: { abandoned: false, result: expect.anything() } });
+  });
+
   // #540: a `/loop` check started by the agent, and a goal sent while it ran.
   // The terminal showed the check's report, then the goal, then the answer.
   it("draws a turn the agent started itself with no prompt, and a message queued behind it below its work", () => {

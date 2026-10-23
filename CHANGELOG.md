@@ -31,6 +31,11 @@
 
 ### Chats
 
+- Keep initiating text expandable beneath autonomous-turn status, treat unknown
+  Claude prompt origins as reader messages, and separate scheduled work from
+  unfinished bare slash commands without splitting running work. Preserve
+  compaction summaries within their original turn. (#566)
+
 - Keep completed Claude compaction idle instead of raising a false stall
   warning, including manual `/compact` queued behind a running turn. Record
   privacy-safe turn-opener labels in stall diagnostics while retaining warnings

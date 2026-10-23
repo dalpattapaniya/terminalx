@@ -183,7 +183,17 @@ function WorkRow({ item, cwd, linkContext, onSendQueuedNow }: { item: WorkItem; 
         </div>
       );
     case "status":
-      return <div className="px-1.5 py-1 text-xs text-faint"><LinkedText text={item.text} context={linkContext} /></div>;
+      return (
+        <div className="px-1.5 py-1 text-xs text-faint">
+          <LinkedText text={item.text} context={linkContext} />
+          {item.initiatingPrompt?.trim() && (
+            <details className="mt-1">
+              <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2">Initiating prompt</summary>
+              <div className="mt-2 whitespace-pre-wrap break-words select-text"><LinkedText text={item.initiatingPrompt} context={linkContext} /></div>
+            </details>
+          )}
+        </div>
+      );
     case "error":
       return (
         <div className="my-1 flex items-start gap-2 rounded-md bg-destructive/10 px-3 py-2 text-[13px] text-destructive">

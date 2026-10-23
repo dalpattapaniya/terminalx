@@ -231,6 +231,9 @@ pub enum Payload {
         /// while it runs is queued behind it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         started_by: Option<String>,
+        /// Original initiating text, disclosed under the origin status rather than a reader bubble.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initiating_prompt: Option<String>,
     },
     TurnCompleted {
         status: TurnStatus,
