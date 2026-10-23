@@ -80,7 +80,7 @@ import { TERMINAL_APPROVAL_REASON, VIEWER_REASON, resetCollab } from "@/lib/clou
 import { dropSessionTerminals, selectSessionTab } from "@/lib/terminal";
 import { TERMINAL_VIEW_OLD_RUNTIME, resetCloudWakes } from "@/lib/sessionBackend";
 import { resetTabViews } from "@/lib/tabViews";
-import { upsertSession, useSessionStore } from "@/lib/sessions";
+import { addProject, upsertSession, useSessionStore } from "@/lib/sessions";
 import { cloudSessionKey } from "@/types/target";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FakeAgentRuntime, agentTab, fakeXterm, type FakeXterm } from "@/test/fakeAgentRuntime";
@@ -276,6 +276,7 @@ describe("a local session's row of tabs under the title bar", () => {
     guard.strict = false;
     guard.local = () => null;
     guard.handlers.work_status = () => ({ isRepo: true, dirty: false, branch: "raccoon/fix", ahead: 0, behind: 0 });
+    guard.handlers.list_harnesses = () => [];
     mocks.prefs.tabStrip = true;
   });
   afterEach(() => {
@@ -306,6 +307,9 @@ describe("a local session's row of tabs under the title bar", () => {
     expect(actions.contains(plus)).toBe(false);
     expect(actions.className).toContain("ml-auto");
     expect(within(actions as HTMLElement).getByRole("button", { name: "Toggle panel" })).toBeTruthy();
+    const share = within(header).getByRole("button", { name: "Share session…" });
+    const continuation = within(header).getByRole("button", { name: "Continue in New Session…" });
+    expect(share.nextElementSibling).toBe(continuation);
     // The open tab is the underlined one.
     const [open, other] = within(strip).getAllByRole("tab");
     expect(open.getAttribute("aria-selected")).toBe("true");
@@ -314,6 +318,52 @@ describe("a local session's row of tabs under the title bar", () => {
     // The title bar is where the window is dragged from; the row is not part of it.
     expect(header.getAttribute("data-tauri-drag-region")).toBe("deep");
     expect(row.closest("[data-tauri-drag-region]")).toBeNull();
+  });
+
+  it.each(["title-bar button", "workspace menu"])("opens the shared continuation dialog for the visible tab from the %s", async (entry) => {
+    const header = show();
+    // The tab on screen can differ from the session's persisted activeTab.
+    fireEvent.click(screen.getByRole("tab", { name: "Write the fix" }));
+    if (entry === "workspace menu") {
+      const menu = within(header).getByRole("button", { name: "Workspace details" });
+      fireEvent.pointerDown(menu, { button: 0, pointerType: "mouse" });
+      fireEvent.pointerUp(menu, { button: 0, pointerType: "mouse" });
+      fireEvent.click(menu);
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Continue in New Session…" }));
+    } else {
+      fireEvent.click(within(header).getByRole("button", { name: "Continue in New Session…" }));
+    }
+    const dialog = await screen.findByRole("dialog", { name: "Continue in New Session" });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(within(dialog).getByText("Write the fix")).toBeTruthy();
+    expect(guard.calls.filter((call) => call.command === "prepare_continuation").map((call) => call.args)).toEqual([
+      { sessionId: "strip-1", tabId: "st-2" },
+    ]);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it.each(["quick chat", "non-Git folder"])("offers continuation for a branchless %s without a workspace menu", async (kind) => {
+    if (kind === "non-Git folder") {
+      guard.handlers.add_project = () => ({ path: "/Users/me/notes", name: "Notes", kind: "folder" });
+      await addProject("/Users/me/notes");
+    }
+    const header = show({
+      ...(kind === "quick chat" ? { kind: "quick" } : {}),
+      projectPath: "/Users/me/notes",
+      cwd: "/Users/me/notes",
+      branch: null,
+      worktreeName: null,
+    });
+    expect(within(header).queryByRole("button", { name: "Workspace details" })).toBeNull();
+    expect(within(header).getByRole("button", { name: "Continue in New Session…" })).toBeTruthy();
+  });
+
+  it("has no continuation action without an active agent tab", async () => {
+    const header = show({ tabs: [], activeTab: null });
+    expect(within(header).queryByRole("button", { name: "Continue in New Session…" })).toBeNull();
+    // Let the empty session finish opening its shell before the next test.
+    await screen.findByRole("tab", { name: "Terminal 1" });
   });
 
   it("names each tab's panel by its tab in the strip", () => {
@@ -345,6 +395,7 @@ describe("a local session's row of tabs under the title bar", () => {
     await open();
     expect(screen.queryByRole("tablist", { name: "Workspace tabs" })).toBeNull();
     expect(screen.getByTestId("session-project")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Continue in New Session…" })).toBeNull();
   });
 
   it("leaves the reader on the terminal they are in when the last agent tab is closed from the strip", async () => {
@@ -366,6 +417,7 @@ describe("a local session's row of tabs under the title bar", () => {
     await settle();
     // The terminal is still the tab on screen, and no shell was opened behind it.
     expect(tabs().map((item) => [item.getAttribute("aria-label"), item.getAttribute("aria-selected")])).toEqual([["Terminal 1", "true"]]);
+    expect(screen.queryByRole("button", { name: "Continue in New Session…" })).toBeNull();
     expect(spawned()).toHaveLength(1);
   });
 
@@ -414,10 +466,27 @@ describe("a quick chat in the floating window's compact chrome", () => {
     expect(screen.getByTestId("switcher")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Open in main window" })).toBeTruthy();
     // And everything a session can do in the main window.
+    expect(screen.getByRole("button", { name: "Continue in New Session…" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "New tab" })).toBeTruthy();
     expect(await screen.findByRole("button", { name: "Show terminal view" })).toBeTruthy();
     // No git was asked about a scratch folder.
     expect(guard.calls.map((call) => call.command)).not.toContain("work_status");
+  });
+
+  it("opens the shared continuation dialog from the first action in the floating window", async () => {
+    guard.handlers.list_harnesses = () => [];
+    const session = quick();
+    upsertSession(session);
+    const view = render(wrap(<SessionView session={session} sidebarOpen={false} onToggleSidebar={() => undefined} chrome={compact} />));
+    const button = screen.getByRole("button", { name: "Continue in New Session…" });
+    expect(view.container.querySelector("header")!.lastElementChild!.firstElementChild).toBe(button);
+    expect(screen.queryByRole("button", { name: "Share session…" })).toBeNull();
+    fireEvent.click(button);
+    await screen.findByRole("dialog", { name: "Continue in New Session" });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(guard.calls.filter((call) => call.command === "prepare_continuation").map((call) => call.args)).toEqual([
+      { sessionId: session.id, tabId: session.activeTab },
+    ]);
   });
 
   it("switches the agent tab between chat and terminal view", async () => {
