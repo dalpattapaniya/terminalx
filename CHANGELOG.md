@@ -8,6 +8,12 @@
   on loaded Macs, while keeping the app's five-second timeout and helper
   cleanup unchanged. (#579)
 
+### Editor
+
+- Keep Preview / Source and neighbouring toolbar buttons readable in narrow
+  editor panes, stepping down to labelled icons as space runs out. Shared
+  segmented switches keep equal, content-sized options and aligned thumbs. (#482)
+
 ### Command line
 
 - Cloud session creation normalizes saved and explicit permission modes just
