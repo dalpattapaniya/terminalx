@@ -999,6 +999,11 @@ impl SessionManager {
                 Err(error) => log::warn!("name conversation: {error:#}"),
             }
         }
+        match store::message_activity::record(&ev) {
+            Ok(Some(session)) => self.sink.emit("session_updated", &session),
+            Ok(None) => {}
+            Err(error) => log::warn!("record message activity: {error:#}"),
+        }
         self.observer.agent_event(&ev);
         self.sink.emit("agent_event", &ev);
         ev

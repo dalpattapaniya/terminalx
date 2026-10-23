@@ -2269,6 +2269,7 @@ impl WorkspaceRpc {
 
     /// Every session of this workspace, whoever asks.
     fn workspace_sessions(&self) -> Result<Vec<SessionEntry>, RpcError> {
+        crate::store::message_activity::backfill(self.sink.clone());
         let root = self.root.to_string_lossy();
         Ok(index::load().map_err(RpcError::internal)?.into_iter().filter(|session| session.project_path == root).collect())
     }

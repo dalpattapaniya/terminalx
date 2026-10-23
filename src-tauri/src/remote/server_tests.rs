@@ -678,6 +678,9 @@ impl crate::cloud_agents::AgentOps for OneTab {
             last_seq: 0,
             created: String::new(),
             modified: String::new(),
+            last_message_at: None,
+            session_created: None,
+            session_last_message_at: None,
         }]
     }
     fn busy(&self, _: &str, _: &str) -> bool {

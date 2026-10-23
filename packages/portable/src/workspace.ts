@@ -182,6 +182,8 @@ export type AgentTabStatus = "idle" | "in_progress" | "waiting" | "completed";
 
 /** An agent tab as `session.tabs` and `session.configure` describe it (docs/CLOUD-AGENT-TABS.md). */
 export interface AgentTabInfo {
+  sessionCreated?: string | null;
+  sessionLastMessageAt?: string | null;
   sessionId: string;
   tabId: string;
   title: string | null;
@@ -211,6 +213,8 @@ export interface AgentTabInfo {
   lastSeq: number;
   created: string;
   modified: string;
+  /** Latest verified user/assistant message time; absent for unverified history. */
+  lastMessageAt?: string | null;
 }
 
 /** An agent tab as the runtime's session index stores it. */
@@ -224,6 +228,8 @@ export interface RuntimeSessionTab {
   status: AgentTabStatus;
   created: string;
   modified: string;
+  /** Latest verified user/assistant message time; absent for unverified history. */
+  lastMessageAt?: string | null;
 }
 
 /** `workspace.remove`: the sessions that went with the worktree, and what became of its branch. */
@@ -423,6 +429,8 @@ export interface RuntimeSession {
   title: string;
   created: string;
   modified: string;
+  /** Latest verified user/assistant message time; absent for unverified history. */
+  lastMessageAt?: string | null;
   archived: boolean;
   pinned: boolean;
   tabs: RuntimeSessionTab[];
