@@ -977,6 +977,10 @@ impl SessionManager {
             tab_id: rt.tab_id.clone(),
             harness: rt.harness.clone(),
             seq: rt.seq,
+            message_ts: (!ts.is_empty() && matches!(&payload,
+                Payload::UserMessage { .. } | Payload::AssistantText { .. }
+                | Payload::TurnCompleted { .. } | Payload::Delta(Delta::TextDelta { .. })
+            )).then(|| ts.clone()),
             ts,
             subagent,
             payload,

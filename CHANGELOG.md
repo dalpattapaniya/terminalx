@@ -7,7 +7,8 @@
 - Show compact local message times with full dates available by keyboard or
   tap, across local, cloud and mobile chats. Keep source timestamps through
   transcript imports and the first text-chunk time through streaming; omit
-  missing or invalid historical times. (#600)
+  missing or invalid historical times, including legacy records whose saved
+  timestamp may be their import time. (#600)
 
 ### Computer use
 

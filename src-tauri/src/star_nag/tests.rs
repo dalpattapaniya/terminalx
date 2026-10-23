@@ -11,7 +11,7 @@ fn launches(core: &mut Core, count: u64, now: i64) {
     }
 }
 fn event(payload: Payload) -> AgentEvent {
-    AgentEvent { id: "event".into(), session_id: "s".into(), tab_id: "t".into(), harness: "codex".into(), seq: 1, ts: String::new(), subagent: None, payload }
+    AgentEvent { id: "event".into(), session_id: "s".into(), tab_id: "t".into(), harness: "codex".into(), seq: 1, ts: String::new(), message_ts: None, subagent: None, payload }
 }
 fn prompt(text: &str, queued: bool) -> AgentEvent {
     event(Payload::UserMessage { author: None, text: text.into(), images: vec![], baseline: None, queued, cwd: None })

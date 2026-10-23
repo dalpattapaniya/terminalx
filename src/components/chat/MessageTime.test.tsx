@@ -8,7 +8,7 @@ import { turnRows } from "../../../mobile/src/ui/transcript-rows";
 
 vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: (path: string) => path, invoke: vi.fn() }));
 afterEach(cleanup);
-const event = (seq: number, ts: string, payload: Payload): AgentEvent => ({ id: `e${seq}`, seq, ts, sessionId: "synthetic", tabId: "tab", harness: "claude", payload });
+const event = (seq: number, ts: string, payload: Payload): AgentEvent => ({ id: `e${seq}`, seq, ts, messageTs: ts, sessionId: "synthetic", tabId: "tab", harness: "claude", payload });
 const sent = "2026-10-22T23:59:00Z";
 const replied = "2026-10-23T00:01:00Z";
 const events = [event(1, sent, { type: "user_message", text: "Synthetic prompt", queued: false }), event(2, replied, { type: "assistant_text", text: "Synthetic reply" })];
@@ -48,11 +48,11 @@ it.each([undefined, "/synthetic/repo"])("renders persisted times in shared local
 it("preserves sent times when queued messages are absorbed or become the next prompt", () => {
   const queued = event(3, replied, { type: "user_message", text: "Synthetic follow-up", queued: true });
   const absorbed = buildTranscript([...events, queued, event(4, "2026-10-23T01:00:00Z", { type: "prompt_absorbed", promptSeq: 3 })], false);
-  expect(absorbed.turns[0].work.at(-1)).toMatchObject({ kind: "message", ts: replied });
+  expect(absorbed.turns[0].work.at(-1)).toMatchObject({ kind: "message", messageTs: replied });
   const promoted = buildTranscript([...events, queued, event(4, "2026-10-23T01:00:00Z", { type: "turn_started", promptSeq: 3 })], false);
-  expect(promoted.turns.at(-1)?.prompt?.ts).toBe(replied);
+  expect(promoted.turns.at(-1)?.prompt?.messageTs).toBe(replied);
   const unknown = buildTranscript([events[0], event(3, "", queued.payload), event(4, replied, { type: "turn_completed", status: "ok", authFailed: false }), event(5, replied, { type: "turn_started", promptSeq: 3 })], false);
-  expect(unknown.turns.at(-1)?.prompt?.ts).toBe("");
+  expect(unknown.turns.at(-1)?.prompt?.messageTs).toBe("");
   const { container } = render(<TurnBlock turn={unknown.turns.at(-1)!} sessionId="synthetic" stream={[]} working={false} />);
   expect(container.querySelector("time")).toBeNull();
 });
@@ -63,5 +63,42 @@ it("shows one time per message across mobile markdown chunks and queued/absorbed
   if (text.kind === "text") text.text = "First paragraph\n\nSecond paragraph";
   const rows = turnRows(turn);
   expect(rows.filter((row) => row.ts).map((row) => row.ts)).toEqual([sent, replied, replied]);
-  expect(rows.filter((row) => row.kind === "work" && row.item.kind === "queued" && row.item.ts === sent)).toHaveLength(1);
+  expect(rows.filter((row) => row.kind === "work" && row.item.kind === "queued" && row.item.messageTs === sent)).toHaveLength(1);
+});
+
+it.each([undefined, "/synthetic/repo"])("omits valid-looking legacy import times after upgrade and reload (cwd %s)", (cwd) => {
+  // An older runtime imported a multi-day conversation in one batch. Its ts
+  // values are valid ISO dates, but say nothing about when the messages were sent.
+  const imported = "2026-10-23T12:00:00Z";
+  const legacyPayloads: Payload[] = [
+    { type: "user_message", text: "Synthetic old prompt", queued: false },
+    { type: "assistant_text", text: "Synthetic old reply" },
+    { type: "user_message", text: "Synthetic old absorbed input", queued: true },
+    { type: "prompt_absorbed", promptSeq: 3 },
+    { type: "user_message", text: "Synthetic old queued input", queued: true },
+    { type: "turn_completed", status: "ok", authFailed: false },
+    { type: "turn_started", promptSeq: 5 },
+    { type: "turn_completed", status: "ok", finalText: "Synthetic old final-only reply", authFailed: false },
+  ];
+  const legacy = legacyPayloads.map((payload, index) => {
+    const { messageTs: _unverified, ...old } = event(index + 1, imported, payload);
+    return old;
+  });
+  const modern = [event(9, sent, events[0].payload), event(10, replied, events[1].payload)];
+  // The new marker survives ordinary serialization/sync. No timestamp is
+  // inferred for old records, and their event metadata remains untouched.
+  const saved = JSON.stringify([...legacy, ...modern]);
+  const draw = () => {
+    const transcript = buildTranscript(JSON.parse(saved), false);
+    expect(transcript.turns[0].ts).toBe(imported);
+    expect(transcript.turns[0].prompt?.ts).toBe(imported);
+    const mobileTimes = transcript.turns.flatMap(turnRows).flatMap((row) => row.kind === "work" && "messageTs" in row.item ? [row.item.messageTs] : [row.ts]).filter(Boolean);
+    expect(mobileTimes).toEqual([sent, replied]);
+    return <>{transcript.turns.map((turn) => <TurnBlock key={turn.key} turn={turn} sessionId="synthetic" cwd={cwd} stream={[]} working={false} />)}</>;
+  };
+  const { container, rerender } = render(draw());
+  const times = () => [...container.querySelectorAll("time")].map((time) => time.dateTime);
+  expect(times()).toEqual([new Date(sent).toISOString(), new Date(replied).toISOString()]);
+  rerender(draw());
+  expect(times()).toEqual([new Date(sent).toISOString(), new Date(replied).toISOString()]);
 });

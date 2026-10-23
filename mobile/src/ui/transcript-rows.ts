@@ -18,15 +18,15 @@ export function turnRows(turn: Turn): TurnRow[] {
   };
   if (turn.prompt) {
     const chunks = turn.prompt.text ? textChunks(turn.prompt.text) : [""];
-    for (const [index, text] of chunks.entries()) rows.push({ key: `prompt:${turn.prompt.seq}:${index}`, kind: "prompt", text, startsTurn: false, ts: index === 0 ? turn.prompt.ts : undefined });
+    for (const [index, text] of chunks.entries()) rows.push({ key: `prompt:${turn.prompt.seq}:${index}`, kind: "prompt", text, startsTurn: false, ts: index === 0 ? turn.prompt.messageTs : undefined });
   }
   for (const item of turn.work) {
-    if (item.kind === "text") addMarkdown(item.key, item.text, item.ts);
+    if (item.kind === "text") addMarkdown(item.key, item.text, item.messageTs);
     // A message the agent took mid-turn is the reader's, drawn like the prompt.
     else if (item.kind === "message") {
-      for (const [index, text] of (item.text ? textChunks(item.text) : [""]).entries()) rows.push({ key: `${item.key}:${index}`, kind: "prompt", text, startsTurn: false, ts: index === 0 ? item.ts : undefined });
+      for (const [index, text] of (item.text ? textChunks(item.text) : [""]).entries()) rows.push({ key: `${item.key}:${index}`, kind: "prompt", text, startsTurn: false, ts: index === 0 ? item.messageTs : undefined });
     } else if ("text" in item) {
-      for (const [index, text] of textChunks(item.text).entries()) rows.push({ key: `${item.key}:${index}`, kind: "work", item: { ...item, text, ...((item.kind === "queued") ? { ts: index === 0 ? item.ts : undefined } : {}) }, startsTurn: false });
+      for (const [index, text] of textChunks(item.text).entries()) rows.push({ key: `${item.key}:${index}`, kind: "work", item: { ...item, text, ...((item.kind === "queued") ? { messageTs: index === 0 ? item.messageTs : undefined } : {}) }, startsTurn: false });
     } else rows.push({ key: item.key, kind: "work", item, startsTurn: false });
   }
   if (turn.finalText) addMarkdown(`final:${turn.key}`, turn.finalText);

@@ -17,7 +17,8 @@ const events = [
   ['2026-10-23T00:01:00Z', {type:'assistant_text', text:'Synthetic reply after midnight.'}],
   ['2026-10-23T00:02:00Z', {type:'user_message', text:'Synthetic queued follow-up.', queued:true}],
   ['', {type:'assistant_text', text:'Synthetic historical reply with no reliable time.'}],
-].map(([ts,payload],seq) => ({id:String(seq),seq,ts,payload,sessionId:'synthetic',tabId:'tab',harness:'claude'}));
+].map(([ts,payload],seq) => ({id:String(seq),seq,ts,messageTs:ts,payload,sessionId:'synthetic',tabId:'tab',harness:'claude'}));
+events.push({id:'legacy',seq:4,ts:'2026-10-23T12:00:00Z',payload:{type:'assistant_text',text:'Synthetic legacy reply with an unverified import time.'},sessionId:'synthetic',tabId:'tab',harness:'claude'});
 const turn = buildTranscript(events, true).turns[0];
 const root = createRoot(document.getElementById('root'));
 window.draw = (cloud = false, text = 'Synthetic streaming reply') => root.render(<main style={{padding:16}}><TurnBlock turn={turn} sessionId='synthetic' cwd={cloud ? undefined : '/synthetic/repo'} working stream={[{ref:{messageId:'stream',index:0},kind:'text',text,partialJson:'',done:false,ts:'2026-10-23T00:03:00Z'}]}/></main>);
@@ -47,7 +48,7 @@ try {
     await page.addInitScript(await readFile(new URL('./tauri-stub.js', import.meta.url), 'utf8'));
     await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/timestamp-layout`);
     await page.locator('time').nth(3).waitFor();
-    assert.equal(await page.locator('time').count(), 4, 'one time per dated message, none for undated history');
+    assert.equal(await page.locator('time').count(), 4, 'one time per verified message, none for undated or legacy imported history');
     const times = await page.locator('time').allTextContents();
     await page.evaluate(() => window.draw(true, 'Synthetic streaming reply continues.'));
     assert.deepEqual(await page.locator('time').allTextContents(), times, 'cloud/stream updates preserve times');

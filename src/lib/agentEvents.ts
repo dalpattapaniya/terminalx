@@ -99,7 +99,7 @@ export function applyEvent(ev: AgentEvent) {
       }
       case "text_delta":
         if (!b) log.stream.push((b = { ref: p.block, kind: "text", text: "", partialJson: "", done: false }));
-        b.ts ??= ev.ts;
+        b.ts ??= ev.messageTs;
         b.text += p.text;
         break;
       case "thinking_delta":

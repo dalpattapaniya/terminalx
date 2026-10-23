@@ -1709,11 +1709,15 @@ fn message_timestamps_preserve_source_and_first_stream_chunk_on_disk() {
     let committed = rig.manager.publish(&mut rt, Payload::AssistantText { block: Some(block), text: "Hello world".into() }, None);
     assert_eq!(first.ts, next.ts);
     assert_eq!(first.ts, committed.ts);
+    assert_eq!(first.message_ts.as_deref(), Some(first.ts.as_str()));
+    assert_eq!(first.message_ts, next.message_ts);
+    assert_eq!(first.message_ts, committed.message_ts);
     let source = rig.manager.publish(&mut rt, Payload::AssistantText { block: None, text: "Source record".into() }, None);
     assert_eq!(source.ts, "2026-10-22T23:59:00Z");
     rt.source_timestamp = Some(String::new());
     let unknown = rig.manager.publish(&mut rt, Payload::AssistantText { block: None, text: "Undated history".into() }, None);
     assert!(unknown.ts.is_empty());
+    assert!(unknown.message_ts.is_none());
     let saved: Vec<AgentEvent> = store::read_lines(&rt.log_path).unwrap();
     assert_eq!(saved, vec![committed, source, unknown]);
 }
@@ -1731,4 +1735,6 @@ fn transcript_message_timestamps_survive_tailing() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].ts, "2026-10-22T23:59:00Z");
     assert_eq!(messages[1].ts, "");
+    assert_eq!(messages[0].message_ts.as_deref(), Some("2026-10-22T23:59:00Z"));
+    assert!(messages[1].message_ts.is_none());
 }

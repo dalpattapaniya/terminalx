@@ -33,7 +33,7 @@ function ReaderBubble({ text, ts }: { text: string; ts?: string }) {
 }
 
 export function TurnCard({ turn }: { turn: Turn }) {
-  return <View style={styles.turn}>{turn.prompt ? <ReaderBubble text={turn.prompt.text} ts={turn.prompt.ts} /> : null}<View style={styles.work}>{turn.work.map((item) => <WorkRow key={item.key} item={item} />)}{turn.finalText ? <Markdown text={turn.finalText} /> : null}</View></View>;
+  return <View style={styles.turn}>{turn.prompt ? <ReaderBubble text={turn.prompt.text} ts={turn.prompt.messageTs} /> : null}<View style={styles.work}>{turn.work.map((item) => <WorkRow key={item.key} item={item} />)}{turn.finalText ? <Markdown text={turn.finalText} /> : null}</View></View>;
 }
 
 export const TranscriptRow = memo(function TranscriptRow({ row }: { row: TurnRow }) {
@@ -45,13 +45,13 @@ export const TranscriptRow = memo(function TranscriptRow({ row }: { row: TurnRow
 
 function WorkRow({ item }: { item: WorkItem }) {
   const { palette } = useTheme();
-  if (item.kind === "text") return <View><Markdown text={item.text} /><MessageTime ts={item.ts} /></View>;
+  if (item.kind === "text") return <View><Markdown text={item.text} /><MessageTime ts={item.messageTs} /></View>;
   if (item.kind === "reasoning") return <LinkedText style={[styles.reasoning, { color: palette.muted }]}>{item.text}</LinkedText>;
   if (item.kind === "tool") return <View style={[styles.tool, { backgroundColor: palette.raised }]}><TerminalIcon size={14} color={palette.muted} /><LinkedText numberOfLines={2} style={[styles.toolText, { color: palette.muted }]}>{`${item.call.title ?? item.call.name}${item.call.abandoned ? " · stopped" : ""}`}</LinkedText></View>;
   if (item.kind === "tool_group") return <View style={[styles.tool, { backgroundColor: palette.raised }]}><TerminalIcon size={14} color={palette.muted} /><Text style={[styles.toolText, { color: palette.muted }]}>{item.name} · {item.calls.length} calls</Text></View>;
   if (item.kind === "error") return <LinkedText style={[styles.body, { color: palette.danger }]}>{item.text}</LinkedText>;
-  if (item.kind === "queued") return <View><LinkedText style={[styles.reasoning, { color: palette.muted }]}>{`Queued · ${item.text}`}</LinkedText><MessageTime ts={item.ts} /></View>;
-  if (item.kind === "message") return <ReaderBubble text={item.text} ts={item.ts} />;
+  if (item.kind === "queued") return <View><LinkedText style={[styles.reasoning, { color: palette.muted }]}>{`Queued · ${item.text}`}</LinkedText><MessageTime ts={item.messageTs} /></View>;
+  if (item.kind === "message") return <ReaderBubble text={item.text} ts={item.messageTs} />;
   if (item.kind === "decision") return <LinkedText style={[styles.reasoning, { color: item.allowed ? palette.success : palette.danger }]}>{item.label}</LinkedText>;
   if (item.kind === "subagent") return <LinkedText style={[styles.reasoning, { color: palette.muted }]}>{`${item.label ?? "Background agent"} · ${item.done ? "done" : "working"}`}</LinkedText>;
   if (item.kind === "compaction") return <Text style={[styles.reasoning, { color: palette.muted }]}>Context compacted</Text>;
