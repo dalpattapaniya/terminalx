@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Chats
+
+- Hide Retry safely when a model or provider usage allowance is exhausted in
+  session recovery, keeping reset information and alternative-model selection
+  available. Transient failures still offer retry. (#601)
+
 ### Issues
 
 - A cloud issue that cannot start because an agent needs sign-in now offers
