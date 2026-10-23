@@ -18,6 +18,8 @@
 
 ### Issues
 
+- Keep cloud sessions openable when their first prompt fails, with the error
+  in their transcript, and stop their issue pipeline and partial agent launch. (#577)
 - Offer a cloud repository’s Markdown issue templates in the new-issue form,
   read through your own GitHub CLI login without a local checkout. (#575)
 - Pipeline reviewers no longer count as another session working on the issue,
