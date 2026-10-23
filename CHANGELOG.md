@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Computer use
+
+- Screen Recording **Grant…** opens System Settings with the helper drag tile
+  without also showing a macOS permission prompt. The permission remains
+  attributed to TerminalX Computer Use Helper. (#569)
+
 ### Development
 
 - Give the permission-probe identity regression more time to start its helper
