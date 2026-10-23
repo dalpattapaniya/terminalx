@@ -30,6 +30,8 @@ Switch.displayName = "Switch";
 export interface SegmentedOption<T extends string> {
   value: T;
   label: React.ReactNode;
+  "aria-label"?: string;
+  title?: string;
 }
 
 /** A track with a sliding thumb; one Tab stop, arrows move inside it. */
@@ -70,11 +72,13 @@ export function Segmented<T extends string>({
       tabIndex={disabled ? -1 : 0}
       onKeyDown={onKey}
       className={cn(
-        "relative inline-grid h-7 rounded-md bg-well p-0.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
+        "relative inline-grid min-w-max shrink-0 h-7 rounded-md bg-well p-0.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
         disabled && "opacity-50",
         className,
       )}
-      style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}
+      // Equal tracks keep the percentage-based thumb aligned; max-content prevents
+      // nowrap labels from painting over each other even in a constrained grid.
+      style={{ gridTemplateColumns: `repeat(${options.length}, minmax(max-content, 1fr))` }}
     >
       <div
         aria-hidden
@@ -91,6 +95,8 @@ export function Segmented<T extends string>({
           type="button"
           role="radio"
           aria-checked={o.value === value}
+          aria-label={o["aria-label"]}
+          title={o.title}
           tabIndex={-1}
           disabled={disabled}
           onClick={() => onChange(o.value)}
