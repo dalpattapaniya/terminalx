@@ -89,7 +89,7 @@ describe("a message queued behind the running turn", () => {
   it("is the reader's message once the agent has taken it, with nothing left to send now", () => {
     const taken: Turn = { ...turn([]), live: true, work: [{ kind: "message", text: "use the staging config", key: "m9", seq: 9, author: { userId: "sam", displayName: "Sam" } }] };
     render(<TooltipProvider><TurnBlock turn={taken} sessionId="s" stream={[]} working onSendQueuedNow={vi.fn()} /></TooltipProvider>);
-    expect(screen.getAllByTestId("reader-message").map((bubble) => bubble.textContent)).toEqual(["what is this?", "Samuse the staging config"]);
+    expect(screen.getAllByTestId("reader-message").map((bubble) => bubble.textContent)).toEqual([expect.stringContaining("what is this?"), "Samuse the staging config"]);
     expect(screen.queryByTestId("queued-message")).toBeNull();
     expect(screen.queryByRole("button", { name: "Send now" })).toBeNull();
   });

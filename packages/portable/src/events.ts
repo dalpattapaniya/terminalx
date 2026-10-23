@@ -9,6 +9,8 @@ export interface AgentEvent {
   harness: string;
   seq: number;
   ts: string;
+  /** Verified source/send time; legacy `ts` may only record when history was imported. */
+  messageTs?: string;
   subagent?: SubagentRef;
   payload: Payload;
 }

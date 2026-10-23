@@ -12,6 +12,11 @@
 
 ### Chats
 
+- Show compact local message times with full dates available by keyboard or
+  tap, across local, cloud and mobile chats. Keep source timestamps through
+  transcript imports and the first text-chunk time through streaming; omit
+  missing or invalid historical times, including legacy records whose saved
+  timestamp may be their import time. (#600)
 - Hide Retry safely when a model or provider usage allowance is exhausted in
   session recovery, keeping reset information and alternative-model selection
   available. Transient failures still offer retry. (#601)
