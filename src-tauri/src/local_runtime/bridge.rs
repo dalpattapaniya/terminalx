@@ -112,6 +112,10 @@ impl Bridge {
         Ok(Self { state, attachment })
     }
 
+    /// The original lease is retained only so reconnect can revoke it even
+    /// after transport loss; this does not assert that the view is live.
+    pub(super) fn identity(&self) -> super::client::AttachmentIdentity { self.attachment.clone() }
+
     pub fn disconnect(&self) {
         let mut state = self.state.lock().unwrap();
         state.detached = true;

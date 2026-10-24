@@ -15,13 +15,12 @@ pub struct Desktop {
     events: Bridge,
     sink: Arc<dyn EventSink>,
     windows: Mutex<HashMap<String, Bridge>>,
-    endpoint: Mutex<Option<crate::hooks::ControlEndpoint>>,
 }
 
 impl Desktop {
     pub fn connect(client: Arc<Client>, sink: Arc<dyn EventSink>) -> Result<Self> {
         let events = Bridge::connect(&client, sink.clone())?;
-        Ok(Self { client, events, sink, windows: Mutex::new(HashMap::new()), endpoint: Mutex::new(None) })
+        Ok(Self { client, events, sink, windows: Mutex::new(HashMap::new()) })
     }
 
     /// Reconnect only to this exact owner, never rediscover or replay a request.
@@ -29,19 +28,33 @@ impl Desktop {
         // End the old event publisher before opening another, and revoke old
         // sharing leases even if the new connection fails. Session processes
         // remain owned by the runtime throughout.
+        let previous = self.events.identity();
         self.disconnect();
-        let next = Self::connect(self.client.clone(), self.sink.clone())?;
-        if let Some(endpoint) = self.endpoint.lock().unwrap().clone() { next.register_window(endpoint)?; }
-        Ok(next)
+        // Socket EOF cleanup runs on another owner thread. Complete a control
+        // round trip before registering the replacement, so it cannot race a
+        // still-valid old window lease. An already-expired lease is harmless;
+        // owner loss is independently rejected by the pinned stream handshake.
+        let _: Result<serde_json::Value> = self.client.call("runtime.detach", serde_json::to_value(previous)?);
+        // The caller must publish the new identity before exposing services.
+        Self::connect(self.client.clone(), self.sink.clone())
+    }
+
+    /// Install the attachment used to validate incoming calls before the owner
+    /// can dispatch any. Failure revokes this attachment, including when the
+    /// owner accepted registration but its response was lost.
+    pub fn activate_window(self: &Arc<Self>, endpoint: crate::hooks::ControlEndpoint,
+        publish: impl FnOnce(&Arc<Self>) -> Result<()>) -> Result<()> {
+        let result = publish(self).and_then(|()| self.register_window(endpoint));
+        if result.is_err() { self.disconnect(); }
+        result
     }
 
     /// The listener is private to this window. Only the owner publishes home discovery.
-    pub fn register_window(&self, endpoint: crate::hooks::ControlEndpoint) -> Result<()> {
+    fn register_window(&self, endpoint: crate::hooks::ControlEndpoint) -> Result<()> {
         let attachment = self.attachment()?;
         let _: serde_json::Value = self.client.call("runtime.window.register", serde_json::json!({
             "epoch":attachment.epoch,"lease":attachment.lease,"socket":endpoint.socket,"token":endpoint.token
         }))?;
-        *self.endpoint.lock().unwrap() = Some(endpoint);
         Ok(())
     }
 

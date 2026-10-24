@@ -4,6 +4,10 @@
 
 ### Runtime investigation
 
+- Publish the desktop attachment before exposing window services to the owner;
+  failed activation disconnects that view without stopping background work.
+  Reconnect explicitly revokes its previous lease before publishing the new one. (#467)
+
 - Add a macOS accessory tray and background notifications to the local runtime
   helper, keeping a single tray through desktop detach and reattachment. Quit
   actions preserve the saved policy and cleanup guard; packaged guest validation

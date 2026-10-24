@@ -41,7 +41,11 @@ from a visible window, a stored status or a restored transcript.
    and both processes continue. Repeat, select keep-running, and verify that the
    desktop process actually exits, the same owner and child PIDs remain, and
    exactly one tray remains with truthful counts and Open / Stop all actions.
-3. Let output and a permission request arrive while detached. Record background
+3. Exercise the owner tray’s Quick Chat action during cold window startup and
+   reattachment. Its first accepted dispatch after service registration must
+   visibly open Quick Chat without repeating the action or using a delayed retry.
+   Record this against the exact built head, separately from normal Open TerminalX.
+   Let output and a permission request arrive while detached. Record background
    notification delivery if the guest grants notifications. Reopen through the
    tray; compare the full retained byte sequence and canonical turns against the
    numbered writer, confirm a pending permission can be answered exactly once,

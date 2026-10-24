@@ -48,9 +48,13 @@ pub(crate) fn connect(app: &AppHandle) -> anyhow::Result<Arc<Desktop>> {
     let client = super::launch::connect_desktop(&source,&home,&app.config().identifier)?;
     let next = Arc::new(Desktop::connect(client,Arc::new(app.clone()))?);
     let endpoint = state.window_endpoint.get().ok_or_else(|| anyhow::anyhow!("The private desktop endpoint is not ready."))?.clone();
-    next.register_window(endpoint)?;
-    state.pairing.attach_runtime(next.clone());
-    *state.runtime.lock().unwrap() = Some(next.clone());
+    next.activate_window(endpoint, |next| {
+        let mut current = state.runtime.lock().unwrap();
+        anyhow::ensure!(current.is_none(), "The desktop connection changed while attaching.");
+        state.pairing.attach_runtime(next.clone());
+        *current = Some(next.clone());
+        Ok(())
+    })?;
     Ok(next)
 }
 
@@ -70,9 +74,9 @@ pub async fn local_runtime_status(state: State<'_, AppState>) -> Result<Connecti
 
 #[tauri::command]
 pub async fn local_runtime_reconnect(app: AppHandle) -> Result<ConnectionState, String> {
-    let previous = app.state::<AppState>().runtime();
     static RECONNECT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _reconnect = RECONNECT.lock().await;
+    let previous = app.state::<AppState>().runtime();
     let Some(previous) = previous else {
         return tauri::async_runtime::spawn_blocking(move || {
             let next = connect(&app).map_err(|error| {
@@ -91,15 +95,16 @@ pub async fn local_runtime_reconnect(app: AppHandle) -> Result<ConnectionState, 
     tauri::async_runtime::spawn_blocking(move || {
         let next = Arc::new(previous.reconnect().map_err(|error| format!("Could not reconnect to the running owner: {error:#}. Reopen TerminalX if it has stopped."))?);
         let status = connected(&next).map_err(|error| format!("{error:#}"))?;
-        {
-            let state = app.state::<AppState>();
+        let state = app.state::<AppState>();
+        let endpoint = state.window_endpoint.get().ok_or("The private desktop endpoint is not ready.")?.clone();
+        next.activate_window(endpoint, |next| {
             let mut current = state.runtime.lock().unwrap();
-            if !current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &previous)) {
-                return Err("The desktop connection changed while reconnecting. Try again.".into());
-            }
+            anyhow::ensure!(current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &previous)),
+                "The desktop connection changed while reconnecting. Try again.");
             state.pairing.attach_runtime(next.clone());
-            *current = Some(next);
-        }
+            *current = Some(next.clone());
+            Ok(())
+        }).map_err(|error| format!("Could not activate window services: {error:#}"))?;
         let _ = app.emit("local_runtime_reattached", ());
         Ok(status)
     }).await.map_err(|error| error.to_string())?

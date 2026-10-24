@@ -532,3 +532,21 @@ Current edits additionally cover mode ABA, owner replacement, in-flight queue
 budgets and stale PTY process identities. Packaged guest checks are specified in
 [LOCAL-RUNTIME-ACCEPTANCE.md](LOCAL-RUNTIME-ACCEPTANCE.md); no installed application
 or host GUI has been exercised.
+
+
+Window-publication checkpoint: the desktop publishes its attachment identity to
+its private request validator before registering window services with the owner.
+Reconnect explicitly revokes the previous lease before creating the replacement;
+a failed publication or registration disconnects only that view. The regression
+checks actual owner dispatch before/after publication, first delivery after
+reattachment, immediate old-lease rejection and failed registration.
+
+The final production-code revision passed desktop and headless all-target Clippy,
+50 local-ui process tests (32 lifecycle, eight mobile, two startup-isolation and
+eight sharing), and the full desktop suite (2,261 unit, six CLI and two serde;
+14 existing ignores). TypeScript and 3,366 Vitest tests passed before these
+Rust-only changes. An additional headless process regression passed for both
+legacy ACP and OpenCode fixture peers: queued turns complete while detached,
+pending permissions survive attachment, duplicate answers fail, and the owner
+identity remains unchanged. Those fixtures do not establish real-provider
+compatibility or credentials. Packaged guest acceptance is still pending.

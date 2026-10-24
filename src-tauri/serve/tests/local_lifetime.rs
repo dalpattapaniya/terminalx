@@ -1062,3 +1062,88 @@ fn window_services_follow_only_the_registered_live_owner_attachment() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
     assert_eq!(std::fs::read(world.data.join("run/control.token")).unwrap(),published);
 }
+
+#[test]
+fn window_publication_precedes_dispatch_and_failed_activation_revokes_the_view() {
+    let world = AgentWorld::new();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "window_publication_process_fixture", "--nocapture"])
+        .env("TERMINALX_467_PUBLICATION_FIXTURE", "1")
+        .env("TERMINALX_HOME", &world.data)
+        .env("CLAUDE_CONFIG_DIR", world.home.join(".claude"))
+        .output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn window_publication_process_fixture() {
+    if std::env::var("TERMINALX_467_PUBLICATION_FIXTURE").as_deref() != Ok("1") { return; }
+    use raccoon_lib::local_runtime::{client::{Client, AttachmentIdentity}, desktop::Desktop};
+    use std::sync::{Arc, Mutex};
+    use std::os::unix::{net::UnixListener, fs::PermissionsExt};
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let client = Client::connect(&world.data).unwrap();
+    let mut endpoint = raccoon_lib::hooks::prepare_control().unwrap();
+    endpoint.socket = world.data.join("run/window-publication.sock");
+    let listener = UnixListener::bind(&endpoint.socket).unwrap();
+    std::fs::set_permissions(&endpoint.socket,std::fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let current: Arc<Mutex<Option<AttachmentIdentity>>> = Arc::new(Mutex::new(None));
+    let observed = current.clone();
+    let token = endpoint.token.clone();
+    let responder = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(15);
+        let mut calls = 0;
+        while calls < 2 {
+            match listener.accept() {
+                Ok((mut socket,_)) => {
+                    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(socket.try_clone().unwrap()).read_line(&mut line).unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let identity = observed.lock().unwrap().clone().expect("owner dispatched before attachment publication");
+                    assert_eq!(request["token"],token);
+                    assert_eq!(request["command"],"window.dispatch");
+                    assert_eq!(request["params"]["epoch"],identity.epoch);
+                    assert_eq!(request["params"]["lease"],identity.lease);
+                    assert_eq!(request["params"]["command"],"floating.show");
+                    calls += 1;
+                    writeln!(socket,"{}",json!({"id":request["id"],"ok":true,"result":{"delivered":calls}})).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until,"window request was lost");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("window accept: {error}"),
+            }
+        }
+    });
+    let first = Arc::new(Desktop::connect(client,Arc::new(raccoon_lib::sink::BroadcastSink::new(32))).unwrap());
+    let publish = |next: &Arc<Desktop>| -> anyhow::Result<()> {
+        // A live caller must not reach the endpoint while its validator still
+        // has no identity (or the previous identity during reconnection).
+        assert_eq!(serve.try_control("floating.show",json!({}))["error"]["code"],"desktop_unavailable");
+        *current.lock().unwrap() = Some(next.attachment()?);
+        Ok(())
+    };
+    first.activate_window(endpoint.clone(),publish).unwrap();
+    assert_eq!(serve.control("floating.show",json!({}))["delivered"],1);
+    let old = first.attachment().unwrap();
+    let next = Arc::new(first.reconnect().unwrap());
+    assert_eq!(serve.try_control("runtime.heartbeat",serde_json::to_value(&old).unwrap())["ok"],false,
+        "reconnect returned before revoking its old owner lease");
+    assert!(first.attachment().is_err());
+    next.activate_window(endpoint.clone(),publish).unwrap();
+    assert_eq!(serve.control("floating.show",json!({}))["delivered"],2);
+    responder.join().unwrap();
+    let old = next.attachment().unwrap();
+    let failed = Arc::new(next.reconnect().unwrap());
+    assert_eq!(serve.try_control("runtime.heartbeat",serde_json::to_value(&old).unwrap())["ok"],false,
+        "reconnect returned before revoking its old owner lease");
+    endpoint.token = "invalid-registration".into();
+    assert!(failed.activate_window(endpoint,publish).is_err());
+    assert!(failed.attachment().is_err(),"failed registration left a valid view");
+    assert_eq!(serve.try_control("floating.show",json!({}))["error"]["code"],"desktop_unavailable");
+    assert_eq!(serve.control("status",json!({}))["pid"],serve.child.id(),"activation failure must not stop the owner");
+}
