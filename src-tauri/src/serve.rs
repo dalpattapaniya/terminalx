@@ -319,6 +319,7 @@ fn run(options: Options) -> Result<()> {
                         if runtime.lifetime.is_some() {
                             crate::local_sharing::owner::reap(&runtime.manager);
                             runtime.manager.mobile.drain(&runtime.manager);
+                            runtime.manager.history_downloads.reap();
                         }
                         if runtime.lifetime.as_ref().is_some_and(|lifetime| lifetime.should_exit_checked(|| {
                             // An explicitly configured relay server is a

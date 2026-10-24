@@ -127,7 +127,7 @@ impl Registry {
         if !supported(command) { return Err(unavailable("This operation is not a window service.")); }
         let service = self.0.lock().unwrap().clone().filter(|service| service.attachment.valid())
             .ok_or_else(|| unavailable("This operation needs an attached TerminalX window."))?;
-        if service.calls.fetch_update(Ordering::AcqRel,Ordering::Acquire,|calls| (calls < MAX_CALLS).then_some(calls+1)).is_err() {
+        if !super::permissions::increment_bounded(&service.calls, MAX_CALLS) {
             return Err(unavailable("The desktop is handling too many requests. No new action was sent."));
         }
         struct Call<'a>(&'a AtomicUsize);

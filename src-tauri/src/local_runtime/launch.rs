@@ -92,7 +92,7 @@ pub fn connect_or_start(source: &Path, home: &Path) -> Result<Arc<Client>> {
 pub fn connect_desktop(source: &Path, home: &Path, application: &str) -> Result<Arc<Client>> {
     let client = launch(source,home,Some(application))?;
     let status: serde_json::Value = client.call("status",serde_json::json!({}))?;
-    if status["localRuntime"]["nativeTray"] != true {
+    if cfg!(target_os = "macos") && status["localRuntime"]["nativeTray"] != true {
         bail!("The running local owner does not support the desktop tray. Its work was left running; attach with a compatible build after it finishes.");
     }
     Ok(client)

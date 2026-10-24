@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Confirm surviving terminal process groups are stopped even after their leader
+  exits, retain Linux desktop runtime packaging/attachment, and load large
+  conversation histories over bounded snapshot chunks. Keep bounded permission
+  and desktop-service admission compatible with current Rust toolchains. (#467)
+
 - Discard delayed process-kill confirmations and errors after runtime invalidation;
   distinguish missing resource details from a verified empty process list. (#467)
 

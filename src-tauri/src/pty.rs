@@ -39,6 +39,7 @@ struct Pane {
     /// beneath it; its original foreground group is work too.
     explicit_command: bool,
     alive: Arc<Mutex<bool>>,
+    group: Arc<OwnedGroup>,
     /// When this pane last wrote something. A caller that has to type into a
     /// program rather than talk to it uses the gap since the last byte as its
     /// only sign that the program has finished drawing and is listening.
@@ -47,6 +48,48 @@ struct Pane {
     cwd: String,
     /// When the pane was opened: where its tab stands among the session's.
     created: String,
+}
+
+
+/// Keep group ownership separate from output EOF and leader exit. Once an
+/// empty group is observed, permanently retire its numeric identity.
+struct OwnedGroup(Mutex<Option<u32>>);
+impl OwnedGroup {
+    fn pid(&self) -> Option<u32> {
+        let mut owned = self.0.lock().unwrap();
+        if owned.is_some_and(|pid| !group_alive(pid)) { *owned = None; }
+        *owned
+    }
+    fn signal(&self, signal: i32) {
+        let mut owned = self.0.lock().unwrap();
+        if let Some(pid) = *owned {
+            if !group_alive(pid) { *owned = None; return; }
+            // A reaped leader's PID is not authority to signal an unrelated
+            // process. Only the PTY's original process group is owned here.
+            #[cfg(unix)]
+            unsafe { libc::kill(-(pid as i32), signal); }
+            #[cfg(not(unix))]
+            { let _ = signal; crate::harness::host::terminate(pid); }
+        }
+    }
+    fn terminate(self: &Arc<Self>) {
+        self.signal(libc::SIGTERM);
+        let group = self.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while group.pid().is_some() && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            group.signal(libc::SIGKILL);
+        });
+    }
+}
+fn group_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    // SAFETY: signal zero observes a known PTY process group.
+    { (unsafe { libc::kill(-(pid as i32), 0) }) == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) }
+    #[cfg(not(unix))]
+    { crate::harness::host::is_alive(pid) }
 }
 
 /// A direct line for one pane's raw output, beside the `pty_data` event: a
@@ -119,6 +162,7 @@ const EXIT_AFTER_OUTPUT: Duration = Duration::from_millis(500);
 
 pub struct Terminals {
     panes: Mutex<HashMap<String, Pane>>,
+    groups: Mutex<Vec<Arc<OwnedGroup>>>,
     retained: Mutex<HashMap<String, crate::local_runtime::scrollback::History>>,
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     /// Keyed by pane id and kept across the pane's own life: a view may
@@ -188,7 +232,7 @@ struct Emitted {
 
 impl Default for Terminals {
     fn default() -> Self {
-        Self { panes: Mutex::new(HashMap::new()), retained: Mutex::default(), sink: Mutex::new(None), taps: Mutex::new(HashMap::new()), emitted: Arc::default(), titles: Mutex::new(HashMap::new()), renamed: Mutex::default() }
+        Self { panes: Mutex::new(HashMap::new()), groups: Mutex::default(), retained: Mutex::default(), sink: Mutex::new(None), taps: Mutex::new(HashMap::new()), emitted: Arc::default(), titles: Mutex::new(HashMap::new()), renamed: Mutex::default() }
     }
 }
 
@@ -316,11 +360,7 @@ impl Terminals {
     pub fn respawn(&self, sink: Arc<dyn EventSink>, id: &str, spec: PaneSpec<'_>) -> Result<()> {
         let printed = self.read_output(id).unwrap_or_default();
         if let Some(pane) = self.panes.lock().unwrap().remove(id) {
-            // A program that has exited is not signalled: its pid may be
-            // another process's by now.
-            if let Some(pid) = pane.pid.filter(|_| *pane.alive.lock().unwrap()) {
-                crate::harness::host::terminate(pid);
-            }
+            pane.group.terminate();
         }
         let result = self.spawn_after(sink, id, spec, printed);
         if result.is_ok() { self.retained.lock().unwrap().remove(id); }
@@ -383,6 +423,12 @@ impl Terminals {
         let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("pty reader: {e}"))?;
         let writer = pair.master.take_writer().map_err(|e| anyhow!("pty writer: {e}"))?;
         let alive = Arc::new(Mutex::new(true));
+        let group = Arc::new(OwnedGroup(Mutex::new(pid)));
+        {
+            let mut groups = self.groups.lock().unwrap();
+            groups.retain(|group| group.pid().is_some());
+            groups.push(group.clone());
+        }
         let last_output = Arc::new(Mutex::new(None));
         let scrollback = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_BYTES)));
         append_scrollback(&scrollback, &printed);
@@ -479,8 +525,10 @@ impl Terminals {
             let sink = sink.clone();
             let id = id.to_string();
             let tap = tap.clone();
+            let group = group.clone();
             std::thread::Builder::new().name(format!("pty-wait-{id}")).spawn(move || {
                 let code = child.wait().ok().map(|s| s.exit_code() as i32);
+                let _ = group.pid();
                 // Let the emitter go if it is holding the pane for its view, then
                 // give it a moment to send the tail, so the exit is not announced
                 // ahead of the output. Bounded: a background job the program left
@@ -494,10 +542,11 @@ impl Terminals {
                 }
                 let _ = emitted_all.recv_timeout(EXIT_AFTER_OUTPUT);
                 sink.emit("pty_exit", &PtyExit { id, code });
+                while group.pid().is_some() { std::thread::sleep(Duration::from_millis(20)); }
             })?;
         }
         let writer = Arc::new(Mutex::new(writer));
-        self.panes.lock().unwrap().insert(id.to_string(), Pane { master: pair.master, writer, pid, explicit_command, alive, last_output, scrollback, cwd: cwd.to_string(), created: crate::store::index::now() });
+        self.panes.lock().unwrap().insert(id.to_string(), Pane { master: pair.master, writer, pid, explicit_command, alive, group, last_output, scrollback, cwd: cwd.to_string(), created: crate::store::index::now() });
         self.keep_slot(id, &tap);
         self.changed();
         Ok(())
@@ -713,9 +762,7 @@ impl Terminals {
     pub fn kill(&self, id: &str) {
         self.retained.lock().unwrap().remove(id);
         if let Some(pane) = self.panes.lock().unwrap().remove(id) {
-            if let Some(pid) = pane.pid {
-                crate::harness::host::terminate(pid);
-            }
+            pane.group.terminate();
             drop(pane);
         }
         self.drop_slot_if_unused(id);
@@ -731,22 +778,20 @@ impl Terminals {
     pub fn kill_and_wait(&self, id: &str, timeout: Duration) {
         self.retained.lock().unwrap().remove(id);
         let Some(pane) = self.panes.lock().unwrap().remove(id) else { return };
-        let pid = pane.pid;
-        if let Some(pid) = pid {
-            crate::harness::host::terminate(pid);
-        }
+        let group = pane.group.clone();
+        group.signal(libc::SIGTERM);
         drop(pane);
         self.drop_slot_if_unused(id);
         self.changed();
-        let Some(pid) = pid else { return };
+        if group.pid().is_none() { return; }
         let start = Instant::now();
         let mut forced = false;
         while start.elapsed() < timeout {
-            if !crate::harness::host::is_alive(pid) {
+            if group.pid().is_none() {
                 return;
             }
             if !forced && start.elapsed() >= TERM_GRACE {
-                crate::harness::host::kill_now(pid);
+                group.signal(libc::SIGKILL);
                 forced = true;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -762,15 +807,13 @@ impl Terminals {
     /// before waiting keeps the wait to one grace period rather than one each.
     pub fn kill_all_and_wait(&self, ids: &[String], timeout: Duration) {
         self.retained.lock().unwrap().retain(|id, _| !ids.contains(id));
-        let mut pids = Vec::new();
+        let mut groups = Vec::new();
         {
             let mut panes = self.panes.lock().unwrap();
             for id in ids {
                 if let Some(pane) = panes.remove(id) {
-                    if let Some(pid) = pane.pid.filter(|_| *pane.alive.lock().unwrap()) {
-                        crate::harness::host::terminate(pid);
-                        pids.push(pid);
-                    }
+                    pane.group.signal(libc::SIGTERM);
+                    groups.push(pane.group.clone());
                 }
             }
         }
@@ -781,19 +824,17 @@ impl Terminals {
         let start = Instant::now();
         let mut forced = false;
         while start.elapsed() < timeout {
-            pids.retain(|pid| crate::harness::host::group_or_process_alive(*pid));
-            if pids.is_empty() {
+            groups.retain(|group| group.pid().is_some());
+            if groups.is_empty() {
                 return;
             }
             if !forced && start.elapsed() >= TERM_GRACE {
-                for pid in &pids {
-                    crate::harness::host::kill_now(*pid);
-                }
+                for group in &groups { group.signal(libc::SIGKILL); }
                 forced = true;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        log::warn!("{} process(es) did not exit within {timeout:?}", pids.len());
+        log::warn!("{} process group(s) did not exit within {timeout:?}", groups.len());
     }
 
     /// Name a shell tab, for every window that lists it.
@@ -946,6 +987,23 @@ impl Terminals {
     /// the pane in place so its last output stays on screen.
     pub fn is_running(&self, id: &str) -> bool {
         self.panes.lock().unwrap().get(id).map(|p| *p.alive.lock().unwrap()).unwrap_or(false)
+    }
+
+    pub(crate) fn owned_groups(&self) -> Vec<u32> {
+        let mut groups = self.groups.lock().unwrap();
+        groups.retain(|group| group.pid().is_some());
+        groups.iter().filter_map(|group|group.pid()).collect()
+    }
+
+    /// Include groups whose pane was closed/replaced before stop-all began.
+    pub(crate) fn stop_owned_groups(&self, timeout: Duration) {
+        let groups = self.groups.lock().unwrap().clone();
+        for group in &groups { group.signal(libc::SIGTERM); }
+        let start = Instant::now();
+        while groups.iter().any(|group|group.pid().is_some()) && start.elapsed() < timeout {
+            if start.elapsed() >= TERM_GRACE { for group in &groups { group.signal(libc::SIGKILL); } }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     pub fn panes(&self) -> Vec<PaneInfo> {

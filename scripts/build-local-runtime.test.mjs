@@ -25,11 +25,11 @@ test('production cannot silently fall back to an ad-hoc signature', () => {
 })
 
 test('reject unsupported targets and malformed options rather than packaging the host binary', () => {
-  assert.throws(() => buildPlan([], { TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: 'x86_64' }, host), /not supported/)
+  assert.throws(() => buildPlan([], { TAURI_ENV_PLATFORM: 'win32', TAURI_ENV_ARCH: 'x86_64' }, host), /not supported/)
   assert.throws(() => buildPlan(['--dev'], { TAURI_ENV_DEBUG: 'false' }, host), /match the Tauri build profile/)
   assert.throws(() => buildPlan([], { TAURI_ENV_DEBUG: 'unexpected' }, host), /Unrecognized/)
 
-  for (const args of [['--target', 'x86_64-unknown-linux-gnu'], ['--profile'], ['--unknown'], ['--profile', '../release']]) {
+  for (const args of [['--target', 'x86_64-pc-windows-msvc'], ['--profile'], ['--unknown'], ['--profile', '../release']]) {
     assert.throws(() => buildPlan(args, {}, host))
   }
 })
@@ -39,4 +39,14 @@ test('artifact selection uses the actual Cargo executable including custom targe
   assert.equal(cargoArtifact([JSON.stringify({ reason: 'build-finished', success: true }), JSON.stringify(artifact)].join('\n')), artifact.executable)
   assert.throws(() => cargoArtifact(''), /exactly one/)
   assert.throws(() => cargoArtifact([JSON.stringify(artifact), JSON.stringify(artifact)].join('\n')), /exactly one/)
+})
+
+test('Linux desktop hooks select their actual target without Apple signing', () => {
+  for (const target of ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-musl']) {
+    const plan = buildPlan([], { TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: target.split('-')[0], TAURI_ENV_DEBUG: 'true' }, target)
+    assert.deepEqual(plan.targets, [target])
+    assert.equal(plan.profile, 'dev')
+    assert.equal(plan.macos, false)
+  }
+  assert.throws(() => buildPlan(['--target', host], { TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: 'x86_64' }, 'x86_64-unknown-linux-gnu'), /match the Tauri target/)
 })

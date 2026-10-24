@@ -598,6 +598,7 @@ pub fn idle_orphaned_tabs() {
 
 #[derive(Clone)]
 pub struct SessionManager {
+    pub(crate) history_downloads: Arc<crate::local_runtime::history::Downloads>,
     pub(crate) mobile: Arc<crate::local_runtime::mobile::Registry>,
     pub(crate) sharing: Arc<Mutex<crate::local_sharing::Sharing>>,
     sink: Arc<dyn EventSink>,
@@ -787,6 +788,7 @@ impl SessionManager {
             writers: Arc::new(Mutex::new(HashMap::new())),
             starts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            history_downloads: Arc::default(),
             stop_pids: Arc::new(Mutex::new(Vec::new())),
             session_stop_pids: Arc::default(),
             follow: Arc::default(),
@@ -1371,6 +1373,8 @@ impl SessionManager {
             if !agent_panes.contains(&pane.id) { return None; }
             roots.push(pane.pid?);
         }
+        // Orphaned groups, including closed/replaced panes, are still work.
+        if self.terminals.owned_groups().iter().any(|pid| !roots.contains(pid)) { return None; }
         Some(roots)
     }
 
@@ -2646,7 +2650,7 @@ impl SessionManager {
         let _admission = crate::issue_pipeline::admission::lock();
         self.begin_shutdown();
         let tabs: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
-        let mut pids: Vec<_> = self.terminals.panes().into_iter().filter(|pane| pane.running).filter_map(|pane| pane.pid).collect();
+        let mut pids = self.terminals.owned_groups();
         for tab in &tabs {
             let tab = tab.lock().unwrap();
             pids.extend(tab.child_pid.or(tab.stopping_pid));
@@ -2662,6 +2666,7 @@ impl SessionManager {
         }
         let panes: Vec<_> = self.terminals.panes().into_iter().map(|pane| pane.id).collect();
         self.terminals.kill_all_and_wait(&panes, RESTART_WAIT);
+        self.terminals.stop_owned_groups(RESTART_WAIT);
         self.host.kill_all_and_wait(RESTART_WAIT);
         pids.retain(|pid| crate::harness::host::group_or_process_alive(*pid));
         *self.stop_pids.lock().unwrap() = pids.clone();

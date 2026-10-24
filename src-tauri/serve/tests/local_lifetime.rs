@@ -1147,3 +1147,105 @@ fn window_publication_process_fixture() {
     assert_eq!(serve.try_control("floating.show",json!({}))["error"]["code"],"desktop_unavailable");
     assert_eq!(serve.control("status",json!({}))["pid"],serve.child.id(),"activation failure must not stop the owner");
 }
+
+#[test]
+fn stop_all_reaps_terminal_descendants_after_the_leader_and_output_exit() {
+    let alive = |pid: u32| std::process::Command::new("/bin/kill").args(["-0", &pid.to_string()]).output().unwrap().status.success();
+    let world = AgentWorld::new();
+    let mut command = world.command();
+    command.args(["--idle-grace-seconds", "1"]);
+    let mut serve = Serve::start(command, &world.data);
+    let attachment = serve.control("runtime.attach", json!({"protocol":1}));
+    let created = serve.control("sessions.create", json!({"project":world.project,"agent":"claude","prompt":"echo:orphan-group","useWorktree":false,"onMain":true,"mode":"manual"}));
+    serve.wait_events(created["tabId"].as_str().unwrap(), "fixture ready", |events| count(events, "turn_completed") == 1);
+    // Python fork preserves the PTY launch group. Close all inherited PTY
+    // descriptors so output EOF cannot disguise the exited leader as live.
+    std::fs::write(world.project.join("fork.py"), r#"import os,signal,time
+signal.signal(signal.SIGHUP,signal.SIG_IGN)
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+pid=os.fork()
+if pid:
+    open('orphan.pid','w').write(str(pid))
+    os._exit(0)
+for fd in range(3):
+    os.close(fd)
+time.sleep(120)
+"#).unwrap();
+    let pane = format!("{}:orphan", created["sessionId"].as_str().unwrap());
+    serve.control("runtime.pty.spawn", json!({"id":pane,"cwd":world.project,"cols":80,"rows":24,"command":"python3 fork.py"}));
+    let child: u32 = common::agent::wait_until("forked descendant", || std::fs::read_to_string(world.project.join("orphan.pid")).ok().and_then(|value|value.parse().ok()));
+    struct Cleanup(u32);
+    impl Drop for Cleanup { fn drop(&mut self) { let _ = std::process::Command::new("/bin/kill").args(["-KILL",&self.0.to_string()]).output(); } }
+    let _cleanup = Cleanup(child);
+    common::agent::wait_until("exited leader and closed output", || {
+        let pane = serve.control("runtime.pty.output",json!({"id":pane}));
+        (pane["running"] == false && !alive(pane["pid"].as_u64().unwrap() as u32)).then_some(())
+    });
+    assert!(alive(child));
+    serve.control("runtime.detach", attachment);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(serve.child.try_wait().unwrap().is_none(), "orphaned terminal work must prevent idle exit");
+    assert!(alive(child));
+    let status = serve.control("status",json!({}));
+    serve.control("runtime.stopAll",json!({"epoch":status["localRuntime"]["epoch"]}));
+    assert!(!alive(child), "Stop all acknowledged while the exited leader's descendant survived");
+    stopped(&mut serve);
+}
+
+#[test]
+fn history_larger_than_an_ipc_frame_loads_including_a_single_oversized_event() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({"project":world.project,"agent":"claude","prompt":"echo:large-history","useWorktree":false,"onMain":true,"mode":"manual"}));
+    let session = created["sessionId"].as_str().unwrap(); let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab,"fixture settled",|events|count(events,"turn_completed")==1);
+    let client = Client::connect(&world.data).unwrap(); let sessions = Sessions::new(client.clone());
+    let baseline = sessions.load_events(session,tab).unwrap();
+    let mut event = serde_json::to_value(&baseline[0]).unwrap();
+    event["seq"] = json!(baseline.iter().map(|event|event.seq).max().unwrap()+1);
+    event["id"] = json!("oversized-event");
+    event["payload"] = json!({"type":"user_message","text":"é".repeat(17*1024*1024),"queued":false});
+    let log = world.data.join("sessions").join(session).join(format!("{tab}.jsonl"));
+    let mut file = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+    serde_json::to_writer(&mut file,&event).unwrap(); writeln!(file).unwrap(); file.flush().unwrap();
+    let loaded = sessions.load_events(session,tab).unwrap();
+    assert_eq!(loaded.len(),baseline.len()+1);
+    assert_eq!(serde_json::to_value(loaded.last().unwrap()).unwrap(),event);
+    assert_eq!(&loaded[..baseline.len()],baseline.as_slice());
+    // Chunk framing is bounded independently of the single oversized event.
+    let opened: serde_json::Value = client.call("runtime.session.eventsOpen",json!({"sessionId":session,"tabId":tab})).unwrap();
+    let bad: anyhow::Result<serde_json::Value> = client.call("runtime.session.eventsChunk",json!({"sessionId":"wrong-session","tabId":tab,"token":opened["token"],"offset":0}));
+    assert!(bad.is_err());
+    let mut appended = event.clone();
+    appended["id"] = json!("later-event");
+    appended["seq"] = json!(event["seq"].as_u64().unwrap()+1);
+    appended["payload"]["text"] = json!("appended after snapshot opened");
+    serde_json::to_writer(&mut file,&appended).unwrap(); writeln!(file).unwrap(); file.flush().unwrap();
+    let mut snapshot = Vec::new();
+    while (snapshot.len() as u64) < opened["size"].as_u64().unwrap() {
+        let chunk: serde_json::Value = client.call("runtime.session.eventsChunk",json!({"sessionId":session,"tabId":tab,"token":opened["token"],"offset":snapshot.len()})).unwrap();
+        assert_eq!(chunk["offset"].as_u64().unwrap(),snapshot.len() as u64);
+        assert!(serde_json::to_vec(&chunk).unwrap().len()<512*1024);
+        let data = base64::engine::general_purpose::STANDARD.decode(chunk["data"].as_str().unwrap()).unwrap();
+        assert!(!data.is_empty());
+        snapshot.extend(data);
+    }
+    assert_eq!(serde_json::from_slice::<Vec<raccoon_lib::events::AgentEvent>>(&snapshot).unwrap(),loaded);
+    let _: serde_json::Value = client.call("runtime.session.eventsClose",json!({"sessionId":session,"tabId":tab,"token":opened["token"]})).unwrap();
+    let next = sessions.load_events(session,tab).unwrap();
+    assert_eq!(&next[..loaded.len()],loaded.as_slice());
+    assert_eq!(serde_json::to_value(next.last().unwrap()).unwrap(),appended);
+    client.stop_all().unwrap(); stopped(&mut serve);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_desktop_attaches_to_a_local_owner_without_a_macos_tray() {
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let client = raccoon_lib::local_runtime::launch::connect_desktop(std::path::Path::new("unused-existing-owner"), &world.data,"com.terminalx.fixture").unwrap();
+    let status: serde_json::Value = client.call("status",json!({})).unwrap();
+    assert_eq!(status["localRuntime"]["nativeTray"],false);
+    client.stop_all().unwrap(); stopped(&mut serve);
+}

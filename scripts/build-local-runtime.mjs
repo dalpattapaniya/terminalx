@@ -24,7 +24,7 @@ export function buildPlan(args, env, host) {
       else profile = value
     } else throw new Error(`Unknown argument: ${args[i]}`)
   }
-  if (env.TAURI_ENV_PLATFORM && env.TAURI_ENV_PLATFORM !== 'darwin') {
+  if (env.TAURI_ENV_PLATFORM && !['darwin', 'linux'].includes(env.TAURI_ENV_PLATFORM)) {
     throw new Error(`Local desktop runtime packaging is not supported for ${env.TAURI_ENV_PLATFORM}`)
   }
   if (env.TAURI_ENV_DEBUG && !['true', 'false'].includes(env.TAURI_ENV_DEBUG)) {
@@ -32,10 +32,13 @@ export function buildPlan(args, env, host) {
   }
   if (dev && env.TAURI_ENV_DEBUG === 'false') throw new Error('The helper profile must match the Tauri build profile')
   const tauriTarget = env.TAURI_ENV_ARCH && env.TAURI_ENV_PLATFORM === 'darwin'
-    ? `${env.TAURI_ENV_ARCH}-apple-darwin` : undefined
+    ? `${env.TAURI_ENV_ARCH}-apple-darwin`
+    : env.TAURI_ENV_ARCH && env.TAURI_ENV_PLATFORM === 'linux'
+      ? (host?.startsWith(`${env.TAURI_ENV_ARCH}-`) && host.includes('-linux-') ? host : `${env.TAURI_ENV_ARCH}-unknown-linux-gnu`) : undefined
   if (target && tauriTarget && target !== tauriTarget) throw new Error('The helper target must match the Tauri target')
   target ??= tauriTarget ?? env.CARGO_BUILD_TARGET ?? host
-  if (!['aarch64-apple-darwin', 'x86_64-apple-darwin', 'universal-apple-darwin'].includes(target)) {
+  const macos = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'universal-apple-darwin'].includes(target)
+  if (!macos && !/^(aarch64|x86_64)-unknown-linux-(gnu|musl)$/.test(target)) {
     throw new Error(`Local desktop runtime packaging is not supported for ${target}`)
   }
   const debug = dev || env.TAURI_ENV_DEBUG === 'true'
@@ -46,10 +49,11 @@ export function buildPlan(args, env, host) {
   }
   const identity = env.APPLE_SIGNING_IDENTITY || '-'
   const production = env.TERMINALX_MAC_RELEASE === '1'
+  if (production && !macos) throw new Error('A macOS release requires a macOS helper target')
   if (production && identity === '-') throw new Error('A production runtime requires APPLE_SIGNING_IDENTITY; ad-hoc signing is insufficient')
   return {
     targets: target === 'universal-apple-darwin' ? ['aarch64-apple-darwin', 'x86_64-apple-darwin'] : [target],
-    profile, identity, production,
+    profile, identity, production, macos,
     identifier: dev ? 'com.terminalx.next.dev.local-runtime' : 'com.terminalx.next.local-runtime',
   }
 }
@@ -69,10 +73,11 @@ function run(command, args, options = {}) {
 }
 
 function main() {
-  if (process.platform !== 'darwin') throw new Error('The local desktop helper must be built on macOS')
+  if (!['darwin', 'linux'].includes(process.platform)) throw new Error('The local desktop helper requires macOS or Linux')
   const host = run('rustc', ['-vV']).match(/^host: (.+)$/m)?.[1]
   const plan = buildPlan(process.argv.slice(2), process.env, host)
-  const env = { ...process.env, CARGO_BUILD_JOBS: '2', SDKROOT: run('xcrun', ['--sdk', 'macosx', '--show-sdk-path']).trim() }
+  const env = { ...process.env, CARGO_BUILD_JOBS: '2' }
+  if (plan.macos) env.SDKROOT = run('xcrun', ['--sdk', 'macosx', '--show-sdk-path']).trim()
   const executables = plan.targets.map(target => cargoArtifact(run('cargo', [
     'build', '--manifest-path', path.join(root, 'src-tauri/serve/Cargo.toml'),
     '--locked', '--features', 'local-ui', '--profile', plan.profile, '--target', target, '--message-format=json-render-diagnostics',
@@ -85,13 +90,15 @@ function main() {
     if (executables.length === 1) copyFileSync(executables[0], staging)
     else run('lipo', ['-create', ...executables, '-output', staging], { stdio: 'inherit' })
     chmodSync(staging, 0o755)
-    const signing = ['--force', '--sign', plan.identity, '--identifier', plan.identifier,
-      '--options', 'runtime', '--entitlements', path.join(root, 'src-tauri/Entitlements.plist')]
-    if (plan.production) signing.push('--timestamp')
-    run('codesign', [...signing, staging], { stdio: 'inherit' })
-    run('codesign', ['--verify', '--strict', staging], { stdio: 'inherit' })
+    if (plan.macos) {
+      const signing = ['--force', '--sign', plan.identity, '--identifier', plan.identifier,
+        '--options', 'runtime', '--entitlements', path.join(root, 'src-tauri/Entitlements.plist')]
+      if (plan.production) signing.push('--timestamp')
+      run('codesign', [...signing, staging], { stdio: 'inherit' })
+      run('codesign', ['--verify', '--strict', staging], { stdio: 'inherit' })
+    }
     renameSync(staging, destination)
-    console.log(`Local runtime: ${destination} (${plan.targets.join(', ')}, ${plan.profile}, ${plan.production ? 'release signing' : 'development signing'})`)
+    console.log(`Local runtime: ${destination} (${plan.targets.join(', ')}, ${plan.profile}, ${plan.macos ? (plan.production ? 'release signing' : 'development signing') : 'Linux executable'})`)
   } finally {
     rmSync(staging, { force: true })
   }

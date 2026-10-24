@@ -111,6 +111,9 @@ pub(crate) fn session(manager: &SessionManager, method: &str, params: Value) -> 
         "resumeConversation" => { manager.resume_conversation(session, tab, string(&params, "harness")?, string(&params, "providerSessionId")?)?; Value::Null }
         "ensureStarted" => { manager.ensure_started(session, tab)?; Value::Null }
         "events" => serde_json::to_value(manager.load_events(session, tab)?)?,
+        "eventsOpen" => serde_json::to_value(manager.history_downloads.open(session, tab, || manager.load_events(session, tab))?)?,
+        "eventsChunk" => serde_json::to_value(manager.history_downloads.chunk(session, tab, string(&params, "token")?, params["offset"].as_u64().context("offset is required")?)?)?,
+        "eventsClose" => { manager.history_downloads.close(session, tab, string(&params, "token")?)?; Value::Null }
         "status" => serde_json::to_value(manager.status_of(session, tab))?,
         "pane" => serde_json::to_value(manager.pane_of(session, tab))?,
         "queued" => serde_json::to_value(manager.queued(session, tab))?,

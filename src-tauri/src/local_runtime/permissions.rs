@@ -20,10 +20,23 @@ pub(crate) fn enable() { LOCAL_OWNER.store(true, Ordering::Release); }
 
 pub(crate) fn enabled() -> bool { LOCAL_OWNER.load(Ordering::Acquire) }
 
+/// CAS keeps the original acquire/release ordering on supported Rust versions,
+/// without the now-deprecated fetch_update API or an increment past the bound.
+pub(super) fn increment_bounded(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut value = counter.load(Ordering::Acquire);
+    loop {
+        if value >= limit { return false; }
+        match counter.compare_exchange_weak(value, value + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => value = current,
+        }
+    }
+}
+
 pub(crate) struct Permit;
 impl Permit {
     pub(crate) fn acquire() -> Option<Self> {
-        WAITERS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_WAITERS).then_some(n + 1)).ok().map(|_| Self)
+        if increment_bounded(&WAITERS, MAX_WAITERS) { Some(Self) } else { None }
     }
 }
 impl Drop for Permit {
@@ -75,6 +88,24 @@ mod tests {
         let (tx, rx) = mpsc::channel::<bool>();
         assert_eq!(wait(rx, Duration::from_millis(1), || true), None);
         assert!(tx.send(true).is_err());
+    }
+
+    #[test]
+    fn bounded_counter_does_not_overflow_or_exceed_limit_under_contention() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(33));
+        let workers: Vec<_> = (0..32).map(|_| {
+            let counter = counter.clone();
+            let start = start.clone();
+            std::thread::spawn(move || { start.wait(); increment_bounded(&counter, 7) })
+        }).collect();
+        start.wait();
+        let accepted = workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>();
+        assert_eq!(accepted, 7);
+        assert_eq!(counter.load(Ordering::Acquire), 7);
+        let full = AtomicUsize::new(usize::MAX);
+        assert!(!increment_bounded(&full, usize::MAX));
+        assert_eq!(full.load(Ordering::Acquire), usize::MAX);
     }
 
     #[test]

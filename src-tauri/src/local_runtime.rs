@@ -20,6 +20,7 @@ pub mod stream;
 #[cfg(unix)]
 pub(crate) mod window;
 pub mod calls;
+pub(crate) mod history;
 pub mod mobile;
 pub mod mobile_output;
 #[cfg(all(target_os = "macos", feature = "local-ui"))]

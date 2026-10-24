@@ -117,7 +117,28 @@ impl Sessions {
     }
 
     pub fn load_events(&self, session: &str, tab: &str) -> Result<Vec<AgentEvent>> {
-        self.tab("events", session, tab, json!({}))
+        use base64::Engine as _;
+        let opened: super::history::Opened = match self.tab("eventsOpen", session, tab, json!({})) {
+            Ok(opened) => opened,
+            // A previously running helper is never killed merely to update the
+            // window. Retain its legacy read until that owner naturally exits.
+            Err(error) if error.to_string().contains("unsupported local session operation") => return self.tab("events", session, tab, json!({})),
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            let mut bytes = Vec::new();
+            while (bytes.len() as u64) < opened.size {
+                let offset = bytes.len() as u64;
+                let chunk: super::history::Chunk = self.tab("eventsChunk", session, tab, json!({"token":opened.token,"offset":offset}))?;
+                anyhow::ensure!(chunk.offset == offset, "History chunk has an unexpected offset.");
+                let data = base64::engine::general_purpose::STANDARD.decode(chunk.data)?;
+                anyhow::ensure!(!data.is_empty() && offset.checked_add(data.len() as u64).is_some_and(|end| end <= opened.size), "History chunk exceeds its snapshot.");
+                bytes.extend(data);
+            }
+            Ok(serde_json::from_slice(&bytes)?)
+        })();
+        let _: Result<()> = self.tab("eventsClose", session, tab, json!({"token":opened.token}));
+        result
     }
 
     pub fn status_of(&self, session: &str, tab: &str) -> Result<TabStatus> {
