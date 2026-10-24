@@ -1138,6 +1138,12 @@ pub fn continue_launch(host: &dyn Host, session_id: &str, tab_id: &str, options:
     if session.tab(tab_id).is_none() { bail!("tab {tab_id} not found in session {session_id}"); }
     let existing = store::for_session(session_id)?.filter(|pipeline| pipeline.author.session_id == session_id);
     if let Some(existing) = existing {
+        // Completed automation is history, not an author handoff. This also
+        // allows retained conversations whose checkout has already been removed.
+        // Active/stopped pipelines must still revoke permissions below.
+        if existing.state == State::Merged && !options.auto_merge && !options.resolve_conflicts {
+            return Ok(None);
+        }
         // Revocations take effect even if the author is busy or the pipeline
         // is stopped and the handoff must be refused. Never grant permission
         // until the handoff has succeeded, and never evaluate the merge gate here.

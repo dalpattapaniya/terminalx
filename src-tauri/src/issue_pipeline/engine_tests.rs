@@ -2347,6 +2347,38 @@ fn all_off_continuation_does_not_create_a_pipeline_and_read_errors_are_not_absen
 }
 
 #[test]
+fn all_off_continuation_preserves_a_merged_pipeline_even_after_workspace_cleanup() {
+    for cleaned in [false, true] {
+        let run = Run::start(&github_issue(), true);
+        set_resolve_conflicts(&run.host, &run.id, true).unwrap();
+        let completed = run.to_gate();
+        assert_eq!(completed.state, State::Merged);
+        assert!(completed.auto_merge && completed.resolve_conflicts);
+        let (announced, sent, pushes, merges) = {
+            let mut world = run.host.world();
+            let author = world.sessions.get_mut("author").unwrap();
+            if cleaned {
+                crate::store::index::mark_workspace_removed(author, Some("main".into()));
+                assert_eq!(author.cwd, author.project_path);
+                assert!(author.worktree_removed);
+            }
+            let mut tab = author.tabs[0].clone();
+            tab.id = "continuation".into();
+            author.tabs.push(tab);
+            (world.announced, world.sent.clone(), world.pushes.clone(), world.merges.clone())
+        };
+        assert!(engine::continue_launch(&run.host, "author", "continuation", &super::LaunchOptions::default()).unwrap().is_none());
+        assert_eq!(run.pipeline(), completed, "Completed author, permissions, review and history must stay unchanged");
+        assert_eq!(store::list().unwrap().len(), 1);
+        let world = run.host.world();
+        assert_eq!(world.announced, announced);
+        assert_eq!(world.sent, sent);
+        assert_eq!(world.pushes, pushes);
+        assert_eq!(world.merges, merges);
+    }
+}
+
+#[test]
 fn refused_continuation_still_revokes_explicit_off_permissions() {
     for stopped in [false, true] {
         let run = Run::start(&github_issue(), true);

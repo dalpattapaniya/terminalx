@@ -10,6 +10,9 @@ Existing permissions are revoked before attempting the author handoff, so a
 busy or stopped author cannot leave an explicit opt-out enabled. With both
 switches off and no existing pipeline, continuation creates no pipeline. A
 lookup or handoff failure prevents the new conversation from starting.
+With both switches off, a merged pipeline also allows an unautomated continuation,
+including after workspace cleanup. Its completed author, review and history stay
+unchanged; there is no handoff or new pipeline.
 
 Folder projects and quick chats have no Git pipeline. A cloud workspace's first
 session and its agent-tab form use the base checkout; create a worktree session

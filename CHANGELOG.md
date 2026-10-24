@@ -4,6 +4,10 @@
 
 ### Session automation
 
+- Allow continuing a merged pipeline's conversation with both automation switches
+  off, including after workspace cleanup, without changing its completed history.
+  Active and stopped pipelines still revoke explicitly disabled permissions.
+
 - Carry both-off continuation choices to the backend, revoking existing merge
   and conflict-resolution permissions before handoff. Do not create a pipeline
   for an unautomated session with both switches off; refuse launch on lookup or

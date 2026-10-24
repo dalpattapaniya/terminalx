@@ -30,7 +30,9 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-it.each(["existing", "absent", "refused"])("carries both off choices through the real continuation flow: %s pipeline", async (state) => {
+it.each(["existing", "absent", "merged", "cleaned", "refused", "stopped"])("carries both off choices through the real continuation flow: %s pipeline", async (state) => {
+  const launchSession = state === "cleaned" ? { ...session, cwd: session.projectPath, worktreeRemoved: true, branch: "main", baseRef: null } : session;
+  mocks.prepare.mockResolvedValue({ sessionId: "author", tabId: "source", title: "Work", cwd: launchSession.cwd, provider: "claude", sourceActive: false, transcriptPath: "/history", lastPrompt: "Work", lastUpdate: "Ready" });
   const prior = { id: "p", projectPath: "/repo", author: { sessionId: "author", tabId: "source" }, autoMerge: true, resolveConflicts: true, events: [], stage: "work", state: "working" };
   mocks.invoke.mockImplementation(async (command, args) => {
     if (command !== "issue_pipeline_continue") return null;
@@ -38,10 +40,11 @@ it.each(["existing", "absent", "refused"])("carries both off choices through the
     // preparation helper. Engine tests exercise the command's state transition.
     expect(args).toEqual({ sessionId: "author", tabId: "next", options: { autoMerge: false, resolveConflicts: false } });
     if (state === "refused") throw new Error("Author is busy; permissions revoked, handoff refused");
-    if (state === "absent") return null;
+    if (state === "stopped") throw new Error("Resume this pipeline before handing it to a new author conversation.");
+    if (["absent", "merged", "cleaned"].includes(state)) return null;
     return { pipeline: { ...prior, author: { sessionId: "author", tabId: "next" }, ...args.options }, authorBrief: "PIPELINE HANDOFF" };
   });
-  render(<ContinuationDialog session={session} source={source} onClose={vi.fn()} />);
+  render(<ContinuationDialog session={launchSession} source={source} onClose={vi.fn()} />);
   await waitFor(() => expect(screen.getByRole("button", { name: "Start New Session" }).hasAttribute("disabled")).toBe(false));
   for (const name of ["Merge when green", "Resolve conflicts automatically"]) {
     const toggle = screen.getByRole("switch", { name });
@@ -52,13 +55,16 @@ it.each(["existing", "absent", "refused"])("carries both off choices through the
   fireEvent.click(screen.getByRole("button", { name: "Start New Session" }));
   await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("issue_pipeline_continue", expect.anything()));
   expect(mocks.invoke.mock.calls.some(([command]) => command === "issue_pipeline_start")).toBe(false);
-  if (state === "refused") {
-    await screen.findByText(/Author is busy/);
+  if (state === "refused" || state === "stopped") {
+    await screen.findByText(state === "refused" ? /Author is busy/ : /Resume this pipeline/);
     expect(mocks.start).not.toHaveBeenCalled();
     expect(mocks.send).not.toHaveBeenCalled();
   } else {
     await waitFor(() => expect(mocks.send).toHaveBeenCalled());
     expect(mocks.invoke.mock.invocationCallOrder[mocks.invoke.mock.calls.findIndex(([command]) => command === "issue_pipeline_continue")]).toBeLessThan(mocks.start.mock.invocationCallOrder[0]);
     expect(mocks.send.mock.calls[0][2].includes("PIPELINE HANDOFF")).toBe(state === "existing");
+    expect(mocks.send.mock.calls[0].slice(0, 2)).toEqual(["author", "next"]);
+    expect(mocks.send.mock.calls[0][2]).toContain('"workingDirectory": "' + launchSession.cwd + '"');
+    expect(mocks.send.mock.calls[0][2]).toContain("/history");
   }
 });
