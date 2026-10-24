@@ -24,6 +24,16 @@
   rules. Cloud workspaces still require a desktop-authorized merge. Workspace
   removal continues to use the existing merged-cleanup policy and grace period.
 
+### Workspace cleanup
+
+- Make keeping conversations the default in workspace removal, using the existing
+  settle flow and naming the project folder where agents resume. Keep original
+  workspace provenance visible and separate from live checkouts in the sidebar. Require a separate
+  permanent-deletion choice and explain provider resume files, recovery and recorded
+  usage. Refuse unsupported cloud retention rather than silently deleting sessions;
+  direct cloud users to the existing worktree cleanup flow. Document and regress
+  the existing prompt-free, deduplicated historical accounting. (#464)
+
 ### Welcome
 
 - Show a resting welcome screen when nothing is selected, with the app mark,
