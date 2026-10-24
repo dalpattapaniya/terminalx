@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Honor explicit Linux helper target ABIs and retain history preparation admission
+  until loading finishes, even after snapshot expiry deadlines. (#467)
+
 - Confirm surviving terminal process groups are stopped even after their leader
   exits, retain Linux desktop runtime packaging/attachment, and load large
   conversation histories over bounded snapshot chunks. Keep bounded permission

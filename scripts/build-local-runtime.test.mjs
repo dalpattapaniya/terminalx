@@ -50,3 +50,31 @@ test('Linux desktop hooks select their actual target without Apple signing', () 
   }
   assert.throws(() => buildPlan(['--target', host], { TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: 'x86_64' }, 'x86_64-unknown-linux-gnu'), /match the Tauri target/)
 })
+
+
+test('full targets preserve a requested musl ABI on a GNU host', () => {
+  const gnu = 'x86_64-unknown-linux-gnu'
+  const musl = 'x86_64-unknown-linux-musl'
+  const dimensions = { TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: 'x86_64' }
+  for (const [args, env] of [
+    [[], { ...dimensions, CARGO_BUILD_TARGET: musl }],
+    [['--target', musl], dimensions],
+    [['--target', musl], { ...dimensions, CARGO_BUILD_TARGET: gnu }],
+    [[], { ...dimensions, TAURI_ENV_TARGET_TRIPLE: musl, CARGO_BUILD_TARGET: gnu }],
+  ]) assert.deepEqual(buildPlan(args, env, gnu).targets, [musl])
+  assert.throws(() => buildPlan(['--target', gnu], { ...dimensions, TAURI_ENV_TARGET_TRIPLE: musl }, gnu), /match the Tauri target/)
+  assert.deepEqual(buildPlan([], dimensions, gnu).targets, [gnu])
+  assert.deepEqual(buildPlan([], dimensions, musl).targets, [musl])
+})
+
+test('full targets must independently match the Tauri architecture and platform', () => {
+  for (const target of ['aarch64-unknown-linux-musl', 'x86_64-apple-darwin']) {
+    const dimensions = { TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: 'x86_64' }
+    for (const [args, env] of [
+      [['--target', target], dimensions],
+      [[], { ...dimensions, CARGO_BUILD_TARGET: target }],
+      [[], { ...dimensions, TAURI_ENV_TARGET_TRIPLE: target }],
+    ]) assert.throws(() => buildPlan(args, env, 'x86_64-unknown-linux-gnu'), /match the Tauri target/)
+  }
+  assert.deepEqual(buildPlan([], { TAURI_ENV_TARGET_TRIPLE: 'universal-apple-darwin', TAURI_ENV_ARCH: 'universal', TAURI_ENV_PLATFORM: 'darwin' }, host).targets, [host, 'x86_64-apple-darwin'])
+})

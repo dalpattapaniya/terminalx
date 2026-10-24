@@ -31,15 +31,22 @@ export function buildPlan(args, env, host) {
     throw new Error('Unrecognized Tauri debug profile')
   }
   if (dev && env.TAURI_ENV_DEBUG === 'false') throw new Error('The helper profile must match the Tauri build profile')
-  const tauriTarget = env.TAURI_ENV_ARCH && env.TAURI_ENV_PLATFORM === 'darwin'
+  // Tauri CLI Rust::env supplies the full target to hooks as
+  // TAURI_ENV_TARGET_TRIPLE. Architecture/platform alone do not identify an ABI.
+  const tauriTarget = env.TAURI_ENV_TARGET_TRIPLE
+  if (target && tauriTarget && target !== tauriTarget) throw new Error('The helper target must match the Tauri target')
+  const fallback = env.TAURI_ENV_ARCH && env.TAURI_ENV_PLATFORM === 'darwin'
     ? `${env.TAURI_ENV_ARCH}-apple-darwin`
     : env.TAURI_ENV_ARCH && env.TAURI_ENV_PLATFORM === 'linux'
-      ? (host?.startsWith(`${env.TAURI_ENV_ARCH}-`) && host.includes('-linux-') ? host : `${env.TAURI_ENV_ARCH}-unknown-linux-gnu`) : undefined
-  if (target && tauriTarget && target !== tauriTarget) throw new Error('The helper target must match the Tauri target')
-  target ??= tauriTarget ?? env.CARGO_BUILD_TARGET ?? host
+      ? (host?.startsWith(`${env.TAURI_ENV_ARCH}-`) && host.includes('-linux-') ? host : `${env.TAURI_ENV_ARCH}-unknown-linux-gnu`) : host
+  target ??= tauriTarget ?? env.CARGO_BUILD_TARGET ?? fallback
   const macos = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'universal-apple-darwin'].includes(target)
   if (!macos && !/^(aarch64|x86_64)-unknown-linux-(gnu|musl)$/.test(target)) {
     throw new Error(`Local desktop runtime packaging is not supported for ${target}`)
+  }
+  if ((env.TAURI_ENV_ARCH && env.TAURI_ENV_ARCH !== target.split('-')[0]) ||
+      (env.TAURI_ENV_PLATFORM && env.TAURI_ENV_PLATFORM !== (macos ? 'darwin' : 'linux'))) {
+    throw new Error('The helper architecture and platform must match the Tauri target')
   }
   const debug = dev || env.TAURI_ENV_DEBUG === 'true'
   profile ??= debug ? 'dev' : 'release'
