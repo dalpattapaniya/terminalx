@@ -1781,18 +1781,18 @@ pub fn list_sessions(app: tauri::AppHandle) -> CmdResult<Vec<SessionEntry>> {
 // ---------------------------------------------------------------- automations
 
 #[tauri::command]
-pub fn automations_list() -> CmdResult<Vec<crate::automations::Automation>> {
-    store::automations::list().map_err(err)
+pub fn automations_list(state: State<'_, AppState>) -> CmdResult<Vec<crate::automations::Automation>> {
+    state.sessions().map_err(err)?.automations().map_err(err)
 }
 
 #[tauri::command]
-pub fn automation_runs(automation_id: String) -> CmdResult<Vec<crate::automations::AutomationRun>> {
-    store::automations::list_runs(&automation_id).map_err(err)
+pub fn automation_runs(state: State<'_, AppState>, automation_id: String) -> CmdResult<Vec<crate::automations::AutomationRun>> {
+    state.sessions().map_err(err)?.automation_runs(&automation_id).map_err(err)
 }
 
 #[tauri::command]
-pub fn automation_issue_states() -> CmdResult<Vec<crate::automations::AutomationIssueState>> {
-    crate::automations::issue_states().map_err(err)
+pub fn automation_issue_states(state: State<'_, AppState>) -> CmdResult<Vec<crate::automations::AutomationIssueState>> {
+    state.sessions().map_err(err)?.automation_issues().map_err(err)
 }
 
 #[tauri::command]
@@ -1803,63 +1803,24 @@ pub async fn automation_issue_preview(project_path: String, repo: String, query:
 }
 
 #[tauri::command]
-pub fn automation_create(app: AppHandle, input: crate::automations::AutomationInput) -> CmdResult<crate::automations::Automation> {
-    let mut input = input;
-    input.project_path = projects::canonical(&input.project_path).map_err(err)?;
-    validate_automation_target(&input)?;
-    let automation = crate::automations::definition_from_input(input, None, chrono::Utc::now()).map_err(err)?;
-    let automation = store::automations::insert(automation).map_err(err)?;
-    crate::automations::emit_definitions(&app);
-    Ok(automation)
+pub fn automation_create(state: State<'_, AppState>, input: crate::automations::AutomationInput) -> CmdResult<crate::automations::Automation> {
+    state.sessions().map_err(err)?.save_automation(None, input).map_err(err)
 }
 
 #[tauri::command]
-pub fn automation_update(app: AppHandle, id: String, input: crate::automations::AutomationInput) -> CmdResult<crate::automations::Automation> {
-    let existing = store::automations::get(&id).map_err(err)?;
-    let mut input = input;
-    input.project_path = projects::canonical(&input.project_path).map_err(err)?;
-    validate_automation_target(&input)?;
-    let automation = crate::automations::definition_from_input(input, Some(&existing), chrono::Utc::now()).map_err(err)?;
-    let reset_seen = match (&existing.issue_trigger, &automation.issue_trigger) {
-        (Some(before), Some(after)) => {
-            before.repo != after.repo
-                || before.query != after.query
-                || (!before.run_on_existing && after.run_on_existing)
-        }
-        (None, Some(_)) => true,
-        _ => false,
-    };
-    let automation = store::automations::replace(automation).map_err(err)?;
-    if reset_seen {
-        store::automations::clear_seen(&id).map_err(err)?;
-    }
-    crate::automations::emit_definitions(&app);
-    Ok(automation)
+pub fn automation_update(state: State<'_, AppState>, id: String, input: crate::automations::AutomationInput) -> CmdResult<crate::automations::Automation> {
+    state.sessions().map_err(err)?.save_automation(Some(&id), input).map_err(err)
 }
 
 #[tauri::command]
-pub fn automation_delete(app: AppHandle, id: String) -> CmdResult<()> {
-    store::automations::remove(&id).map_err(err)?;
-    crate::automations::emit_definitions(&app);
-    Ok(())
-}
-
-fn validate_automation_target(input: &crate::automations::AutomationInput) -> CmdResult<()> {
-    if input.workspace == crate::automations::AutomationWorkspace::NewWorktree && !git::is_repo(Path::new(&input.project_path)) {
-        return Err("Folder automations must use an existing session; worktrees require a Git repository.".into());
-    }
-    if input.workspace == crate::automations::AutomationWorkspace::Session {
-        let target = index::get(input.session_id.as_deref().ok_or("Choose a session for this automation.")?).map_err(err)?;
-        if projects::canonical(&target.project_path).map_err(err)? != input.project_path {
-            return Err("The selected session belongs to another project.".into());
-        }
-    }
-    Ok(())
+pub fn automation_delete(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    state.sessions().map_err(err)?.delete_automation(&id).map_err(err)
 }
 
 #[tauri::command]
-pub async fn automation_run_now(app: AppHandle, id: String) -> CmdResult<crate::automations::AutomationRun> {
-    tauri::async_runtime::spawn_blocking(move || crate::automations::dispatch(&app, &id, crate::automations::AutomationTrigger::Manual, None).map_err(err))
+pub async fn automation_run_now(state: State<'_, AppState>, id: String) -> CmdResult<crate::automations::AutomationRun> {
+    let sessions = state.sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.run_automation(&id).map_err(err))
         .await
         .map_err(err)?
 }
@@ -1937,11 +1898,7 @@ fn announce_tabs(app: &AppHandle) {
 #[tauri::command]
 pub fn remove_tab(app: AppHandle, session_id: String, tab_id: String) -> CmdResult<()> {
     let state = app.state::<crate::AppState>();
-    kill_tab(&app, &state, &session_id, &tab_id);
-    crate::session_ops::close_tab_entry(&session_id, &tab_id)?;
-    announce_session(&app, &session_id);
-    announce_tabs(&app);
-    Ok(())
+    state.sessions().map_err(err)?.close_tab(&session_id, &tab_id).map_err(err)
 }
 
 /// Bring a closed tab back into its session, with its conversation.

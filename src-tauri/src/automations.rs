@@ -206,7 +206,7 @@ pub struct Automation {
     pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationInput {
     pub name: String,
@@ -660,6 +660,38 @@ fn new_run(
 
 fn emit_run(app: &impl AutomationHost, run: &AutomationRun) {
     app.sink().emit("automation_run", run);
+}
+
+/// Save definitions in the process that schedules them. The canonical target
+/// and existing definition are resolved here, not trusted from a window cache.
+pub fn save_definition(app: &impl AutomationHost, id: Option<&str>, mut input: AutomationInput) -> Result<Automation> {
+    input.project_path = crate::store::projects::canonical(&input.project_path)?;
+    if input.workspace == AutomationWorkspace::NewWorktree && !crate::git::is_repo(Path::new(&input.project_path)) {
+        bail!("Folder automations must use an existing session; worktrees require a Git repository.");
+    }
+    if input.workspace == AutomationWorkspace::Session {
+        let target = index::get(input.session_id.as_deref().context("Choose a session for this automation.")?)?;
+        if crate::store::projects::canonical(&target.project_path)? != input.project_path {
+            bail!("The selected session belongs to another project.");
+        }
+    }
+    let existing = id.map(automation_store::get).transpose()?;
+    let automation = definition_from_input(input, existing.as_ref(), Utc::now())?;
+    let reset_seen = existing.as_ref().is_some_and(|existing| match (&existing.issue_trigger, &automation.issue_trigger) {
+        (Some(before), Some(after)) => before.repo != after.repo || before.query != after.query || (!before.run_on_existing && after.run_on_existing),
+        (None, Some(_)) => true,
+        _ => false,
+    });
+    let automation = if existing.is_some() { automation_store::replace(automation)? } else { automation_store::insert(automation)? };
+    if reset_seen { automation_store::clear_seen(&automation.id)?; }
+    emit_definitions(app);
+    Ok(automation)
+}
+
+pub fn remove_definition(app: &impl AutomationHost, id: &str) -> Result<()> {
+    automation_store::remove(id)?;
+    emit_definitions(app);
+    Ok(())
 }
 
 pub fn emit_definitions(app: &impl AutomationHost) {

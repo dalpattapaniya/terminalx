@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Close tabs through their runtime owner so confirmed process exit precedes
+  closed-tab retention, and stale views cannot restart them. Route automation
+  definitions and manual runs through that same owner, retaining disabled
+  pipeline/merge choices. (#467)
+
 - Forward desktop session-link admission and writes to the runtime owner, with
   account/attachment fencing, owner-side invitation rate limits, and access
   revalidation before queued guest output is sent. Reconnecting does not replay

@@ -81,6 +81,12 @@ pub(crate) fn session(manager: &SessionManager, method: &str, params: Value) -> 
     if method == "running" { return Ok(serde_json::to_value(manager.running_tabs())?); }
     if method == "permissions" { return Ok(serde_json::to_value(manager.pending_permissions())?); }
     match method {
+        "automations" => return Ok(serde_json::to_value(crate::store::automations::list()?)?),
+        "automationRuns" => return Ok(serde_json::to_value(crate::store::automations::list_runs(string(&params, "id")?)?)?),
+        "automationIssues" => return Ok(serde_json::to_value(crate::automations::issue_states()?)?),
+        "automationSave" => return Ok(serde_json::to_value(crate::automations::save_definition(&manager.automation_host(), params["id"].as_str(), serde_json::from_value(params["input"].clone())?)?)?),
+        "automationDelete" => { crate::automations::remove_definition(&manager.automation_host(), string(&params, "id")?)?; return Ok(Value::Null); }
+        "automationRun" => return Ok(serde_json::to_value(crate::automations::dispatch(&manager.automation_host(), string(&params, "id")?, crate::automations::AutomationTrigger::Manual, None)?)?),
         "paneAgents" => return Ok(serde_json::to_value(manager.pane_agents())?),
         "addTab" => return Ok(serde_json::to_value(manager.add_tab(string(&params, "sessionId")?, &serde_json::from_value(params["tab"].clone())?)?)?),
         "usage" => return Ok(serde_json::to_value(manager.usage_snapshot())?),
@@ -104,6 +110,7 @@ pub(crate) fn session(manager: &SessionManager, method: &str, params: Value) -> 
             serde_json::from_value(params.get("images").cloned().unwrap_or_else(|| json!([])))?)?)?,
         "interrupt" => json!(manager.interrupt(session, tab)?),
         "stop" => { manager.stop(session, tab)?; Value::Null }
+        "closeTab" => { manager.close_tab(session, tab)?; Value::Null }
         "sendQueuedNow" => { manager.send_queued_now(session, tab, params["seq"].as_u64().context("seq is required")?)?; Value::Null }
         "cancelQueued" => serde_json::to_value(manager.cancel_queued(session, tab, string(&params, "messageId")?)?)?,
         "permission" => { manager.respond_permission(session, tab, string(&params, "requestId")?, string(&params, "optionId")?)?; Value::Null }

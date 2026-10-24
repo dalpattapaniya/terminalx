@@ -419,3 +419,11 @@ headless suite (including 18 lifecycle and eight sharing process regressions).
 Eight external-relay tests remain ignored. A test request that incorrectly added
 a tab id to session.status was corrected to the real scoped contract; assertions
 remain strict. These results do not establish packaged desktop acceptance.
+
+Owner command checkpoint: tab closure now serializes with admission, confirms
+process exit, and retains the conversation in the existing closed-tab store.
+Late view/composer requests cannot recreate the closed tab. Automation reads,
+definition changes and manual dispatch use the owner scheduler/store, including
+the existing pipeline consent flags. Twenty disposable lifecycle process tests
+and desktop/headless Clippy passed for this checkpoint; startup cutover and
+packaged desktop acceptance are still pending.

@@ -943,6 +943,10 @@ impl SessionManager {
         );
     }
 
+    pub(crate) fn automation_host(&self) -> crate::automations::RuntimeHost {
+        crate::automations::RuntimeHost { sink: self.sink.clone(), sessions: self.clone() }
+    }
+
     pub fn terminals(&self) -> &Arc<pty::Terminals> {
         &self.terminals
     }
@@ -1942,6 +1946,26 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Closing a tab is an owner operation: confirm its agent stopped before
+    /// removing the open entry, while retaining provider history for reopening.
+    pub fn close_tab(&self, session_id: &str, tab_id: &str) -> Result<()> {
+        // Send/queue admission and view-triggered starts cannot reopen the
+        // process between its confirmed exit and removal of the open entry.
+        let _admission = crate::issue_pipeline::admission::lock();
+        let entry = index::get(session_id)?;
+        let pane = entry.tab(tab_id).context("tab not found")?.pane_id();
+        self.stop(session_id, tab_id)?;
+        // A followed shell is closed by the explicit tab-close action too.
+        if crate::pty::is_shell_id(&pane) {
+            self.terminals.kill_and_wait(&pane, RESTART_WAIT);
+            self.sink.emit("pty_closed", &pane);
+        }
+        crate::session_ops::close_tab_entry(session_id, tab_id).map_err(anyhow::Error::msg)?;
+        self.sink.emit("session_updated", &index::get(session_id)?);
+        self.sink.emit("tab_state_changed", &index::tab_state()?);
+        Ok(())
+    }
+
     pub fn respond_permission(&self, session_id: &str, tab_id: &str, request_id: &str, option_id: &str) -> Result<()> {
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut rt = rt_arc.lock().unwrap();
@@ -2443,6 +2467,7 @@ impl SessionManager {
     /// started — the app restarting into a session that was already running —
     /// never saw the event, and would show a terminal view with nothing in it.
     pub fn ensure_started(&self, session_id: &str, tab_id: &str) -> Result<()> {
+        let _admission = crate::issue_pipeline::admission::lock();
         self.accepting_work()?;
         let rt_arc = self.runtime(session_id, tab_id)?;
         let entry = index::get(session_id)?;

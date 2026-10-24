@@ -49,6 +49,30 @@ impl Sessions {
         self.call(&format!("runtime.session.{method}"), params)
     }
 
+    pub fn automations(&self) -> Result<Vec<crate::automations::Automation>> {
+        self.call("runtime.session.automations", json!({}))
+    }
+
+    pub fn automation_runs(&self, id: &str) -> Result<Vec<crate::automations::AutomationRun>> {
+        self.call("runtime.session.automationRuns", json!({"id":id}))
+    }
+
+    pub fn automation_issues(&self) -> Result<Vec<crate::automations::AutomationIssueState>> {
+        self.call("runtime.session.automationIssues", json!({}))
+    }
+
+    pub fn save_automation(&self, id: Option<&str>, input: crate::automations::AutomationInput) -> Result<crate::automations::Automation> {
+        self.call("runtime.session.automationSave", json!({"id":id,"input":input}))
+    }
+
+    pub fn delete_automation(&self, id: &str) -> Result<()> {
+        self.call("runtime.session.automationDelete", json!({"id":id}))
+    }
+
+    pub fn run_automation(&self, id: &str) -> Result<crate::automations::AutomationRun> {
+        self.call("runtime.session.automationRun", json!({"id":id}))
+    }
+
     pub fn usage_snapshot(&self) -> Result<crate::status::usage::UsageSnapshot> {
         self.call("runtime.session.usage", json!({}))
     }
@@ -126,6 +150,11 @@ impl Sessions {
     pub fn stop(&self, session: &str, tab: &str) -> Result<()> {
         self.tab("stop", session, tab, json!({}))
     }
+
+    pub fn close_tab(&self, session: &str, tab: &str) -> Result<()> {
+        self.tab("closeTab", session, tab, json!({}))
+    }
+
 
     pub fn send_queued_now(&self, session: &str, tab: &str, seq: u64) -> Result<()> {
         self.tab("sendQueuedNow", session, tab, json!({"seq":seq}))

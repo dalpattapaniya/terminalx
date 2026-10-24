@@ -634,3 +634,66 @@ fn desktop_reconnect_revokes_old_views_without_replaying_or_replacing_the_owner(
     assert!(next.reconnect().is_err(), "reconnect must not follow a replacement owner or replay an earlier request");
     assert_ne!(replacement.control("status", json!({}))["localRuntime"]["epoch"], old_attachment.epoch);
 }
+
+#[test]
+fn closing_a_tab_stops_the_owner_and_retains_its_conversation() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"ask:echo close-owned-tab",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    assert_eq!(serve.control("wait", json!({"target":tab,"timeoutSeconds":10}))["reason"], "permission");
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let before = sessions.load_events(session, tab).unwrap();
+    assert!(!before.is_empty());
+    let pane = sessions.pane_of(session, tab).unwrap().unwrap().pane_id;
+    sessions.close_tab(session, tab).unwrap();
+    assert!(sessions.ensure_started(session, tab).is_err(), "a late view must not recreate the closed agent");
+    assert!(sessions.send(session, tab, "echo:must-not-reopen".into(), vec![]).is_err(), "a stale composer cannot reopen a closed tab");
+    assert!(!serve.control("runtime.pty.output", json!({"id":pane}))["running"].as_bool().unwrap());
+    assert!(sessions.pending_permissions().unwrap().iter().all(|pending| pending.tab_id != tab));
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(world.data.join("sessions/index.json")).unwrap()).unwrap();
+    assert!(index["sessions"].as_array().unwrap().iter().find(|entry| entry["id"] == session).unwrap()["tabs"].as_array().unwrap().iter().all(|entry| entry["id"] != tab));
+    assert!(index["closedTabs"].as_array().unwrap().iter().any(|entry| entry["sessionId"] == session && entry["tab"]["id"] == tab));
+    let after = sessions.load_events(session, tab).unwrap();
+    for event in before { assert!(after.iter().any(|retained| retained.id == event.id)); }
+    let after_json = after.iter().map(|event| serde_json::to_value(event).unwrap()).collect::<Vec<_>>();
+    assert_eq!(count(&after_json, "turn_completed"), 1);
+}
+
+#[test]
+fn automation_commands_use_the_owner_and_preserve_disabled_pipeline_choices() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let input = json!({
+        "name":"Owner automation","enabled":false,"projectPath":world.project,
+        "harness":"claude","mode":"manual","prompt":"echo:owner-manual-automation",
+        "workspace":"newWorktree",
+        "schedule":{"kind":"preset","preset":"hourly","minute":0,"timezone":"UTC","dtstart":"1970-01-01T00:00:00Z"},
+        "pipeline":{"autoMerge":false,"resolveConflicts":false}
+    });
+    let created = sessions.save_automation(None, serde_json::from_value(input.clone()).unwrap()).unwrap();
+    assert_eq!(sessions.automations().unwrap().len(), 1);
+    let run = sessions.run_automation(&created.id).unwrap();
+    let tab = run.tab_id.as_deref().unwrap();
+    serve.wait_events(tab, "manual owner automation to finish", |events| count(events, "turn_completed") == 1);
+    assert!(texts(&serve.events(tab), "assistant_text").iter().any(|text| text.contains("owner-manual-automation")));
+    let runs = sessions.automation_runs(&created.id).unwrap();
+    assert!(runs.iter().any(|saved| saved.run_id == run.run_id));
+    let mut update = input;
+    update["name"] = json!("Updated at owner");
+    let updated = sessions.save_automation(Some(&created.id), serde_json::from_value(update).unwrap()).unwrap();
+    assert_eq!(updated.name, "Updated at owner");
+    assert_eq!(updated.pipeline.as_ref().map(|options| (options.auto_merge, options.resolve_conflicts)), Some((false, false)));
+    let pipelines = std::fs::read_to_string(world.data.join("issue-pipelines.json")).ok()
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text).unwrap()).unwrap_or_else(|| json!({"pipelines":[]}));
+    assert_eq!(pipelines["pipelines"], json!([]));
+    sessions.delete_automation(&created.id).unwrap();
+    assert!(sessions.automations().unwrap().is_empty());
+}
