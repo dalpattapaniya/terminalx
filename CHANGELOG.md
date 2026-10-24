@@ -127,6 +127,13 @@
 
 ### Chat
 
+- Deliver queued messages through the provider's native interrupt without pasting
+  them again. Keep repeated Send now clicks harmless, retain provider queue order,
+  publish successful submission atomically with Enter, and show Codex continuations
+  as working when an older interrupt hook arrives. Reconcile completion debt in
+  record order and serialize managed transcript reads through application so
+  concurrent readers cannot close a newer continuation or cancel its approval. (#627)
+
 - Keep table Copy/Download menus readable and inside the window, and expand tables
   into a scrollable viewer above the conversation with keyboard focus restored on
   exit. Include Streamdown control styles and keep linked-code toolbars visible. (#624)
