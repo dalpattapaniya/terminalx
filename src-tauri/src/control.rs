@@ -241,6 +241,7 @@ pub struct ControlService {
     /// Set by the headless runtime (`cloud-workspace`, `local`); the desktop
     /// app reports none.
     runtime_kind: Option<String>,
+    local_lifetime: Option<Arc<crate::local_runtime::Lifetime>>,
     /// Asks the person before an agent's write to an issue. Only the desktop
     /// app has a window to ask in; without one such a write is refused.
     #[cfg(feature = "desktop")]
@@ -272,6 +273,7 @@ impl ControlService {
             manager,
             endpoint,
             runtime_kind: None,
+            local_lifetime: None,
             #[cfg(feature = "desktop")]
             questions: None,
             desktop: Some(DesktopControl { computer, browser, pairing: None }),
@@ -291,6 +293,7 @@ impl ControlService {
             manager,
             endpoint,
             runtime_kind: Some(runtime_kind),
+            local_lifetime: None,
             #[cfg(feature = "desktop")]
             questions: None,
             #[cfg(feature = "desktop")]
@@ -300,10 +303,19 @@ impl ControlService {
 
     pub fn handle(&self, request: ControlRequest) -> ControlResponse {
         let id = request.id.clone();
+        let _request = match self.local_lifetime.as_ref().map(|lifetime| lifetime.enter()).transpose() {
+            Ok(guard) => guard,
+            Err(error) => return ControlResponse::failure(id, error),
+        };
         match self.execute(&request.command, request.params, &id) {
             Ok(result) => ControlResponse::success(id, result),
             Err(error) => ControlResponse::failure(id, error),
         }
+    }
+
+    pub(crate) fn with_local_lifetime(mut self, lifetime: Arc<crate::local_runtime::Lifetime>) -> Self {
+        self.local_lifetime = Some(lifetime);
+        self
     }
 
     #[cfg(feature = "desktop")]
@@ -319,6 +331,16 @@ impl ControlService {
     }
 
     fn execute(&self, command: &str, params: Value, request_id: &str) -> Result<Value, ControlError> {
+        if command.starts_with("runtime.") {
+            if let Some(lifetime) = &self.local_lifetime {
+                if command.starts_with("runtime.session.") || command.starts_with("runtime.pty.") {
+                    return crate::local_runtime::calls::execute(&self.manager, &self.sink, command, params).map_err(ControlError::internal);
+                }
+                let result = lifetime.command(command, params)?;
+                if command == "runtime.stopAll" { self.manager.begin_shutdown(); }
+                return Ok(result);
+            }
+        }
         #[cfg(feature = "desktop")]
         if let Some(desktop) = &self.desktop {
             if let Some(action) = command.strip_prefix("share.") {
@@ -389,6 +411,9 @@ impl ControlService {
                 });
                 if let Some(kind) = &self.runtime_kind {
                     status["runtimeKind"] = json!(kind);
+                }
+                if let Some(lifetime) = &self.local_lifetime {
+                    status["localRuntime"] = lifetime.status();
                 }
                 if let Some(grants) = crate::cloud_grants::status_json() {
                     status["agentGrants"] = grants;
@@ -773,6 +798,9 @@ impl ControlService {
             .min(86_400);
         let deadline = Instant::now() + Duration::from_secs(timeout);
         loop {
+            if self.local_lifetime.as_ref().is_some_and(|lifetime| lifetime.is_stopping()) {
+                return Err(ControlError::new("runtime_stopping", "The local runtime is stopping.", None::<String>));
+            }
             let status = self.manager.status_of(&target.session.id, &target.tab.id);
             let running = self.manager.is_running(&target.session.id, &target.tab.id);
             let reason = match status {

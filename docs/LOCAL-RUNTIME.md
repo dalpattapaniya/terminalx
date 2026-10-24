@@ -1,9 +1,12 @@
 # Local background runtime proposal (#467)
 
-Status: investigation and validation preparation, **not implemented**. Baseline:
-`958d1c77` (includes #464 / #621). #567 / #622 reserves session, pipeline,
-control, registration and remote protocol integration. This document requests
-those integration points; it does not authorize changing their contracts.
+Status: implementation in progress, **not complete**. The original investigation
+used `958d1c77` (includes #464 / #621); main through #567 / #622 (`22429b99`)
+was merged as `9c6e7830`. The coordinator released session/pipeline/control
+integration and confirmed ownership of native `pty.rs`, `sink.rs` and PTY
+command handlers. #232 retains its frontend terminal and performance files.
+Local owner locking, lifecycle control and bounded event/PTY streams now run in
+`terminalx-serve`; desktop ownership and quit integration remain unfinished.
 
 ## Current ownership and reusable paths
 
@@ -19,12 +22,13 @@ those integration points; it does not authorize changing their contracts.
 | Control | Per-launch authenticated socket plus `hooks.sock` publication guarded by `hooks.lock` | Keep per-launch hook identity; a separate lifetime lock must prevent multiple local owners before any store mutation |
 | Cloud RPC | `remote/{host,server,protocol}` exposes versioned workspace methods with authority checks and idempotency | Reuse handlers over authenticated local transport, preserving cloud capabilities and authorization |
 
-`terminalx-serve --runtime-kind local` currently has no UI lease, idle shutdown,
-desktop notification host or local workspace RPC listener. Its control socket
-is a request/response CLI surface, not the event/PTY subscription protocol.
+The original `terminalx-serve --runtime-kind local` had no UI lease or idle
+shutdown. The current implementation adds those and an authenticated event/PTY
+socket alongside its existing request/response control socket; desktop
+notification hosting and complete desktop RPC integration remain unfinished.
 `BroadcastSink` is bounded and can lag: subscribing alone is not a durable replay
-mechanism. Local mode does not automatically start the cloud agent mailbox or
-pipeline observer; these must not be activated using synthetic cloud identity.
+mechanism. Local mode now starts its own pipeline observer without a synthetic cloud
+identity or cloud agent mailbox.
 
 ## Proposed ownership and attachment
 
@@ -59,7 +63,7 @@ The desktop becomes a client before loading sessions. Sequence:
    because transport disconnected. Failed transport is not a finished turn.
 
 Use an additive local lifecycle namespace for attach/lease/detach and stop-all;
-exact wire fields are deferred until #567 lands. Do not proxy arbitrary Tauri
+the current protocol is described in HEADLESS-SERVE.md. Do not proxy arbitrary Tauri
 command names. Inventory `commands.rs`, `src/lib/api.ts` and portable workspace
 methods before wiring: local mode must support multiple projects, unlike the
 existing one-root cloud connection. Destructive worktree operations stay at the
@@ -136,15 +140,15 @@ notification authorization on macOS; these are not established by a shell test.
 
 ## Integration release request and reviewable stages
 
-Coordinator release is needed for `session.rs`, `session_follow.rs`,
+The coordinator released `session.rs`, `session_follow.rs`,
 `issue_pipeline/*`, `remote/{host,server,protocol}.rs`, `control.rs`,
 `session_ops.rs`, hooks/launch registration and CLI integration. Additional
 production wiring will need `serve.rs`, `lib.rs`, `commands.rs`, `sink.rs`,
 `quit.rs`, settings/tray/automations/pairing, `src/lib/api.ts`, portable workspace
-client, helper packaging/signing and tests. #232 must release PTY transport
-integration separately. No reserved files are changed by this preparation.
+client, helper packaging/signing and tests. Native PTY transport integration was subsequently released; #232 retains the
+frontend renderer and performance files. No reserved frontend files are changed.
 
-Proposed stages for coordinator agreement **before any partial PR**:
+Accepted stages as incremental commits in **one complete issue PR**:
 
 1. Runtime ownership, authentication and local transport, with process tests;
    cloud and existing desktop behavior remain runnable.
@@ -199,5 +203,45 @@ signed updater survival. The installed live app is never a test target.
 - Python syntax and `git diff --check`: passed.
 
 The four final CONTRIBUTING checks and native acceptance have not been run for
-this preparation. Production behavior is unchanged; #467 is blocked on the
-coordinator's integration release, not ready for a completion PR.
+this preparation. Desktop quit behavior is unchanged. The ownership dependency
+was subsequently released; implementation is proceeding, not ready for a
+completion PR.
+
+## Current implementation evidence
+
+On 2026-10-24 the eight disposable `serve/tests/local_lifetime.rs` tests passed:
+exclusive ownership, attached idle grace, detached fake-provider completion and
+approval, unacknowledged output release and bounded replay, rejected event
+authentication, pinned-client refusal after owner replacement, stop-all
+cancellation of an admitted long poll, and independent native bridge views.
+Headless all-target Clippy passed. The desktop ownership unit filter passed five
+tests before the latest installer and bridge tests were added.
+
+TypeScript checking passed. The full Vitest run had 3,351 passing tests and one
+GuestSession Stop-button failure; its isolated four-test rerun passed. This is
+not a full-suite pass. A subsequent full rerun passed all 285 files and 3,352
+tests. Desktop Clippy passed before the store transaction edits; native tests
+and validation of those new edits are still being run.
+No actual desktop quit, signed app replacement, tray, notification, keychain,
+ACP, or OpenCode acceptance is established by these checks.
+
+## Index transaction audit
+
+`store/index.rs` is the only production writer of `sessions/index.json`.
+`message_activity` reads it; test fixtures and remote-mirror tests also write
+private copies. Every `save_file` call now sits inside the stable `index.lock`
+transaction, including shell cleanup/conversion and the test-only `save`.
+The lock covers the read, callback and atomic write; it is not the JSON inode
+that gets replaced. The existing atomic write and unknown-field serialization
+remain intact. No-op shell conversions still avoid a write.
+
+Lock ordering is caller/runtime lock, index transaction, then the existing
+process-wide atomic-write mutex. `write_atomic` never calls back into index
+mutations. Index callbacks mutate their provided records; event publication,
+process stops and provider-history copying happen after/outside the transaction.
+Reads stay lock-free and see a complete committed JSON file. Nested mutation
+callbacks fail immediately instead of deadlocking. Acquisition times out after
+30 seconds without calling the mutation. A file descriptor owns the OS lease,
+so callback errors, panics and process death release it; its sidecar path is
+never unlinked. Older builds that do not use this lock must not concurrently
+write the home: owner compatibility checks are still necessary.

@@ -51,6 +51,7 @@ Options:
                          local development and the relay integration test
                          (cloud workspaces get it from the bootstrap)
   --self-test            Start, run one shell in a PTY, then exit
+  --idle-grace-seconds N Local runtime idle grace (1–3600; default 60)
   -V, --version          Print the version
   -h, --help             Print this help
 
@@ -80,6 +81,7 @@ impl RuntimeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
+    pub idle_grace_seconds: u64,
     pub project_root: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
     pub runtime_kind: RuntimeKind,
@@ -96,7 +98,7 @@ enum Command {
 
 fn parse(args: &[String]) -> Result<Command> {
     let mut options =
-        Options { project_root: None, data_dir: None, runtime_kind: RuntimeKind::Local, self_test: false, relay_link: None };
+        Options { idle_grace_seconds: crate::local_runtime::IDLE_GRACE.as_secs(), project_root: None, data_dir: None, runtime_kind: RuntimeKind::Local, self_test: false, relay_link: None };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -123,6 +125,10 @@ fn parse(args: &[String]) -> Result<Command> {
             }
             "--relay-link" => options.relay_link = Some(PathBuf::from(value(flag)?)),
             "--self-test" if inline.is_none() => options.self_test = true,
+            "--idle-grace-seconds" => {
+                options.idle_grace_seconds = value(flag)?.parse().context("idle grace must be seconds from 1 to 3600")?;
+                if !(1..=3600).contains(&options.idle_grace_seconds) { bail!("idle grace must be seconds from 1 to 3600"); }
+            }
             other => bail!("unknown argument {other}"),
         }
     }
@@ -177,6 +183,7 @@ pub fn main() -> i32 {
 
 /// Everything a running runtime owns; dropped in `shutdown`.
 struct Runtime {
+    lifetime: Option<Arc<crate::local_runtime::Lifetime>>,
     sink: Arc<BroadcastSink>,
     host: Arc<crate::harness::host::Host>,
     terminals: Arc<crate::pty::Terminals>,
@@ -206,6 +213,11 @@ fn run(options: Options) -> Result<()> {
         bail!("pass --data-dir (or set TERMINALX_HOME); terminalx-serve will not share the desktop app's ~/.raccoon");
     }
     let data_dir = crate::store::root().context("open the state directory")?;
+    let _owner = if options.runtime_kind == RuntimeKind::Local {
+        Some(crate::local_runtime::Owner::acquire(&data_dir)?)
+    } else {
+        None
+    };
     // The identity comes first: nothing is served until the runtime knows
     // which workspace it is, and a rejected token stops here.
     let cloud = match options.runtime_kind {
@@ -288,7 +300,25 @@ fn run(options: Options) -> Result<()> {
     let outcome = if options.self_test {
         self_test(&runtime, &tokio)
     } else {
-        tokio.block_on(wait_for_shutdown_signal());
+        tokio.block_on(async {
+            let signal = wait_for_shutdown_signal();
+            tokio::pin!(signal);
+            loop {
+                tokio::select! {
+                    _ = &mut signal => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        if runtime.lifetime.as_ref().is_some_and(|lifetime| lifetime.should_exit(|| {
+                            // An explicitly configured relay server is a
+                            // standing service, not a detached desktop owner.
+                            options.relay_link.is_some()
+                                || runtime.manager.has_background_work()
+                                || runtime.terminals.stats().running != 0
+                                || crate::issue_pipeline::engine::holding() != 0
+                        })) { break; }
+                    }
+                }
+            }
+        });
         Ok(())
     };
     shutdown(&runtime);
@@ -381,6 +411,8 @@ fn report_activity(runtime: &Runtime, cloud: Arc<crate::cloud_bootstrap::Bootstr
 
 /// The desktop's `setup`, less everything that needs a window.
 fn start(options: &Options) -> Result<Runtime> {
+    let lifetime = (options.runtime_kind == RuntimeKind::Local)
+        .then(|| crate::local_runtime::Lifetime::new(Duration::from_secs(options.idle_grace_seconds)));
     let project_root = match &options.project_root {
         Some(root) => {
             let project = crate::store::projects::add(&root.to_string_lossy())
@@ -389,6 +421,18 @@ fn start(options: &Options) -> Result<Runtime> {
         }
         None => None,
     };
+    // Recovery is a new-owner operation, never an attachment operation. Do it
+    // before either listener can accept a command that starts fresh work.
+    let interrupted = if options.runtime_kind == RuntimeKind::Local {
+        crate::store::index::load()?.into_iter().flat_map(|session| {
+            session.tabs.into_iter().filter(|tab| matches!(tab.status,
+                crate::store::index::TabStatus::InProgress | crate::store::index::TabStatus::Waiting))
+                .map(move |tab| (session.id.clone(), tab.id))
+        }).collect()
+    } else {
+        project_root.as_deref().map(crate::cloud_agents::interrupted_tabs).unwrap_or_default()
+    };
+    crate::session::idle_orphaned_tabs();
     // Recover local history before hooks can publish live activity.
     if let Err(error) = crate::store::activity::summary() {
         log::error!("initialize activity history: {error:#}");
@@ -409,18 +453,27 @@ fn start(options: &Options) -> Result<Runtime> {
     );
     manager.follow_pane_exits();
     let hooked = manager.clone();
-    let service = crate::control::ControlService::headless(
+    let mut service = crate::control::ControlService::headless(
         sink.clone(),
         manager.clone(),
         control_endpoint.clone(),
         options.runtime_kind.as_str().into(),
     );
+    if let Some(lifetime) = &lifetime {
+        service = service.with_local_lifetime(lifetime.clone());
+        #[cfg(unix)]
+        lifetime.set_stream_socket(crate::local_runtime::stream::start(&control_endpoint, sink.clone(), terminals.clone(), lifetime.clone())?);
+    }
     let socket = crate::hooks::serve(control_endpoint, move |frame| hooked.on_hook(frame), move |request| service.handle(request))
         .context("listen on the hook and control socket")?;
     log::info!("hook socket at {}", socket.display());
-    let interrupted = project_root.as_deref().map(crate::cloud_agents::interrupted_tabs).unwrap_or_default();
-    crate::session::idle_orphaned_tabs();
-    Ok(Runtime { sink, host, terminals, manager, socket, project_root, interrupted, pipelines })
+    if options.runtime_kind == RuntimeKind::Local && options.relay_link.is_none() && !options.self_test {
+        manager.follow_terminals();
+        let pipeline_host = Arc::new(crate::issue_pipeline::host::LocalHost::new(sink.clone(), manager.clone()));
+        pipelines.attach(pipeline_host.clone());
+        crate::issue_pipeline::runtime::start(pipeline_host, interrupted.clone());
+    }
+    Ok(Runtime { lifetime, sink, host, terminals, manager, socket, project_root, interrupted, pipelines })
 }
 
 /// Serve the workspace through the relay in the background, and report
@@ -630,8 +683,10 @@ fn start_relay_host(
 }
 
 fn shutdown(runtime: &Runtime) {
-    runtime.host.kill_all();
-    runtime.terminals.kill_all();
+    runtime.manager.begin_shutdown();
+    let panes: Vec<_> = runtime.terminals.panes().into_iter().map(|pane| pane.id).collect();
+    runtime.terminals.kill_all_and_wait(&panes, Duration::from_secs(5));
+    runtime.host.kill_all_and_wait(Duration::from_secs(5));
     if let Err(error) = crate::store::activity::shutdown() {
         log::error!("flush activity on exit: {error:#}");
     }
@@ -754,6 +809,7 @@ mod tests {
         assert_eq!(
             parsed,
             Command::Serve(Options {
+                idle_grace_seconds: crate::local_runtime::IDLE_GRACE.as_secs(),
                 project_root: Some("/workspace".into()),
                 data_dir: Some("/var/lib/terminalx".into()),
                 runtime_kind: RuntimeKind::CloudWorkspace,

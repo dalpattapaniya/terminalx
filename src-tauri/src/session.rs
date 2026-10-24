@@ -599,6 +599,7 @@ pub struct SessionManager {
     /// interleave their paste and their Enter.
     writers: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     starts: Arc<std::sync::atomic::AtomicU64>,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Tabs following their terminal (#437); off until the desktop app asks.
     follow: Arc<follow::Following>,
 }
@@ -767,6 +768,7 @@ impl SessionManager {
             tabs: Arc::new(Mutex::new(HashMap::new())),
             writers: Arc::new(Mutex::new(HashMap::new())),
             starts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             follow: Arc::default(),
         };
         let watcher = manager.clone();
@@ -1283,6 +1285,17 @@ impl SessionManager {
             .collect()
     }
 
+    /// Local lifetime cannot use the cloud activity silence budget: even a
+    /// silent turn or a queued follow-up must survive a detached window.
+    pub(crate) fn has_background_work(&self) -> bool {
+        let runtimes: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
+        runtimes.into_iter().any(|runtime| {
+            let runtime = runtime.lock().unwrap();
+            runtime.turn_open || !runtime.pending.is_empty() || !runtime.queued.is_empty()
+                || runtime.stop_in_flight
+        })
+    }
+
     /// Turns in progress and permission prompts waiting, counted without
     /// copying either (the cloud activity report polls this every second).
     pub fn turn_counts(&self) -> (usize, usize) {
@@ -1374,6 +1387,7 @@ impl SessionManager {
     }
 
     fn spawn_child(&self, rt: &mut TabRuntime, rt_arc: &Arc<Mutex<TabRuntime>>, program: &Path, args: &[String], cwd: &str) -> Result<()> {
+        self.accepting_work()?;
         let sink = Arc::new(TabSink { manager: self.clone(), rt: rt_arc.clone() });
         let mut env = vec![
             ("RACCOON_SESSION_ID".to_string(), rt.session_id.clone()),
@@ -1467,12 +1481,16 @@ impl SessionManager {
         &self, session_id: &str, tab_id: &str, prompt: PromptText,
         images: Vec<ImageInput>, receipt: Option<DeliveryReceipt>,
     ) -> Result<SendOutcome> {
+        self.accepting_work()?;
         let _admission = crate::issue_pipeline::admission::lock();
         crate::issue_pipeline::admission::check(session_id, tab_id)?;
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut entry = index::get(session_id)?;
         let mut tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
         let mut rt = rt_arc.lock().unwrap();
+        // Shutdown may have fenced and cleared this runtime while the sender
+        // was waiting for its lock. Do not refill a cleared follow-up queue.
+        self.accepting_work()?;
         if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
         // A CLI the reader started by hand is theirs to drive: it runs with
         // whatever permissions they gave it, which no share was checked
@@ -2358,6 +2376,34 @@ impl SessionManager {
         self.host.kill_all();
     }
 
+    fn accepting_work(&self) -> Result<()> {
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("The local runtime is stopping; no new work was accepted.");
+        }
+        Ok(())
+    }
+
+    /// Fence follow-ups before terminating processes. A late completion must
+    /// not drain a queue or start a replacement during stop-all/logout.
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closing();
+        let runtimes: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
+        for runtime in runtimes {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.stopping = true;
+            runtime.queued.clear();
+            if let Engine::Cli(cli) = &mut runtime.engine {
+                for echo in &mut cli.echoed {
+                    if let Some(receipt) = echo.receipt.take() {
+                        let _ = receipt.send(Err("The local runtime was stopped before prompt delivery was confirmed.".into()));
+                    }
+                }
+            }
+            self.cancel_asks(&mut runtime);
+        }
+    }
+
     // ---- Claude, PTY-first
 
     /// The terminal pane a tab's CLI runs in. Derived from the tab id so the
@@ -2373,6 +2419,7 @@ impl SessionManager {
     /// started — the app restarting into a session that was already running —
     /// never saw the event, and would show a terminal view with nothing in it.
     pub fn ensure_started(&self, session_id: &str, tab_id: &str) -> Result<()> {
+        self.accepting_work()?;
         let rt_arc = self.runtime(session_id, tab_id)?;
         let entry = index::get(session_id)?;
         let tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
@@ -2446,6 +2493,7 @@ impl SessionManager {
     /// Returns whether this call is what started it, so a prompt sent in the
     /// same breath knows to wait for the TUI to finish drawing.
     fn start_cli(&self, rt: &mut TabRuntime, rt_arc: &Arc<Mutex<TabRuntime>>, entry: &index::SessionEntry, tab: &TabEntry) -> Result<bool> {
+        self.accepting_work()?;
         if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
         let Some(kind) = pty_first(&tab.harness) else { return Ok(false) };
         let pane = tab.pane_id();

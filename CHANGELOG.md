@@ -4,6 +4,16 @@
 
 ### Runtime investigation
 
+- Serialize session-index read/modify/write transactions across processes using
+  a stable sidecar lock, retaining closed conversations and unknown fields during
+  simultaneous window and runtime updates. Add disposable process regressions
+  for lost updates, lock timeout, failure and crash recovery. (#467)
+
+- Add single-owner local runtime locking, authenticated attachment leases and
+  stop-all, bounded event/PTY subscriptions, and process tests for detached turns,
+  pending permissions and output flow control. Fence follow-ups during shutdown
+  and wait for child termination. Desktop quit integration remains in progress.
+
 - Document local background runtime ownership, compatibility and integration
   dependencies, and add a disposable probe of the existing headless runtime's
   launcher lifetime, control authentication and PTY self-test. Desktop quit and

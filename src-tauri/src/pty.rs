@@ -729,7 +729,7 @@ impl Terminals {
             let mut panes = self.panes.lock().unwrap();
             for id in ids {
                 if let Some(pane) = panes.remove(id) {
-                    if let Some(pid) = pane.pid {
+                    if let Some(pid) = pane.pid.filter(|_| *pane.alive.lock().unwrap()) {
                         crate::harness::host::terminate(pid);
                         pids.push(pid);
                     }
@@ -743,7 +743,7 @@ impl Terminals {
         let start = Instant::now();
         let mut forced = false;
         while start.elapsed() < timeout {
-            pids.retain(|pid| crate::harness::host::is_alive(*pid));
+            pids.retain(|pid| crate::harness::host::group_or_process_alive(*pid));
             if pids.is_empty() {
                 return;
             }
