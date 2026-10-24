@@ -44,6 +44,16 @@
   launcher lifetime, control authentication and PTY self-test. Desktop quit and
   reattachment behavior is not implemented by this preparation. (#467)
 
+### Chat
+
+- Keep table Copy/Download menus readable and inside the window, and expand tables
+  into a scrollable viewer above the conversation with keyboard focus restored on
+  exit. Include Streamdown control styles and keep linked-code toolbars visible. (#624)
+
+- Wrap long separators and unbroken plain text inside prompt, delivered and queued
+  messages, including narrow chat and document layouts. Preserve original text,
+  line breaks and selection while keeping code blocks horizontally scrollable. (#623)
+
 ### Session automation
 
 - Allow continuing a merged pipeline's conversation with both automation switches
