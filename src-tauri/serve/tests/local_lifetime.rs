@@ -697,3 +697,251 @@ fn automation_commands_use_the_owner_and_preserve_disabled_pipeline_choices() {
     sessions.delete_automation(&created.id).unwrap();
     assert!(sessions.automations().unwrap().is_empty());
 }
+
+#[test]
+fn an_owner_hook_disconnect_withdraws_the_card_and_rejects_a_late_answer() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = AgentWorld::new();
+    let fake = std::fs::canonicalize(world.bin.join("claude")).unwrap();
+    std::fs::remove_file(world.bin.join("claude")).unwrap();
+    let captured = world.home.join("launch.json");
+    // Only the disposable fixture launch is captured; never a user credential.
+    let wrapper = format!("#!/usr/bin/python3\nimport os,json\nwith open({},'w') as f: json.dump({{k:os.environ[k] for k in ['RACCOON_HOOK_TOKEN','RACCOON_TAB_ID','RACCOON_SESSION_ID']}},f)\nos.execv({},[{}]+__import__('sys').argv[1:])\n",
+        serde_json::to_string(&captured).unwrap(), serde_json::to_string(&fake).unwrap(), serde_json::to_string(&fake).unwrap());
+    std::fs::write(world.bin.join("claude"), wrapper).unwrap();
+    std::fs::set_permissions(world.bin.join("claude"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:ready",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab, "initial turn completion", |events| count(events, "turn_completed") == 1);
+    let launch: serde_json::Value = serde_json::from_slice(&std::fs::read(captured).unwrap()).unwrap();
+    let mut hook = UnixStream::connect(&serve.socket).unwrap();
+    let frame = json!({"session":launch["RACCOON_SESSION_ID"],"tab":launch["RACCOON_TAB_ID"],
+        "token":launch["RACCOON_HOOK_TOKEN"],"event":"PermissionRequest",
+        "payload":{"tool_name":"Bash","tool_input":{"command":"echo must-not-run"}}});
+    writeln!(hook,"{frame}").unwrap();
+    let pending = common::agent::wait_until("the connected hook card", || {
+        let pending = serve.control("permissions.list", json!({}));
+        (!pending["permissions"].as_array().unwrap().is_empty()).then_some(pending)
+    });
+    let request = pending["permissions"][0]["requestId"].clone();
+    drop(hook);
+    assert_eq!(serve.try_control("permissions.allow", json!({"request":request}))["ok"], false);
+    common::agent::wait_until("the disconnected hook card to withdraw", || {
+        serve.control("permissions.list", json!({}))["permissions"].as_array().unwrap().is_empty().then_some(())
+    });
+    assert!(!serve.events(tab).iter().any(|event| event["payload"]["type"] == "permission_decided" && event["payload"]["allowed"] == true));
+}
+
+#[test]
+fn owner_hook_process_fails_closed_when_its_socket_disappears() {
+    use std::process::{Child, Command, Stdio};
+    use std::io::Read;
+    struct HookChild(Child);
+    impl Drop for HookChild {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    let home = tempfile::tempdir().unwrap();
+    for event in ["PermissionRequest", "PreToolUse"] {
+        let socket = home.path().join(format!("{event}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_terminalx-serve"));
+        command.args(["hook",event,"--local-owner-decision"])
+            .env_clear().env("HOME",home.path()).env("TERMINALX_HOME",home.path())
+            .env("CLAUDE_CONFIG_DIR",home.path()).env("RACCOON_HOOK_SOCKET",&socket)
+            .env("RACCOON_TAB_ID","fixture").env("RACCOON_HOOK_TOKEN","fixture-only")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = HookChild(command.spawn().unwrap());
+        child.0.stdin.take().unwrap().write_all(b"{}\n").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (connection,_) = common::agent::wait_until("hook connection", || match listener.accept() {
+            Ok(connection) => Some(connection),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("hook fixture accept: {error}"),
+        });
+        connection.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = BufReader::new(connection);
+        let mut frame = String::new();
+        reader.read_line(&mut frame).unwrap();
+        drop(reader);
+        drop(listener);
+        let status = common::agent::wait_until("hook denial before exit", || child.0.try_wait().unwrap());
+        assert!(status.success());
+        let mut output = Vec::new();
+        child.0.stdout.take().unwrap().take(1024 * 1024).read_to_end(&mut output).unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let decision = &reply["hookSpecificOutput"];
+        assert_eq!(if event == "PreToolUse" { &decision["permissionDecision"] } else { &decision["decision"]["behavior"] }, "deny");
+    }
+}
+
+#[test]
+fn resource_projection_and_stop_rules_are_checked_by_the_owner() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:resource-owner",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab, "resource owner turn", |events| count(events, "turn_completed") == 1);
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let pane = sessions.pane_of(created["sessionId"].as_str().unwrap(), tab).unwrap().unwrap().pane_id;
+    assert_eq!(sessions.resource_overview().unwrap()["agentCount"], 1);
+    let sample = sessions.resource_sample().unwrap();
+    let process = sample["processes"].as_array().unwrap().iter().find(|entry| entry["paneId"] == pane).unwrap();
+    assert_eq!(process["tabId"], tab);
+    assert_eq!(process["killRule"], "none");
+    assert!(sessions.resource_kill(&pane, true).is_err(), "resource controls cannot bypass an agent tab's ordered Stop");
+    let status = serve.control("status", json!({}));
+    serve.control("runtime.stopAll", json!({"epoch":status["localRuntime"]["epoch"]}));
+    stopped(&mut serve);
+    assert!(sessions.resource_overview().is_err(), "a disconnected owner is not a zero-agent snapshot");
+}
+
+#[test]
+fn stop_all_acknowledges_confirmed_terminal_group_exit() {
+    let alive = |pid: u32| std::process::Command::new("/bin/kill").args(["-0", &pid.to_string()]).output().unwrap().status.success();
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:stop-all",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab, "stop-all fixture turn", |events| count(events, "turn_completed") == 1);
+    let pane = format!("{}:9",created["sessionId"].as_str().unwrap());
+    serve.control("runtime.pty.spawn", json!({"id":pane,"cwd":world.project,"cols":80,"rows":24,
+        "command":"sh -c 'trap \"\" TERM; sleep 60 & echo $! > child.pid; wait'"}));
+    let parent = serve.control("runtime.pty.output",json!({"id":pane}))["pid"].as_u64().unwrap() as u32;
+    let child: u32 = common::agent::wait_until("the terminal child to start", || {
+        std::fs::read_to_string(world.project.join("child.pid")).ok().and_then(|text| text.trim().parse().ok())
+    });
+    assert!(alive(parent));
+    assert!(alive(child));
+    let status = serve.control("status",json!({}));
+    serve.control("runtime.stopAll",json!({"epoch":status["localRuntime"]["epoch"]}));
+    assert!(!alive(parent), "an acknowledgement cannot precede process exit");
+    assert!(!alive(child), "the terminal child must be stopped too");
+    stopped(&mut serve);
+}
+
+#[test]
+fn an_idle_managed_cli_exits_and_its_terminal_tail_survives_the_next_owner() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let mut command = world.command();
+    command.args(["--idle-grace-seconds","1"]);
+    let mut serve = Serve::start(command, &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:retained-before-idle",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab, "idle fixture turn", |events| count(events, "turn_completed") == 1);
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let pane = sessions.pane_of(session,tab).unwrap().unwrap().pane_id;
+    let before = serve.control("runtime.pty.output",json!({"id":pane}));
+    assert_eq!(before["running"],true);
+    stopped(&mut serve);
+    assert!(world.data.join("run/pty-history.json").is_file());
+    let replacement = Serve::start(world.command(), &world.data);
+    let after = replacement.control("runtime.pty.output",json!({"id":pane}));
+    assert_eq!(after["data"],before["data"]);
+    assert_eq!(after["running"],false);
+    assert!(after["pid"].is_null());
+    assert!(!world.data.join("run/pty-history.json").exists(),"an old snapshot cannot resurrect a subsequently closed pane");
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let events = sessions.load_events(session,tab).unwrap();
+    let serialized = serde_json::to_value(&events).unwrap().to_string();
+    assert!(!serialized.contains("Session closed"));
+    sessions.ensure_started(session,tab).unwrap();
+    let resumed = replacement.control("runtime.pty.output",json!({"id":pane}));
+    let original = base64::engine::general_purpose::STANDARD.decode(before["data"].as_str().unwrap()).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(resumed["data"].as_str().unwrap()).unwrap();
+    assert!(bytes.starts_with(&original),"resuming a CLI must retain its prior terminal output");
+    assert_eq!(resumed["running"],true);
+}
+
+#[test]
+fn an_open_plain_shell_keeps_its_environment_across_detached_idle_grace() {
+    let world = AgentWorld::new();
+    let mut command = world.command();
+    command.args(["--idle-grace-seconds", "1"]);
+    let mut serve = Serve::start(command, &world.data);
+    let attachment = serve.control("runtime.attach", json!({"protocol":1}));
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:shell-owner",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab,"shell owner ready",|events| count(events,"turn_completed")==1);
+    let pane = format!("{}:retained-shell",created["sessionId"].as_str().unwrap());
+    serve.control("runtime.pty.spawn",json!({"id":pane,"cwd":world.project,"cols":80,"rows":24}));
+    let input = base64::engine::general_purpose::STANDARD.encode(b"export TERMINALX_FIXTURE_RETAINED=still-here\n");
+    serve.control("runtime.pty.write",json!({"id":pane,"data":input}));
+    let pid = serve.control("runtime.pty.output",json!({"id":pane}))["pid"].clone();
+    serve.control("runtime.detach",attachment);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(serve.child.try_wait().unwrap().is_none());
+    let attached = serve.control("runtime.attach",json!({"protocol":1}));
+    let input = base64::engine::general_purpose::STANDARD.encode(b"printf 'fixture-state:%s:end\\n' \"$TERMINALX_FIXTURE_RETAINED\"\n");
+    serve.control("runtime.pty.write",json!({"id":pane,"data":input}));
+    let until = Instant::now()+Duration::from_secs(5);
+    loop {
+        let output = serve.control("runtime.pty.output",json!({"id":pane}));
+        assert_eq!(output["pid"],pid);
+        assert_eq!(output["running"],true);
+        let bytes = base64::engine::general_purpose::STANDARD.decode(output["data"].as_str().unwrap()).unwrap();
+        if String::from_utf8_lossy(&bytes).contains("fixture-state:still-here:end") { break; }
+        assert!(Instant::now()<until,"shell environment was not retained");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    serve.control("runtime.stopAll",json!({"epoch":attached["epoch"]}));
+    stopped(&mut serve);
+}
+
+#[test]
+fn deleting_a_session_stops_only_its_owner_processes_and_rejects_stale_views() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create",json!({
+        "project":world.project,"agent":"claude","prompt":"ask:echo deleted-session",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let other = serve.control("sessions.create",json!({
+        "project":world.project,"agent":"claude","prompt":"ask:echo retained-session",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    let other_tab = other["tabId"].as_str().unwrap();
+    for target in [tab,other_tab] {
+        assert_eq!(serve.control("wait",json!({"target":target,"timeoutSeconds":10}))["reason"],"permission");
+    }
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let agent = sessions.pane_of(session,tab).unwrap().unwrap().pane_id;
+    let shell = format!("{session}:delete-shell");
+    serve.control("runtime.pty.spawn",json!({"id":shell,"cwd":world.project,"cols":80,"rows":24,"command":"sleep 60"}));
+    let pids: Vec<_> = [&agent,&shell].iter().map(|id| serve.control("runtime.pty.output",json!({"id":id}))["pid"].as_u64().unwrap()).collect();
+    sessions.delete_session(session).unwrap();
+    for pid in pids {
+        assert!(!std::process::Command::new("/bin/kill").args(["-0",&pid.to_string()])
+            .stderr(std::process::Stdio::null()).status().unwrap().success(),"deletion acknowledged before child exit");
+    }
+    assert!(sessions.ensure_started(session,tab).is_err());
+    assert!(sessions.send(session,tab,"echo:stale".into(),vec![]).is_err());
+    let pending = sessions.pending_permissions().unwrap();
+    assert!(pending.iter().all(|ask| ask.tab_id != tab));
+    assert!(pending.iter().any(|ask| ask.tab_id == other_tab));
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(world.data.join("sessions/index.json")).unwrap()).unwrap();
+    assert!(index["sessions"].as_array().unwrap().iter().all(|entry| entry["id"] != session));
+    assert!(index["sessions"].as_array().unwrap().iter().any(|entry| entry["id"] == other["sessionId"]));
+    assert!(world.project.join("README.md").is_file(),"deleting a conversation must not delete its workspace");
+}

@@ -39,6 +39,8 @@ pub fn execute(manager: &SessionManager, sink: &Arc<dyn EventSink>, command: &st
         };
         match method {
             "spawn" => {
+                let _admission = crate::issue_pipeline::admission::lock();
+                manager.accepting_work()?;
                 // Agent panes are exclusively SessionManager's to launch.
                 if !crate::pty::is_shell_id(id) { bail!("shell pane id must name its session"); }
                 let session = crate::pty::shell_session(id).context("session is required")?;
@@ -81,6 +83,7 @@ pub(crate) fn session(manager: &SessionManager, method: &str, params: Value) -> 
     if method == "running" { return Ok(serde_json::to_value(manager.running_tabs())?); }
     if method == "permissions" { return Ok(serde_json::to_value(manager.pending_permissions())?); }
     match method {
+        "deleteSession" => { manager.delete_session(string(&params, "sessionId")?)?; return Ok(Value::Null); }
         "automations" => return Ok(serde_json::to_value(crate::store::automations::list()?)?),
         "automationRuns" => return Ok(serde_json::to_value(crate::store::automations::list_runs(string(&params, "id")?)?)?),
         "automationIssues" => return Ok(serde_json::to_value(crate::automations::issue_states()?)?),
@@ -89,6 +92,9 @@ pub(crate) fn session(manager: &SessionManager, method: &str, params: Value) -> 
         "automationRun" => return Ok(serde_json::to_value(crate::automations::dispatch(&manager.automation_host(), string(&params, "id")?, crate::automations::AutomationTrigger::Manual, None)?)?),
         "paneAgents" => return Ok(serde_json::to_value(manager.pane_agents())?),
         "addTab" => return Ok(serde_json::to_value(manager.add_tab(string(&params, "sessionId")?, &serde_json::from_value(params["tab"].clone())?)?)?),
+        "resourceOverview" => return Ok(serde_json::to_value(manager.resource_overview())?),
+        "resourceSample" => return Ok(serde_json::to_value(manager.resource_sample()?)?),
+        "resourceKill" => return Ok(serde_json::to_value(manager.resource_kill(string(&params, "paneId")?, params["confirmed"].as_bool().context("confirmed must be a boolean")?)?)?),
         "usage" => return Ok(serde_json::to_value(manager.usage_snapshot())?),
         "refreshUsage" => return Ok(serde_json::to_value(manager.refresh_usage(params["manual"].as_bool().context("manual must be a boolean")?))?),
         "resetCodexUsage" => return Ok(serde_json::to_value(manager.reset_codex_usage()?)?),

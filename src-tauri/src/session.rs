@@ -88,6 +88,18 @@ pub enum Decision {
     Deny,
 }
 
+pub(crate) struct DecisionSender {
+    sender: std::sync::mpsc::Sender<Decision>,
+    caller: crate::hooks::Caller,
+}
+
+impl DecisionSender {
+    fn send(self, decision: Decision) -> std::result::Result<(), ()> {
+        if !self.caller.connected() { return Err(()); }
+        self.sender.send(decision).map_err(|_| ())
+    }
+}
+
 /// Own the receiver so a timed-out hook stops accepting answers before it
 /// waits to reacquire the runtime lock. Only the returned decision resumes work.
 fn wait_for_decision(rx: std::sync::mpsc::Receiver<Decision>, wait: std::time::Duration) -> Option<Decision> {
@@ -413,7 +425,7 @@ pub struct CliTab {
     /// once more, in case the CLI let the first one go by.
     nudge_by: Option<Instant>,
     /// Hook threads parked on a decision, by request id.
-    pub decisions: HashMap<String, std::sync::mpsc::Sender<Decision>>,
+    pub decisions: HashMap<String, DecisionSender>,
     /// Keeps the turn's reply from being drawn twice when the `Stop` hook and
     /// the transcript record cross.
     pub turn_tail: tui::TurnTail,
@@ -600,6 +612,8 @@ pub struct SessionManager {
     writers: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     starts: Arc<std::sync::atomic::AtomicU64>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    stop_pids: Arc<Mutex<Vec<u32>>>,
+    session_stop_pids: Arc<Mutex<HashMap<String, Vec<u32>>>>,
     /// Tabs following their terminal (#437); off until the desktop app asks.
     follow: Arc<follow::Following>,
 }
@@ -769,6 +783,8 @@ impl SessionManager {
             writers: Arc::new(Mutex::new(HashMap::new())),
             starts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_pids: Arc::new(Mutex::new(Vec::new())),
+            session_stop_pids: Arc::default(),
             follow: Arc::default(),
         };
         let watcher = manager.clone();
@@ -1292,12 +1308,41 @@ impl SessionManager {
     /// Local lifetime cannot use the cloud activity silence budget: even a
     /// silent turn or a queued follow-up must survive a detached window.
     pub(crate) fn has_background_work(&self) -> bool {
+        if !self.session_stop_pids.lock().unwrap().is_empty() { return true; }
         let runtimes: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
         runtimes.into_iter().any(|runtime| {
             let runtime = runtime.lock().unwrap();
             runtime.turn_open || !runtime.pending.is_empty() || !runtime.queued.is_empty()
                 || runtime.stop_in_flight
         })
+    }
+
+    /// Roots that may be stopped after the detached idle grace. A shell's
+    /// environment and foreground job are state, so every open plain terminal
+    /// and hand-started agent remains work. Only managed, settled agents qualify.
+    pub(crate) fn idle_process_roots(&self) -> Option<Vec<u32>> {
+        let tabs: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
+        let mut agent_panes = std::collections::HashSet::new();
+        let mut roots = Vec::new();
+        for tab in tabs {
+            let tab = tab.lock().unwrap();
+            if tab.turn_open || !tab.pending.is_empty() || !tab.queued.is_empty() || tab.stop_in_flight { return None; }
+            match &tab.engine {
+                Engine::Cli(cli) => {
+                    if cli.by_hand.is_some() || !cli.ready.settled() || cli.awaiting_delivery.is_some() || cli.resend_after_abort.is_some() || !cli.held.is_empty() {
+                        return None;
+                    }
+                    agent_panes.insert(cli.pane_id.clone());
+                }
+                Engine::Acp(_) | Engine::OpenCode(_) => roots.extend(tab.child_pid),
+                Engine::None => {}
+            }
+        }
+        for pane in self.terminals.panes().into_iter().filter(|pane| pane.running) {
+            if !agent_panes.contains(&pane.id) { return None; }
+            roots.push(pane.pid?);
+        }
+        Some(roots)
     }
 
     /// Turns in progress and permission prompts waiting, counted without
@@ -1333,6 +1378,18 @@ impl SessionManager {
                 && crate::cloud_grants::sign_in_required_for_launch(&runtime.harness, &runtime.launch_key()).is_none();
             (active + usize::from(turn), pending + runtime.pending.len())
         })
+    }
+
+    pub(crate) fn resource_overview(&self) -> crate::status::resources::ResourceOverview {
+        self.status.resources.overview(&self.terminals)
+    }
+
+    pub(crate) fn resource_sample(&self) -> Result<crate::status::resources::ResourceSnapshot> {
+        self.status.resources.sample(&self.terminals)
+    }
+
+    pub(crate) fn resource_kill(&self, pane: &str, confirmed: bool) -> Result<crate::status::resources::KillResult> {
+        self.status.resources.kill(&self.terminals, pane, confirmed)
     }
 
     pub fn usage_snapshot(&self) -> crate::status::usage::UsageSnapshot {
@@ -1966,6 +2023,59 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Delete only after this owner confirms the session's process groups
+    /// exited. Admission remains held through removal, so a stale window cannot
+    /// launch into a directory or conversation while it is being deleted.
+    pub(crate) fn delete_session(&self, session_id: &str) -> Result<()> {
+        let _admission = crate::issue_pipeline::admission::lock();
+        self.accepting_work()?;
+        let entry = index::get(session_id)?;
+        self.stop_session_confirmed(&entry)?;
+        crate::session_ops::delete_session_blocking(self.sink.as_ref(), session_id, &|_| {})
+            .map_err(anyhow::Error::msg)?;
+        self.tabs.lock().unwrap().retain(|_, tab| tab.lock().unwrap().session_id != session_id);
+        Ok(())
+    }
+
+    /// Caller holds checkout admission across its stop and subsequent mutation.
+    /// Failed group confirmations survive retries even after a PTY was removed.
+    fn stop_session_confirmed(&self, entry: &index::SessionEntry) -> Result<()> {
+        let tab_ids: Vec<_> = entry.tabs.iter().map(|tab| tab.id.clone()).collect();
+        let mut panes = self.terminals.session_pane_ids(&entry.id, &tab_ids);
+        panes.extend(entry.tabs.iter().map(TabEntry::pane_id));
+        panes.sort();
+        panes.dedup();
+        let mut pids: Vec<_> = self.terminals.panes().into_iter()
+            .filter(|pane| panes.contains(&pane.id)).filter_map(|pane| pane.pid).collect();
+        for tab in &entry.tabs {
+            let runtime = self.runtime(&entry.id, &tab.id)?;
+            let runtime = runtime.lock().unwrap();
+            pids.extend(runtime.child_pid.or(runtime.stopping_pid));
+        }
+        pids.extend(self.session_stop_pids.lock().unwrap().get(&entry.id).into_iter().flatten().copied());
+        pids.sort_unstable();
+        pids.dedup();
+        self.session_stop_pids.lock().unwrap().insert(entry.id.clone(), pids.clone());
+        // Continue stopping this session after an individual failure, but never
+        // convert that failure to permission to remove its history.
+        let mut failures = Vec::new();
+        for tab in &entry.tabs {
+            if let Err(error) = self.stop(&entry.id, &tab.id) { failures.push(error.to_string()); }
+        }
+        self.terminals.kill_all_and_wait(&panes, RESTART_WAIT);
+        pids.retain(|pid| crate::harness::host::group_or_process_alive(*pid));
+        if !pids.is_empty() {
+            self.session_stop_pids.lock().unwrap().insert(entry.id.clone(), pids);
+            bail!("Session processes have not all exited. Its history was kept; retry the operation after they stop.");
+        }
+        self.session_stop_pids.lock().unwrap().remove(&entry.id);
+        if !failures.is_empty() { bail!("The session could not be stopped: {}", failures.join("; ")); }
+        for pane in panes.into_iter().filter(|pane| crate::pty::is_shell_id(pane)) {
+            self.sink.emit("pty_closed", &pane);
+        }
+        Ok(())
+    }
+
     pub fn respond_permission(&self, session_id: &str, tab_id: &str, request_id: &str, option_id: &str) -> Result<()> {
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut rt = rt_arc.lock().unwrap();
@@ -2424,7 +2534,7 @@ impl SessionManager {
         self.host.kill_all();
     }
 
-    fn accepting_work(&self) -> Result<()> {
+    pub(crate) fn accepting_work(&self) -> Result<()> {
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             bail!("The local runtime is stopping; no new work was accepted.");
         }
@@ -2433,6 +2543,38 @@ impl SessionManager {
 
     /// Fence follow-ups before terminating processes. A late completion must
     /// not drain a queue or start a replacement during stop-all/logout.
+    /// Stop-all acknowledgement means the owned process groups actually exited.
+    /// Preserve failed PIDs in tab state so an explicit retry can confirm them.
+    pub(crate) fn stop_all_confirmed(&self) -> Result<()> {
+        let _admission = crate::issue_pipeline::admission::lock();
+        self.begin_shutdown();
+        let tabs: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
+        let mut pids: Vec<_> = self.terminals.panes().into_iter().filter(|pane| pane.running).filter_map(|pane| pane.pid).collect();
+        for tab in &tabs {
+            let tab = tab.lock().unwrap();
+            pids.extend(tab.child_pid.or(tab.stopping_pid));
+        }
+        pids.extend(self.stop_pids.lock().unwrap().iter().copied());
+        pids.extend(self.session_stop_pids.lock().unwrap().values().flatten().copied());
+        pids.sort_unstable();
+        pids.dedup();
+        let mut failures = Vec::new();
+        for tab in tabs {
+            let (session, id) = { let tab = tab.lock().unwrap(); (tab.session_id.clone(), tab.tab_id.clone()) };
+            if let Err(error) = self.stop(&session, &id) { failures.push(error.to_string()); }
+        }
+        let panes: Vec<_> = self.terminals.panes().into_iter().map(|pane| pane.id).collect();
+        self.terminals.kill_all_and_wait(&panes, RESTART_WAIT);
+        self.host.kill_all_and_wait(RESTART_WAIT);
+        pids.retain(|pid| crate::harness::host::group_or_process_alive(*pid));
+        *self.stop_pids.lock().unwrap() = pids.clone();
+        if !pids.is_empty() {
+            bail!("Stop all could not confirm every process exited. Retry Stop all; the runtime remains stopping.");
+        }
+        if !failures.is_empty() { bail!("Stop all could not settle every tab: {}", failures.join("; ")); }
+        Ok(())
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         self.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
         self.closing();
@@ -2551,7 +2693,11 @@ impl SessionManager {
                 return Ok(false);
             }
         }
-        self.terminals.kill_and_wait(&pane, RESTART_WAIT);
+        // An orderly idle exit left history, not a process to kill. Keep
+        // those bytes for the newly resumed CLI's terminal stream.
+        if self.terminals.is_live(&pane) {
+            self.terminals.kill_and_wait(&pane, RESTART_WAIT);
+        }
         // A conversation the reader started by hand comes with no mode the
         // app knows (#437). Launched by the app it runs in the one that asks:
         // not the app's default, which would hand it more than the reader
@@ -3807,6 +3953,13 @@ impl SessionManager {
     /// answered. The hook thread parks here, which is exactly what holds the
     /// CLI's tool call up until the reader decides.
     fn ask_permission(&self, rt_arc: &Arc<Mutex<TabRuntime>>, frame: &HookFrame, kind: CliKind) -> HookReply {
+        let local_owner = crate::local_runtime::permissions::enabled();
+        let _waiter = if local_owner {
+            match crate::local_runtime::permissions::Permit::acquire() {
+                Some(permit) => Some(permit),
+                None => return reply_for(kind, &frame.event, Decision::Deny),
+            }
+        } else { None };
         let request_id = uuid::Uuid::now_v7().to_string();
         let tool_name = frame.payload["tool_name"].as_str().unwrap_or("tool").to_string();
         let input = frame.payload["tool_input"].clone();
@@ -3835,7 +3988,10 @@ impl SessionManager {
             let mut rt = rt_arc.lock().unwrap();
             let Engine::Cli(p) = &mut rt.engine else { return HookReply::default() };
             if !p.origin.accepts(frame) { return HookReply::default(); }
-            p.decisions.insert(request_id.clone(), tx);
+            p.decisions.insert(request_id.clone(), DecisionSender {
+                sender: tx,
+                caller: if local_owner { crate::hooks::Caller::current() } else { crate::hooks::Caller::default() },
+            });
             // The event carries no tool_use_id — it fires before the call is
             // recorded — so the card stands on its own rather than attaching
             // to a tool row.
@@ -3864,7 +4020,9 @@ impl SessionManager {
             CliKind::Claude => claude::pty::PERMISSION_WAIT,
             CliKind::Codex => codex::pty::PERMISSION_WAIT,
         };
-        let answer = wait_for_decision(rx, wait);
+        let answer = if local_owner {
+            crate::local_runtime::permissions::wait(rx, crate::local_runtime::permissions::WAIT, crate::hooks::caller_connected)
+        } else { wait_for_decision(rx, wait) };
         let mut rt = rt_arc.lock().unwrap();
         // Teardown or a settings restart may replace this CLI while the hook
         // waits. An answer for that old launch cannot start the new one's work.
@@ -3888,6 +4046,17 @@ impl SessionManager {
             // Withdrawn with its turn (`cancel_asks`), which has said so in the
             // chat already: the tool is not run, and nothing has lapsed.
             None if !rt.pending.contains_key(&request_id) => reply_for(kind, gate, Decision::Deny),
+            None if local_owner => {
+                // A finite provider deadline or a lost hook transport is a
+                // denial, never permission to continue through a default reply.
+                self.apply(&mut rt, Payload::PermissionDecided { request_id, tool_use_id: None, allowed: false, label: "Cancelled".into(), automatic: true }, None);
+                if rt.pending.is_empty() {
+                    let status = if rt.turn_open { TabStatus::InProgress } else { TabStatus::Idle };
+                    self.record_activity(&rt, status, store::activity::Source::Live);
+                    self.set_status(&mut rt, status);
+                }
+                reply_for(kind, gate, Decision::Deny)
+            }
             None => {
                 // The CLI has stopped waiting on us and will ask in its own
                 // TUI; the card must stop offering buttons that go nowhere.

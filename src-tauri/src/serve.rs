@@ -308,17 +308,27 @@ fn run(options: Options) -> Result<()> {
                     _ = &mut signal => break,
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {
                         if runtime.lifetime.is_some() { crate::local_sharing::owner::reap(&runtime.manager); }
-                        if runtime.lifetime.as_ref().is_some_and(|lifetime| lifetime.should_exit(|| {
+                        if runtime.lifetime.as_ref().is_some_and(|lifetime| lifetime.should_exit_checked(|| {
                             // An explicitly configured relay server is a
                             // standing service, not a detached desktop owner.
                             options.relay_link.is_some()
                                 || runtime.manager.has_background_work()
-                                || runtime.terminals.stats().running != 0
+                                || runtime.manager.idle_process_roots().is_none()
                                 || crate::issue_pipeline::engine::holding() != 0
                                 // An enabled schedule/issue watcher is an
                                 // explicit standing task, including between
                                 // runs. Never abandon its next dispatch.
                                 || crate::store::automations::list().map_or(true, |automations| automations.iter().any(|automation| automation.enabled))
+                        }, || {
+                            let Some(roots) = runtime.manager.idle_process_roots() else { return false };
+                            match crate::local_runtime::idle::safe(&roots) {
+                                Ok(true) => match crate::local_runtime::scrollback::save(&data_dir, &runtime.terminals) {
+                                    Ok(()) => true,
+                                    Err(error) => { log::warn!("retain idle terminal output: {error:#}"); false }
+                                },
+                                Ok(false) => false,
+                                Err(error) => { log::warn!("classify idle runtime: {error:#}"); false }
+                            }
                         })) { break; }
                     }
                 }
@@ -445,8 +455,15 @@ fn start(options: &Options) -> Result<Runtime> {
     let sink = Arc::new(BroadcastSink::new(1024));
     let host = Arc::new(crate::harness::host::Host::new());
     let terminals = Arc::new(crate::pty::Terminals::new());
+    #[cfg(unix)]
+    if options.runtime_kind == RuntimeKind::Local {
+        crate::local_runtime::scrollback::restore(&crate::store::root()?, &terminals)?;
+    }
     let control_endpoint = crate::hooks::prepare_control()?;
     let pipelines = Arc::new(RuntimeObserver::default());
+    if options.runtime_kind == RuntimeKind::Local {
+        crate::local_runtime::permissions::enable();
+    }
     let manager = crate::session::SessionManager::new(
         sink.clone(),
         pipelines.clone(),
@@ -469,7 +486,14 @@ fn start(options: &Options) -> Result<Runtime> {
         #[cfg(unix)]
         lifetime.set_stream_socket(crate::local_runtime::stream::start(&control_endpoint, sink.clone(), terminals.clone(), lifetime.clone())?);
     }
-    let socket = crate::hooks::serve(control_endpoint, move |frame| hooked.on_hook(frame), move |request| service.handle(request))
+    let hook_lifetime = lifetime.clone();
+    let socket = crate::hooks::serve(control_endpoint, move |frame| {
+        let _request = match hook_lifetime.as_ref().map(|life| life.enter()).transpose() {
+            Ok(request) => request,
+            Err(_) => return crate::hooks::HookReply::refused("The runtime is stopping."),
+        };
+        hooked.on_hook(frame)
+    }, move |request| service.handle(request))
         .context("listen on the hook and control socket")?;
     log::info!("hook socket at {}", socket.display());
     if options.runtime_kind == RuntimeKind::Local && options.relay_link.is_none() && !options.self_test {

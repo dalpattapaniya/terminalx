@@ -2113,8 +2113,7 @@ pub struct WorkspaceRemoveReport {
 pub async fn delete_session(app: AppHandle, session_id: String) -> CmdResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<crate::AppState>();
-        let stop = |session: &SessionEntry| stop_sessions_and_wait(&state, std::slice::from_ref(session));
-        crate::session_ops::delete_session_blocking(&app, &session_id, &stop).map(|_| ())
+        state.sessions().map_err(err)?.delete_session(&session_id).map_err(err)
     })
     .await
     .map_err(err)?
@@ -2651,15 +2650,14 @@ pub async fn status_codex_reset(state: State<'_, AppState>) -> CmdResult<crate::
 }
 
 #[tauri::command]
-pub fn status_resource_overview(state: State<'_, AppState>) -> crate::status::resources::ResourceOverview {
-    state.status.resources.overview(&state.terminals)
+pub fn status_resource_overview(state: State<'_, AppState>) -> CmdResult<serde_json::Value> {
+    state.sessions().map_err(err)?.resource_overview().map_err(err)
 }
 
 #[tauri::command]
-pub async fn status_resource_sample(state: State<'_, AppState>) -> CmdResult<crate::status::resources::ResourceSnapshot> {
-    let status = state.status.clone();
-    let terminals = state.terminals.clone();
-    tauri::async_runtime::spawn_blocking(move || status.resources.sample(&terminals).map_err(err)).await.map_err(err)?
+pub async fn status_resource_sample(state: State<'_, AppState>) -> CmdResult<serde_json::Value> {
+    let sessions = state.sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.resource_sample().map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
@@ -2667,10 +2665,9 @@ pub async fn status_resource_kill(
     state: State<'_, AppState>,
     pane_id: String,
     confirmed: Option<bool>,
-) -> CmdResult<crate::status::resources::KillResult> {
-    let status = state.status.clone();
-    let terminals = state.terminals.clone();
-    tauri::async_runtime::spawn_blocking(move || status.resources.kill(&terminals, &pane_id, confirmed.unwrap_or(false)).map_err(err))
+) -> CmdResult<serde_json::Value> {
+    let sessions = state.sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.resource_kill(&pane_id, confirmed.unwrap_or(false)).map_err(err))
         .await
         .map_err(err)?
 }

@@ -11,6 +11,9 @@
 //! - the hook never blocks forever (a bounded read timeout), and
 //! - anything that goes wrong — no socket, no app, bad frame — exits 0 with
 //!   empty output, which the CLI reads as "this hook had nothing to say".
+//!
+//! Local-owner deciding hooks instead return an explicit denial on failure; a
+//! lost owner must never authorize a tool through an empty hook response.
 
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -416,6 +419,55 @@ pub fn hook_command(exe: &Path, event: &str) -> String {
     format!("{quoted} hook {event}")
 }
 
+/// The extra argument changes wait/failure handling only. It grants no authority:
+/// the owner still validates the launch token, session, tab and transcript.
+pub(crate) fn decision_hook_command(exe: &Path, event: &str, local_owner: bool) -> String {
+    let mut command = hook_command(exe, event);
+    if local_owner { command.push_str(" --local-owner-decision"); }
+    command
+}
+
+#[cfg(unix)]
+thread_local! {
+    static CALLER: std::cell::RefCell<Option<std::sync::Arc<std::os::unix::net::UnixStream>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Inspect the hook transport without consuming bytes or spawning a watcher.
+/// No transport is installed for direct in-process calls and unit tests.
+#[derive(Clone, Default)]
+pub(crate) struct Caller {
+    #[cfg(unix)]
+    stream: Option<std::sync::Arc<std::os::unix::net::UnixStream>>,
+}
+
+impl Caller {
+    pub(crate) fn current() -> Self {
+        #[cfg(unix)]
+        return Self { stream: CALLER.with(|caller| caller.borrow().clone()) };
+        #[cfg(not(unix))]
+        Self::default()
+    }
+
+    pub(crate) fn connected(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(stream) = self.stream.as_ref() else { return true };
+            let mut byte = 0u8;
+            // SAFETY: the descriptor is held by the thread-local stream and `byte`
+            // is writable for one byte. PEEK never consumes protocol data.
+            let read = unsafe { libc::recv(stream.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+            // A hook sends exactly one frame. Extra bytes cannot extend a
+            // disconnected caller's lifetime by keeping unread input queued.
+            read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        }
+        #[cfg(not(unix))]
+        true
+    }
+}
+
+pub(crate) fn caller_connected() -> bool { Caller::current().connected() }
+
 /// The status-line command is the same authenticated forwarder, but it prints
 /// no line back into the TUI.
 pub fn statusline_command(exe: &Path) -> String {
@@ -522,7 +574,10 @@ fn accept(listener: std::os::unix::net::UnixListener, dispatch: Dispatch) -> std
                 if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
                     return;
                 }
+                let Ok(connection) = stream.try_clone() else { return };
+                CALLER.with(|caller| *caller.borrow_mut() = Some(std::sync::Arc::new(connection)));
                 let reply = dispatch(&line);
+                CALLER.with(|caller| *caller.borrow_mut() = None);
                 let mut stream = stream;
                 if let Ok(mut bytes) = serde_json::to_vec(&reply) {
                     bytes.push(b'\n');
@@ -759,13 +814,17 @@ pub fn run_hook_cli() -> bool {
         return false;
     }
     let event = args.next().unwrap_or_default();
+    let local_decision = args.next().as_deref() == Some("--local-owner-decision")
+        && matches!(event.as_str(), "PermissionRequest" | "PreToolUse");
     // Read stdin first, always: the CLI closes the pipe once the hook has
     // taken it, and exiting mid-write surfaces to the CLI as a broken pipe.
     let mut stdin = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin);
     // Never nothing: a permission hook that prints an empty stdout is read as
     // a refusal, so silence has to be spelt out as an empty object.
-    let out = ask_app(&event, &stdin).unwrap_or_else(|| serde_json::json!({}));
+    let out = ask_app_with_policy(&event, &stdin, local_decision).unwrap_or_else(|| {
+        if local_decision { denied_hook(&event) } else { serde_json::json!({}) }
+    });
     let _ = std::io::stdout().write_all(out.to_string().as_bytes());
     let _ = std::io::stdout().write_all(b"\n");
     true
@@ -793,6 +852,18 @@ pub fn run_statusline_cli() -> bool {
 /// Send one frame and wait for the reply. `None` on any failure, so the CLI
 /// carries on exactly as it would with no hook installed.
 fn ask_app(event: &str, stdin: &str) -> Option<Value> {
+    ask_app_with_policy(event, stdin, false)
+}
+
+fn denied_hook(event: &str) -> Value {
+    if event == "PreToolUse" {
+        crate::harness::codex::pty::pre_tool_decision(false)
+    } else {
+        crate::harness::codex::pty::permission_decision(false)
+    }
+}
+
+fn ask_app_with_policy(event: &str, stdin: &str, local_decision: bool) -> Option<Value> {
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
 
@@ -805,7 +876,7 @@ fn ask_app(event: &str, stdin: &str) -> Option<Value> {
         payload,
     };
     let path = std::env::var(SOCKET_ENV).ok()?;
-    let timeout = reply_timeout(&frame.event);
+    let timeout = if local_decision { crate::local_runtime::permissions::BRIDGE_WAIT } else { reply_timeout(&frame.event) };
     let mut bytes = serde_json::to_vec(&frame).ok()?;
     bytes.push(b'\n');
     #[cfg(unix)]
@@ -832,6 +903,28 @@ fn ask_app(event: &str, stdin: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_wait_observes_hook_disconnect_without_consuming_bytes() {
+        let (owner, mut hook) = std::os::unix::net::UnixStream::pair().unwrap();
+        CALLER.with(|caller| *caller.borrow_mut() = Some(std::sync::Arc::new(owner)));
+        assert!(caller_connected());
+        hook.write_all(b"x").unwrap();
+        assert!(!caller_connected());
+        let mut byte = [0];
+        CALLER.with(|caller| caller.borrow().as_ref().unwrap().as_ref().read_exact(&mut byte)).unwrap();
+        assert_eq!(byte, [b'x']);
+        drop(hook);
+        assert!(!caller_connected());
+        CALLER.with(|caller| *caller.borrow_mut() = None);
+    }
+
+    #[test]
+    fn owner_hook_transport_failure_is_a_denial_for_both_gates() {
+        assert_eq!(denied_hook("PermissionRequest")["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert_eq!(denied_hook("PreToolUse")["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
 
     #[test]
     fn the_hook_command_is_this_binary_with_the_event() {

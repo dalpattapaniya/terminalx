@@ -18,6 +18,9 @@ use crate::control::ControlError;
 #[cfg(unix)]
 pub mod stream;
 pub mod calls;
+pub(crate) mod permissions;
+pub(crate) mod scrollback;
+pub(crate) mod idle;
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
@@ -97,6 +100,7 @@ struct State {
     requests: usize,
     idle_since: Option<Instant>,
     stop_requested: bool,
+    stop_failed: bool,
     exiting: bool,
 }
 
@@ -154,7 +158,7 @@ impl Lifetime {
             state: Mutex::new(State {
                 starting: false,
                 leases: HashMap::new(), requests: 0, idle_since: Some(Instant::now()),
-                stop_requested: false, exiting: false,
+                stop_requested: false, stop_failed: false, exiting: false,
             }),
         })
     }
@@ -172,11 +176,15 @@ impl Lifetime {
     }
 
     pub fn enter(self: &Arc<Self>) -> Result<RequestGuard, ControlError> {
+        self.enter_command(false)
+    }
+
+    pub(crate) fn enter_command(self: &Arc<Self>, stop_retry: bool) -> Result<RequestGuard, ControlError> {
         let mut state = self.state.lock().unwrap();
         if state.starting {
             return Err(ControlError::new("runtime_starting", "The local runtime is restoring its stores.", None::<String>));
         }
-        if state.exiting || state.stop_requested {
+        if state.exiting || (state.stop_requested && !(stop_retry && state.stop_failed)) {
             return Err(unavailable());
         }
         state.requests += 1;
@@ -218,7 +226,7 @@ impl Lifetime {
         if state.starting {
             return Err(ControlError::new("runtime_starting", "The local runtime is restoring its stores.", None::<String>));
         }
-        if state.exiting || state.stop_requested {
+        if state.exiting || (state.stop_requested && !(command == "runtime.stopAll" && state.stop_failed)) {
             return Err(unavailable());
         }
         match command {
@@ -259,11 +267,16 @@ impl Lifetime {
                     return Err(ControlError::new("runtime_restarted", "Refresh runtime status before stopping all work.", None::<String>));
                 }
                 state.stop_requested = true;
+                state.stop_failed = false;
                 for attachment in state.leases.values() { attachment.revoke(); }
                 Ok(json!({ "stopping": true }))
             }
             _ => Err(ControlError::new("unsupported", "Unknown local runtime lifecycle command.", None::<String>)),
         }
+    }
+
+    pub(crate) fn stop_failed(&self) {
+        self.state.lock().unwrap().stop_failed = true;
     }
 
     /// Commit shutdown under the same lock that admits commands. Callers
@@ -272,11 +285,23 @@ impl Lifetime {
         self.should_exit_at(Instant::now(), busy)
     }
 
+    pub(crate) fn should_exit_checked(&self, busy: impl FnOnce() -> bool, confirm: impl FnOnce() -> bool) -> bool {
+        self.should_exit_confirmed(Instant::now(), busy, confirm)
+    }
+
     fn should_exit_at(&self, now: Instant, busy: impl FnOnce() -> bool) -> bool {
+        self.should_exit_confirmed(now, busy, || true)
+    }
+
+    fn should_exit_confirmed(&self, now: Instant, busy: impl FnOnce() -> bool, confirm: impl FnOnce() -> bool) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.starting { return false; }
         if state.requests != 0 { return false; }
-        if state.stop_requested { state.exiting = true; return true; }
+        if state.stop_requested {
+            if state.stop_failed { return false; }
+            state.exiting = true;
+            return true;
+        }
         let had_clients = !state.leases.is_empty();
         state.leases.retain(|_, attachment| attachment.valid_at(now));
         if !state.leases.is_empty() || busy() {
@@ -286,6 +311,10 @@ impl Lifetime {
         if had_clients { state.idle_since = Some(now); }
         let since = *state.idle_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= self.grace {
+            if !confirm() {
+                state.idle_since = Some(now);
+                return false;
+            }
             state.exiting = true;
         }
         state.exiting
@@ -295,6 +324,25 @@ impl Lifetime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_stop_stays_available_only_for_an_explicit_retry() {
+        let life = Lifetime::new(Duration::ZERO);
+        let request = life.enter().unwrap();
+        life.command("runtime.stopAll", json!({"epoch":life.epoch})).unwrap();
+        life.stop_failed();
+        drop(request);
+        assert!(!life.should_exit(|| false));
+        assert!(life.enter().is_err());
+        assert!(life.command("runtime.attach", json!({"protocol":PROTOCOL})).is_err());
+        let retry = life.enter_command(true).unwrap();
+        assert!(life.command("runtime.stopAll", json!({"epoch":"old-owner"})).is_err());
+        assert!(!life.should_exit(|| false));
+        life.command("runtime.stopAll", json!({"epoch":life.epoch})).unwrap();
+        assert!(!life.should_exit(|| false), "the stop acknowledgement is still being prepared");
+        drop(retry);
+        assert!(life.should_exit(|| false));
+    }
 
     #[test]
     fn detach_serializes_with_an_admitted_write_and_refuses_the_next_one() {

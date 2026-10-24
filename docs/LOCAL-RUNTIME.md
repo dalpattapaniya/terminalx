@@ -81,8 +81,9 @@ returns. Pending approvals/questions, queued delivery, pipelines, cleanup and
 in-flight mutations count as work. Do not reuse `turn_counts()` as the shutdown
 predicate: its cloud silence budget eventually excludes a still-live turn.
 Unknown terminal activity is busy; silence is never evidence that a command
-finished. A plain shell that can be proven idle may close at grace expiry; a
-foreground job, stopped job or unclassified descendant keeps the runtime alive.
+finished. An open plain shell preserves its environment and remains live, even
+at its prompt. Managed, settled agent CLIs qualify only when a final process
+table inspection proves they have no descendants; unknown activity stays live.
 Idle agent CLIs may close only after their turns, pending asks and queues drain.
 Idle shutdown and new attach/start must serialize under the lifecycle state
 machine so work cannot be accepted after shutdown commits.
@@ -97,22 +98,49 @@ an interrupted turn. Do not configure a helper to restart after logout or boot.
 
 ## Permission and output constraints requiring implementation
 
-Keeping the runtime alive does **not** yet preserve an overnight approval:
-`ask_permission` has a provider-specific deadline and on expiry publishes
-`Lapsed` and `PermissionExpired`. Codex also imposes a hook timeout. Simply
-persisting an answerable card or removing TerminalX's timeout would be false.
-Validate each provider's actual hook/TUI behavior and implement a live pending
-decision path or an explicit provider prompt handoff with a valid response
-mechanism. Do not auto-allow, replay an expired decision into another turn, or
-claim this acceptance criterion passes before provider validation.
+Local owner permission hooks now share one policy: provider timeout 2,147,483
+seconds, owner decision deadline 30 seconds earlier, bridge deadline 15 seconds
+earlier. This is finite (about 24.8 days), not an unlimited hook. Inspection of
+installed Claude Code 2.1.309 found a positive seconds schema and command runner
+`Math.min(timeout * 1000, 2147483647)`. Codex 0.153.4 normalizes deciding timeouts
+with a 600-second default and no 600-second ceiling; an isolated real
+`app-server hooks/list` accepted 2,147,483 seconds for both PermissionRequest and
+PreToolUse without warnings. Only SessionEnd/Interrupt are capped at 3 seconds
+in that Codex version. The repeatable evidence script is
+`scripts/local-runtime/provider-hook-probe.py`; Claude evidence is static binary
+inspection, not a real permission round-trip. Sources:
+[Codex 0.153.4 normalization](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/hooks/src/engine/discovery.rs)
+and [Claude hook timeout behavior](https://code.claude.com/docs/en/hooks#timeouts).
 
-The existing 512 KiB PTY tail is memory-only and may trim at a newline on attach.
-It cannot promise unlimited full scrollback. Keep bounded retention with explicit
-truncation information, and retain finished panes until the reader can observe
-their result. A disk spool, if needed for grace expiry, must be owner-only,
-bounded per pane and globally, distinguish output from process liveness, and
-never resurrect an exited process. Coordinate all transport/renderer changes
-with #232; do not add a competing PTY implementation.
+The policy is enabled only after the local runtime acquires its ownership lock.
+Cloud/default command and reporting waits remain unchanged. Deciding bridge
+commands carry an explicit failure-policy argument, which grants no authority:
+origin tokens/session/tab checks still happen in the owner. Missing/refused/lost
+owner transports return denial JSON for both gates, never an empty allow-through
+reply. Pending cards hold owner lifetime, independently of view leases. Sender
+removal cancels immediately; a disconnected hook is detected within 100 ms,
+without a watcher thread or a runtime lock held while waiting. Answers also
+check the live hook connection at admission. At most 256 deciding waits are
+retained per owner; excess requests are denied. Reaching the finite ceiling
+withdraws the card and denies, rather than presenting an answerable stale card.
+Real Claude/Codex interactive permission behavior and packaged quit/reopen still
+need guest acceptance; elapsed provider timers cannot be renewed by a UI attach.
+
+Each live PTY retains a bounded 512 KiB tail. At orderly idle shutdown the
+owner atomically saves at most 32 MiB of terminal tails in its private runtime
+directory. Reopening consumes that snapshot as output history, with no live PID;
+only still-present sessions and open agent tabs are restored. A new CLI can append
+to its retained tail. Snapshots reject symlinks, public files, oversized data and
+duplicate IDs. A crash can lose memory-only output and remains an interruption;
+this is not an unlimited scrollback promise. The frontend transport stays unchanged.
+
+Stop-all acknowledges only after managed agents and all terminal process groups
+have actually exited. A failed stop leaves the owner available solely for an
+explicit authenticated stop retry; it never reports success or accepts new work.
+Resource sampling and termination rules are evaluated by the actual owner.
+Explicit session deletion also runs there: checkout admission remains held through
+process confirmation and history removal, failed confirmations retain history,
+and other sessions sharing the same checkout remain running.
 
 ## Window features, updates and macOS
 

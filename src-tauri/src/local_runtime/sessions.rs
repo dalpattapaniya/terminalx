@@ -49,6 +49,10 @@ impl Sessions {
         self.call(&format!("runtime.session.{method}"), params)
     }
 
+    pub fn delete_session(&self, session: &str) -> Result<()> {
+        self.call("runtime.session.deleteSession", json!({"sessionId":session}))
+    }
+
     pub fn automations(&self) -> Result<Vec<crate::automations::Automation>> {
         self.call("runtime.session.automations", json!({}))
     }
@@ -71,6 +75,18 @@ impl Sessions {
 
     pub fn run_automation(&self, id: &str) -> Result<crate::automations::AutomationRun> {
         self.call("runtime.session.automationRun", json!({"id":id}))
+    }
+
+    pub fn resource_overview(&self) -> Result<Value> {
+        self.call("runtime.session.resourceOverview", json!({}))
+    }
+
+    pub fn resource_sample(&self) -> Result<Value> {
+        self.call("runtime.session.resourceSample", json!({}))
+    }
+
+    pub fn resource_kill(&self, pane: &str, confirmed: bool) -> Result<Value> {
+        self.call("runtime.session.resourceKill", json!({"paneId":pane,"confirmed":confirmed}))
     }
 
     pub fn usage_snapshot(&self) -> Result<crate::status::usage::UsageSnapshot> {

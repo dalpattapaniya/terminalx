@@ -303,7 +303,7 @@ impl ControlService {
 
     pub fn handle(&self, request: ControlRequest) -> ControlResponse {
         let id = request.id.clone();
-        let _request = match self.local_lifetime.as_ref().map(|lifetime| lifetime.enter()).transpose() {
+        let _request = match self.local_lifetime.as_ref().map(|lifetime| lifetime.enter_command(request.command == "runtime.stopAll")).transpose() {
             Ok(guard) => guard,
             Err(error) => return ControlResponse::failure(id, error),
         };
@@ -340,7 +340,12 @@ impl ControlService {
                     return crate::local_runtime::calls::execute(&self.manager, &self.sink, command, params).map_err(ControlError::internal);
                 }
                 let result = lifetime.command(command, params)?;
-                if command == "runtime.stopAll" { self.manager.begin_shutdown(); }
+                if command == "runtime.stopAll" {
+                    if let Err(error) = self.manager.stop_all_confirmed() {
+                        lifetime.stop_failed();
+                        return Err(ControlError::internal(error));
+                    }
+                }
                 return Ok(result);
             }
         }

@@ -4,6 +4,16 @@
 
 ### Runtime investigation
 
+- Confirm process-group exit before acknowledging local stop-all, retain bounded
+  terminal history across orderly idle-owner shutdown, and keep open shells or
+  unknown child activity alive. Resource commands now inspect the owner, and
+  session deletion confirms its processes stopped before removing history. (#467)
+
+- Keep local-owner permission cards alive across view detachment using aligned
+  provider/bridge/owner deadlines, bounded waiters and explicit cancellation.
+  Lost hook transports and stale answers fail closed; cloud/default waits remain
+  unchanged. Provider timers remain finite (about 24.8 days). (#467)
+
 - Close tabs through their runtime owner so confirmed process exit precedes
   closed-tab retention, and stale views cannot restart them. Route automation
   definitions and manual runs through that same owner, retaining disabled

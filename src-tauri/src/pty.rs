@@ -119,6 +119,7 @@ const EXIT_AFTER_OUTPUT: Duration = Duration::from_millis(500);
 
 pub struct Terminals {
     panes: Mutex<HashMap<String, Pane>>,
+    retained: Mutex<HashMap<String, crate::local_runtime::scrollback::History>>,
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     /// Keyed by pane id and kept across the pane's own life: a view may
     /// attach before its pane is spawned, and stays attached when the process
@@ -187,7 +188,7 @@ struct Emitted {
 
 impl Default for Terminals {
     fn default() -> Self {
-        Self { panes: Mutex::new(HashMap::new()), sink: Mutex::new(None), taps: Mutex::new(HashMap::new()), emitted: Arc::default(), titles: Mutex::new(HashMap::new()), renamed: Mutex::default() }
+        Self { panes: Mutex::new(HashMap::new()), retained: Mutex::default(), sink: Mutex::new(None), taps: Mutex::new(HashMap::new()), emitted: Arc::default(), titles: Mutex::new(HashMap::new()), renamed: Mutex::default() }
     }
 }
 
@@ -302,7 +303,10 @@ impl Terminals {
     /// it to tell the CLI — and every hook the CLI spawns, since a hook is a
     /// grandchild of this shell — which tab it belongs to.
     pub fn spawn(&self, sink: Arc<dyn EventSink>, id: &str, spec: PaneSpec<'_>) -> Result<()> {
-        self.spawn_after(sink, id, spec, Vec::new())
+        let printed = self.retained.lock().unwrap().get(id).map(|history| history.data.clone()).unwrap_or_default();
+        let result = self.spawn_after(sink, id, spec, printed);
+        if result.is_ok() { self.retained.lock().unwrap().remove(id); }
+        result
     }
 
     /// Open a pane in the place of one whose program has exited, keeping what
@@ -318,7 +322,9 @@ impl Terminals {
                 crate::harness::host::terminate(pid);
             }
         }
-        self.spawn_after(sink, id, spec, printed)
+        let result = self.spawn_after(sink, id, spec, printed);
+        if result.is_ok() { self.retained.lock().unwrap().remove(id); }
+        result
     }
 
     fn spawn_after(&self, sink: Arc<dyn EventSink>, id: &str, spec: PaneSpec<'_>, printed: Vec<u8>) -> Result<()> {
@@ -667,9 +673,11 @@ impl Terminals {
     }
 
     pub fn read_output(&self, id: &str) -> Option<Vec<u8>> {
-        let scrollback = self.panes.lock().unwrap().get(id)?.scrollback.clone();
-        let bytes = scrollback.lock().unwrap().iter().copied().collect();
-        Some(bytes)
+        let scrollback = self.panes.lock().unwrap().get(id).map(|pane| pane.scrollback.clone());
+        match scrollback {
+            Some(scrollback) => Some(scrollback.lock().unwrap().iter().copied().collect()),
+            None => self.retained.lock().unwrap().get(id).map(|history| history.data.clone()),
+        }
     }
 
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
@@ -686,6 +694,7 @@ impl Terminals {
     }
 
     pub fn kill(&self, id: &str) {
+        self.retained.lock().unwrap().remove(id);
         if let Some(pane) = self.panes.lock().unwrap().remove(id) {
             if let Some(pid) = pane.pid {
                 crate::harness::host::terminate(pid);
@@ -703,6 +712,7 @@ impl Terminals {
     /// the old one has let go dies on the spot. Claude Code's TUI also ignores
     /// SIGTERM outright, so asking politely and moving on is not enough.
     pub fn kill_and_wait(&self, id: &str, timeout: Duration) {
+        self.retained.lock().unwrap().remove(id);
         let Some(pane) = self.panes.lock().unwrap().remove(id) else { return };
         let pid = pane.pid;
         if let Some(pid) = pid {
@@ -734,6 +744,7 @@ impl Terminals {
     /// gone, so a directory they ran in can be removed. Signalling them all
     /// before waiting keeps the wait to one grace period rather than one each.
     pub fn kill_all_and_wait(&self, ids: &[String], timeout: Duration) {
+        self.retained.lock().unwrap().retain(|id, _| !ids.contains(id));
         let mut pids = Vec::new();
         {
             let mut panes = self.panes.lock().unwrap();
@@ -770,14 +781,14 @@ impl Terminals {
 
     /// Name a shell tab, for every window that lists it.
     pub fn set_title(&self, id: &str, title: &str) {
-        if self.panes.lock().unwrap().contains_key(id) {
+        if self.panes.lock().unwrap().contains_key(id) || self.retained.lock().unwrap().contains_key(id) {
             self.titles.lock().unwrap().insert(id.to_string(), title.to_string());
         }
     }
 
     /// The reader gave a shell tab a name of their own.
     pub fn rename(&self, id: &str, title: &str) {
-        if self.panes.lock().unwrap().contains_key(id) {
+        if self.panes.lock().unwrap().contains_key(id) || self.retained.lock().unwrap().contains_key(id) {
             self.titles.lock().unwrap().insert(id.to_string(), title.to_string());
             self.renamed.lock().unwrap().insert(id.to_string());
         }
@@ -828,9 +839,14 @@ impl Terminals {
         let session_id = shell_session(id)?.to_string();
         let (cwd, exited, created) = {
             let panes = self.panes.lock().unwrap();
-            let pane = panes.get(id)?;
-            let alive = *pane.alive.lock().unwrap();
-            (pane.cwd.clone(), !alive, pane.created.clone())
+            if let Some(pane) = panes.get(id) {
+                let alive = *pane.alive.lock().unwrap();
+                (pane.cwd.clone(), !alive, pane.created.clone())
+            } else {
+                let retained = self.retained.lock().unwrap();
+                let history = retained.get(id)?;
+                (history.cwd.clone(), true, history.created.clone())
+            }
         };
         let title = self.titles.lock().unwrap().get(id).cloned();
         let renamed = self.renamed.lock().unwrap().contains(id);
@@ -862,7 +878,9 @@ impl Terminals {
     /// there when they were opened needs in order to list them.
     pub fn shells(&self) -> Vec<ShellPane> {
         let mut ids: Vec<String> = self.panes.lock().unwrap().keys().filter(|id| shell_session(id).is_some()).cloned().collect();
+        ids.extend(self.retained.lock().unwrap().keys().filter(|id| shell_session(id).is_some()).cloned());
         ids.sort();
+        ids.dedup();
         ids.iter().filter_map(|id| self.shell(id)).collect()
     }
 
@@ -870,7 +888,7 @@ impl Terminals {
     pub fn session_pane_ids(&self, session_id: &str, tab_ids: &[String]) -> Vec<String> {
         let prefix = format!("{session_id}:");
         let tabs: Vec<String> = tab_ids.iter().map(|tab| format!("tab:{tab}")).collect();
-        self.panes.lock().unwrap().keys().filter(|id| id.starts_with(&prefix) || tabs.contains(id)).cloned().collect()
+        self.panes().into_iter().map(|pane| pane.id).filter(|id| id.starts_with(&prefix) || tabs.contains(id)).collect()
     }
 
     pub fn kill_session_shells(&self, session_id: &str) {
@@ -914,17 +932,52 @@ impl Terminals {
     }
 
     pub fn panes(&self) -> Vec<PaneInfo> {
-        self.panes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(id, pane)| PaneInfo {
-                id: id.clone(),
-                pid: pane.pid,
-                running: *pane.alive.lock().unwrap(),
-                cwd: pane.cwd.clone(),
-            })
-            .collect()
+        let mut panes: HashMap<_, _> = self.retained.lock().unwrap().iter().map(|(id, pane)|
+            (id.clone(), PaneInfo { id: id.clone(), pid: None, running: false, cwd: pane.cwd.clone() })).collect();
+        panes.extend(self.panes.lock().unwrap().iter().map(|(id, pane)| (id.clone(), PaneInfo {
+            id: id.clone(), pid: pane.pid, running: *pane.alive.lock().unwrap(), cwd: pane.cwd.clone(),
+        })));
+        panes.into_values().collect()
+    }
+
+    pub(crate) fn history(&self, budget: usize) -> Vec<crate::local_runtime::scrollback::History> {
+        use crate::local_runtime::scrollback::History;
+        let mut history = self.retained.lock().unwrap().clone();
+        let panes = self.panes.lock().unwrap();
+        let each = (budget / (history.len() + panes.len()).max(1)).min(SCROLLBACK_BYTES);
+        let titles = self.titles.lock().unwrap();
+        let renamed = self.renamed.lock().unwrap();
+        for (id, pane) in panes.iter() {
+            let printed = pane.scrollback.lock().unwrap();
+            history.insert(id.clone(), History { id: id.clone(), cwd: pane.cwd.clone(), created: pane.created.clone(),
+                title: titles.get(id).cloned(), renamed: renamed.contains(id),
+                data: printed.iter().skip(printed.len().saturating_sub(each)).copied().collect() });
+        }
+        for pane in history.values_mut() {
+            pane.title = titles.get(&pane.id).cloned();
+            pane.renamed = renamed.contains(&pane.id);
+            if pane.data.len() > each {
+                pane.data.drain(..pane.data.len() - each);
+            }
+            if pane.data.len() == each {
+                if let Some(newline) = pane.data.iter().take(4096).position(|byte| *byte == b'\n') {
+                    pane.data.drain(..=newline);
+                }
+            }
+        }
+        history.into_values().collect()
+    }
+
+    pub(crate) fn restore_history(&self, history: Vec<crate::local_runtime::scrollback::History>) {
+        let mut titles = self.titles.lock().unwrap();
+        let mut renamed = self.renamed.lock().unwrap();
+        for pane in &history {
+            if let Some(title) = &pane.title { titles.insert(pane.id.clone(), title.clone()); }
+            if pane.renamed { renamed.insert(pane.id.clone()); }
+        }
+        drop(renamed);
+        drop(titles);
+        *self.retained.lock().unwrap() = history.into_iter().map(|pane| (pane.id.clone(), pane)).collect();
     }
 
     pub fn stats(&self) -> TerminalStats {
@@ -934,12 +987,14 @@ impl Terminals {
             (views + tapped.0.len(), bytes + tapped.0.iter().map(Tapped::unacked).sum::<usize>())
         });
         let panes = self.panes.lock().unwrap();
+        let retained = self.retained.lock().unwrap();
+        let retained = retained.iter().filter(|(id, _)| !panes.contains_key(*id)).map(|(_, pane)| pane).collect::<Vec<_>>();
         TerminalStats {
             views,
             unacked_bytes,
-            panes: panes.len(),
+            panes: panes.len() + retained.len(),
             running: panes.values().filter(|pane| *pane.alive.lock().unwrap()).count(),
-            scrollback_bytes: panes.values().map(|pane| pane.scrollback.lock().unwrap().len()).sum(),
+            scrollback_bytes: panes.values().map(|pane| pane.scrollback.lock().unwrap().len()).sum::<usize>() + retained.iter().map(|pane| pane.data.len()).sum::<usize>(),
             data_events: self.emitted.events.load(Ordering::Relaxed),
             data_bytes: self.emitted.bytes.load(Ordering::Relaxed),
         }
@@ -949,8 +1004,9 @@ impl Terminals {
         // A name outlives its pane no longer than this.
         {
             let panes = self.panes.lock().unwrap();
-            self.titles.lock().unwrap().retain(|id, _| panes.contains_key(id));
-            self.renamed.lock().unwrap().retain(|id| panes.contains_key(id));
+            let retained = self.retained.lock().unwrap();
+            self.titles.lock().unwrap().retain(|id, _| panes.contains_key(id) || retained.contains_key(id));
+            self.renamed.lock().unwrap().retain(|id| panes.contains_key(id) || retained.contains_key(id));
         }
         if let Some(sink) = self.sink.lock().unwrap().as_ref() {
             sink.emit(crate::status::resources::CHANGED_EVENT, &());
