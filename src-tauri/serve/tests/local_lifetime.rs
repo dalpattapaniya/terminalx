@@ -182,7 +182,20 @@ fn event_socket_rejects_invalid_authentication_without_an_attachment() {
 #[test]
 fn native_client_pins_its_owner_and_cannot_send_to_a_replacement() {
     let world = AgentWorld::new();
-    let mut serve = Serve::start(world.command(), &world.data);
+    // This is an empty-profile transport test. Registering the fixture Git
+    // project also starts asynchronous GitHub PR recovery, whose legitimate
+    // missing-credential error races the empty accounting assertion below.
+    // Start without a project so there is no unrelated external GitHub work.
+    let start = || {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_terminalx-serve"));
+        command.arg("--data-dir").arg(&world.data)
+            .env("HOME", &world.home)
+            .env("CLAUDE_CONFIG_DIR", world.home.join(".claude"))
+            .env_remove("TERMINALX_HOME")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
+        Serve::start(command, &world.data)
+    };
+    let mut serve = start();
     let client = raccoon_lib::local_runtime::client::Client::connect(&world.data).unwrap();
     let mut events = client.stream().unwrap();
     writeln!(events.writer().unwrap(), "{}", json!({"method":"ping"})).unwrap();
@@ -195,12 +208,12 @@ fn native_client_pins_its_owner_and_cannot_send_to_a_replacement() {
     sessions.usage_snapshot().unwrap();
     let activity = sessions.activity_summary().unwrap();
     assert_eq!(activity.agents_spawned, 0);
-    assert!(activity.accounting_error.is_none());
+    assert!(activity.accounting_error.is_none(), "unexpected accounting error: {:?}", activity.accounting_error);
     client.stop_all().unwrap();
     stopped(&mut serve);
     drop(events);
     drop(serve);
-    let replacement = Serve::start(world.command(), &world.data);
+    let replacement = start();
     assert!(client.call::<serde_json::Value>("status", json!({})).is_err());
     assert!(sessions.usage_snapshot().is_err(), "disconnected usage must not look like an empty account");
     assert!(sessions.activity_summary().is_err(), "disconnected activity must not be read by a new UI owner");
