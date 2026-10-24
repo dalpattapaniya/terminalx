@@ -1534,13 +1534,15 @@ impl SessionManager {
         text: String,
         images: Vec<ImageInput>,
     ) -> Result<SendOutcome> {
+        let admission = crate::issue_pipeline::admission::lock();
         let mut sharing = self.sharing.lock().unwrap();
         if let Some(share) = sharing.sessions.get_mut(session_id) {
             share.host_takeover(tab_id, chrono::Utc::now().timestamp_millis());
             self.sink.emit("session_share_changed", &serde_json::json!({ "sessionId": session_id, "state": share.snapshot(chrono::Utc::now().timestamp_millis(), true) }));
-            return self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: Some(share.host.clone()), shared_connection: None }, images, None);
+            return self.send_admitted(&admission, session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: Some(share.host.clone()), shared_connection: None }, images, None);
         }
-        self.send_with_display_text(session_id, tab_id, text.clone(), text, images)
+        drop(sharing);
+        self.send_display_admitted(&admission, session_id, tab_id, text.clone(), text, images)
     }
 
     /// Continuations use the normal send path, but only acknowledge delivery
@@ -1564,15 +1566,10 @@ impl SessionManager {
 
     /// Send one prompt to the agent while publishing a different, user-facing
     /// representation to the transcript.
-    pub(crate) fn send_with_display_text(
-        &self,
-        session_id: &str,
-        tab_id: &str,
-        text: String,
-        display_text: String,
-        images: Vec<ImageInput>,
+    fn send_display_admitted(&self, admission: &std::sync::MutexGuard<'static, ()>,
+        session_id: &str, tab_id: &str, text: String, display_text: String, images: Vec<ImageInput>,
     ) -> Result<SendOutcome> {
-        let outcome = self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text, display: display_text, author: None, shared_connection: None }, images, None);
+        let outcome = self.send_admitted(admission, session_id, tab_id, PromptText { mobile: None, agent: text, display: display_text, author: None, shared_connection: None }, images, None);
         // The app declining to type into the tab's terminal is no error of
         // the agent's: nothing is raised in the tab, and the reason is said.
         if outcome.as_ref().is_err_and(|error| error.is::<follow::Refusal>()) {
@@ -1590,24 +1587,40 @@ impl SessionManager {
     /// the PTY writer takes the same permit again immediately before typing.
     pub(crate) fn send_mobile(&self, session_id: &str, tab_id: &str, text: String, display: String,
         images: Vec<ImageInput>, permit: crate::local_runtime::mobile::WritePermit) -> Result<SendOutcome> {
+        // Admission precedes sharing, device grants and tab revisions. Delete
+        // and stop-all hold admission while invalidating those same permits.
+        let admission = crate::issue_pipeline::admission::lock();
         let _sharing = self.sharing.lock().unwrap();
         let _admitted = permit.enter()?;
         permit.check_mode(session_id, tab_id)?;
-        self.send_impl(session_id, tab_id, PromptText { mobile:Some(permit.clone()),
+        self.send_admitted(&admission, session_id, tab_id, PromptText { mobile:Some(permit.clone()),
             shared_connection:None,author:None,agent:text,display }, images, None)
     }
 
-    /// Already admitted under `sharing`: use the same prompt writer as the host.
+    /// Caller acquires checkout admission before sharing/attachment authority.
+    pub(crate) fn send_shared_admitted(&self, admission: &std::sync::MutexGuard<'static, ()>, session_id: &str, tab_id: &str, text: String, author: crate::local_sharing::Person, connection: crate::local_sharing::WritePermit) -> Result<SendOutcome> {
+        self.send_admitted(admission, session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: Some(author), shared_connection: Some(connection) }, Vec::new(), None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn send_shared(&self, session_id: &str, tab_id: &str, text: String, author: crate::local_sharing::Person, connection: crate::local_sharing::WritePermit) -> Result<SendOutcome> {
-        self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: Some(author), shared_connection: Some(connection) }, Vec::new(), None)
+        let admission = crate::issue_pipeline::admission::lock();
+        self.send_shared_admitted(&admission, session_id, tab_id, text, author, connection)
     }
 
     fn send_impl(
         &self, session_id: &str, tab_id: &str, prompt: PromptText,
         images: Vec<ImageInput>, receipt: Option<DeliveryReceipt>,
     ) -> Result<SendOutcome> {
+        let admission = crate::issue_pipeline::admission::lock();
+        self.send_admitted(&admission, session_id, tab_id, prompt, images, receipt)
+    }
+
+    fn send_admitted(&self, _admission: &std::sync::MutexGuard<'static, ()>,
+        session_id: &str, tab_id: &str, prompt: PromptText,
+        images: Vec<ImageInput>, receipt: Option<DeliveryReceipt>,
+    ) -> Result<SendOutcome> {
         self.accepting_work()?;
-        let _admission = crate::issue_pipeline::admission::lock();
         crate::issue_pipeline::admission::check(session_id, tab_id)?;
         let rt_arc = self.runtime(session_id, tab_id)?;
         let mut entry = index::get(session_id)?;
@@ -4414,6 +4427,10 @@ impl Sink for TabSink {
 #[cfg(test)]
 #[path = "session_watch_tests.rs"]
 mod watch_tests;
+
+#[cfg(test)]
+#[path = "session_mobile_admission_tests.rs"]
+mod mobile_admission_tests;
 
 #[cfg(test)]
 #[path = "session_follow_tests.rs"]

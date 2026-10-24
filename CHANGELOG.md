@@ -4,6 +4,10 @@
 
 ### Runtime investigation
 
+- Acquire checkout admission before mobile/sharing write permits so concurrent
+  deletion and revocation cannot deadlock. Revalidate sharing replies against
+  the owner before handing buffered session data to a guest connection. (#467)
+
 - Wake the local helper's AppKit event loop after backend shutdown, so idle
   exit and explicit stop-all do not leave a stopped menu-bar process behind. (#467)
 

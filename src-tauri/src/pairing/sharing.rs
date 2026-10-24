@@ -545,7 +545,7 @@ impl PairingManager {
                                     Ok(value) => json!({ "id": request["id"], "ok": true, "result": value }),
                                     Err(error) => json!({ "id": request["id"], "ok": false, "error": { "code": "forbidden", "message": error.to_string() } }),
                                 };
-                                super::send_encrypted_text(&mut socket, &mut crypto, &response.to_string()).await?;
+                                self.send_share_reply(&mut socket, &mut crypto, &session_id, &id, method, response).await?;
                                 self.emit_share(&session_id);
                                 if invalid_refresh { bail!("Your sign-in is no longer valid."); }
                             }
@@ -569,6 +569,28 @@ impl PairingManager {
         self.emit_share(&session_id);
         let _ = socket.close(None).await;
         result
+    }
+
+    // An RPC result can remain buffered after owner-side removal completes.
+    // Revalidate this exact connection before handing successful data to the
+    // transport. This cannot retract bytes already handed to the socket, and
+    // must never retry the original operation on reconnect.
+    async fn send_share_reply<S>(&self, socket: &mut WebSocketStream<S>, crypto: &mut E2eeSession,
+        session: &str, connection: &str, method: &str, mut response: Value) -> Result<()>
+    where S: AsyncRead + AsyncWrite + Unpin {
+        if response["ok"] == true {
+            let status = self.guest_status(session, connection)?;
+            let admitted = status["admitted"].as_bool().unwrap_or(false);
+            match method {
+                // Pending approval is a valid authentication outcome, but a
+                // previously admitted authentication must not survive removal.
+                "session.authenticate" if response["result"]["admitted"] == false => (),
+                "session.status" => response["result"] = status,
+                _ if !admitted => bail!("Access ended before the reply was delivered."),
+                _ => (),
+            }
+        }
+        super::send_encrypted_text(socket, crypto, &response.to_string()).await
     }
 
     fn join_share_guest(&self, session: &str, guest: Guest) -> Result<bool> {
@@ -619,6 +641,119 @@ async fn verify_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_sensitive_reply_is_not_sent_after_guest_removal() {
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(root.path().join("adapter.log")).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pairing::sharing::tests::delayed_reply_child_fixture", "--nocapture"])
+            .env("TERMINALX_TEST_SHARING_REPLY_ADAPTER", "1")
+            .env("TERMINALX_HOME", root.path().join("store"))
+            .env("CLAUDE_CONFIG_DIR", root.path().join("claude"))
+            .stdin(std::process::Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log)
+            .process_group(0).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: this is the private process group just created for
+                // this fixture, including its disposable runtime owner.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+                child.wait().unwrap();
+                panic!("sharing reply fixture exceeded its process deadline: {}", std::fs::read_to_string(root.path().join("adapter.log")).unwrap());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(result.success(), "{}", std::fs::read_to_string(root.path().join("adapter.log")).unwrap());
+    }
+
+    #[tokio::test]
+    async fn delayed_reply_child_fixture() {
+        if std::env::var("TERMINALX_TEST_SHARING_REPLY_ADAPTER").as_deref() != Ok("1") { return; }
+        use super::super::{crypto::{begin_e2ee_session, E2eeClientHandshake, HostKeypair}, pairing_websocket_config};
+        use tokio_tungstenite::tungstenite::protocol::Role as SocketRole;
+        let _home = store::temp_home();
+        let root = store::root().unwrap();
+        let entry: index::SessionEntry = serde_json::from_value(json!({
+            "id":"shared", "projectPath":root,"cwd":root,"title":"sharing reply",
+            "created":index::now(),"modified":index::now(),"tabs":[] })).unwrap();
+        index::save(&[entry]).unwrap();
+        struct Child(std::process::Child);
+        impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let log = std::fs::File::create(root.join("owner.log")).unwrap();
+        let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "serve::tests::sharing_reply_owner_fixture", "--nocapture"])
+            .env("TERMINALX_TEST_SHARING_REPLY_OWNER", &root)
+            .env("TERMINALX_HOME", &root).env("CLAUDE_CONFIG_DIR", root.join("claude"))
+            .stdin(std::process::Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let client = loop {
+            if let Ok(client) = crate::local_runtime::client::Client::connect(&root) { break client; }
+            assert!(child.0.try_wait().unwrap().is_none(), "owner exited: {}", std::fs::read_to_string(root.join("owner.log")).unwrap());
+            assert!(std::time::Instant::now() < until, "owner startup deadline");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let runtime = Arc::new(crate::local_runtime::desktop::Desktop::connect(client,
+            Arc::new(crate::sink::BroadcastSink::new(256))).unwrap());
+        let account = Arc::new(crate::account::AccountManager::default());
+        account.set_context_for_test(Some(crate::account::AccountContext {
+            access_token:"fixture".into(),user_id:"host".into(),email:"host@example.invalid".into(),
+            display_name:"Host".into(),profile_id:"profile".into(),organization_id:"org".into(),
+            relay_entitled:true,generation:1 }));
+        let pairing = Arc::new(PairingManager::new(account));
+        pairing.attach_runtime(runtime.clone());
+        let expiry = now() + 60_000;
+        pairing.runtime_sharing("create", json!({"sessionId":"shared","linkId":"link",
+            "url":"https://terminalx.ai/join#fixture","tokenHash":"fixture-hash","credentialExpiresAt":expiry,"directOnly":true,
+            "host":{"userId":"host","displayName":"Host","email":"host@example.invalid","organizationIds":["org"]},
+            "settings":{"audience":"anyone","role":"viewer","people":[],"expiresAt":expiry,
+                "approveEachPerson":true,"canApprove":false,"maximumPeople":4,"singleUse":false}})).unwrap().unwrap();
+        pairing.runtime_sharing("join", json!({"sessionId":"shared","linkId":"link","connectionId":"connection",
+            "person":{"userId":"alice","displayName":"Alice","email":"alice@example.invalid","emailVerified":true,"organizationIds":[]}})).unwrap().unwrap();
+        let key = HostKeypair::from_secret([7; 32]);
+        let handshake = E2eeClientHandshake::new(&key.public_key_b64(), "direct", None).unwrap();
+        let (ready, mut crypto) = begin_e2ee_session(&key, handshake.hello().clone(), "direct", None).unwrap();
+        let mut guest_crypto = handshake.accept_ready(&serde_json::to_string(&ready).unwrap()).unwrap();
+        let (host_io, guest_io) = tokio::io::duplex(64 * 1024);
+        let mut host = WebSocketStream::from_raw_socket(host_io, SocketRole::Server, Some(pairing_websocket_config())).await;
+        let mut guest = WebSocketStream::from_raw_socket(guest_io, SocketRole::Client, Some(pairing_websocket_config())).await;
+        // Pending authentication must still reach the guest without exposing
+        // session data; approval is checked afresh on subsequent replies.
+        let pending = json!({"id":"auth", "ok":true,"result":{"admitted":false}});
+        pairing.send_share_reply(&mut host, &mut crypto, "shared", "connection", "session.authenticate", pending.clone()).await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), guest.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        let plain = guest_crypto.open(&super::super::decode_canonical_base64(&frame).unwrap(), PayloadKind::Text).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&plain).unwrap(), pending);
+        pairing.runtime_sharing("approve", json!({"sessionId":"shared","linkId":"link","userId":"alice","allow":true})).unwrap().unwrap();
+        pairing.share_rpc("shared", "connection", "chat.post", json!({"sessionId":"shared", "text":"private note"})).unwrap();
+        // The real authoritative read has completed, but its response has not
+        // entered the encrypted transport. Removal completes on another thread
+        // before the barrier allows adapter delivery to proceed.
+        let value = pairing.share_rpc("shared", "connection", "chat.list", json!({"sessionId":"shared"})).unwrap();
+        assert!(value.to_string().contains("private note"));
+        let live = json!({"id":"live", "ok":true,"result":value});
+        pairing.send_share_reply(&mut host, &mut crypto, "shared", "connection", "chat.list", live.clone()).await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), guest.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        let plain = guest_crypto.open(&super::super::decode_canonical_base64(&frame).unwrap(), PayloadKind::Text).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&plain).unwrap(), live);
+        let value = pairing.share_rpc("shared", "connection", "chat.list", json!({"sessionId":"shared"})).unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let removing = pairing.clone();
+        let removal = std::thread::spawn(move || {
+            removing.runtime_sharing("remove", json!({"sessionId":"shared","linkId":"link","userId":"alice"})).unwrap().unwrap();
+            release.send(()).unwrap();
+        });
+        released.await.unwrap();
+        removal.join().unwrap();
+        let response = json!({"id":"read", "ok":true, "result":value});
+        assert!(pairing.send_share_reply(&mut host, &mut crypto, "shared", "connection", "chat.list", response).await.is_err());
+        drop(host);
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), guest.next()).await.unwrap();
+        assert!(!matches!(frame, Some(Ok(Message::Text(_)))), "revoked data crossed the guest socket");
+        runtime.stop_all().unwrap();
+    }
+
     #[test]
     fn scoped_router_resolves_only_public_tabs_and_enforces_roles_on_real_session_state() {
         let _home = store::temp_home();

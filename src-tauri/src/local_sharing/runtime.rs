@@ -56,6 +56,8 @@ pub(crate) fn request(
     if method == "session.status" {
         return guest_status(sessions, owner, session, connection);
     }
+    // Never wait for checkout admission while holding sharing or a view lease.
+    let admission = crate::issue_pipeline::admission::lock();
     let mut sharing = sessions.sharing.lock().unwrap();
     let share = sharing
         .sessions
@@ -214,7 +216,8 @@ pub(crate) fn request(
                 }
                 Ok(json!({ "queued": true, "events": [] }))
             } else {
-                let outcome = sessions.send_shared(
+                let outcome = sessions.send_shared_admitted(
+                    &admission,
                     session,
                     tab_id,
                     text,
@@ -283,6 +286,8 @@ pub(crate) fn drain_queue(
     owner: Option<&super::owner::Actor>,
     session: &str,
 ) -> Result<()> {
+    // Never wait for checkout admission while holding sharing or a view lease.
+    let admission = crate::issue_pipeline::admission::lock();
     let mut sharing = sessions.sharing.lock().unwrap();
     let Some(share) = sharing.sessions.get_mut(session) else {
         return Ok(());
@@ -317,7 +322,7 @@ pub(crate) fn drain_queue(
                 .as_ref()
                 .map(|attachment| attachment.enter())
                 .transpose()?;
-            sessions.send_shared(session, &input.tab_id, input.text, person.clone(), permit)?;
+            sessions.send_shared_admitted(&admission, session, &input.tab_id, input.text, person.clone(), permit)?;
             share.record(
                 &person.user_id,
                 "prompt",

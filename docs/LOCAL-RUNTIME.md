@@ -1,6 +1,45 @@
-# Local background runtime proposal (#467)
+# Local background runtime (#467)
 
-Status: implementation in progress, **not complete**. The original investigation
+The desktop now attaches to a separately launched local `terminalx-serve` owner.
+Session processes, transcript readers, permission waits, queue delivery, activity,
+local pipelines and scheduled automations belong to that owner. Closing or quitting
+the desktop detaches views; it does not stop accepted work. Final packaged
+acceptance and independent review remain in progress; this document does not
+claim production signing, updater or credentialed-provider acceptance.
+
+The helper is copied into a verified, immutable private location before launch,
+with a lifetime lock and authenticated per-launch sockets. Desktop callbacks use
+a private endpoint and a fixed service allowlist bound to the live attachment.
+The owner never forwards generic control authority to paired devices or guests.
+Store read-modify-write transactions use a stable cross-process lock, preserving
+unknown fields and closed-tab history across atomic file replacement.
+
+PTY readers retain bounded output and atomically replay it when a view attaches.
+View acknowledgements remain independent, so a detached or stalled view cannot
+block its process forever. Pending permissions remain at the owner; expired,
+cancelled or stale answers fail closed. Only a new owner performs interruption
+recovery. Transport loss is reported as unavailable rather than false idle state.
+
+Normal quit defaults to keeping work, with a first-choice dialog and saved policy.
+Explicit stop-all confirms process termination and retains recoverable state on
+failure. A single accessory tray remains with the owner, shows live counts and
+routes Open, Quick Chat and quit actions through the registered window. Local
+notifications and automations continue there; dictation, computer use, the browser
+and mobile connection transport remain window-owned. An unattached owner exits
+after its idle grace only when no live shell, active turn, permission, queued work,
+cleanup or enabled schedule remains. AppKit receives a private wake event when
+backend shutdown completes, so idle exit does not require a user's mouse event.
+
+See [the isolated acceptance procedure](LOCAL-RUNTIME-ACCEPTANCE.md) for measured
+artifact requirements and the distinction between fixture/development evidence
+and real accounts, production updates and notarization.
+
+## Original proposal and checkpoint record
+
+The following investigation and checkpoint notes are historical; statements that
+integration remains unfinished describe their checkpoint, not current source.
+
+Original status: implementation in progress, **not complete**. The original investigation
 used `958d1c77` (includes #464 / #621); main through #567 / #622 (`22429b99`)
 was merged as `9c6e7830`. The coordinator released session/pipeline/control
 integration and confirmed ownership of native `pty.rs`, `sink.rs` and PTY
@@ -315,6 +354,19 @@ Account clear retains a revoked generation until the attachment ends, so a late
 register cannot restore its grants. Attachment expiry/disconnect invalidates the
 same grant checked at delivery. A write guard serializes actual input with detach
 and stop-all; share recreation also changes the delivery-permit generation.
+
+Checkout admission is acquired before sharing, attachment, device-grant and tab
+revision guards. Already-admitted send bodies receive that guard rather than
+locking it recursively; asynchronous PTY writers retain their final authority
+checks. Deletion and stop-all can therefore revoke queued senders without waiting
+for a permit held by a thread that is itself waiting for checkout admission.
+
+The window revalidates the exact sharing connection after an owner RPC succeeds
+and before forwarding its reply. A removed, expired or disconnected guest loses
+buffered data as well as future requests. Pending authentication is distinct from
+a data-bearing reply, and status replies use the fresh owner projection. This is
+a delivery-boundary check, not atomic revocation of bytes already handed to the
+network; no failed check replays the original operation.
 
 This is still backend integration, not complete desktop pairing migration.
 The desktop pairing adapter must register/revoke its context on the live owner,

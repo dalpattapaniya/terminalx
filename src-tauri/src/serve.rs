@@ -874,6 +874,16 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    // Used only by the desktop adapter's disposable IPC regression. Running
+    // the same backend in a child avoids global store/env changes in Cargo.
+    #[test]
+    fn sharing_reply_owner_fixture() {
+        let Some(root) = std::env::var_os("TERMINALX_TEST_SHARING_REPLY_OWNER") else { return };
+        run(Options { idle_grace_seconds: 30, project_root: None,
+            data_dir: Some(root.into()), runtime_kind: RuntimeKind::Local,
+            self_test: false, relay_link: None }).unwrap();
+    }
+
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()
     }
