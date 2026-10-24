@@ -2266,3 +2266,48 @@ fn an_author_handoff_requires_an_idle_resumed_pipeline_and_preserves_review_evid
     assert_eq!(continued.verdict, reviewed);
     assert_eq!(run.host.world().sessions.get("author").unwrap().tabs[0].id, "t1");
 }
+
+#[test]
+fn a_continuation_persists_its_explicit_merge_choice_without_merging() {
+    for (before, choice, cloud, expected) in [(true, false, false, false), (false, true, false, true), (false, true, true, false)] {
+        let run = Run::start(&github_issue(), before);
+        set_resolve_conflicts(&run.host, &run.id, true).unwrap();
+        let mut pipeline = run.pipeline();
+        pipeline.cloud = cloud;
+        store::commit(&mut pipeline).unwrap();
+        {
+            let mut world = run.host.world();
+            let author = world.sessions.get_mut("author").unwrap();
+            let mut tab = author.tabs[0].clone();
+            tab.id = "continuation".into();
+            author.tabs.push(tab);
+        }
+        let continued = start(&run.host, "author", "continuation", Some(choice), None).unwrap();
+        assert_eq!(continued.auto_merge, expected);
+        assert_eq!(run.pipeline().auto_merge, expected);
+        assert!(continued.resolve_conflicts);
+        assert_eq!(continued.author.tab_id, "continuation");
+        assert!(run.merges().is_empty());
+    }
+}
+
+#[test]
+fn resolver_termination_releases_a_stopped_pipelines_checkout() {
+    for interrupted in [true, false] {
+        let run = Run::start(&github_issue(), false);
+        set_resolve_conflicts(&run.host, &run.id, true).unwrap();
+        run.host.world().conflict = true;
+        assert_eq!(run.poll().stage, Stage::Resolve);
+        act(&run.host, &run.id, Action::Stop).unwrap();
+        assert!(run.pipeline().resolution.is_some(), "Stop cannot release a still-running resolver");
+        turn_failed(&run.host, "resolver", "t1", engine::turn_failure(interrupted));
+        let stopped = run.pipeline();
+        assert!(stopped.stopped);
+        assert_eq!(stopped.state, State::Stopped);
+        assert!(stopped.resolution.is_none());
+        assert!(stopped.events.iter().any(|event| event.kind == "resolutionStopped"));
+        assert!(super::admission::check("author", "t1").is_ok());
+        assert!(run.merges().is_empty());
+        assert!(run.host.world().pushes.is_empty());
+    }
+}

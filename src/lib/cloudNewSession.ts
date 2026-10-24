@@ -176,7 +176,8 @@ export async function startInWorkspace(
       useWorktree: request.useWorktree,
       ...(request.pipeline?.resolveConflicts ? { pipeline: true, pipelineOptions: { ...request.pipeline, autoMerge: false }, pipelineSettings: request.pipelineSettings as unknown as Record<string, unknown> } : {}),
       ...(issue
-        ? { issue: issue.ref, issueBody: issue.body, worktreeName: issue.worktreeName, pipeline: issue.pipeline, pipelineSettings: issue.settings as unknown as Record<string, unknown> }
+        ? { issue: issue.ref, issueBody: issue.body, worktreeName: issue.worktreeName, pipeline: issue.pipeline, pipelineSettings: issue.settings as unknown as Record<string, unknown>,
+            ...(issue.pipeline && request.pipeline ? { pipelineOptions: { ...request.pipeline, autoMerge: false } } : {}) }
         : {}),
     };
     let created: Awaited<ReturnType<typeof newCloudAgentTab>>;

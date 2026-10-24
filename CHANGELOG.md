@@ -4,6 +4,10 @@
 
 ### Session automation
 
+- Preserve explicit merge and conflict-resolution launch choices when continuing
+  local work or starting cloud issue sessions. Release a stopped resolver’s
+  checkout reservation when its agent terminates.
+
 - Add shared launch controls for automatic conflict resolution and merging
   after review and final-head checks, with project defaults and session controls.
   Branch sessions without an issue can now use the same pipeline without tracker

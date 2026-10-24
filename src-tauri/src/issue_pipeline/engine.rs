@@ -1155,6 +1155,13 @@ pub fn start(host: &dyn Host, session_id: &str, tab_id: &str, auto_merge: Option
                 bail!("Wait for the existing conversations to finish before handing over this pipeline.");
             }
             if step.p.state == State::Merged { bail!("This branch's pipeline has merged. Start new work on a new branch."); }
+            // Launch choices are authorization, not merely defaults. Persist
+            // through the switch writer so save() cannot restore the old value.
+            if let Some(value) = auto_merge {
+                let value = value && !step.p.cloud && !host.cloud();
+                store::set_switches(&step.p.id, |pipeline| pipeline.auto_merge = value)?;
+                step.record("autoMerge", if value { "Automatic merge enabled for the new author." } else { "Automatic merge disabled for the new author." });
+            }
             step.p.author = next;
             step.enter(Stage::Work, "The new author conversation is continuing the work.");
             step.record("handoff", "Pipeline ownership moved to a new conversation in this session; the original history was left unchanged.");
@@ -1272,8 +1279,15 @@ pub fn turn_failed(host: &dyn Host, session_id: &str, tab_id: &str, detail: &str
             Role::Reviewer => step.p.stage == Stage::Review,
             Role::Resolver => step.p.stage == Stage::Resolve,
         };
-        if waiting_on_it && step.p.state == State::Working {
-            if role == Role::Resolver { step.p.resolution = None; }
+        // Termination releases the checkout even if Stop changed the state
+        // while the resolver was still running. Stop itself must not release it.
+        if role == Role::Resolver && step.p.resolution.take().is_some() {
+            if step.p.stopped {
+                step.record("resolutionStopped", format!("{detail} The conflict resolver released the checkout; inspect its changes before continuing."));
+            } else {
+                step.needs_you(StopReason::SessionStopped { role: role.label().into(), detail: detail.to_string() });
+            }
+        } else if waiting_on_it && step.p.state == State::Working {
             step.needs_you(StopReason::SessionStopped { role: role.label().into(), detail: detail.to_string() });
         }
         Ok(())
