@@ -34,7 +34,9 @@
     "test:webkit-editor-toolbar": "node scripts/webkit/editor-toolbar.mjs",
     "test:webkit-tab-strip": "node scripts/webkit/tab-strip.mjs",
     "build:local-runtime": "node scripts/build-local-runtime.mjs",
-    "test:local-runtime-build": "vitest run scripts/build-local-runtime.test.mjs"
+    "test:local-runtime-build": "vitest run scripts/build-local-runtime.test.mjs",
+    "build:terminalx-launcher": "node scripts/build-terminalx-launcher.mjs",
+    "test:terminalx-launcher": "vitest run scripts/build-terminalx-launcher.test.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",

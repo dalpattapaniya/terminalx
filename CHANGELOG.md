@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Package the macOS CLI launcher as a native executable so its signature survives updater archive extraction; preserve CLI arguments, process identity and signal behavior. (#467)
+
 - Recheck deferred settings restarts when their worker reserves the launch so a
   new turn on the same CLI keeps its process, permissions and pending delivery. (#467)
 

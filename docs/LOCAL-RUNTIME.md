@@ -627,3 +627,9 @@ registry and removes only matching objects. Shared force-stop can therefore
 invalidate a mobile tab while holding its sharing attachment without cycling
 against a mobile check, close, device revoke or account clear. The bounded mixed
 lease subprocess regression exercises these four interleavings.
+
+The macOS CLI sidecar is a generated native launcher. Its signature stays in
+the executable across updater extraction, while it `exec`s the sibling desktop
+binary's `terminalx` command with unchanged arguments, environment, working
+directory and streams. It does not own sessions or add another runtime process.
+See `docs/RELEASING.md` for archive signature validation.

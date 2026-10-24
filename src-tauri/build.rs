@@ -8,6 +8,7 @@ fn main() {
     embed_cli_skill();
     #[cfg(feature = "desktop")]
     {
+        ensure_terminalx_launcher();
         ensure_helper_resource_dirs();
         ensure_local_runtime_resource_dir();
         ensure_agent_browser_stand_in();
@@ -109,4 +110,27 @@ fn link_clang_builtins() {
             return;
         }
     }
+}
+
+/// Direct Cargo checks also package the real CLI sidecar. No nested Cargo,
+/// downloads or success stand-ins; rustc emits the requested target executable.
+#[cfg(feature = "desktop")]
+fn ensure_terminalx_launcher() {
+    let target = std::env::var("TARGET").expect("Cargo target");
+    if !target.ends_with("-apple-darwin") { return; }
+    let source = "../native/terminalx-launcher/main.rs";
+    println!("cargo:rerun-if-changed={source}");
+    let output = format!("binaries/terminalx-{target}");
+    let temporary = format!("{output}.tmp-{}", std::process::id());
+    std::fs::create_dir_all("binaries").expect("create sidecar directory");
+    let status = std::process::Command::new(std::env::var_os("RUSTC").expect("Cargo rustc"))
+        .args(["--edition=2021", "--crate-name", "terminalx_launcher", "--target", &target,
+            "-C", if std::env::var("PROFILE").as_deref() == Ok("debug") { "opt-level=0" } else { "opt-level=2" },
+            source, "-o", &temporary])
+        .status().expect("build native CLI launcher");
+    if !status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        panic!("native CLI launcher build failed");
+    }
+    std::fs::rename(&temporary, &output).expect("publish native CLI launcher");
 }
