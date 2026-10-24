@@ -2091,13 +2091,13 @@ fn failed_restart_wait_blocks_only_its_unchanged_claim() {
         if replaced { assert_eq!(rig.events(), before); }
         if !replaced {
             let prompt = PromptText { mobile: None, agent: "must not start".into(), display: "must not start".into(), author: None, shared_connection: None };
-            let error = rig.manager.send_impl(SESSION, TAB, prompt, vec![], None).err().expect("failed shutdown refuses new work");
+            let error = rig.manager.send_impl(SESSION, TAB, prompt, vec![], None).expect_err("failed shutdown refuses new work");
             assert!(error.to_string().contains("Stop has not confirmed local process exit"), "unexpected internal refusal: {error:#}");
             assert_eq!(rig.rt.lock().unwrap().recovery, Some(RecoveryKind::Disconnected));
             // The public adapter deliberately normalizes internal failures.
             // Check its existing contract separately, without expecting the
             // internal guard's text to pass through that boundary unchanged.
-            let public = rig.manager.send(SESSION, TAB, "must not start".into(), vec![]).err().expect("public send also refuses new work");
+            let public = rig.manager.send(SESSION, TAB, "must not start".into(), vec![]).expect_err("public send also refuses new work");
             assert_eq!(public.to_string(), RecoveryKind::Failed.message(), "unexpected public refusal: {public:#}");
             assert!(!rig.manager.terminals.is_running(&rig.pane));
             assert!(rig.rt.lock().unwrap().stopping);
