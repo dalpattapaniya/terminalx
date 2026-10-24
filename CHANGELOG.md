@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Show resources as unavailable when the background owner disconnects or a
+  resource read fails; discard older replies and hide stale process actions. (#467)
+
 - Keep shared force-stop and paired-device revocation responsive by releasing mobile registry locks before waiting for attachment authority.
 
 ### Runtime investigation

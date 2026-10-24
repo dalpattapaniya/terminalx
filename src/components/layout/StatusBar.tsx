@@ -123,13 +123,22 @@ function groupProcesses(processes: ProcSample[]): ResourceGroup[] {
 }
 
 function ResourceCluster({ narrow }: { narrow: boolean }) {
-  const { settings, resources, resourceSample, resourcesRefreshing } = useStatus();
+  const { settings, resources, resourcesAvailable, resourceSample, resourcesRefreshing } = useStatus();
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<{ process: ProcSample; message: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [killing, setKilling] = useState<string | null>(null);
   useResourceSampling(open, refreshResourceSample);
+  useEffect(() => {
+    if (!resourcesAvailable) { setOpen(false); setPending(null); setError(null); }
+  }, [resourcesAvailable]);
   if (!settings.resources) return null;
+  if (!resourcesAvailable) return (
+    <button type="button" aria-label="Resources unavailable" onClick={() => void refreshResourceSample()}
+      disabled={resourcesRefreshing} className="h-[19px] rounded px-1.5 text-muted-foreground hover:bg-veil-raised">
+      Resources unavailable
+    </button>
+  );
 
   const pressureClass = resources.pressure != null && resources.pressure >= 0.8
     ? "text-destructive"
@@ -206,7 +215,7 @@ function ResourceCluster({ narrow }: { narrow: boolean }) {
             <div className="mb-2.5 flex items-center gap-2">
               <div>
                 <div className="text-xs font-medium">App resources</div>
-                <div className="mt-0.5 text-[10.5px] text-faint">Processes started by this window</div>
+                <div className="mt-0.5 text-[10.5px] text-faint">Processes owned by the background runtime</div>
               </div>
               <button
                 type="button"
