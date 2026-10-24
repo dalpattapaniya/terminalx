@@ -3510,6 +3510,15 @@ pub async fn issue_pipeline_start(app: AppHandle, session_id: String, tab_id: St
 }
 
 #[tauri::command]
+pub async fn issue_pipeline_continue(app: AppHandle, session_id: String, tab_id: String, options: crate::issue_pipeline::LaunchOptions) -> CmdResult<Option<StartedIssuePipeline>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
+        let pipeline = crate::issue_pipeline::engine::continue_launch(&host, &session_id, &tab_id, &options).map_err(err)?;
+        Ok(pipeline.map(|pipeline| StartedIssuePipeline { pipeline, author_brief: crate::issue_pipeline::prompts::author_brief() }))
+    }).await.map_err(err)?
+}
+
+#[tauri::command]
 pub async fn issue_pipeline_set_auto_merge(app: AppHandle, id: String, value: bool) -> CmdResult<crate::issue_pipeline::Pipeline> {
     tauri::async_runtime::spawn_blocking(move || {
         let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;

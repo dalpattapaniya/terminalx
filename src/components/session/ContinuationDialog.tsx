@@ -55,7 +55,7 @@ export function ContinuationDialog({ session, source, into, onClose, onLateError
   const project = into?.project ?? store.projects.find((project) => project.path === session.projectPath);
   const pipelineLaunch = usePipelineLaunch(project?.path ?? null, pipelineSettings(project), !project || (into && !worktree) ? "Choose a worktree branch to automate this session." : undefined);
   const settings = value && selection.harness
-    ? { harness: selection.harness.id, model: selection.modelId, effort: selection.effort, permissionMode: selection.mode, ...(pipelineLaunch.value.autoMerge || pipelineLaunch.value.resolveConflicts ? { pipeline: pipelineLaunch.value } : {}) }
+    ? { harness: selection.harness.id, model: selection.modelId, effort: selection.effort, permissionMode: selection.mode, ...(!into || pipelineLaunch.value.autoMerge || pipelineLaunch.value.resolveConflicts ? { pipeline: pipelineLaunch.value } : {}) }
     : null;
 
   useEffect(() => {

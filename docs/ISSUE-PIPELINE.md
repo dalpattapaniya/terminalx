@@ -5,6 +5,12 @@ when green** on Git worktree branches. Both default to the project's pipeline
 settings and can be changed from the session's pipeline panel. The read-only
 cleanup line follows the existing merged-cleanup settings; its link opens those
 settings. There is no per-session cleanup override or second deletion engine.
+Continuing a session applies both launch switches even when both are off.
+Existing permissions are revoked before attempting the author handoff, so a
+busy or stopped author cannot leave an explicit opt-out enabled. With both
+switches off and no existing pipeline, continuation creates no pipeline. A
+lookup or handoff failure prevents the new conversation from starting.
+
 Folder projects and quick chats have no Git pipeline. A cloud workspace's first
 session and its agent-tab form use the base checkout; create a worktree session
 from the cloud project to use conflict automation. Cloud merging always remains

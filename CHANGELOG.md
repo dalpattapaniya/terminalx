@@ -4,6 +4,11 @@
 
 ### Session automation
 
+- Carry both-off continuation choices to the backend, revoking existing merge
+  and conflict-resolution permissions before handoff. Do not create a pipeline
+  for an unautomated session with both switches off; refuse launch on lookup or
+  handoff errors instead of retaining prior authorization silently.
+
 - Group session automation controls accessibly and validate both launch switches,
   cleanup settings, and agent controls in WebKit without relaxing overflow,
   overlap, or narrow-pane wrapping checks. Keep tall issue launch settings and

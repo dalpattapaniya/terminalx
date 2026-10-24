@@ -89,6 +89,12 @@ export async function startPipeline(sessionId: string, tabId: string, autoMerge:
   return started;
 }
 
+export async function continuePipeline(sessionId: string, tabId: string, options: { autoMerge: boolean; resolveConflicts: boolean }): Promise<StartedIssuePipeline | null> {
+  const started = await pipelinesApi.continue(sessionId, tabId, options);
+  if (started) upsertPipeline(started.pipeline);
+  return started;
+}
+
 export async function setPipelineResolveConflicts(id: string, value: boolean): Promise<IssuePipeline> {
   const pipeline = await pipelinesApi.setResolveConflicts(id, value);
   upsertPipeline(pipeline);

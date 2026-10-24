@@ -2311,3 +2311,58 @@ fn resolver_termination_releases_a_stopped_pipelines_checkout() {
         assert!(run.host.world().pushes.is_empty());
     }
 }
+
+#[test]
+fn all_off_continuation_revokes_both_permissions_and_hands_over_the_existing_pipeline() {
+    let run = Run::start(&github_issue(), true);
+    set_resolve_conflicts(&run.host, &run.id, true).unwrap();
+    {
+        let mut world = run.host.world();
+        let author = world.sessions.get_mut("author").unwrap();
+        let mut tab = author.tabs[0].clone();
+        tab.id = "continuation".into();
+        author.tabs.push(tab);
+    }
+    let continued = engine::continue_launch(&run.host, "author", "continuation", &super::LaunchOptions::default()).unwrap().unwrap();
+    assert_eq!(continued.id, run.id);
+    assert_eq!(continued.author.tab_id, "continuation");
+    assert!(!continued.auto_merge && !continued.resolve_conflicts);
+    assert!(!run.pipeline().auto_merge && !run.pipeline().resolve_conflicts);
+    assert_eq!(store::list().unwrap().len(), 1);
+    assert!(run.merges().is_empty());
+    // Retry on the already-created destination must apply revocations too.
+    store::set_switches(&run.id, |pipeline| { pipeline.auto_merge = true; pipeline.resolve_conflicts = true; }).unwrap();
+    engine::continue_launch(&run.host, "author", "continuation", &super::LaunchOptions::default()).unwrap();
+    assert!(!run.pipeline().auto_merge && !run.pipeline().resolve_conflicts);
+}
+
+#[test]
+fn all_off_continuation_does_not_create_a_pipeline_and_read_errors_are_not_absence() {
+    let _home = crate::store::temp_home();
+    let host = FakeHost::new(&github_issue());
+    assert!(engine::continue_launch(&host, "author", "t1", &super::LaunchOptions::default()).unwrap().is_none());
+    assert!(store::list().unwrap().is_empty());
+    std::fs::write(crate::store::root().unwrap().join("issue-pipelines.json"), "not valid JSON").unwrap();
+    assert!(engine::continue_launch(&host, "author", "t1", &super::LaunchOptions::default()).is_err());
+}
+
+#[test]
+fn refused_continuation_still_revokes_explicit_off_permissions() {
+    for stopped in [false, true] {
+        let run = Run::start(&github_issue(), true);
+        set_resolve_conflicts(&run.host, &run.id, true).unwrap();
+        {
+            let mut world = run.host.world();
+            let author = world.sessions.get_mut("author").unwrap();
+            let mut tab = author.tabs[0].clone();
+            tab.id = "continuation".into();
+            author.tabs.push(tab);
+            author.tabs[0].status = crate::store::index::TabStatus::InProgress;
+        }
+        if stopped { act(&run.host, &run.id, Action::Stop).unwrap(); }
+        assert!(engine::continue_launch(&run.host, "author", "continuation", &super::LaunchOptions::default()).is_err());
+        assert_eq!(run.pipeline().author.tab_id, "t1");
+        assert!(!run.pipeline().auto_merge && !run.pipeline().resolve_conflicts);
+        assert!(run.merges().is_empty());
+    }
+}

@@ -1131,6 +1131,33 @@ fn verdict_line(verdict: &Verdict, max_rounds: u32) -> String {
 
 // ---- what moves a pipeline -------------------------------------------------
 
+/// Apply continuation launch choices, including explicit revocations. An
+/// all-off launch without an existing pipeline leaves the session unautomated.
+pub fn continue_launch(host: &dyn Host, session_id: &str, tab_id: &str, options: &super::LaunchOptions) -> Result<Option<Pipeline>> {
+    let session = host.session(session_id)?;
+    if session.tab(tab_id).is_none() { bail!("tab {tab_id} not found in session {session_id}"); }
+    let existing = store::for_session(session_id)?.filter(|pipeline| pipeline.author.session_id == session_id);
+    if let Some(existing) = existing {
+        // Revocations take effect even if the author is busy or the pipeline
+        // is stopped and the handoff must be refused. Never grant permission
+        // until the handoff has succeeded, and never evaluate the merge gate here.
+        let revoked = store::set_switches(&existing.id, |pipeline| {
+            if !options.auto_merge { pipeline.auto_merge = false; }
+            if !options.resolve_conflicts { pipeline.resolve_conflicts = false; }
+        })?;
+        host.changed(&revoked);
+    } else if !options.auto_merge && !options.resolve_conflicts {
+        return Ok(None);
+    }
+    let pipeline = start(host, session_id, tab_id, Some(options.auto_merge), None)?;
+    let pipeline = store::set_switches(&pipeline.id, |pipeline| {
+        pipeline.auto_merge = options.auto_merge && !pipeline.cloud && !host.cloud();
+        pipeline.resolve_conflicts = options.resolve_conflicts;
+    })?;
+    host.changed(&pipeline);
+    Ok(Some(pipeline))
+}
+
 /// Start a pipeline for a session that was started from an issue.
 /// `auto_merge` is the issue's own switch; `None` takes the project's default.
 /// `issue_body` is the issue's text as the session was started with it, kept
