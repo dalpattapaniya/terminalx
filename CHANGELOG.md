@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep shared force-stop and paired-device revocation responsive by releasing mobile registry locks before waiting for attachment authority.
+
 ### Runtime investigation
 
 - Acquire checkout admission before mobile/sharing write permits so concurrent

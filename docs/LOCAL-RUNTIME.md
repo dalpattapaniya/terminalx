@@ -615,3 +615,15 @@ passed actual idle exit (2.21 seconds with a two-second grace) and authenticated
 stop-all exit (0.27 seconds), without any external UI event. Local-UI all-target
 Clippy passed. A rebuilt desktop bundle and the remaining guest acceptance cases
 still need validation; these results are not a completed issue claim.
+
+### Mobile authority lock order
+
+Mobile registry metadata never waits on an attachment, grant, driver or tab
+revision lock. Readers snapshot identity under the registry, acquire attachment
+authority, then revalidate the current generation and connection pointer.
+Same-lease mutations serialize through that attachment; revocation still fences
+in-flight writes before acknowledging. Pruning checks snapshots outside the
+registry and removes only matching objects. Shared force-stop can therefore
+invalidate a mobile tab while holding its sharing attachment without cycling
+against a mobile check, close, device revoke or account clear. The bounded mixed
+lease subprocess regression exercises these four interleavings.

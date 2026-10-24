@@ -98,6 +98,8 @@ pub(crate) fn request(
         .as_ref()
         .map(|attachment| attachment.enter())
         .transpose()?;
+    #[cfg(test)]
+    after_attachment();
     let tab_id = tab_id.unwrap_or_default();
     match method {
         "session.tabs.list" => {
@@ -388,4 +390,18 @@ pub(crate) fn validate_params(method: &str, params: &Value, session: &str) -> Re
         bail!("Public tab id required.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_ATTACHMENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn observe_attachment(callback: Box<dyn FnOnce()>) {
+    AFTER_ATTACHMENT.with(|slot| *slot.borrow_mut() = Some(callback));
+}
+#[cfg(test)]
+fn after_attachment() {
+    let callback = AFTER_ATTACHMENT.with(|slot| slot.borrow_mut().take());
+    if let Some(callback) = callback { callback(); }
 }
