@@ -886,8 +886,8 @@ export function IssuesView({
             </div>
           </EmptyView>
         ) : (
-          <>
-            <div className="flex shrink-0 flex-col gap-2 border-b border-hairline px-5 pb-3 pt-4">
+          <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+            <div className="flex flex-col gap-2 border-b border-hairline px-5 pb-3 pt-4">
               <div className="flex items-baseline gap-2">
                 <WithTooltip label={copied ? "Copied" : "Copy identifier"}>
                   <button
@@ -1001,8 +1001,9 @@ export function IssuesView({
                 isGit && pipelineDefaults.enabled && <span className="text-[11px] text-faint">No pull request is opened for a session on the project’s own checkout.</span>
               )}
             </div>
-            {/* The pipeline scrolls with the issue: its findings and record can be long. */}
-            <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+            {/* Launch controls, findings and comments share a scroll region so
+                a tall header cannot strand Start session below the viewport. */}
+            <div>
               {pipeline && <IssuePipelinePanel key={pipeline.id} pipeline={pipeline} />}
               <div className="px-5 py-4">
                 {detailLoading && <div className="text-xs text-faint">Loading…</div>}
@@ -1035,7 +1036,7 @@ export function IssuesView({
                 </div>
               )}
             </div>
-          </>
+          </div>
         )}
       </div>
       {takenBy && (

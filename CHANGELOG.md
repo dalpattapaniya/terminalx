@@ -4,6 +4,11 @@
 
 ### Session automation
 
+- Group session automation controls accessibly and validate both launch switches,
+  cleanup settings, and agent controls in WebKit without relaxing overflow,
+  overlap, or narrow-pane wrapping checks. Keep tall issue launch settings and
+  Start session reachable by scrolling them with the issue content.
+
 - Preserve explicit merge and conflict-resolution launch choices when continuing
   local work or starting cloud issue sessions. Release a stopped resolver’s
   checkout reservation when its agent terminates.

@@ -10,7 +10,7 @@ export function PipelineLaunchControls({ launch, disabled }: { launch: ReturnTyp
   const [settingsOpen, setSettingsOpen] = useState(false);
   const keeps = !launch.projectPath || !mergedCleanupOn(cleanup.settings, launch.projectPath);
   const unavailable = launch.unavailable ?? (!launch.settings.enabled ? "The project pipeline is disabled." : undefined);
-  return <div className="flex w-full flex-col gap-2 rounded-lg bg-well p-3 text-xs">
+  return <div role="group" aria-label="Session automation" className="flex min-w-0 w-full flex-col gap-2 rounded-lg bg-well p-3 text-xs">
     <label className="flex items-center justify-between gap-2"><span>Resolve conflicts automatically</span>
       <Switch aria-label="Resolve conflicts automatically" checked={launch.value.resolveConflicts} disabled={disabled || !!unavailable} onCheckedChange={(resolveConflicts) => launch.change({ resolveConflicts })} /></label>
     <label className="flex items-center justify-between gap-2"><span>Merge when green</span>
