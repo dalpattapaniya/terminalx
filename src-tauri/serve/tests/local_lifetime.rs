@@ -1231,7 +1231,7 @@ fn history_larger_than_an_ipc_frame_loads_including_a_single_oversized_event() {
         assert!(!data.is_empty());
         snapshot.extend(data);
     }
-    assert_eq!(serde_json::from_slice::<Vec<raccoon_lib::events::AgentEvent>>(&snapshot).unwrap(),loaded);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&snapshot).unwrap(),serde_json::to_value(&loaded).unwrap());
     let _: serde_json::Value = client.call("runtime.session.eventsClose",json!({"sessionId":session,"tabId":tab,"token":opened["token"]})).unwrap();
     let next = sessions.load_events(session,tab).unwrap();
     assert_eq!(&next[..loaded.len()],loaded.as_slice());

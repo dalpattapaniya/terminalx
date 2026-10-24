@@ -60,27 +60,27 @@ impl OwnedGroup {
         if owned.is_some_and(|pid| !group_alive(pid)) { *owned = None; }
         *owned
     }
-    fn signal(&self, signal: i32) {
+    fn signal(&self, force: bool) {
         let mut owned = self.0.lock().unwrap();
         if let Some(pid) = *owned {
             if !group_alive(pid) { *owned = None; return; }
             // A reaped leader's PID is not authority to signal an unrelated
             // process. Only the PTY's original process group is owned here.
             #[cfg(unix)]
-            unsafe { libc::kill(-(pid as i32), signal); }
+            unsafe { libc::kill(-(pid as i32), if force { libc::SIGKILL } else { libc::SIGTERM }); }
             #[cfg(not(unix))]
-            { let _ = signal; crate::harness::host::terminate(pid); }
+            { if force { crate::harness::host::kill_now(pid); } else { crate::harness::host::terminate(pid); } }
         }
     }
     fn terminate(self: &Arc<Self>) {
-        self.signal(libc::SIGTERM);
+        self.signal(false);
         let group = self.clone();
         std::thread::spawn(move || {
             let start = Instant::now();
             while group.pid().is_some() && start.elapsed() < Duration::from_secs(2) {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            group.signal(libc::SIGKILL);
+            group.signal(true);
         });
     }
 }
@@ -779,7 +779,7 @@ impl Terminals {
         self.retained.lock().unwrap().remove(id);
         let Some(pane) = self.panes.lock().unwrap().remove(id) else { return };
         let group = pane.group.clone();
-        group.signal(libc::SIGTERM);
+        group.signal(false);
         drop(pane);
         self.drop_slot_if_unused(id);
         self.changed();
@@ -791,7 +791,7 @@ impl Terminals {
                 return;
             }
             if !forced && start.elapsed() >= TERM_GRACE {
-                group.signal(libc::SIGKILL);
+                group.signal(true);
                 forced = true;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -812,7 +812,7 @@ impl Terminals {
             let mut panes = self.panes.lock().unwrap();
             for id in ids {
                 if let Some(pane) = panes.remove(id) {
-                    pane.group.signal(libc::SIGTERM);
+                    pane.group.signal(false);
                     groups.push(pane.group.clone());
                 }
             }
@@ -829,7 +829,7 @@ impl Terminals {
                 return;
             }
             if !forced && start.elapsed() >= TERM_GRACE {
-                for group in &groups { group.signal(libc::SIGKILL); }
+                for group in &groups { group.signal(true); }
                 forced = true;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -998,10 +998,10 @@ impl Terminals {
     /// Include groups whose pane was closed/replaced before stop-all began.
     pub(crate) fn stop_owned_groups(&self, timeout: Duration) {
         let groups = self.groups.lock().unwrap().clone();
-        for group in &groups { group.signal(libc::SIGTERM); }
+        for group in &groups { group.signal(false); }
         let start = Instant::now();
         while groups.iter().any(|group|group.pid().is_some()) && start.elapsed() < timeout {
-            if start.elapsed() >= TERM_GRACE { for group in &groups { group.signal(libc::SIGKILL); } }
+            if start.elapsed() >= TERM_GRACE { for group in &groups { group.signal(true); } }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
