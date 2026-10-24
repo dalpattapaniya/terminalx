@@ -81,6 +81,17 @@ pub fn start(host: Arc<LocalHost>, interrupted: Vec<(String, String)>) {
     }
 }
 
+/// A new local owner means the old process really ended. Reopening a window
+/// never enters this path. Preserve interrupted work for explicit recovery.
+pub(crate) fn start_local(host: Arc<LocalHost>) {
+    engine::recover(&*host);
+    let spawned = std::thread::Builder::new().name("local-issue-pipeline-poll".into()).spawn(move || loop {
+        std::thread::sleep(engine::POLL_EVERY);
+        engine::poll(&*host);
+    });
+    if let Err(error) = spawned { log::error!("start local issue pipeline poller: {error}"); }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};

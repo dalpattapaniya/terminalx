@@ -15,12 +15,13 @@ pub struct Desktop {
     events: Bridge,
     sink: Arc<dyn EventSink>,
     windows: Mutex<HashMap<String, Bridge>>,
+    endpoint: Mutex<Option<crate::hooks::ControlEndpoint>>,
 }
 
 impl Desktop {
     pub fn connect(client: Arc<Client>, sink: Arc<dyn EventSink>) -> Result<Self> {
         let events = Bridge::connect(&client, sink.clone())?;
-        Ok(Self { client, events, sink, windows: Mutex::new(HashMap::new()) })
+        Ok(Self { client, events, sink, windows: Mutex::new(HashMap::new()), endpoint: Mutex::new(None) })
     }
 
     /// Reconnect only to this exact owner, never rediscover or replay a request.
@@ -29,7 +30,19 @@ impl Desktop {
         // sharing leases even if the new connection fails. Session processes
         // remain owned by the runtime throughout.
         self.disconnect();
-        Self::connect(self.client.clone(), self.sink.clone())
+        let next = Self::connect(self.client.clone(), self.sink.clone())?;
+        if let Some(endpoint) = self.endpoint.lock().unwrap().clone() { next.register_window(endpoint)?; }
+        Ok(next)
+    }
+
+    /// The listener is private to this window. Only the owner publishes home discovery.
+    pub fn register_window(&self, endpoint: crate::hooks::ControlEndpoint) -> Result<()> {
+        let attachment = self.attachment()?;
+        let _: serde_json::Value = self.client.call("runtime.window.register", serde_json::json!({
+            "epoch":attachment.epoch,"lease":attachment.lease,"socket":endpoint.socket,"token":endpoint.token
+        }))?;
+        *self.endpoint.lock().unwrap() = Some(endpoint);
+        Ok(())
     }
 
     pub fn disconnect(&self) {

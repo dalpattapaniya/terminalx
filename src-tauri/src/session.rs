@@ -959,6 +959,22 @@ impl SessionManager {
         );
     }
 
+    pub(crate) fn pipeline(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        use crate::issue_pipeline::{engine,host::LocalHost};
+        self.accepting_work()?;
+        let host = LocalHost::new(self.sink.clone(),self.clone());
+        let string = |key: &str| params[key].as_str().with_context(|| format!("{key} is required"));
+        let started = |pipeline| serde_json::json!({"pipeline":pipeline,"authorBrief":crate::issue_pipeline::prompts::author_brief()});
+        Ok(match method {
+            "start" => started(engine::start(&host,string("sessionId")?,string("tabId")?,params["autoMerge"].as_bool(),None)?),
+            "continue" => engine::continue_launch(&host,string("sessionId")?,string("tabId")?,&serde_json::from_value(params["options"].clone())?)?.map(started).unwrap_or(serde_json::Value::Null),
+            "autoMerge" => serde_json::to_value(engine::set_auto_merge(&host,string("id")?,params["value"].as_bool().context("value is required")?)?)?,
+            "resolveConflicts" => serde_json::to_value(engine::set_resolve_conflicts(&host,string("id")?,params["value"].as_bool().context("value is required")?)?)?,
+            "act" => serde_json::to_value(engine::act(&host,string("id")?,serde_json::from_value(params["action"].clone())?)?)?,
+            _ => anyhow::bail!("unsupported desktop pipeline operation"),
+        })
+    }
+
     pub(crate) fn workspace(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         crate::local_runtime::workspaces::execute(self, self.sink.as_ref(), method, params)
     }

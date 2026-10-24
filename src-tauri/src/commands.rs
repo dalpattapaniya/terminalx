@@ -1995,29 +1995,6 @@ pub async fn move_quick_chat_to_project(app: AppHandle, session_id: String, proj
     }).await.map_err(err)?
 }
 
-/// How often idle quick chats are looked for.
-const RETENTION_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-
-
-/// Apply the retention setting now, and again every few hours while the app runs.
-pub fn start_quick_chat_retention(app: AppHandle) {
-    let spawned = std::thread::Builder::new().name("quick-chat-retention".into()).spawn(move || loop {
-        sweep_quick_chats(&app);
-        std::thread::sleep(RETENTION_SWEEP_EVERY);
-    });
-    if let Err(error) = spawned {
-        log::warn!("quick chat retention is off for this run: {error}");
-    }
-}
-
-fn sweep_quick_chats(app: &AppHandle) {
-    let state = app.state::<crate::AppState>();
-    // The owner schedules retention itself. A window never starts a second sweep.
-    if state.runtime().is_some() { return; }
-    let result = state.sessions().and_then(|sessions| sessions.workspace::<serde_json::Value>("retention", serde_json::json!({})));
-    if let Err(error) = result { log::warn!("quick chat retention: {error:#}"); }
-}
-
 /// What a session's scratch directory holds, for the delete confirmation.
 #[tauri::command]
 pub async fn quick_chat_scratch(session_id: String) -> CmdResult<crate::session_ops::QuickChatScratch> {
@@ -2737,47 +2714,25 @@ pub fn gh_available() -> bool {
 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
-pub async fn pty_spawn(app: AppHandle, state: State<'_, AppState>, id: String, cwd: String, cols: u16, rows: u16, command: Option<String>, title: Option<String>) -> CmdResult<()> {
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.spawn(&id, &cwd, cols, rows, command.as_deref(), title.as_deref()))
-            .await.map_err(err)?.map_err(err);
-    }
-    let spec = crate::pty::PaneSpec { cwd: &cwd, cols: cols.max(2), rows: rows.max(1), command: command.as_deref(), env: &[] };
-    state.terminals.spawn(std::sync::Arc::new(app.clone()), &id, spec).map_err(err)?;
-    if let Some(title) = title.as_deref().filter(|title| !title.trim().is_empty()) {
-        state.terminals.set_title(&id, title);
-    }
-    // A shell tab is every window's to list, not only the one that opened it.
-    if let Some(shell) = state.terminals.shell(&id) {
-        let _ = app.emit(PTY_OPENED_EVENT, &shell);
-    }
-    Ok(())
+pub async fn pty_spawn(state: State<'_, AppState>, id: String, cwd: String, cols: u16, rows: u16, command: Option<String>, title: Option<String>) -> CmdResult<()> {
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.spawn(&id, &cwd, cols, rows, command.as_deref(), title.as_deref())).await.map_err(err)?.map_err(err)
 }
 
-pub(crate) const PTY_OPENED_EVENT: &str = "pty_opened";
-pub(crate) const PTY_CLOSED_EVENT: &str = "pty_closed";
-pub(crate) const PTY_RENAMED_EVENT: &str = "pty_renamed";
 
 /// Which of these shell tabs are running a command now, for a close that would end it.
 #[tauri::command]
 pub async fn pty_busy(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<Vec<String>> {
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.busy(&ids)).await.map_err(err)?.map_err(err);
-    }
-    Ok(ids.into_iter().filter(|id| state.terminals.is_busy(id)).collect())
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.busy(&ids)).await.map_err(err)?.map_err(err)
 }
 
 /// The shell tabs that are open, in every session: a window loaded after
 /// they were opened (the floating one, a reload) lists them from this.
 #[tauri::command]
 pub async fn pty_shells(state: State<'_, AppState>) -> CmdResult<Vec<crate::pty::ShellPane>> {
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.shells()).await.map_err(err)?.map_err(err);
-    }
-    // A shell an agent was started in is that agent's tab from then on
-    // (#437): the session lists it, and it is not also a shell tab.
-    let taken: std::collections::HashSet<String> = index::load().unwrap_or_default().iter().flat_map(|session| &session.tabs).filter_map(|tab| tab.follow.pane.clone()).collect();
-    Ok(state.terminals.shells().into_iter().filter(|shell| !taken.contains(&shell.id)).collect())
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.shells()).await.map_err(err)?.map_err(err)
 }
 
 /// The agents in front of terminals right now (#437), for a window that
@@ -2796,29 +2751,16 @@ pub async fn tab_resume_conversation(app: AppHandle, session_id: String, tab_id:
 }
 
 #[tauri::command]
-pub async fn pty_rename(app: AppHandle, state: State<'_, AppState>, id: String, title: String) -> CmdResult<()> {
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.rename(&id, &title)).await.map_err(err)?.map_err(err);
-    }
-    state.terminals.rename(&id, &title);
-    if let Some(shell) = state.terminals.shell(&id) {
-        let _ = app.emit(PTY_RENAMED_EVENT, &shell);
-    }
-    Ok(())
+pub async fn pty_rename(state: State<'_, AppState>, id: String, title: String) -> CmdResult<()> {
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.rename(&id, &title)).await.map_err(err)?.map_err(err)
 }
 
 #[tauri::command]
 pub async fn pty_write(state: State<'_, AppState>, id: String, data: String) -> CmdResult<()> {
-    if !state.pairing.desktop_terminal_input_allowed(&id) {
-        return Ok(());
-    }
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.write(&id, data.as_bytes())).await.map_err(err)?.map_err(err);
-    }
-    // A paste can fill the PTY's input buffer while the program is busy
-    // writing output. Never wait for it on the UI thread: that also prevents
-    // the window's output acknowledgements and other panes' input arriving.
-    state.terminals.write_async(&id, data.into_bytes()).await.map_err(err)
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    if !state.pairing.desktop_terminal_input_allowed(&id) { return Ok(()); }
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.write(&id, data.as_bytes())).await.map_err(err)?.map_err(err)
 }
 
 /// The window shows this pane: send it the pane's output as raw bytes, the
@@ -2826,47 +2768,37 @@ pub async fn pty_write(state: State<'_, AppState>, id: String, data: String) -> 
 /// `token` names this attachment in the acknowledgements and the detach that follow.
 #[tauri::command]
 pub async fn pty_attach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> CmdResult<()> {
-    if let Some(runtime) = state.runtime() {
-        let label = window.label().to_owned();
-        return tauri::async_runtime::spawn_blocking(move || runtime.attach(&label, &id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok())))
-            .await.map_err(err)?.map_err(err);
-    }
-    state.terminals.attach(window.label(), &id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok()));
-    Ok(())
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    let label = window.label().to_owned();
+    tauri::async_runtime::spawn_blocking(move || runtime.attach(&label, &id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok())))
+        .await.map_err(err)?.map_err(err)
 }
 
 /// The window has drawn `drawn` bytes of the pane's output since it attached (flow control).
 #[tauri::command]
 pub fn pty_ack(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String, drawn: u64) -> CmdResult<()> {
-    if let Some(runtime) = state.runtime() { return runtime.ack(window.label(), &id, &token, drawn).map_err(err); }
-    state.terminals.ack(&id, &token, drawn);
-    Ok(())
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    runtime.ack(window.label(), &id, &token, drawn).map_err(err)
 }
 
 /// A freshly loaded window: whatever its previous page was shown is gone.
 /// Only this window's views: another window goes on showing its terminals.
 #[tauri::command]
 pub fn pty_detach_all(window: tauri::WebviewWindow, state: State<'_, AppState>) {
-    if let Some(runtime) = state.runtime() { runtime.detach_window(window.label()); return; }
-    state.terminals.detach_window(window.label());
+    if let Some(runtime) = state.runtime() { runtime.detach_window(window.label()); }
 }
 
 #[tauri::command]
 pub fn pty_detach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String) -> CmdResult<()> {
-    if let Some(runtime) = state.runtime() { return runtime.detach(window.label(), &id, &token).map_err(err); }
-    state.terminals.detach(&id, &token);
-    Ok(())
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    runtime.detach(window.label(), &id, &token).map_err(err)
 }
 
 #[tauri::command]
 pub async fn pty_resize(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> CmdResult<()> {
-    if !state.pairing.desktop_terminal_input_allowed(&id) {
-        return Ok(());
-    }
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.resize(&id, cols, rows)).await.map_err(err)?.map_err(err);
-    }
-    state.terminals.resize(&id, cols.max(2), rows.max(1)).map_err(err)
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    if !state.pairing.desktop_terminal_input_allowed(&id) { return Ok(()); }
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.resize(&id, cols, rows)).await.map_err(err)?.map_err(err)
 }
 
 #[tauri::command]
@@ -2875,19 +2807,9 @@ pub fn mobile_terminal_drivers(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-pub async fn pty_kill(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
-    if let Some(runtime) = state.runtime() {
-        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.kill(&id)).await.map_err(err)?.map_err(err);
-    }
-    // By its name, not by whether it is still running: a shell whose process
-    // has already gone is still a tab in the other window, to be dropped there.
-    let shell = crate::pty::is_shell_id(&id);
-    state.terminals.kill(&id);
-    // Closed for everyone: the other window drops its tab for it too.
-    if shell {
-        let _ = app.emit(PTY_CLOSED_EVENT, &id);
-    }
-    Ok(())
+pub async fn pty_kill(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
+    tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.kill(&id)).await.map_err(err)?.map_err(err)
 }
 
 /// The webview's answer to a `terminal_perf_request` event.
@@ -3348,7 +3270,7 @@ pub async fn github_identity(project_path: String, refresh: Option<bool>) -> Cmd
 
 /// A pipeline as it starts, with what the author's first prompt must carry
 /// for the pipeline to hear when the work is done.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartedIssuePipeline {
     pub pipeline: crate::issue_pipeline::Pipeline,
@@ -3365,50 +3287,32 @@ pub fn issue_pipelines_list() -> CmdResult<Vec<crate::issue_pipeline::Pipeline>>
 /// cannot serve: one on the default branch, or in a project that turned it off.
 #[tauri::command]
 pub async fn issue_pipeline_start(app: AppHandle, session_id: String, tab_id: String, auto_merge: Option<bool>) -> CmdResult<StartedIssuePipeline> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
-        let pipeline = crate::issue_pipeline::engine::start(&host, &session_id, &tab_id, auto_merge, None).map_err(err)?;
-        Ok(StartedIssuePipeline { pipeline, author_brief: crate::issue_pipeline::prompts::author_brief() })
-    })
-    .await
-    .map_err(err)?
+    let sessions = app.state::<AppState>().sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.pipeline("start", serde_json::json!({"sessionId":session_id,"tabId":tab_id,"autoMerge":auto_merge})).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn issue_pipeline_continue(app: AppHandle, session_id: String, tab_id: String, options: crate::issue_pipeline::LaunchOptions) -> CmdResult<Option<StartedIssuePipeline>> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
-        let pipeline = crate::issue_pipeline::engine::continue_launch(&host, &session_id, &tab_id, &options).map_err(err)?;
-        Ok(pipeline.map(|pipeline| StartedIssuePipeline { pipeline, author_brief: crate::issue_pipeline::prompts::author_brief() }))
-    }).await.map_err(err)?
+    let sessions = app.state::<AppState>().sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.pipeline("continue", serde_json::json!({"sessionId":session_id,"tabId":tab_id,"options":options})).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn issue_pipeline_set_auto_merge(app: AppHandle, id: String, value: bool) -> CmdResult<crate::issue_pipeline::Pipeline> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
-        crate::issue_pipeline::engine::set_auto_merge(&host, &id, value).map_err(err)
-    })
-    .await
-    .map_err(err)?
+    let sessions = app.state::<AppState>().sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.pipeline("autoMerge", serde_json::json!({"id":id,"value":value})).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn issue_pipeline_set_resolve_conflicts(app: AppHandle, id: String, value: bool) -> CmdResult<crate::issue_pipeline::Pipeline> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
-        crate::issue_pipeline::engine::set_resolve_conflicts(&host, &id, value).map_err(err)
-    }).await.map_err(err)?
+    let sessions = app.state::<AppState>().sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.pipeline("resolveConflicts", serde_json::json!({"id":id,"value":value})).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn issue_pipeline_act(app: AppHandle, id: String, action: crate::issue_pipeline::engine::Action) -> CmdResult<crate::issue_pipeline::Pipeline> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
-        crate::issue_pipeline::engine::act(&host, &id, action).map_err(err)
-    })
-    .await
-    .map_err(err)?
+    let sessions = app.state::<AppState>().sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.pipeline("act", serde_json::json!({"id":id,"action":action})).map_err(err)).await.map_err(err)?
 }
 
 /// Move a cloud workspace's Linear issue to its team's review state with the

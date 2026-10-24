@@ -649,8 +649,8 @@ pub fn set_tab_layout(workspace: &str, mut layout: TabLayout) -> Result<Vec<Sess
     })
 }
 
-/// Shells do not outlive the app, so a layout that still names one is naming
-/// a tab that cannot come back. Called once when the app starts.
+/// Explicit legacy layout cleanup. Window startup must retain owner shells.
+#[cfg_attr(not(test), expect(dead_code, reason = "Preserve the explicit layout maintenance API; desktop attachment must not call it."))]
 pub fn forget_shell_tabs() -> Result<()> {
     with_file_lock(|| {
         let mut file = load_file()?;

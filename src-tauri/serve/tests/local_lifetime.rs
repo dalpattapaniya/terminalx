@@ -1004,3 +1004,57 @@ fn cli_workspace_deletion_confirms_owner_processes_and_keeps_the_project() {
     assert!(world.project.join("README.md").is_file());
     assert!(serve.control("permissions.list",json!({}))["permissions"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn window_services_follow_only_the_registered_live_owner_attachment() {
+    use std::os::unix::{net::UnixListener, fs::PermissionsExt};
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let endpoint = world.data.join("run/window-test.sock");
+    let listener = UnixListener::bind(&endpoint).unwrap();
+    std::fs::set_permissions(&endpoint,std::fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let token = "d".repeat(64);
+    let expected = token.clone();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let responder = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut socket,_)) => {
+                    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(socket.try_clone().unwrap()).read_line(&mut line).unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["token"],expected);
+                    assert_eq!(request["command"],"window.dispatch");
+                    assert_eq!(request["params"]["command"],"computer.listApps");
+                    seen.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    writeln!(socket,"{}",json!({"id":request["id"],"ok":true,"result":{"servedBy":"private-window"}})).unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until,"owner did not dispatch to the private window");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("private window accept: {error}"),
+            }
+        }
+    });
+    let attachment = serve.control("runtime.attach",json!({"protocol":1}));
+    let mut registration = json!({"epoch":attachment["epoch"],"lease":attachment["lease"],"socket":endpoint,"token":token});
+    registration["epoch"] = json!("wrong-owner");
+    assert_eq!(serve.try_control("runtime.window.register",registration.clone())["ok"],false);
+    registration["epoch"] = attachment["epoch"].clone();
+    serve.control("runtime.window.register",registration.clone());
+    let published = std::fs::read(world.data.join("run/control.token")).unwrap();
+    assert_eq!(published,serve.token.as_bytes());
+    assert_eq!(serve.control("computer.listApps",json!({}))["servedBy"],"private-window");
+    responder.join().unwrap();
+    serve.control("runtime.detach",attachment);
+    assert_eq!(serve.try_control("computer.listApps",json!({}))["error"]["code"],"desktop_unavailable");
+    assert_eq!(serve.try_control("runtime.window.register",registration)["ok"],false);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+    assert_eq!(std::fs::read(world.data.join("run/control.token")).unwrap(),published);
+}

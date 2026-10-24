@@ -78,7 +78,7 @@ pub fn held(app: &AppHandle) -> bool {
     if EXIT_READY.load(Ordering::SeqCst) { return false; }
     let runtime = app.try_state::<crate::AppState>().and_then(|state| state.runtime());
     let warning = GUARD.pending();
-    if runtime.is_none() && warning.is_none() { return false; }
+    if runtime.is_none() && warning.is_none() && !requires_stop(EXPLICIT_STOP.load(Ordering::SeqCst), settings::load().quit_behavior) { return false; }
     if GUARD.asking.swap(true, Ordering::SeqCst) { return true; }
     let stop_all = EXPLICIT_STOP.swap(false, Ordering::SeqCst);
     let app = app.clone();
@@ -116,6 +116,8 @@ pub fn held(app: &AppHandle) -> bool {
                     // owner must not be presented as a successful stop-all.
                     runtime.stop_all()?;
                 }
+            } else if requires_stop(stop_all, settings::load().quit_behavior) {
+                anyhow::bail!("The background runtime is unavailable, so stopping agents and terminals could not be confirmed. Reconnect before trying Stop All again.");
             }
             Ok(true)
         })();
@@ -150,6 +152,10 @@ fn choice(pressed: &MessageDialogResult) -> Option<QuitBehavior> {
         MessageDialogResult::Custom(label) if label == STOP_WORK => Some(QuitBehavior::StopAll),
         _ => None,
     }
+}
+
+fn requires_stop(explicit: bool, saved: Option<QuitBehavior>) -> bool {
+    explicit || saved == Some(QuitBehavior::StopAll)
 }
 
 /// Put a Quit item this app answers in place of the system's, which on macOS
@@ -190,6 +196,16 @@ mod tests {
         assert_eq!(guard.pending(), None);
         guard.set(Some("  ".into()));
         assert_eq!(guard.pending(), None, "nothing to say is nothing under way");
+    }
+
+    #[test]
+    fn an_unavailable_owner_cannot_satisfy_an_explicit_or_saved_stop() {
+        for saved in [None, Some(QuitBehavior::KeepRunning), Some(QuitBehavior::StopAll)] {
+            assert!(requires_stop(true, saved));
+        }
+        assert!(requires_stop(false, Some(QuitBehavior::StopAll)));
+        assert!(!requires_stop(false, Some(QuitBehavior::KeepRunning)));
+        assert!(!requires_stop(false, None));
     }
 
     #[test]

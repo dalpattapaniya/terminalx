@@ -508,6 +508,19 @@ where
     Ok(socket)
 }
 
+/// Serve window-only services without ever competing for home discovery.
+/// Dropping the unused publisher leaves the private listener running, but
+/// cannot acquire the home lock or replace its socket/token after owner loss.
+pub fn serve_private<F, C>(endpoint: ControlEndpoint, hook_handler: F, control_handler: C) -> anyhow::Result<PathBuf>
+where
+    F: Fn(HookFrame) -> HookReply + Send + Sync + 'static,
+    C: Fn(crate::control::ControlRequest) -> crate::control::ControlResponse + Send + Sync + 'static,
+{
+    let socket = endpoint.socket.clone();
+    drop(listen(endpoint, hook_handler, control_handler)?);
+    Ok(socket)
+}
+
 /// Listen on the launch's own socket, and hand back what keeps the published
 /// one. Nothing is published until the publisher is asked to look: `serve`
 /// asks once and then on a timer, and that timer is the only clock in any of
@@ -1013,6 +1026,52 @@ mod tests {
         let token_path = control_token_path().unwrap();
         assert_eq!(std::fs::read_to_string(token_path).unwrap(), endpoint.token);
         assert_eq!(std::fs::metadata(control_token_path().unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_window_authenticates_without_taking_home_after_owner_loss() {
+        use std::os::unix::net::UnixListener;
+        let _home = crate::store::temp_home();
+        let published = socket_path().unwrap();
+        let token = control_token_path().unwrap();
+        let lock_path = run_dir().unwrap().join("hooks.lock");
+        let window = prepare_control().unwrap();
+        serve_private(window.clone(), |_| HookReply::default(), |request| {
+            crate::control::ControlResponse::success(request.id, json!({"window": true}))
+        }).unwrap();
+        assert!(!published.exists());
+        assert!(!token.exists());
+        assert!(!lock_path.exists());
+        let call = |credential: &str| send(&window.socket, &json!({"id":"window", "command":"status", "token":credential}));
+        assert_eq!(call("wrong")["error"]["code"], "unauthorized");
+        assert_eq!(call(&window.token)["result"]["window"], true);
+
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).unwrap();
+        lock.try_lock().unwrap();
+        let owner = UnixListener::bind(&published).unwrap();
+        std::fs::write(&token, "owner-credential").unwrap();
+        let socket_identity = file_identity(&published).unwrap();
+        let lock_identity = file_identity(&lock_path).unwrap();
+        assert_eq!(call(&window.token)["result"]["window"], true);
+        drop(owner);
+        drop(lock);
+        // Longer than the ordinary publication retry: a private window must
+        // never begin publishing when its background owner disappears.
+        std::thread::sleep(PUBLISH_RETRY + Duration::from_millis(100));
+        assert!(!window.publishes());
+        assert_eq!(file_identity(&published).unwrap(), socket_identity);
+        assert_eq!(file_identity(&lock_path).unwrap(), lock_identity);
+        assert_eq!(std::fs::read_to_string(&token).unwrap(), "owner-credential");
+        assert_eq!(call("wrong")["error"]["code"], "unauthorized");
+        assert_eq!(call(&window.token)["result"]["window"], true);
+
+        let (restarted, _, _publisher) = launch("restarted-owner");
+        assert!(restarted.publishes());
+        assert_eq!(shell_reaches(), "restarted-owner");
+        assert_eq!(std::fs::read_to_string(&token).unwrap(), restarted.token);
+        assert!(!window.publishes());
+        assert_eq!(call(&window.token)["result"]["window"], true);
     }
 
     #[cfg(unix)]

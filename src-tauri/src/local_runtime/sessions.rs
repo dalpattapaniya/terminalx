@@ -15,38 +15,23 @@ use crate::session::{HandoffInfo, ImageInput, PendingPermission, QueuedMessage, 
 use crate::store::index::TabStatus;
 
 #[derive(Clone)]
-pub struct Sessions(Backend);
-
-#[derive(Clone)]
-enum Backend {
-    Owner(Arc<Client>),
-    // Transitional desktop ownership, removed with the final startup cutover.
-    // Both paths use the same admitted native operations and fallible reads.
-    #[cfg(feature = "desktop")]
-    InProcess(crate::session::SessionManager),
-}
+pub struct Sessions(Arc<Client>);
 
 impl Sessions {
-    pub fn new(client: Arc<Client>) -> Self { Self(Backend::Owner(client)) }
-
-    #[cfg(feature = "desktop")]
-    pub(crate) fn in_process(manager: crate::session::SessionManager) -> Self { Self(Backend::InProcess(manager)) }
+    pub fn new(client: Arc<Client>) -> Self { Self(client) }
 
     fn call<T: DeserializeOwned>(&self, command: &str, params: Value) -> Result<T> {
-        match &self.0 {
-            Backend::Owner(client) => client.call(command, params),
-            #[cfg(feature = "desktop")]
-            Backend::InProcess(manager) => {
-                let method = command.strip_prefix("runtime.session.").ok_or_else(|| anyhow::anyhow!("unsupported desktop session operation"))?;
-                Ok(serde_json::from_value(super::calls::session(manager, method, params)?)?)
-            }
-        }
+        self.0.call(command,params)
     }
 
     fn tab<T: DeserializeOwned>(&self, method: &str, session: &str, tab: &str, mut params: Value) -> Result<T> {
         params["sessionId"] = json!(session);
         params["tabId"] = json!(tab);
         self.call(&format!("runtime.session.{method}"), params)
+    }
+
+    pub fn pipeline<T: DeserializeOwned>(&self, operation: &str, params: Value) -> Result<T> {
+        self.call("runtime.session.pipeline",json!({"operation":operation,"params":params}))
     }
 
     pub fn workspace<T: DeserializeOwned>(&self, operation: &str, params: Value) -> Result<T> {

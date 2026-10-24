@@ -161,6 +161,8 @@ pub struct AppState {
     pub browser: Arc<browser::BrowserRuntime>,
     manager: std::sync::Mutex<Option<session::SessionManager>>,
     runtime: std::sync::Mutex<Option<Arc<local_runtime::desktop::Desktop>>>,
+    runtime_error: std::sync::Mutex<String>,
+    window_endpoint: std::sync::OnceLock<hooks::ControlEndpoint>,
 }
 
 #[cfg(feature = "desktop")]
@@ -175,8 +177,7 @@ impl AppState {
 
     pub fn sessions(&self) -> anyhow::Result<local_runtime::sessions::Sessions> {
         if let Some(runtime) = self.runtime() { return runtime.sessions(); }
-        self.manager().map(local_runtime::sessions::Sessions::in_process)
-            .ok_or_else(|| anyhow::anyhow!("not ready"))
+        Err(anyhow::anyhow!(self.runtime_error.lock().unwrap().clone()))
     }
 
 }
@@ -230,6 +231,8 @@ pub fn run() {
         browser: browser.clone(),
         manager: std::sync::Mutex::new(None),
         runtime: std::sync::Mutex::new(None),
+        runtime_error: std::sync::Mutex::new("The background runtime is not attached.".into()),
+        window_endpoint: std::sync::OnceLock::new(),
     };
 
     tauri::Builder::default()
@@ -271,10 +274,6 @@ pub fn run() {
                 }
                 Err(error) => log::warn!("allow attachments in the asset scope: {error:#}"),
             }
-            // Shells ended with the last run of the app; a tab layout that still names one names nothing.
-            if let Err(error) = store::index::forget_shell_tabs() {
-                log::warn!("forget the shell tabs of the last run: {error:#}");
-            }
             agent_keys.configure(&app.config().identifier);
             cloud_remote.watch_identity(app.handle().clone());
             account.configure(&app.config().identifier)?;
@@ -315,64 +314,20 @@ pub fn run() {
             if let Ok(resources) = app.path().resource_dir() {
                 computer.set_resource_dir(resources, &app.config().identifier);
             }
-            // Recover local history before hooks/automations can publish live
-            // activity. Provider cache scans are deliberately unrelated.
-            if let Err(error) = store::activity::summary() {
-                log::error!("initialize activity history: {error:#}");
-            }
-            let control_endpoint = hooks::prepare_control()?;
+            local_runtime::ui::observe(app.handle());
             let sink: Arc<dyn sink::EventSink> = Arc::new(app.handle().clone());
-            let manager = session::SessionManager::new(
-                sink.clone(),
-                Arc::new(app.handle().clone()),
-                host.clone(),
-                terminals.clone(),
-                codex_models.clone(),
-                status_state.clone(),
-                control_endpoint.clone(),
-            );
-            *app.state::<AppState>().manager.lock().unwrap() = Some(manager.clone());
-            pairing.attach_sessions(manager.clone());
-            // The agent CLIs' hooks reach the app through this socket; without
-            // it a PTY-first tab still runs, it just cannot report or ask.
-            let hooked = manager.clone();
+            let endpoint = hooks::prepare_control()?;
             let asking = app.handle().clone();
             let ask: issue_control::Ask = Arc::new(move |question: issue_control::Question| {
                 tauri::async_runtime::block_on(commands::cloud_control_question(asking.clone(), question.title, question.message, question.agree))
             });
-            let service = control::ControlService::new(sink.clone(), manager.clone(), control_endpoint.clone(), computer.clone(), browser.clone()).with_pairing(pairing.clone()).with_questions(ask);
-            match hooks::serve(control_endpoint, move |frame| hooked.on_hook(frame), move |request| service.handle(request)) {
-                Ok(path) => log::info!("hook socket at {}", path.display()),
-                Err(e) => log::warn!("hook socket: {e:#}"),
+            control::WindowControl::new(sink, computer.clone(), browser.clone())
+                .serve(app.handle().clone(), endpoint.clone(), pairing.clone(), ask)?;
+            let _ = app.state::<AppState>().window_endpoint.set(endpoint);
+            if let Err(error) = local_runtime::ui::connect(app.handle()) {
+                *app.state::<AppState>().runtime_error.lock().unwrap() = format!("{error:#}");
+                log::error!("attach background runtime: {error:#}");
             }
-            std::thread::spawn(|| {
-                if let Err(error) = github::recover_workspace_prs() {
-                    let detail = format!("{error:#}").to_lowercase();
-                    let category = if detail.contains("auth") || detail.contains("login") || detail.contains("credential") {
-                        "credentials"
-                    } else if detail.contains("rate limit") {
-                        "rate_limit"
-                    } else {
-                        "connection"
-                    };
-                    log::warn!("recover workspace PR history failed (category={category}; workspace details omitted)");
-                    let message = if category == "credentials" {
-                        "GitHub credentials need attention before pull-request data can be refreshed."
-                    } else if category == "rate_limit" {
-                        "GitHub rate limits prevented pull-request data from refreshing. We’ll retry on restart or workspace refresh."
-                    } else {
-                        "Some pull-request data couldn’t be refreshed because GitHub is unreachable. We’ll retry on restart or workspace refresh."
-                    };
-                    store::activity::report_error(message.into());
-                }
-            });
-            manager.follow_pane_exits();
-            session::idle_orphaned_tabs();
-            // Tabs follow what runs in their terminal (#437). Only here: a
-            // cloud workspace's runtime does not.
-            manager.follow_terminals();
-            automations::start_scheduler(app.handle().clone());
-            issue_pipeline::desktop::start(app.handle().clone());
             work_claims.start(app.handle().clone());
             // The built-in browser: sweep daemons a crashed run left behind,
             // then keep this run's own daemons warm and its page list honest.
@@ -380,7 +335,6 @@ pub fn run() {
             browser.sweep_orphans();
             browser.start_keepalive();
             floating::install(app.handle());
-            commands::start_quick_chat_retention(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -799,27 +753,14 @@ pub fn run() {
             }
             if let tauri::WindowEvent::Destroyed = event {
                 if let Some(state) = window.try_state::<AppState>() {
-                    state.pairing.stop();
+                    if let Some(runtime) = state.runtime() { runtime.detach_window(window.label()); }
                     if window.label() == "main" {
-                        if let Err(error) = store::activity::shutdown() {
-                            log::error!("flush activity on window teardown: {error:#}");
-                        }
-                        // The app goes with its main window, as it always
-                        // has: a hidden floating window must not keep it
-                        // running with every agent stopped.
-                        if let Some(floating) = window.app_handle().get_webview_window(floating::LABEL) {
-                            let _ = floating.destroy();
-                        }
+                        state.pairing.stop();
+                        if let Some(runtime) = state.runtime() { runtime.disconnect(); }
+                        if let Some(floating) = window.app_handle().get_webview_window(floating::LABEL) { let _ = floating.destroy(); }
+                        state.computer.shutdown();
+                        state.browser.shutdown();
                     }
-                    // The panes that exit from here on were closed by the
-                    // app, and no tab is turned into a terminal for that.
-                    if let Some(manager) = state.manager() {
-                        manager.closing();
-                    }
-                    state.host.kill_all();
-                    state.terminals.kill_all();
-                    state.computer.shutdown();
-                    state.browser.shutdown();
                 }
             }
         })
@@ -842,9 +783,9 @@ pub fn run() {
                 // destroying the window first; the computer-use helper must
                 // not outlive the app on either path.
                 state.computer.shutdown();
-                if let Err(error) = store::activity::shutdown() {
-                    log::error!("flush activity on exit: {error:#}");
-                }
+                state.pairing.stop();
+                if let Some(runtime) = state.runtime() { runtime.disconnect(); }
+                state.browser.shutdown();
             }
         });
 }

@@ -469,3 +469,19 @@ checkpoint, alongside 47 session-operation and 19 merged-cleanup tests. The full
 native suite last passed on the preceding checkpoint (2,248 unit, six CLI and
 two serde tests); it has not yet been rerun for these cleanup changes. Production
 startup, paired-device adapters and packaged desktop acceptance remain pending.
+
+
+Desktop attachment checkpoint: production startup now connects to the local
+owner instead of creating a window-owned SessionManager. Closing the window
+detaches its views and private service endpoint without stopping processes.
+Computer/browser/cloud UI services are a fixed allowlist behind authenticated
+private IPC, fenced at both ends to the current attachment. This endpoint never
+publishes home discovery credentials, even after owner loss; it cannot replace
+the owner. Local pipeline recovery and automation scheduling run only in the
+owner. An explicit stop request with no owner reports failure.
+
+Desktop/headless all-target Clippy and 30 lifecycle process tests passed on this
+checkpoint. Focused native checks passed 33 window, 153 pipeline and four quit
+tests. These are checkpoint results, not the final full-suite or packaged
+acceptance: paired-device adapters, background tray/notifications and genuine
+packaged quit/reopen/update validation remain outstanding.

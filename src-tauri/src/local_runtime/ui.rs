@@ -11,9 +11,47 @@ use crate::{AppState, store::settings::{self, QuitBehavior}};
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ConnectionState {
-    InProcess,
     Connected { epoch: String, running_agents: usize, terminals: usize },
     Unavailable { message: String },
+}
+
+/// Presentation-only observer installed once per window process. Scheduling and
+/// activity accounting remain in the owner; reopening does not replay usage.
+pub(crate) fn observe(app: &AppHandle) {
+    use crate::sink::EventSink;
+    let observed = app.clone();
+    EventSink::listen(app,"agent_event",Box::new(move |payload| {
+        if let Ok(event) = serde_json::from_str::<crate::events::AgentEvent>(payload) {
+            observed.state::<AppState>().star_nag.observe(&observed,&event);
+        }
+    }));
+    let observed = app.clone();
+    EventSink::listen(app,"agent_work_started",Box::new(move |payload| {
+        if let Ok(total) = serde_json::from_str::<u64>(payload) {
+            observed.state::<AppState>().star_nag.work_started(&observed,total);
+        }
+    }));
+    let observed = app.clone();
+    EventSink::listen(app,"tab_status",Box::new(move |payload| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { return };
+        let (Some(session),Some(tab)) = (value["sessionId"].as_str(),value["tabId"].as_str()) else { return };
+        if let Ok(status) = serde_json::from_value(value["status"].clone()) {
+            observed.state::<AppState>().star_nag.status(&observed,format!("{session}/{tab}"),status);
+        }
+    }));
+}
+
+pub(crate) fn connect(app: &AppHandle) -> anyhow::Result<Arc<Desktop>> {
+    let state = app.state::<AppState>();
+    let source = app.path().resource_dir()?.join("local-runtime/terminalx-serve");
+    let home = crate::store::root()?;
+    let client = super::launch::connect_or_start(&source,&home)?;
+    let next = Arc::new(Desktop::connect(client,Arc::new(app.clone()))?);
+    let endpoint = state.window_endpoint.get().ok_or_else(|| anyhow::anyhow!("The private desktop endpoint is not ready."))?.clone();
+    next.register_window(endpoint)?;
+    state.pairing.attach_runtime(next.clone());
+    *state.runtime.lock().unwrap() = Some(next.clone());
+    Ok(next)
 }
 
 fn connected(runtime: &Desktop) -> anyhow::Result<ConnectionState> {
@@ -25,16 +63,28 @@ fn connected(runtime: &Desktop) -> anyhow::Result<ConnectionState> {
 
 #[tauri::command]
 pub async fn local_runtime_status(state: State<'_, AppState>) -> Result<ConnectionState, String> {
-    let Some(runtime) = state.runtime() else { return Ok(ConnectionState::InProcess) };
+    let Some(runtime) = state.runtime() else { return Ok(ConnectionState::Unavailable { message: state.runtime_error.lock().unwrap().clone() }) };
     tauri::async_runtime::spawn_blocking(move || connected(&runtime).unwrap_or_else(|error| ConnectionState::Unavailable { message: format!("{error:#}") }))
         .await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn local_runtime_reconnect(app: AppHandle) -> Result<ConnectionState, String> {
-    let previous = app.state::<AppState>().runtime().ok_or("The background runtime is not attached.")?;
+    let previous = app.state::<AppState>().runtime();
     static RECONNECT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _reconnect = RECONNECT.lock().await;
+    let Some(previous) = previous else {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let next = connect(&app).map_err(|error| {
+                let message = format!("{error:#}");
+                *app.state::<AppState>().runtime_error.lock().unwrap() = message.clone();
+                message
+            })?;
+            let result = connected(&next).map_err(|error| format!("{error:#}"))?;
+            let _ = app.emit("local_runtime_reattached", ());
+            Ok(result)
+        }).await.map_err(|error| error.to_string())?;
+    };
     if !app.state::<AppState>().runtime().as_ref().is_some_and(|current| Arc::ptr_eq(current, &previous)) {
         return Err("The desktop connection changed while reconnecting. Try again.".into());
     }

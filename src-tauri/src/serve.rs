@@ -503,8 +503,30 @@ fn start(options: &Options) -> Result<Runtime> {
         let automation_host = crate::automations::RuntimeHost { sink: sink.clone(), sessions: manager.clone() };
         pipelines.attach_local_automations(automation_host.clone());
         crate::automations::recover_open_runs(&automation_host);
-        crate::issue_pipeline::runtime::start(pipeline_host, interrupted.clone());
+        crate::issue_pipeline::runtime::start_local(pipeline_host);
         crate::automations::start_recovered_scheduler(automation_host);
+            std::thread::spawn(|| {
+                if let Err(error) = crate::github::recover_workspace_prs() {
+                    let detail = format!("{error:#}").to_lowercase();
+                    let category = if detail.contains("auth") || detail.contains("login") || detail.contains("credential") {
+                        "credentials"
+                    } else if detail.contains("rate limit") {
+                        "rate_limit"
+                    } else {
+                        "connection"
+                    };
+                    log::warn!("recover workspace PR history failed (category={category}; workspace details omitted)");
+                    let message = if category == "credentials" {
+                        "GitHub credentials need attention before pull-request data can be refreshed."
+                    } else if category == "rate_limit" {
+                        "GitHub rate limits prevented pull-request data from refreshing. We’ll retry on restart or workspace refresh."
+                    } else {
+                        "Some pull-request data couldn’t be refreshed because GitHub is unreachable. We’ll retry on restart or workspace refresh."
+                    };
+                    crate::store::activity::report_error(message.into());
+                }
+            });
+
     }
     if let Some(lifetime) = &lifetime {
         lifetime.ready();

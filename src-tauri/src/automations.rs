@@ -1629,20 +1629,11 @@ pub(crate) fn recover_open_runs(app: &impl AutomationHost) {
     }
 }
 
-pub fn start_scheduler(app: impl AutomationHost) {
-    start_scheduler_inner(app, true);
-}
-
 /// Local owners recover synchronously before accepting external commands.
 pub(crate) fn start_recovered_scheduler(app: impl AutomationHost) {
-    start_scheduler_inner(app, false);
-}
-
-fn start_scheduler_inner(app: impl AutomationHost, recover: bool) {
     std::thread::Builder::new()
         .name("automation-scheduler".into())
         .spawn(move || {
-            if recover { recover_open_runs(&app); }
             loop {
                 if let Err(error) = evaluate(&app) {
                     log::warn!("automation scheduler: {error:#}");

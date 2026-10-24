@@ -17,6 +17,8 @@ use crate::control::ControlError;
 
 #[cfg(unix)]
 pub mod stream;
+#[cfg(unix)]
+pub(crate) mod window;
 pub mod calls;
 pub(crate) mod workspaces;
 pub(crate) mod permissions;
@@ -132,6 +134,8 @@ impl Attachment {
 }
 
 pub struct Lifetime {
+    #[cfg(unix)]
+    pub(crate) window: window::Registry,
     epoch: String,
     stream_socket: std::sync::OnceLock<std::path::PathBuf>,
     grace: Duration,
@@ -153,6 +157,8 @@ fn unavailable() -> ControlError {
 impl Lifetime {
     pub fn new(grace: Duration) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(unix)]
+            window: window::Registry::default(),
             epoch: uuid::Uuid::new_v4().to_string(),
             stream_socket: std::sync::OnceLock::new(),
             grace,

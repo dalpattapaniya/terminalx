@@ -4,6 +4,12 @@
 
 ### Runtime investigation
 
+- Attach desktop startup and session/terminal commands to the local runtime
+  owner. Window-only services use a private, attachment-fenced endpoint that
+  cannot take over owner discovery; unavailable owners fail explicitly. Local
+  pipeline recovery and scheduling run in the owner. Mobile/tray integration
+  and packaged acceptance remain in progress. (#467)
+
 - Route local workspace cleanup and quick-chat relocation through the runtime
   owner. A failed process stop preserves the workspace and every affected
   conversation, including when an earlier session already stopped. (#467)
