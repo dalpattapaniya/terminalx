@@ -4,6 +4,9 @@
 
 ### Runtime investigation
 
+- Wake the local helper's AppKit event loop after backend shutdown, so idle
+  exit and explicit stop-all do not leave a stopped menu-bar process behind. (#467)
+
 - Publish the desktop attachment before exposing window services to the owner;
   failed activation disconnects that view without stopping background work.
   Reconnect explicitly revokes its previous lease before publishing the new one. (#467)

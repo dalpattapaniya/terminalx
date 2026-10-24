@@ -550,3 +550,16 @@ legacy ACP and OpenCode fixture peers: queued turns complete while detached,
 pending permissions survive attachment, duplicate answers fail, and the owner
 identity remains unchanged. Those fixtures do not establish real-provider
 compatibility or credentials. Packaged guest acceptance is still pending.
+
+Packaged guest acceptance exposed an AppKit-specific idle-exit failure: backend
+shutdown finished, but `NSApplication.stop` called from the timer did not wake
+`nextEvent`. The helper now posts a private application-defined event after
+stopping. Apple's documented `stop:` contract requires event dispatch; no user
+input should be necessary. The opt-in native guest regression reproduced the
+failure on helper `db2ef716d28e1b68997b1b5b381338458120e7e81d16bba362a02ed35574c1e5`.
+The repaired development helper
+`5e3fc5c26ae657266a6cdbc571fd3306a251d2d09a3a1635d4951fd00b02b151`
+passed actual idle exit (2.21 seconds with a two-second grace) and authenticated
+stop-all exit (0.27 seconds), without any external UI event. Local-UI all-target
+Clippy passed. A rebuilt desktop bundle and the remaining guest acceptance cases
+still need validation; these results are not a completed issue claim.

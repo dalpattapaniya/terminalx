@@ -35,6 +35,13 @@ from a visible window, a stored status or a restored transcript.
 
 ## Lifecycle observations
 
+Before the interactive cases, run `python3 scripts/local-runtime/native-lifetime.py
+<bundled-terminalx-serve> --allocated-disposable-guest` inside that guest. This
+starts the actual AppKit owner in new private homes and requires idle shutdown
+and authenticated stop-all to exit without any mouse or keyboard event. Never
+run this opt-in native UI regression on the host. Its JSON result includes the
+helper hash and process exit timings; a headless suite does not cover this loop.
+
 1. Start a delayed fixture turn and a plain terminal that writes numbered lines
    to its PTY and a disposable output file. Retain the starting event/byte cursor.
 2. Quit with the first-choice dialog dismissed: verify the app remains attached

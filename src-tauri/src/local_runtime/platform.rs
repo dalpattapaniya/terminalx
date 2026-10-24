@@ -8,8 +8,8 @@ use anyhow::{bail, Context, Result};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString, NSTimer};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem, NSAlert};
+use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString, NSTimer, NSPoint};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem, NSAlert, NSEvent, NSEventType, NSEventModifierFlags};
 use serde_json::json;
 use crate::session::SessionManager;
 use crate::sink::EventSink;
@@ -221,6 +221,15 @@ impl Controller {
             let app = NSApplication::sharedApplication(self.mtm());
             if shared.terminating.load(Ordering::SeqCst) { app.replyToApplicationShouldTerminate(true); }
             app.stop(None);
+            // stop: only takes effect after AppKit dispatches an NSEvent. This
+            // callback is an NSTimer, so an idle menu-bar process otherwise
+            // stays in nextEvent forever with its backend already stopped.
+            // A private application event wakes the loop without user input.
+            if let Some(event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                NSEventType::ApplicationDefined, NSPoint::new(0.0, 0.0), NSEventModifierFlags::empty(), 0.0, 0, None, 0, 0, 0,
+            ) {
+                app.postEvent_atStart(&event, true);
+            }
             return;
         }
         // Publish an item only after this process acquired runtime ownership.
