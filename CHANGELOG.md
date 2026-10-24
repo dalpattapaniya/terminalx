@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Fence a local sharing account generation even when sign-out arrives before
+  registration, so late registration cannot restore revoked access and stale
+  sign-out cannot revoke a newer account. Cover both orderings in a disposable
+  owner-process regression. (#467)
+
 - Move shared-session admission and dispatch into a portable owner-side router.
   Bind internal sharing grants to an attachment and account generation, revoke
   them on disconnect, and reject delivery permits from recreated shares. Desktop

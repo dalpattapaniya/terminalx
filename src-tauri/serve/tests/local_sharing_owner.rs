@@ -251,6 +251,30 @@ fn account_clear_and_attachment_loss_cannot_reanimate_grants() {
 }
 
 #[test]
+fn sign_out_before_registration_fences_late_registration_without_revoking_a_newer_account() {
+    let mut fixture = Fixture::new("");
+    fixture.actor["generation"] = json!(2);
+    // Generation 2 has never registered: its sign-out arrived first.
+    fixture.call("clear", json!({}));
+    fixture.call("clear", json!({}));
+    fixture.refused("register", json!({}));
+    fixture.actor["generation"] = json!(3);
+    fixture.call("register", json!({}));
+    fixture.link("viewer", false);
+    let mut stale = fixture.actor.clone();
+    stale["generation"] = json!(2);
+    assert_eq!(
+        fixture
+            .serve
+            .try_control("runtime.sharing.clear", json!({"actor":stale}))["ok"],
+        false
+    );
+    // A stale sign-out must not remove the newer account's grant.
+    assert_eq!(fixture.join()["admitted"], true);
+    fixture.call("guest", fixture.guest("session.tail", json!({})));
+}
+
+#[test]
 fn revocation_while_the_provider_is_not_ready_prevents_the_actual_pty_write() {
     for operation in ["revoke", "clear", "detach"] {
         let fixture = Fixture::with_readiness_gate("", true);

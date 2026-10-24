@@ -156,8 +156,15 @@ pub(crate) fn execute(
     if method == "register" {
         return register(&mut sharing, actor, attachment);
     }
-    let attachment = registered(&sharing, &actor)?;
     if method == "clear" {
+        // Sign-out may overtake the registration request on another socket.
+        // Record a tombstone even before registration, but never let an old
+        // sign-out invalidate a newer account on this attachment.
+        if let Some(previous) = sharing.owners.get(&actor.lease) {
+            if previous.actor != actor && actor.generation <= previous.actor.generation {
+                bail!("The account generation is stale or inconsistent.");
+            }
+        }
         sharing.sessions.retain(|_, share| {
             if share
                 .owner
@@ -170,9 +177,17 @@ pub(crate) fn execute(
                 true
             }
         });
-        sharing.owners.get_mut(&actor.lease).unwrap().revoked = true;
+        sharing.owners.insert(
+            actor.lease.clone(),
+            Registration {
+                actor,
+                attachment,
+                revoked: true,
+            },
+        );
         return Ok(json!({"cleared":true}));
     }
+    let attachment = registered(&sharing, &actor)?;
     let session = text(&params, "sessionId")?;
     if method == "create" {
         let entry = index::get(session)?;
