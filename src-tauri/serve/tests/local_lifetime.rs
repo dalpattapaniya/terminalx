@@ -189,12 +189,18 @@ fn native_client_pins_its_owner_and_cannot_send_to_a_replacement() {
     assert_eq!(events.receive().unwrap()["type"], "pong");
     let status: serde_json::Value = client.call("status", json!({})).unwrap();
     assert_eq!(status["pid"], serve.child.id());
+    assert_eq!(events.attachment().epoch, status["localRuntime"]["epoch"]);
+    assert!(!events.attachment().lease.is_empty());
+    let sessions = raccoon_lib::local_runtime::sessions::Sessions::new(client.clone());
     client.stop_all().unwrap();
     stopped(&mut serve);
     drop(events);
     drop(serve);
     let replacement = Serve::start(world.command(), &world.data);
     assert!(client.call::<serde_json::Value>("status", json!({})).is_err());
+    assert!(sessions.running_tabs().is_err(), "disconnect is not an empty running list");
+    assert!(sessions.pending_permissions().is_err(), "disconnect must not hide pending asks");
+    assert!(sessions.status_of("unknown", "unknown").is_err(), "disconnect is not idle");
     assert!(client.stop_all().is_err(), "stale clients must never follow a rotated discovery token");
     assert_ne!(status["localRuntime"]["epoch"], replacement.control("status", json!({}))["localRuntime"]["epoch"]);
 }
@@ -445,4 +451,45 @@ fn interrupted_automation_is_recovered_before_ready_and_not_on_reattach() {
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), recovered,
         "attachment must not rewrite recovered automation history");
+}
+
+#[test]
+fn typed_session_adapter_reattaches_to_a_pending_turn_and_answers_without_recovery() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let first_client = Client::connect(&world.data).unwrap();
+    let first_stream = first_client.stream().unwrap();
+    let epoch = first_stream.attachment().epoch.clone();
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"ask:echo pending-while-detached",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    drop(first_stream);
+    drop(first_client);
+    assert_eq!(serve.control("wait", json!({"target":tab,"timeoutSeconds":10}))["reason"], "permission");
+    let client = Client::connect(&world.data).unwrap();
+    let stream = client.stream().unwrap();
+    assert_eq!(stream.attachment().epoch, epoch);
+    let sessions = Sessions::new(client.clone());
+    let pending = sessions.pending_permissions().unwrap();
+    let pending = pending.iter().find(|request| request.tab_id == tab).unwrap();
+    assert_eq!(pending.session_id, session);
+    assert!(sessions.running_tabs().unwrap().iter().any(|running| running.tab_id == tab));
+    assert!(sessions.pane_of(session, tab).unwrap().is_some());
+    assert!(sessions.queued(session, tab).unwrap().is_empty());
+    sessions.load_events(session, tab).unwrap();
+    sessions.respond_permission(session, tab, &pending.request_id, "allow").unwrap();
+    serve.wait_events(tab, "reattached permission completion", |events| count(events, "turn_completed") == 1);
+    let events: Vec<serde_json::Value> = sessions.load_events(session, tab).unwrap().into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
+    assert_eq!(texts(&events, "user_message"), ["ask:echo pending-while-detached"]);
+    assert!(!serde_json::to_string(&events).unwrap().contains("Session closed."));
+    assert!(sessions.pending_permissions().unwrap().is_empty());
+    sessions.send(session, tab, "echo:typed-after-attach".into(), Vec::new()).unwrap();
+    serve.wait_events(tab, "typed adapter send", |events| texts(events, "assistant_text").iter().any(|text| text.contains("typed-after-attach")));
+    client.stop_all().unwrap();
+    stopped(&mut serve);
+    assert!(sessions.load_events(session, tab).is_err());
 }

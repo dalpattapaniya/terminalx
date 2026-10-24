@@ -24,6 +24,8 @@ pub fn execute(manager: &SessionManager, sink: &Arc<dyn EventSink>, command: &st
             "status" => serde_json::to_value(manager.status_of(session, tab))?,
             "pane" => serde_json::to_value(manager.pane_of(session, tab))?,
             "queued" => serde_json::to_value(manager.queued(session, tab))?,
+            "sendConfirmed" => serde_json::to_value(manager.send_confirmed(session, tab, string(&params, "text")?.into())?)?,
+            "prepareContinuation" => serde_json::to_value(crate::continuation::prepare(session, tab, manager.tracked_transcript(session, tab))?)?,
             "send" => serde_json::to_value(manager.send(session, tab, string(&params, "text")?.into(),
                 serde_json::from_value(params.get("images").cloned().unwrap_or_else(|| json!([])))?)?)?,
             "interrupt" => json!(manager.interrupt(session, tab)?),

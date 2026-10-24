@@ -47,7 +47,7 @@ pub struct PendingAsk {
     pub suggestions: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingPermission {
     pub session_id: String,
@@ -58,7 +58,7 @@ pub struct PendingPermission {
     pub options: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunningTab {
     pub session_id: String,
@@ -604,7 +604,7 @@ pub struct SessionManager {
     follow: Arc<follow::Following>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffInfo {
     pub command: String,
@@ -623,7 +623,7 @@ pub struct TabStatusEvent {
 
 /// Told to the frontend when a tab's CLI gets its terminal pane, so the pane
 /// can be adopted by the tab's terminal view.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabPtyEvent {
     pub session_id: String,
@@ -639,7 +639,7 @@ pub struct TabPtyEvent {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendOutcome {
     pub queued: bool,
@@ -665,7 +665,7 @@ struct PromptDelivery {
     shared: Option<(crate::local_sharing::WritePermit, String, String, u64)>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageInput {
     pub media_type: String,

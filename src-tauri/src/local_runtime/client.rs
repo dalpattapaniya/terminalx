@@ -97,29 +97,43 @@ impl Client {
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         serde_json::to_writer(&mut socket, &json!({"protocol":super::PROTOCOL,"token":self.token.as_str()}))?;
         socket.write_all(b"\n")?;
-        let mut connection = Connection { read: BufReader::new(socket.try_clone()?), write: socket };
-        let hello = connection.receive()?;
+        let mut read = BufReader::new(socket.try_clone()?);
+        let hello = receive(&mut read)?;
         if hello["type"] != "ready" || hello["attachment"]["epoch"] != self.epoch {
             bail!("runtime changed before event attachment");
         }
-        connection.read.get_ref().set_read_timeout(None)?;
-        Ok(connection)
+        let attachment: AttachmentIdentity = serde_json::from_value(hello["attachment"].clone())?;
+        if attachment.lease.is_empty() || attachment.lease.len() > 128 { bail!("invalid runtime attachment lease"); }
+        read.get_ref().set_read_timeout(None)?;
+        Ok(Connection { read, write: socket, attachment })
     }
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentIdentity {
+    pub epoch: String,
+    pub lease: String,
+}
+
 pub struct Connection {
+    attachment: AttachmentIdentity,
     read: BufReader<UnixStream>,
     write: UnixStream,
 }
 
 impl Connection {
+    pub fn attachment(&self) -> &AttachmentIdentity { &self.attachment }
+
     pub fn writer(&self) -> Result<UnixStream> { Ok(self.write.try_clone()?) }
 
-    pub fn receive(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let count = (&mut self.read).take(1024 * 1024 + 1).read_line(&mut line)?;
-        if count == 0 { bail!("local event stream disconnected"); }
-        if count > 1024 * 1024 { bail!("local event frame exceeded its size limit"); }
-        Ok(serde_json::from_str(&line)?)
-    }
+    pub fn receive(&mut self) -> Result<Value> { receive(&mut self.read) }
+}
+
+fn receive(read: &mut BufReader<UnixStream>) -> Result<Value> {
+    let mut line = String::new();
+    let count = read.take(1024 * 1024 + 1).read_line(&mut line)?;
+    if count == 0 { bail!("local event stream disconnected"); }
+    if count > 1024 * 1024 { bail!("local event frame exceeded its size limit"); }
+    Ok(serde_json::from_str(&line)?)
 }

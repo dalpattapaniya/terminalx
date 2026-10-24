@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Add a typed native session client with fallible live-state reads and owner-side
+  continuation preparation. Verify pending permission reattachment, subsequent
+  turns and refusal to follow a replacement owner in disposable process tests.
+  Desktop command routing remains in progress. (#467)
+
 - Fence a local sharing account generation even when sign-out arrives before
   registration, so late registration cannot restore revoked access and stale
   sign-out cannot revoke a newer account. Cover both orderings in a disposable

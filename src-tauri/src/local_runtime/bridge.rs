@@ -44,12 +44,14 @@ impl State {
 }
 
 pub struct Bridge {
+    attachment: super::client::AttachmentIdentity,
     state: Arc<Mutex<State>>,
 }
 
 impl Bridge {
     pub fn connect(client: &Client, sink: Arc<dyn EventSink>) -> Result<Self> {
         let mut connection = client.stream()?;
+        let attachment = connection.attachment().clone();
         let state = Arc::new(Mutex::new(State { write: connection.writer()?, views: HashMap::new(), connected: true }));
         let reader = state.clone();
         std::thread::Builder::new().name("local-runtime-events".into()).spawn(move || {
@@ -88,7 +90,12 @@ impl Bridge {
                 sink.emit("local_runtime_disconnected", &json!({"reattachRequired":true}));
             }
         })?;
-        Ok(Self { state })
+        Ok(Self { state, attachment })
+    }
+
+    pub fn attachment(&self) -> Result<super::client::AttachmentIdentity> {
+        if !self.state.lock().unwrap().connected { bail!("local runtime event connection is closed"); }
+        Ok(self.attachment.clone())
     }
 
     pub fn attach(&self, id: &str, token: &str, tap: Tap) -> Result<()> {

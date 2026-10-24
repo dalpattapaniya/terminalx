@@ -21,6 +21,8 @@ pub mod calls;
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
+pub mod sessions;
+#[cfg(unix)]
 pub mod launch;
 #[cfg(unix)]
 pub mod bridge;

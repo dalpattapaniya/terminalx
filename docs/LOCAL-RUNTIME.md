@@ -295,3 +295,21 @@ sharing-router tests, eight lifetime tests, 24 terminal-follow tests and 54
 prompt/interrupt tests (two existing ignored). These are focused checkpoint
 results; full issue validation, mobile observation and actual desktop acceptance
 remain outstanding.
+
+## Native session adapter checkpoint
+
+The typed `local_runtime::sessions::Sessions` adapter reads events, running tabs,
+permission requests, pane identities, queues and status from its pinned owner.
+It also forwards tab mutations, including explicit delivery confirmation and
+continuation preparation, so the window need not inspect or reconcile another
+process's live transcript. All reads return errors on disconnection; no empty
+queue or idle state is synthesized. The event connection exposes its validated
+owner epoch and attachment lease for scoped sharing registration.
+
+A real disposable runtime test detaches before a permission request, reconnects,
+answers the retained request and sends another turn through this adapter without
+recovery. Replacement-owner tests require live-state reads to fail on the old
+client. This does not yet switch desktop command routing or satisfy packaged
+quit/reopen acceptance. A separate account test covers sign-out overtaking
+registration: a revoked generation cannot register late, and its stale sign-out
+cannot revoke a newer account.
