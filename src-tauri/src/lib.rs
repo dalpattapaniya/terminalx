@@ -384,6 +384,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            local_runtime::ui::local_runtime_status,
+            local_runtime::ui::local_runtime_reconnect,
+            local_runtime::ui::local_runtime_settings,
+            local_runtime::ui::set_local_runtime_quit_behavior,
             commands::list_projects,
             commands::account_status,
             commands::account_refresh_roles,
@@ -770,6 +774,8 @@ pub fn run() {
             // The same request as the tray's Quit: it can be held back, see below.
             if event.id().as_ref() == quit::MENU_ID {
                 app.exit(0);
+            } else if event.id().as_ref() == quit::STOP_ALL_MENU_ID {
+                quit::stop_all_and_quit(app);
             }
         })
         .on_window_event(|window, event| {

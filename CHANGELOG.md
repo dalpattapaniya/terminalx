@@ -4,6 +4,17 @@
 
 ### Runtime investigation
 
+- Forward desktop session-link admission and writes to the runtime owner, with
+  account/attachment fencing, owner-side invitation rate limits, and access
+  revalidation before queued guest output is sent. Reconnecting does not replay
+  revoked grants. Paired-device integration remains in progress. (#467)
+
+- Add a truthful disconnected-owner notice with explicit reconnect, retain the
+  saved quit preference, and route app/tray stop-all through the cleanup guard.
+  Dismissing the first choice leaves work running; an unavailable owner cannot
+  be reported as successfully stopped. Production startup integration remains
+  in progress. (#467)
+
 - Centralize provider usage refresh in the session owner, preserving account
   privacy, refresh backoff and early Claude updates. Add fallible usage/activity
   adapters and independent desktop-window PTY connections without duplicate

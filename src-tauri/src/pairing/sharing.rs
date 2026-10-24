@@ -202,6 +202,17 @@ impl PairingManager {
             used_by: None,
         };
         let result = (|| {
+            if self.is_stopped() || !self.account.is_current(&context)
+                || context.generation == self.sharing_blocked_generation.load(Ordering::SeqCst) {
+                bail!("Your account changed while creating the link. Try again.");
+            }
+            if let Some(result) = self.runtime_sharing("create", json!({
+                "sessionId": session_id, "linkId": id, "settings": link.settings,
+                "url": link.url, "directOnly": link.direct_only,
+                "credentialExpiresAt": link.credential_expires_at, "tokenHash": link.token_hash,
+                "host": { "userId": context.user_id, "displayName": context.display_name,
+                    "email": context.email, "emailVerified": false, "organizationIds": [context.organization_id] }
+            })) { return result; }
             let mut sharing = manager(self)?.sharing.lock().unwrap();
             shareable(&session_id)?;
             if self.is_stopped()
@@ -252,6 +263,7 @@ impl PairingManager {
     }
 
     pub(crate) fn share_status(&self, session_id: &str) -> Result<Value> {
+        if let Some(result) = self.runtime_sharing("status", json!({"sessionId": session_id})) { return result; }
         if let Some(share) = manager(self)?
             .sharing
             .lock()
@@ -278,6 +290,23 @@ impl PairingManager {
         action: &str,
         params: Value,
     ) -> Result<Value> {
+        let mut remote_params = params.clone();
+        let object = remote_params.as_object_mut().context("Sharing parameters must be an object.")?;
+        object.insert("sessionId".into(), json!(session_id));
+        if let Some(result) = self.runtime_sharing(action, remote_params) {
+            let state = result?;
+            if let Some(relay) = self.current_relay() {
+                if action == "stop" {
+                    if let Some(links) = state["revokeLinks"].as_array() {
+                        for link in links.iter().filter_map(Value::as_str) { relay.revoke(link.into()); }
+                    }
+                } else if action == "revoke" && params["removeGuests"].as_bool().unwrap_or(true) {
+                    if let Some(link) = params["linkId"].as_str() { relay.revoke(link.into()); }
+                }
+            }
+            self.emit_share(session_id);
+            return self.share_status(session_id);
+        }
         let mut sharing = manager(self)?.sharing.lock().unwrap();
         if action == "stop" {
             if let Some(mut share) = sharing.sessions.remove(session_id) {
@@ -368,9 +397,13 @@ impl PairingManager {
         token: &str,
         expected: Option<&str>,
     ) -> Option<(String, String)> {
+        let hash = token_hash(token);
+        if let Some(result) = self.runtime_sharing("lookup", json!({"tokenHash": hash, "expectedLink": expected})) {
+            let found = result.ok()?;
+            return Some((found["sessionId"].as_str()?.into(), found["linkId"].as_str()?.into()));
+        }
         let sessions = self.sessions.get()?;
         let mut sharing = sessions.sharing.lock().unwrap();
-        let hash = token_hash(token);
         for (session, share) in &mut sharing.sessions {
             for link in share.links.values_mut() {
                 if !link.revoked
@@ -450,17 +483,24 @@ impl PairingManager {
                             if now() - verified_at >= IDENTITY_MS / 2 {
                                 let token = token.clone();
                                 let person = verify_identity(token, &mut cancelled).await?;
-                                let mut sharing = manager(self)?.sharing.lock().unwrap();
-                                sharing.sessions.get_mut(&session_id).context("Access ended.")?.refresh_identity(&id, person, now())?;
+                                self.refresh_share_guest(&session_id, &id, person)?;
                                 verified_at = now();
                             }
                             self.drain_share_queue(&session_id)?;
                             let status = self.guest_status(&session_id, &id)?;
+                            active.store(status["admitted"].as_bool().unwrap_or(false), Ordering::SeqCst);
                             super::send_encrypted_text(&mut socket, &mut crypto, &json!({ "method": "share.changed", "params": status }).to_string()).await?;
                         } else if now() - verified_at > 15_000 { bail!("Sign in to join this session."); }
                     }
                     Some(frame) = output.recv() => {
                         if active.load(Ordering::SeqCst) {
+                            // The owner's revocation/identity state is authoritative,
+                            // including for queued output produced before a revoke.
+                            let owner_backed = self.runtime.lock().unwrap().is_some();
+                            if owner_backed && !self.guest_status(&session_id, &id)?["admitted"].as_bool().unwrap_or(false) {
+                                active.store(false, Ordering::SeqCst);
+                                continue;
+                            }
                             super::send_encrypted_text(&mut socket, &mut crypto, &frame.to_string()).await?;
                         }
                     }
@@ -485,15 +525,13 @@ impl PairingManager {
                                     let verify = token.clone();
                                     match verify_identity(verify, &mut cancelled).await {
                                         Ok(person) => {
-                                            let mut sharing = manager(self)?.sharing.lock().unwrap();
-                                            let share = sharing.sessions.get_mut(&session_id).context("Sharing ended.")?;
                                             let admission = if access_token.is_some() {
-                                                share.refresh_identity(&id, person, now()).map(|_| share.guests[&id].admitted)
-                                            } else { share.join(Guest { connection_id: id.clone(), link_id: link_id.clone(), person, role: Role::Viewer,
+                                                self.refresh_share_guest(&session_id, &id, person)
+                                            } else { self.join_share_guest(&session_id, Guest { connection_id: id.clone(), link_id: link_id.clone(), person, role: Role::Viewer,
                                                 can_approve: false, admitted: false, verified_until: now() + IDENTITY_MS, active: active.clone(), cancel: cancel.clone(),
-                                                viewing: None, typing: false, last_write: 0, write_revision: 0 }, now()) };
+                                                viewing: None, typing: false, last_write: 0, write_revision: 0 }) };
                                             match admission {
-                                                Ok(admitted) => { access_token = Some(token); verified_at = now(); Ok(json!({ "admitted": admitted })) }
+                                                Ok(admitted) => { active.store(admitted, Ordering::SeqCst); access_token = Some(token); verified_at = now(); Ok(json!({ "admitted": admitted })) }
                                                 Err(error) => Err(error),
                                             }
                                         }
@@ -523,29 +561,45 @@ impl PairingManager {
         }.await;
         active.store(false, Ordering::SeqCst);
         sink.unlisten(listener);
-        if let Some(share) = manager(self)?
-            .sharing
-            .lock()
-            .unwrap()
-            .sessions
-            .get_mut(&session_id)
-        {
-            share.disconnect(&id, now());
+        if let Some(result) = self.runtime_sharing("disconnect", json!({"sessionId":session_id,"connectionId":id})) {
+            if let Err(error) = result { log::debug!("disconnect owner guest: {error:#}"); }
+        } else if let Some(sessions) = self.sessions.get() {
+            if let Some(share) = sessions.sharing.lock().unwrap().sessions.get_mut(&session_id) { share.disconnect(&id, now()); }
         }
         self.emit_share(&session_id);
         let _ = socket.close(None).await;
         result
     }
 
+    fn join_share_guest(&self, session: &str, guest: Guest) -> Result<bool> {
+        if let Some(result) = self.runtime_sharing("join", json!({"sessionId":session,"connectionId":guest.connection_id,"linkId":guest.link_id,"person":guest.person})) {
+            return Ok(result?["admitted"].as_bool().unwrap_or(false));
+        }
+        manager(self)?.sharing.lock().unwrap().sessions.get_mut(session).context("Sharing ended.")?.join(guest, now())
+    }
+
+    fn refresh_share_guest(&self, session: &str, connection: &str, person: local_sharing::Person) -> Result<bool> {
+        if let Some(result) = self.runtime_sharing("refresh", json!({"sessionId":session,"connectionId":connection,"person":person})) {
+            return Ok(result?["admitted"].as_bool().unwrap_or(false));
+        }
+        let mut sharing = manager(self)?.sharing.lock().unwrap();
+        let share = sharing.sessions.get_mut(session).context("Access ended.")?;
+        share.refresh_identity(connection, person, now())?;
+        Ok(share.guests[connection].admitted)
+    }
+
     fn guest_status(&self, session: &str, connection: &str) -> Result<Value> {
+        if let Some(result) = self.runtime_sharing("guest", json!({"sessionId":session,"connectionId":connection,"method":"session.status","params":{"sessionId":session}})) { return result; }
         local_sharing::runtime::guest_status(manager(self)?, None, session, connection)
     }
 
     pub(crate) fn share_rpc(&self, session: &str, connection: &str, method: &str, params: Value) -> Result<Value> {
+        if let Some(result) = self.runtime_sharing("guest", json!({"sessionId":session,"connectionId":connection,"method":method,"params":params})) { return result; }
         local_sharing::runtime::request(manager(self)?, None, session, connection, method, params)
     }
 
     pub(crate) fn drain_share_queue(&self, session: &str) -> Result<()> {
+        if let Some(result) = self.runtime_sharing("drain", json!({"sessionId":session})) { return result.map(|_| ()); }
         local_sharing::runtime::drain_queue(manager(self)?, None, session)
     }
 

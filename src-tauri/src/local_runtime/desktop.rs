@@ -23,6 +23,20 @@ impl Desktop {
         Ok(Self { client, events, sink, windows: Mutex::new(HashMap::new()) })
     }
 
+    /// Reconnect only to this exact owner, never rediscover or replay a request.
+    pub fn reconnect(&self) -> Result<Self> {
+        // End the old event publisher before opening another, and revoke old
+        // sharing leases even if the new connection fails. Session processes
+        // remain owned by the runtime throughout.
+        self.disconnect();
+        Self::connect(self.client.clone(), self.sink.clone())
+    }
+
+    pub fn disconnect(&self) {
+        self.events.disconnect();
+        self.windows.lock().unwrap().clear();
+    }
+
     pub fn attachment(&self) -> Result<AttachmentIdentity> { self.events.attachment() }
 
     pub fn sessions(&self) -> Result<Sessions> {
@@ -36,6 +50,24 @@ impl Desktop {
     }
 
     pub fn stop_all(&self) -> Result<()> { self.client.stop_all() }
+
+    /// Internal owner RPC only. Identity comes from the desktop's verified
+    /// account, never from a guest frame; owner-side admission remains final.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn sharing(&self, context: &crate::account::AccountContext, method: &str, mut params: serde_json::Value) -> Result<serde_json::Value> {
+        use serde_json::json;
+        let attachment = self.attachment()?;
+        let actor = json!({ "epoch": attachment.epoch, "lease": attachment.lease,
+            "generation": context.generation, "userId": context.user_id,
+            "profileId": context.profile_id, "organizationId": context.organization_id });
+        if method != "clear" {
+            let _: serde_json::Value = self.client.call("runtime.sharing.register", json!({"actor": actor}))?;
+        }
+        let object = params.as_object_mut().ok_or_else(|| anyhow::anyhow!("Sharing parameters must be an object."))?;
+        object.insert("actor".into(), actor);
+        self.client.call(&format!("runtime.sharing.{method}"), params)
+    }
+
 
     pub fn attach(&self, window: &str, id: &str, token: &str, tap: Tap) -> Result<()> {
         self.attachment()?;

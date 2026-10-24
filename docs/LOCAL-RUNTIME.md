@@ -374,4 +374,48 @@ idle interactive shell can safely be reaped by the detached-owner policy.
 Seventeen disposable lifecycle tests pass at this checkpoint, including typed
 terminal input/resize/stop and per-window acknowledgement isolation. Saved quit
 policy data defaults to keeping work, with an unset value reserved for the first
-quit choice; the quit dialog and settings presentation are still pending.
+quit choice. The next checkpoint adds the quit dialog and settings presentation,
+with production startup still using the in-process backend.
+
+
+## Reconnect and quit presentation checkpoint
+
+The connection notice separates unavailable live state from session history. It
+subscribes before reading status, ignores older status results after a disconnect,
+and reconnects only when explicitly requested. A reconnect closes old view leases
+before opening a replacement event attachment to the same owner generation; it
+never replays input or silently follows a replacement runtime. Successful
+reattachment reloads the view once to rebuild snapshots and PTY taps. Pairing must
+bind its new account-scoped owner adapter before production reconnect is enabled.
+
+The first intercepted quit offers keep-running, stop-all, and cancellation. Only
+an explicit choice is saved. The existing cleanup warning precedes the choice or
+stop request. App and tray explicit stop-all use the same guard without changing
+the saved normal-quit policy. Failure to save the preference or obtain the pinned
+owner's authenticated stop acknowledgement keeps the app open and shows the
+error. Update restarts continue to bypass interactive quit choices. The actual
+startup/teardown ownership cutover and background tray handoff are still pending;
+this checkpoint must not be treated as completed desktop quit/update acceptance.
+
+Settings hide the background policy for the transitional in-process backend.
+Disconnected owner state keeps the preference visible and never substitutes an
+empty session list. Focused UI tests exercise status/disconnect races, explicit
+retry, failed preference writes, cancellation-safe defaults and single reload.
+
+
+Session-link adapters now forward invitation lookup/rate limiting, host changes,
+guest join/refresh, queue draining and scoped guest calls to the owner when
+attached. No desktop sharing mutex is held across RPC. Every call carries the
+current verified account generation and event attachment, and the owner applies
+its existing role, approval, mode and final-writer checks. Sign-out clears the
+owner generation before changing the account; a failed clear disconnects the
+lease. Queued outbound guest events recheck owner access before forwarding.
+Reconnect binds pairing to the new lease without recreating old guest grants.
+Paired-device/mobile host RPC and startup attachment remain to be integrated.
+
+This checkpoint passed TypeScript, all 288 Vitest files / 3,366 tests, desktop
+and headless all-target Clippy, three focused native quit tests, and the full
+headless suite (including 18 lifecycle and eight sharing process regressions).
+Eight external-relay tests remain ignored. A test request that incorrectly added
+a tab id to session.status was corrected to the real scoped contract; assertions
+remain strict. These results do not establish packaged desktop acceptance.

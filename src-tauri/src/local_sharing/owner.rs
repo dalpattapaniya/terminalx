@@ -9,6 +9,7 @@ use crate::store::index;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -188,7 +189,34 @@ pub(crate) fn execute(
         return Ok(json!({"cleared":true}));
     }
     let attachment = registered(&sharing, &actor)?;
+    if method == "lookup" {
+        let hash = text(&params, "tokenHash")?;
+        let expected = params["expectedLink"].as_str();
+        let time = now();
+        for (session, share) in &mut sharing.sessions {
+            if authorize(share, Some(&actor)).is_err() { continue; }
+            for link in share.links.values_mut() {
+                if !link.revoked && link.settings.expires_at > time && link.credential_expires_at > time
+                    && (!link.settings.single_use || link.used_by.is_none())
+                    && expected.is_none_or(|expected| expected == link.id)
+                    && bool::from(link.token_hash.as_bytes().ct_eq(hash.as_bytes())) {
+                    while link.join_attempts.front().is_some_and(|at| *at < time - 60_000) { link.join_attempts.pop_front(); }
+                    if link.join_attempts.len() >= 60 { bail!("Too many invitation attempts."); }
+                    link.join_attempts.push_back(time);
+                    return Ok(json!({"sessionId":session,"linkId":link.id}));
+                }
+            }
+        }
+        bail!("The invitation is unavailable.");
+    }
     let session = text(&params, "sessionId")?;
+    if matches!(method, "status" | "stop") && !sharing.sessions.contains_key(session) {
+        index::get(session)?;
+        let path = crate::store::session_dir(session)?.join("share-activity.jsonl");
+        let activity = if path.exists() { crate::store::read_lines::<Value>(&path)? } else { Vec::new() };
+        return Ok(json!({"active":false,"links":[],"people":[],"leases":[],"notes":[],"queue":[],
+            "activity":activity.into_iter().rev().take(1000).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>(),"revokeLinks":[]}));
+    }
     if method == "create" {
         let entry = index::get(session)?;
         if entry.tabs.iter().any(|tab| {
@@ -302,6 +330,18 @@ pub(crate) fn execute(
             )?;
             Ok(share.snapshot(now(), true))
         }
+        "takeover" => {
+            share.host_takeover(text(&params, "tabId")?, now());
+            Ok(share.snapshot(now(), true))
+        }
+        "note" => {
+            let text = super::runtime::message(&params)?;
+            let note = super::Note { id: uuid::Uuid::now_v7().to_string(), author: share.host.clone(), text, created_at: now() };
+            share.record(&actor.user_id, "note", json!({"noteId":note.id}), now());
+            share.notes.push_back(note);
+            while share.notes.len() > 500 { share.notes.pop_front(); }
+            Ok(share.snapshot(now(), true))
+        }
         "join" => {
             let connection = text(&params, "connectionId")?.to_string();
             if share.guests.contains_key(&connection) {
@@ -331,7 +371,7 @@ pub(crate) fn execute(
                 serde_json::from_value(params["person"].clone())?,
                 now(),
             )?;
-            Ok(json!({"refreshed":true}))
+            Ok(json!({"refreshed":true,"admitted":share.guests[text(&params, "connectionId")?].admitted}))
         }
         "disconnect" => {
             share.disconnect(text(&params, "connectionId")?, now());

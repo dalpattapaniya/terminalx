@@ -352,3 +352,42 @@ fn a_restarted_owner_refuses_the_previous_accounts_attachment() {
     );
     assert!(texts(&replacement.events(&fixture.tab), "user_message").is_empty());
 }
+
+#[test]
+fn invitation_lookup_is_owner_scoped_rate_limited_and_revoked_atomically() {
+    let fixture = Fixture::new("");
+    fixture.link("viewer", false);
+    fixture.refused("lookup", json!({"tokenHash":"wrong-hash"}));
+    fixture.refused("lookup", json!({"tokenHash":"fixture-hash","expectedLink":"another-link"}));
+    let mut wrong = fixture.params(json!({"tokenHash":"fixture-hash"}));
+    wrong["actor"]["profileId"] = json!("another-profile");
+    assert_eq!(fixture.serve.try_control("runtime.sharing.lookup", wrong)["ok"], false);
+    for _ in 0..60 {
+        let found = fixture.call("lookup", json!({"tokenHash":"fixture-hash","expectedLink":"link"}));
+        assert_eq!(found["sessionId"], fixture.session);
+        assert_eq!(found["linkId"], "link");
+    }
+    fixture.refused("lookup", json!({"tokenHash":"fixture-hash"}));
+    fixture.call("revoke", json!({"linkId":"link","removeGuests":true}));
+    fixture.refused("lookup", json!({"tokenHash":"fixture-hash"}));
+}
+
+#[test]
+fn host_notes_and_guest_visibility_stay_at_the_owner_after_revocation() {
+    let fixture = Fixture::new("");
+    assert_eq!(fixture.call("status", json!({}))["active"], false);
+    fixture.link("viewer", true);
+    assert_eq!(fixture.join()["admitted"], false);
+    assert_eq!(fixture.call("guest", json!({"connectionId":"guest","method":"session.status","params":{"sessionId":fixture.session}}))["admitted"], false);
+    fixture.call("approve", json!({"linkId":"link","userId":"guest-user","allow":true}));
+    let state = fixture.call("note", json!({"text":"A note retained by the owner."}));
+    assert_eq!(state["notes"][0]["text"], "A note retained by the owner.");
+    assert_eq!(fixture.call("guest", json!({"connectionId":"guest","method":"session.status","params":{"sessionId":fixture.session}}))["admitted"], true);
+    fixture.call("remove", json!({"linkId":"link","userId":"guest-user"}));
+    fixture.refused("guest", json!({"connectionId":"guest","method":"session.status","params":{"sessionId":fixture.session}}));
+    let stopped = fixture.call("stop", json!({}));
+    assert_eq!(stopped["revokeLinks"], json!(["link"]));
+    let closed = fixture.call("status", json!({}));
+    assert_eq!(closed["active"], false);
+    assert!(closed["activity"].as_array().unwrap().iter().any(|event| event["action"] == "note"));
+}

@@ -112,6 +112,12 @@ impl Bridge {
         Ok(Self { state, attachment })
     }
 
+    pub fn disconnect(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.detached = true;
+        state.close();
+    }
+
     pub fn attachment(&self) -> Result<super::client::AttachmentIdentity> {
         if !self.state.lock().unwrap().connected { bail!("local runtime event connection is closed"); }
         Ok(self.attachment.clone())
@@ -150,9 +156,5 @@ impl Bridge {
 }
 
 impl Drop for Bridge {
-    fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        state.detached = true;
-        state.close();
-    }
+    fn drop(&mut self) { self.disconnect(); }
 }

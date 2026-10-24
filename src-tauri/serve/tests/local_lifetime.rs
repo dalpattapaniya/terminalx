@@ -586,7 +586,7 @@ fn typed_terminal_adapter_preserves_input_resize_and_explicit_stop() {
         let output = read();
         (output.contains("received:typed input survives") && output.contains("30 100")).then_some(())
     });
-    assert_eq!(terminals.busy(std::slice::from_ref(&id)).unwrap(), [id.clone()]);
+    assert_eq!(terminals.busy(std::slice::from_ref(&id)).unwrap().as_slice(), std::slice::from_ref(&id));
     terminals.rename(&id, "Renamed through owner").unwrap();
     assert!(terminals.shells().unwrap().iter().any(|shell| shell.id == id && shell.title.as_deref() == Some("Renamed through owner")));
     assert!(terminals.spawn("unknown-session:1", world.project.to_str().unwrap(), 80, 24, None, None).is_err());
@@ -598,4 +598,39 @@ fn typed_terminal_adapter_preserves_input_resize_and_explicit_stop() {
     stopped(&mut serve);
     assert!(terminals.stats().is_err());
     assert!(terminals.shells().is_err());
+}
+
+#[test]
+fn desktop_reconnect_revokes_old_views_without_replaying_or_replacing_the_owner() {
+    use raccoon_lib::local_runtime::{client::Client, desktop::Desktop};
+    use std::sync::Arc;
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:once-before-reconnect",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    serve.wait_events(tab, "initial turn completion", |events| count(events, "turn_completed") == 1);
+    let client = Client::connect(&world.data).unwrap();
+    let sink = Arc::new(raccoon_lib::sink::BroadcastSink::new(32));
+    let previous = Desktop::connect(client.clone(), sink).unwrap();
+    let old_attachment = previous.attachment().unwrap();
+    let next = previous.reconnect().unwrap();
+    assert_eq!(next.attachment().unwrap().epoch, old_attachment.epoch);
+    assert_ne!(next.attachment().unwrap().lease, old_attachment.lease);
+    assert!(previous.sessions().is_err(), "retained old handles must not pretend their view is still connected");
+    common::agent::wait_until("old desktop lease revocation", || {
+        client.call::<serde_json::Value>("runtime.heartbeat", serde_json::to_value(&old_attachment).unwrap()).is_err().then_some(())
+    });
+    let events: Vec<serde_json::Value> = next.sessions().unwrap().load_events(session, tab).unwrap().into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
+    assert_eq!(texts(&events, "user_message"), ["echo:once-before-reconnect"]);
+    assert_eq!(count(&events, "turn_completed"), 1);
+    client.stop_all().unwrap();
+    stopped(&mut serve);
+    drop(serve);
+    let replacement = Serve::start(world.command(), &world.data);
+    assert!(next.reconnect().is_err(), "reconnect must not follow a replacement owner or replay an earlier request");
+    assert_ne!(replacement.control("status", json!({}))["localRuntime"]["epoch"], old_attachment.epoch);
 }

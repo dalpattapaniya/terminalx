@@ -74,6 +74,7 @@ pub struct PairingManager {
     sink: OnceLock<Arc<dyn EventSink>>,
     /// Set once the session manager exists, which is after `configure`.
     sessions: OnceLock<SessionManager>,
+    runtime: Mutex<Option<Arc<crate::local_runtime::desktop::Desktop>>>,
     inner: Mutex<Inner>,
     epoch: AtomicU64,
     sharing_blocked_generation: AtomicU64,
@@ -106,6 +107,7 @@ impl PairingManager {
             direct_port: direct::PORT,
             sink: OnceLock::new(),
             sessions: OnceLock::new(),
+            runtime: Mutex::new(None),
             inner: Mutex::new(Inner::default()),
             epoch: AtomicU64::new(0),
             sharing_blocked_generation: AtomicU64::new(u64::MAX),
@@ -179,6 +181,38 @@ impl PairingManager {
     /// Mobile clients read and drive tabs through the session manager.
     pub fn attach_sessions(&self, sessions: SessionManager) {
         let _ = self.sessions.set(sessions);
+    }
+
+    pub(crate) fn attach_runtime(&self, runtime: Arc<crate::local_runtime::desktop::Desktop>) {
+        *self.runtime.lock().unwrap() = Some(runtime);
+    }
+
+    /// No desktop sharing mutex spans an RPC. Once attached, transport failure
+    /// is an error, never permission to use the obsolete in-process owner.
+    fn runtime_sharing(&self, method: &str, params: serde_json::Value) -> Option<Result<serde_json::Value>> {
+        let runtime = self.runtime.lock().unwrap().clone()?;
+        Some((|| {
+            let context = self.account.context().context("Sign in to share a session.")?;
+            if method != "clear" && (self.is_stopped() || context.generation == self.sharing_blocked_generation.load(Ordering::SeqCst)) {
+                bail!("The sharing account is no longer active.");
+            }
+            let result = runtime.sharing(&context, method, params);
+            if method != "clear" && !self.account.is_current(&context) {
+                // Do not expose an old account response to its replacement.
+                if runtime.sharing(&context, "clear", serde_json::json!({})).is_err() { runtime.disconnect(); }
+                bail!("The sharing account changed during this request.");
+            }
+            result
+        })())
+    }
+
+    fn clear_runtime_sharing(&self) {
+        if let Some(Err(error)) = self.runtime_sharing("clear", serde_json::json!({})) {
+            // Drop the authoritative lease if the owner cannot acknowledge the
+            // account fence. Never keep forwarding against uncertain grants.
+            if let Some(runtime) = self.runtime.lock().unwrap().clone() { runtime.disconnect(); }
+            log::warn!("clear owner sharing: {error:#}");
+        }
     }
 
     pub fn status(&self) -> PairingStatus {
@@ -310,6 +344,7 @@ impl PairingManager {
         self.epoch.fetch_add(1, Ordering::SeqCst);
         self.sharing_blocked_generation.store(self.account.current_generation(), Ordering::SeqCst);
         self.leave_guest();
+        self.clear_runtime_sharing();
         if let Some(sessions) = self.sessions.get() {
             let ids: Vec<_> = sessions.sharing.lock().unwrap().sessions.keys().cloned().collect();
             for id in ids { let _ = self.change_share(&id, "stop", serde_json::json!({})); }
@@ -376,6 +411,7 @@ impl PairingManager {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.leave_guest();
+        self.clear_runtime_sharing();
         if let Some(sessions) = self.sessions.get() {
             let ids: Vec<_> = sessions.sharing.lock().unwrap().sessions.keys().cloned().collect();
             for id in ids { let _ = self.change_share(&id, "stop", serde_json::json!({})); }

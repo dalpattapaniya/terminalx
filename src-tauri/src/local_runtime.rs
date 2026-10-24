@@ -30,6 +30,8 @@ pub mod bridge;
 pub mod desktop;
 #[cfg(unix)]
 pub mod terminals;
+#[cfg(all(unix, feature = "desktop"))]
+pub mod ui;
 
 pub const PROTOCOL: u64 = 1;
 pub const IDLE_GRACE: Duration = Duration::from_secs(60);
