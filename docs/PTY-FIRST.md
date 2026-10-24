@@ -804,7 +804,9 @@ rule at click time rather than trusting the rendered row.
   app acknowledges the exact written plain-text FIFO prefix in that record,
   retaining each composer's identity. Multiline and repeated prompts keep their
   order; unmatched text or an unverified combined-image representation remains
-  pending. The probe used the real CLI with a credential-free loopback Responses
+  pending. Enter and successful-submission bookkeeping share the runtime lock,
+  so a fast acceptance cannot be consumed between the write and identity arming;
+  failed writes leave identities unarmed. The probe used the real CLI with a credential-free loopback Responses
   server, and does not establish live OpenAI account integration.
   A separate packaged baseline run at `5f2c9a38` reproduced the second paste:
   both queued sequence IDs logged another `body_written` after Send now,

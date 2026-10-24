@@ -915,6 +915,93 @@ fn real_codex_escape_capture_acknowledges_the_whole_combined_queue() {
     assert!(rig.held().is_empty());
 }
 
+/// The real captured batch can reach the tail between Enter and its writer's
+/// bookkeeping. Synchronize that exact point without relying on thread timing.
+#[test]
+fn codex_batch_acceptance_cannot_overtake_enter_publication() {
+    use std::io::Write;
+    for atomic in [false, true] {
+        let rig = Rig::of(CliKind::Codex, "").with_pane();
+        let records: Vec<&str> = include_str!("harness/codex/fixtures/queued_escape.jsonl").lines().collect();
+        rig.compose("TX627_START Bare TUI queue probe.", 0);
+        rig.append(&format!("{}\n{}\n", records[0], records[1]));
+        rig.compose("TX627_FOLLOW_1 Please summarize progress before continuing.", 0);
+        rig.submitted();
+        rig.compose("TX627_FOLLOW_2 Then list remaining steps.", 0);
+        let seqs = rig.held();
+        let second = seqs[1];
+        let acceptance = format!("{}\n", records[2..5].join("\n"));
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (pumped_tx, pumped_rx) = std::sync::mpsc::channel();
+        let manager = rig.manager.clone();
+        let rt = rig.rt.clone();
+        let tail = rig.tail.clone();
+        let transcript = rig.transcript.clone();
+        let reader = std::thread::spawn(move || {
+            written_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::fs::OpenOptions::new().append(true).open(transcript).unwrap().write_all(acceptance.as_bytes()).unwrap();
+            let blocked = matches!(rt.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            blocked_tx.send(blocked).unwrap();
+            manager.pump(&rt, &tail);
+            pumped_tx.send(()).unwrap();
+        });
+        let write = || -> Result<()> {
+            rig.manager.terminals.write(&rig.pane, tui::SUBMIT)?;
+            written_tx.send(()).unwrap();
+            let blocked = blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            if !blocked {
+                // Negative control: force the old write-before-lock ordering
+                // to consume the acceptance before submitted can be published.
+                pumped_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Ok(())
+        };
+        if atomic {
+            SessionManager::submit_composer_prompt(&rig.rt, Some(second), None, false, write).unwrap();
+        } else {
+            write().unwrap();
+            SessionManager::submit_composer_prompt(&rig.rt, Some(second), None, false, || Ok(())).unwrap();
+        }
+        reader.join().unwrap();
+        let events = rig.events();
+        let prompts = events.iter().filter(|e| matches!(e.payload, Payload::UserMessage { .. })).count();
+        if atomic {
+            assert!(rig.held().is_empty(), "both written identities are accepted by the first read");
+            assert_eq!(prompts, 3, "no duplicate combined prompt");
+            for seq in seqs {
+                assert_eq!(events.iter().filter(|e| matches!(e.payload, Payload::TurnStarted { prompt_seq: Some(id), .. } | Payload::PromptAbsorbed { prompt_seq: id } if id == seq)).count(), 1);
+            }
+        } else {
+            assert_eq!(rig.held(), seqs, "the old ordering loses the only acceptance record");
+            assert_eq!(prompts, 4, "negative control reproduces the duplicate combined prompt");
+        }
+    }
+}
+
+#[test]
+fn failed_enter_never_arms_delivery_and_receipt_only_enter_keeps_its_identity() {
+    for kind in BOTH {
+        let rig = Rig::of(kind, "");
+        let receipt = rig.compose_confirmed("continue work");
+        let seq = match &rig.rt.lock().unwrap().engine { Engine::Cli(p) => p.echoed.back().unwrap().seq, _ => unreachable!() };
+        let snapshot = || {
+            let rt = rig.rt.lock().unwrap();
+            let Engine::Cli(p) = &rt.engine else { unreachable!() };
+            (p.echoed.back().unwrap().seq, p.echoed.back().unwrap().submitted, p.accept_by, p.nudge_by)
+        };
+        let before = snapshot();
+        assert_eq!(before.0, seq);
+        assert!(SessionManager::submit_composer_prompt(&rig.rt, Some(seq), Some(seq), true, || Err(anyhow!("synthetic Enter failure"))).is_err());
+        assert_eq!(snapshot(), before, "failed Enter leaves identities and deadlines unarmed");
+        assert!(matches!(receipt.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        SessionManager::submit_composer_prompt(&rig.rt, None, Some(seq), false, || Ok(())).unwrap();
+        assert!(snapshot().1, "a receipt-only constructor still arms its own identity");
+        rig.cli_takes("continue work");
+        assert_eq!(receipt.try_recv().unwrap(), Ok(()));
+    }
+}
+
 #[test]
 fn codex_batch_acknowledgement_requires_the_exact_written_fifo() {
     let queue = |texts: &[&str]| -> std::collections::VecDeque<ComposerEcho> {

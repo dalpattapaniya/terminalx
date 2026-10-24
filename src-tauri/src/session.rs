@@ -3269,34 +3269,8 @@ impl SessionManager {
                 }
                 std::thread::sleep(tui::submit_delay(body.len()));
                 still_there()?;
-                if let Some((seq, _)) = &receipt {
-                    // Hold the runtime lock across Enter and arming so a fast
-                    // submit hook/echo cannot arrive between the two.
-                    let mut rt = rt_arc.lock().unwrap();
-                    terminals.write(&pane, tui::SUBMIT)?;
-                    if let Engine::Cli(p) = &mut rt.engine {
-                        if let Some(echo) = p.echoed.iter_mut().find(|echo| echo.seq == *seq) {
-                            echo.submitted = true;
-                        }
-                    }
-                } else {
-                    terminals.write(&pane, tui::SUBMIT)?;
-                }
+                Self::submit_composer_prompt(&rt_arc, seq, receipt.as_ref().map(|(seq, _)| *seq), acknowledged, || terminals.write(&pane, tui::SUBMIT))?;
                 stage("submit_written", serde_json::json!({ "paste": read.as_str() }));
-                if let Some(seq) = seq {
-                    // Armed after the write, not across it: an acknowledgement
-                    // that got here first has cleared `awaiting_delivery`.
-                    let mut rt = rt_arc.lock().unwrap();
-                    if let Engine::Cli(p) = &mut rt.engine {
-                        if let Some(echo) = p.echoed.iter_mut().find(|echo| echo.seq == seq) {
-                            echo.submitted = true;
-                        }
-                        if acknowledged && p.awaiting_delivery == Some(seq) {
-                            p.accept_by = Some(Instant::now() + tui::ACCEPT_TIMEOUT);
-                            p.nudge_by = Some(Instant::now() + tui::NUDGE_AFTER);
-                        }
-                    }
-                }
                 Ok(())
             })();
             if let Err(e) = result {
@@ -3325,6 +3299,28 @@ impl SessionManager {
         if let (Err(e), Some((_, receipt))) = (spawned, spawn_receipt) {
             let _ = receipt.send(Err(format!("Could not start prompt delivery: {e}")));
         }
+    }
+
+    /// Enter and its delivery identities become visible together. A provider
+    /// can echo a combined queue as soon as it reads Enter; the transcript
+    /// reader must not consume that record while an identity is still unarmed.
+    fn submit_composer_prompt(rt_arc: &Arc<Mutex<TabRuntime>>, seq: Option<u64>, receipt_seq: Option<u64>, acknowledged: bool, write: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut rt = rt_arc.lock().unwrap();
+        write()?;
+        if let Engine::Cli(p) = &mut rt.engine {
+            for seq in receipt_seq.into_iter().chain(seq) {
+                if let Some(echo) = p.echoed.iter_mut().find(|echo| echo.seq == seq) {
+                    echo.submitted = true;
+                }
+            }
+            if let Some(seq) = seq {
+                if acknowledged && p.awaiting_delivery == Some(seq) {
+                    p.accept_by = Some(Instant::now() + tui::ACCEPT_TIMEOUT);
+                    p.nudge_by = Some(Instant::now() + tui::NUDGE_AFTER);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn cancel_shared_prompt(&self, rt: &mut TabRuntime, seq: u64) {

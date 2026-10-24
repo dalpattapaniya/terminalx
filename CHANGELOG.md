@@ -6,7 +6,8 @@
 
 - Deliver queued messages through the provider's native interrupt without pasting
   them again. Keep repeated Send now clicks harmless, retain provider queue order,
-  and show Codex continuations as working when an older interrupt hook arrives. (#627)
+  publish successful submission atomically with Enter, and show Codex continuations
+  as working when an older interrupt hook arrives. (#627)
 
 - Keep table Copy/Download menus readable and inside the window, and expand tables
   into a scrollable viewer above the conversation with keyboard focus restored on
