@@ -9,7 +9,7 @@ mod diagnostics;
 mod direct;
 mod guest;
 mod mobile;
-mod model;
+use crate::local_runtime::mobile::model;
 mod registry;
 mod relay;
 pub(crate) mod sharing;
@@ -206,7 +206,26 @@ impl PairingManager {
         })())
     }
 
+    fn fence_runtime_mobile(&self, method: &str, params: serde_json::Value) -> Result<()> {
+        let Some(runtime) = self.runtime.lock().unwrap().clone() else { return Ok(()) };
+        let result = (|| {
+            let attachment = runtime.attachment()?;
+            let actor = crate::local_runtime::mobile::Actor {
+                epoch:attachment.epoch, lease:attachment.lease,
+                generation:self.account.current_generation(),
+                user_id:registry::load_account_mirror()?.map(|mirror| mirror.user_id),
+            };
+            runtime.mobile(&actor, method, params)?;
+            Ok(())
+        })();
+        if result.is_err() { runtime.disconnect(); }
+        result
+    }
+
     fn clear_runtime_sharing(&self) {
+        if let Err(error) = self.fence_runtime_mobile("clear", serde_json::json!({})) {
+            log::warn!("clear owner mobile grants: {error:#}");
+        }
         if let Some(Err(error)) = self.runtime_sharing("clear", serde_json::json!({})) {
             // Drop the authoritative lease if the owner cannot acknowledge the
             // account fence. Never keep forwarding against uncertain grants.
@@ -710,6 +729,15 @@ impl PairingManager {
                         {
                             continue;
                         }
+                        if let Ok(Some(device)) = self.registry.automatic_for_grant(
+                            &context.user_id, &revocation.client_installation_id, &revocation.grant_request_id,
+                        ) {
+                            if let Err(error) = self.fence_runtime_mobile("revoke", serde_json::json!({"deviceId":device.id})) {
+                                // The failed fence disconnects the attachment before
+                                // the persisted credential is retired below.
+                                log::warn!("fence revoked mobile grant: {error:#}");
+                            }
+                        }
                         if let Ok(Some(device)) = self.registry.revoke_automatic_grant(
                             &context.user_id,
                             &revocation.client_installation_id,
@@ -1037,11 +1065,11 @@ impl PairingManager {
             "transcriptHashB64": session.transcript_hash_b64,
         });
         send_encrypted_text(&mut socket, &mut session, &authenticated.to_string()).await?;
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
         let mobile_connection = Arc::new(mobile::MobileConnection::new(
-            self.mobile.clone(),
+            self, &device, self.mobile.clone(),
             outbound_tx,
-        ));
+        )?);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         self.connections
             .lock()
@@ -1050,8 +1078,10 @@ impl PairingManager {
             .or_default()
             .push(cancel_tx);
         self.emit();
+        let mut stream_health = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             tokio::select! {
+                _ = stream_health.tick() => { mobile_connection.check_buffer()?; }
                 _ = cancel_rx.recv() => {
                     mobile_connection.close(self);
                     let _ = socket.close(None).await;
@@ -1062,6 +1092,7 @@ impl PairingManager {
                         mobile_connection.close(self);
                         return Ok(());
                     };
+                    mobile_connection.check(self)?;
                     send_encrypted_text(&mut socket, &mut session, &outgoing.to_string()).await?;
                 }
                 incoming = socket.next() => {
@@ -1075,7 +1106,15 @@ impl PairingManager {
                             let bytes = decode_canonical_base64(&text)?;
                             let plaintext = session.open(&bytes, PayloadKind::Text)?;
                             let request: serde_json::Value = serde_json::from_slice(&plaintext)?;
+                            mobile_connection.check(self)?;
                             let response = self.rpc_response(&request, &device, &connection, &mobile_connection).await;
+                            // Revalidate after asynchronous work: queued replies must not
+                            // disclose session data after revocation or account replacement.
+                            // Successful self-unpairing deliberately revokes this connection;
+                            // its acknowledgement contains no session data.
+                            let forgot_self = request["method"] == "pairing.forget"
+                                && response["ok"] == true;
+                            if !forgot_self { mobile_connection.check(self)?; }
                             send_encrypted_text(&mut socket, &mut session, &response.to_string()).await?;
                         }
                         Message::Binary(bytes) => {
@@ -1272,6 +1311,7 @@ impl PairingManager {
     }
 
     fn revoke_local(&self, device_id: &str) -> Result<()> {
+        self.fence_runtime_mobile("revoke", serde_json::json!({"deviceId":device_id}))?;
         let _ = self.registry.revoke(device_id)?;
         self.secrets.delete_device_token(device_id)?;
         self.cancel_connections(device_id);
@@ -1380,13 +1420,11 @@ impl PairingManager {
         !self.is_stopped() && self.epoch.load(Ordering::SeqCst) == epoch
     }
 
-    pub fn desktop_terminal_input_allowed(&self, pane_id: &str) -> bool {
-        !self.mobile.is_mobile_driven(pane_id)
+    pub fn mobile_driven_tabs(&self) -> Result<Vec<String>> {
+        let runtime = self.runtime.lock().unwrap().clone().context("The local runtime is unavailable.")?;
+        runtime.terminals()?.mobile_drivers()
     }
 
-    pub fn mobile_driven_tabs(&self) -> Vec<String> {
-        self.mobile.driven_tab_ids()
-    }
 }
 
 #[derive(Deserialize)]

@@ -388,6 +388,9 @@ impl ControlService {
         }
         if command.starts_with("runtime.") {
             if let Some(lifetime) = &self.local_lifetime {
+                if let Some(method) = command.strip_prefix("runtime.mobile.") {
+                    return crate::local_runtime::mobile::execute(&self.manager, lifetime, method, params).map_err(ControlError::internal);
+                }
                 if let Some(method) = command.strip_prefix("runtime.sharing.") {
                     return crate::local_sharing::owner::execute(&self.manager, lifetime, method, params).map_err(ControlError::internal);
                 }

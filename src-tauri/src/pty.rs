@@ -629,6 +629,23 @@ impl Terminals {
         Ok(())
     }
 
+    /// Capture the writer only if it is still the process the caller admitted.
+    /// Keeping that writer Arc cannot redirect bytes to a replacement pane.
+    pub(crate) fn write_for_process(&self, id: &str, pid: u32, data: &[u8]) -> Result<()> {
+        let writer = {
+            let panes = self.panes.lock().unwrap();
+            let pane = panes.get(id).context("no such terminal")?;
+            if pane.pid != Some(pid) || !*pane.alive.lock().unwrap() {
+                anyhow::bail!("the terminal process changed before input delivery");
+            }
+            pane.writer.clone()
+        };
+        let mut writer = writer.lock().unwrap();
+        writer.write_all(data)?;
+        writer.flush()?;
+        Ok(())
+    }
+
     /// How many bytes written into the pane its program has yet to read.
     /// `None` where that cannot be asked: no such pane, a pane whose program
     /// has gone, or a platform whose PTY keeps no such count.

@@ -18,6 +18,7 @@ pub fn execute(manager: &SessionManager, sink: &Arc<dyn EventSink>, command: &st
     }
     if let Some(method) = command.strip_prefix("runtime.pty.") {
         let terminals = manager.terminals();
+        if method == "mobileDrivers" { return Ok(serde_json::to_value(manager.mobile.driven_tabs())?); }
         if method == "shells" { return Ok(serde_json::to_value(terminals.shells())?); }
         if method == "stats" { return Ok(serde_json::to_value(terminals.stats())?); }
         if method == "visibleShells" {
@@ -55,10 +56,11 @@ pub fn execute(manager: &SessionManager, sink: &Arc<dyn EventSink>, command: &st
             "write" => {
                 let data = string(&params, "data")?;
                 if data.len() > 1024 * 1024 { bail!("terminal input is too large"); }
-                terminals.write(id, &base64::engine::general_purpose::STANDARD.decode(data)?)?;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+                manager.mobile.desktop_input(id, || terminals.write(id, &bytes))?;
                 Ok(Value::Null)
             }
-            "resize" => { let (cols, rows) = size()?; terminals.resize(id, cols, rows)?; Ok(Value::Null) }
+            "resize" => { let (cols, rows) = size()?; manager.mobile.desktop_input(id, || terminals.resize(id, cols, rows))?; Ok(Value::Null) }
             "busy" => Ok(json!(terminals.is_busy(id))),
             "output" => Ok(json!({"data":terminals.read_output(id).map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
                 "running":terminals.is_running(id), "pid":terminals.pid(id)})),

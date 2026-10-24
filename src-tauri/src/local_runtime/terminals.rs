@@ -13,6 +13,8 @@ use super::client::Client;
 pub struct Terminals(Arc<Client>);
 
 impl Terminals {
+    pub fn mobile_drivers(&self) -> Result<Vec<String>> { self.0.call("runtime.pty.mobileDrivers", serde_json::json!({})) }
+
     pub fn new(client: Arc<Client>) -> Self { Self(client) }
 
     pub fn spawn(&self, id: &str, cwd: &str, cols: u16, rows: u16, command: Option<&str>, title: Option<&str>) -> Result<()> {

@@ -598,6 +598,7 @@ pub fn idle_orphaned_tabs() {
 
 #[derive(Clone)]
 pub struct SessionManager {
+    pub(crate) mobile: Arc<crate::local_runtime::mobile::Registry>,
     pub(crate) sharing: Arc<Mutex<crate::local_sharing::Sharing>>,
     sink: Arc<dyn EventSink>,
     observer: Arc<dyn SessionObserver>,
@@ -661,6 +662,7 @@ pub struct SendOutcome {
 }
 
 struct PromptText {
+    mobile: Option<crate::local_runtime::mobile::WritePermit>,
     shared_connection: Option<crate::local_sharing::WritePermit>,
     author: Option<crate::local_sharing::Person>,
     agent: String,
@@ -669,6 +671,7 @@ struct PromptText {
 
 #[derive(Default)]
 struct PromptDelivery {
+    mobile: Option<(crate::local_runtime::mobile::WritePermit, String, String, u64)>,
     ready: Option<Arc<tui::Ready>>,
     /// The composer's `user_message` this is the typing of. `None` for a
     /// command the app types for itself, which is nobody's message.
@@ -679,7 +682,7 @@ struct PromptDelivery {
     shared: Option<(crate::local_sharing::WritePermit, String, String, u64)>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageInput {
     pub media_type: String,
@@ -771,6 +774,7 @@ impl SessionManager {
         control: crate::hooks::ControlEndpoint,
     ) -> Self {
         let manager = Self {
+            mobile: Arc::new(crate::local_runtime::mobile::Registry::default()),
             sharing: Arc::new(Mutex::new(crate::local_sharing::Sharing::default())),
             sink,
             observer,
@@ -1327,7 +1331,12 @@ impl SessionManager {
 
     /// Local lifetime cannot use the cloud activity silence budget: even a
     /// silent turn or a queued follow-up must survive a detached window.
+    pub(crate) fn mobile_driver_changed(&self, session: &str, tab: &str, active: bool) {
+        self.sink.emit("mobile_terminal_driver", &serde_json::json!({"sessionId":session,"tabId":tab,"active":active}));
+    }
+
     pub(crate) fn has_background_work(&self) -> bool {
+        if self.mobile.has_pending() { return true; }
         if !self.session_stop_pids.lock().unwrap().is_empty() { return true; }
         let runtimes: Vec<_> = self.tabs.lock().unwrap().values().cloned().collect();
         runtimes.into_iter().any(|runtime| {
@@ -1529,7 +1538,7 @@ impl SessionManager {
         if let Some(share) = sharing.sessions.get_mut(session_id) {
             share.host_takeover(tab_id, chrono::Utc::now().timestamp_millis());
             self.sink.emit("session_share_changed", &serde_json::json!({ "sessionId": session_id, "state": share.snapshot(chrono::Utc::now().timestamp_millis(), true) }));
-            return self.send_impl(session_id, tab_id, PromptText { agent: text.clone(), display: text, author: Some(share.host.clone()), shared_connection: None }, images, None);
+            return self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: Some(share.host.clone()), shared_connection: None }, images, None);
         }
         self.send_with_display_text(session_id, tab_id, text.clone(), text, images)
     }
@@ -1538,7 +1547,7 @@ impl SessionManager {
     /// when the provider echoes the prompt or runs its UserPromptSubmit hook.
     pub fn send_confirmed(&self, session_id: &str, tab_id: &str, text: String) -> Result<SendOutcome> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let outcome = self.send_impl(session_id, tab_id, PromptText { agent: text.clone(), display: text, author: None, shared_connection: None }, Vec::new(), Some(tx))?;
+        let outcome = self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: None, shared_connection: None }, Vec::new(), Some(tx))?;
         rx.recv_timeout(std::time::Duration::from_secs(90))
             .map_err(|_| anyhow!("The new session opened, but prompt delivery could not be confirmed. Check its terminal before retrying; the prepared prompt is retained."))?
             .map_err(anyhow::Error::msg)?;
@@ -1563,7 +1572,7 @@ impl SessionManager {
         display_text: String,
         images: Vec<ImageInput>,
     ) -> Result<SendOutcome> {
-        let outcome = self.send_impl(session_id, tab_id, PromptText { agent: text, display: display_text, author: None, shared_connection: None }, images, None);
+        let outcome = self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text, display: display_text, author: None, shared_connection: None }, images, None);
         // The app declining to type into the tab's terminal is no error of
         // the agent's: nothing is raised in the tab, and the reason is said.
         if outcome.as_ref().is_err_and(|error| error.is::<follow::Refusal>()) {
@@ -1577,9 +1586,20 @@ impl SessionManager {
         outcome.map_err(|error| anyhow!(RecoveryKind::classify(&error.to_string()).message()))
     }
 
+    /// Keep the device grant and tab epoch through synchronous headless input;
+    /// the PTY writer takes the same permit again immediately before typing.
+    pub(crate) fn send_mobile(&self, session_id: &str, tab_id: &str, text: String, display: String,
+        images: Vec<ImageInput>, permit: crate::local_runtime::mobile::WritePermit) -> Result<SendOutcome> {
+        let _sharing = self.sharing.lock().unwrap();
+        let _admitted = permit.enter()?;
+        permit.check_mode(session_id, tab_id)?;
+        self.send_impl(session_id, tab_id, PromptText { mobile:Some(permit.clone()),
+            shared_connection:None,author:None,agent:text,display }, images, None)
+    }
+
     /// Already admitted under `sharing`: use the same prompt writer as the host.
     pub(crate) fn send_shared(&self, session_id: &str, tab_id: &str, text: String, author: crate::local_sharing::Person, connection: crate::local_sharing::WritePermit) -> Result<SendOutcome> {
-        self.send_impl(session_id, tab_id, PromptText { agent: text.clone(), display: text, author: Some(author), shared_connection: Some(connection) }, Vec::new(), None)
+        self.send_impl(session_id, tab_id, PromptText { mobile: None, agent: text.clone(), display: text, author: Some(author), shared_connection: Some(connection) }, Vec::new(), None)
     }
 
     fn send_impl(
@@ -1617,6 +1637,9 @@ impl SessionManager {
         // shell once that CLI is gone, and the watcher may be a moment behind.
         if let Some(left) = self.left_the_terminal(&rt) {
             return Err(follow::Refusal(left).into());
+        }
+        if prompt.mobile.is_some() && (rt.turn_open || !rt.pending.is_empty()) {
+            return Err(crate::local_runtime::mobile::Busy.into());
         }
         let (refs, wire_images) = Self::archive_images(session_id, &images)?;
 
@@ -1950,9 +1973,9 @@ impl SessionManager {
         rt.open_turn();
         rt.turn_started_at = Some(Instant::now());
         self.set_status(rt, TabStatus::InProgress);
-        self.type_prompt(&rt_arc, &pane, prompt.text, prompt.attachments, PromptDelivery { ready: Some(ready.clone()), seq: Some(seq), queued: false, receipt: None, shared: None });
+        self.type_prompt(&rt_arc, &pane, prompt.text, prompt.attachments, PromptDelivery { ready: Some(ready.clone()), seq: Some(seq), queued: false, receipt: None, shared: None, mobile: None });
         for (seq, prompt) in rest {
-            self.type_prompt(&rt_arc, &pane, prompt.text, prompt.attachments, PromptDelivery { ready: Some(ready.clone()), seq: Some(seq), queued: true, receipt: None, shared: None });
+            self.type_prompt(&rt_arc, &pane, prompt.text, prompt.attachments, PromptDelivery { ready: Some(ready.clone()), seq: Some(seq), queued: true, receipt: None, shared: None, mobile: None });
         }
     }
 
@@ -1965,6 +1988,7 @@ impl SessionManager {
 
     /// Kill the agent but keep resume state, so the next prompt resumes.
     pub fn stop(&self, session_id: &str, tab_id: &str) -> Result<()> {
+        self.mobile.invalidate_tab(session_id, tab_id);
         let key = key_of(session_id, tab_id);
         let rt_arc = self.runtime(session_id, tab_id)?;
         if matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.by_hand.is_some()) {
@@ -2481,6 +2505,7 @@ impl SessionManager {
     /// turn it would interrupt is over. Until that restart the tab is in the
     /// mode it was in, and is shown in it (`harness::settings`).
     pub fn set_permission_mode(&self, session_id: &str, tab_id: &str, mode: &str) -> Result<()> {
+        self.mobile.invalidate_tab(session_id, tab_id);
         let sharing = self.sharing.lock().unwrap();
         if sharing.sessions.contains_key(session_id) && !settings::allowed_while_shared(mode) {
             bail!("Stop sharing this session before switching to {}.", settings::mode_label(mode));
@@ -3416,6 +3441,7 @@ impl SessionManager {
             seq: Some(ev.seq),
             queued,
             receipt: receipt.map(|receipt| (ev.seq, receipt)),
+            mobile: prompt.mobile.map(|permit| (permit, entry.id.clone(), tab.id.clone(), ev.seq)),
             shared: prompt.shared_connection.map(|connection| (connection, entry.id.clone(), tab.id.clone(), ev.seq)),
         });
         Ok(SendOutcome { queued, events: vec![ev] })
@@ -3464,7 +3490,7 @@ impl SessionManager {
     /// are noted in the tab's diagnostics as they pass, and the watcher holds
     /// the CLI to acknowledging it (`accept_by`).
     fn type_prompt(&self, rt_arc: &Arc<Mutex<TabRuntime>>, pane: &str, text: String, attachments: Vec<String>, delivery: PromptDelivery) {
-        let PromptDelivery { ready, seq, queued, receipt, shared } = delivery;
+        let PromptDelivery { ready, seq, queued, receipt, shared, mobile } = delivery;
         let sent_at = Instant::now();
         // A slash command opens a palette or runs in the CLI itself, and a
         // continuation has its own receipt: neither is held to the deadline.
@@ -3495,7 +3521,7 @@ impl SessionManager {
                 None => Ok(()),
             };
             if let Some(ready) = &ready {
-                let readiness = manager.wait_ready(&pane, ready, shared.as_ref());
+                let readiness = manager.wait_ready(&pane, ready, shared.as_ref(), mobile.as_ref());
                 stage("ready", serde_json::json!({ "readiness": readiness.as_str() }));
                 let mut rt = rt_arc.lock().unwrap();
                 // Stop or a restart may have replaced the CLI while waiting.
@@ -3504,6 +3530,7 @@ impl SessionManager {
                 }
                 if readiness == Readiness::Cancelled {
                     if let Some((_, _, _, seq)) = &shared { manager.cancel_shared_prompt(&mut rt, *seq); }
+                    if let Some((_, _, _, seq)) = &mobile { manager.cancel_shared_prompt(&mut rt, *seq); }
                     return;
                 }
                 if !manager.prepare_prompt(&mut rt, readiness, receipt.as_ref().map(|(_, receipt)| receipt)) {
@@ -3512,7 +3539,7 @@ impl SessionManager {
             }
             let mut admitted_to_writer = false;
             let result = (|| -> Result<()> {
-                let mut sharing = shared.as_ref().map(|_| manager.sharing.lock().unwrap());
+                let mut sharing = (shared.is_some() || mobile.is_some()).then(|| manager.sharing.lock().unwrap());
                 let mut owner_attachment = None;
                 if let (Some((connection, session_id, tab_id, _)), Some(sharing)) = (&shared, &mut sharing) {
                     let share = sharing.sessions.get_mut(session_id).ok_or_else(|| anyhow!("Sharing ended before prompt delivery."))?;
@@ -3522,6 +3549,13 @@ impl SessionManager {
                     let tab = current.tab(tab_id).ok_or_else(|| anyhow!("Tab closed before prompt delivery."))?;
                     if !settings::allowed_while_shared(&tab.permission_mode) || manager.pane_of(session_id, tab_id).is_none_or(|current| current.pane_id != pane) {
                         bail!("The shared tab changed before prompt delivery.");
+                    }
+                }
+                let _mobile = mobile.as_ref().map(|(permit,_,_,_)| permit.enter()).transpose()?;
+                if let Some((permit, session, tab, _)) = &mobile {
+                    permit.check_mode(session, tab)?;
+                    if manager.pane_of(session, tab).is_none_or(|current| current.pane_id != pane) {
+                        bail!("The mobile terminal instance changed before delivery.");
                     }
                 }
                 let _owner_attachment = owner_attachment.as_ref().map(|attachment| attachment.enter()).transpose()?;
@@ -3581,6 +3615,7 @@ impl SessionManager {
                 let mut rt = rt_arc.lock().unwrap();
                 if !admitted_to_writer {
                     if let Some((_, _, _, seq)) = &shared { manager.cancel_shared_prompt(&mut rt, *seq); return; }
+                    if let Some((_, _, _, seq)) = &mobile { manager.cancel_shared_prompt(&mut rt, *seq); return; }
                 }
                 if ready.as_ref().is_some_and(|ready| !matches!(&rt.engine, Engine::Cli(p) if Arc::ptr_eq(&p.ready, ready))) {
                     return;
@@ -3659,7 +3694,7 @@ impl SessionManager {
     /// A quiet Claude pane that never said it was up is read before it is
     /// trusted: the CLI's first-run screens (onboarding, trust, a custom API
     /// key, the bypass disclaimer) are quiet too, and are `Blocked`.
-    fn wait_ready(&self, pane: &str, ready: &tui::Ready, shared: Option<&(crate::local_sharing::WritePermit, String, String, u64)>) -> Readiness {
+    fn wait_ready(&self, pane: &str, ready: &tui::Ready, shared: Option<&(crate::local_sharing::WritePermit, String, String, u64)>, mobile: Option<&(crate::local_runtime::mobile::WritePermit, String, String, u64)>) -> Readiness {
         let deadline = Instant::now() + tui::READY_TIMEOUT;
         let blocked = || {
             if !ready.announces_start() {
@@ -3668,6 +3703,9 @@ impl SessionManager {
             self.terminals.read_output(pane).and_then(|out| claude::pty::blocking_screen(&out))
         };
         loop {
+            if mobile.is_some_and(|(permit,session,tab,_)| !permit.valid() || permit.check_mode(session,tab).is_err()) {
+                return Readiness::Cancelled;
+            }
             if let Some((permit, session, tab, _)) = shared {
                 if self.sharing.lock().unwrap().sessions.get(session).is_none_or(|share| !share.permit_current(permit, tab, chrono::Utc::now().timestamp_millis())) {
                     return Readiness::Cancelled;
@@ -4425,7 +4463,7 @@ mod tests {
 
     #[test]
     fn codex_image_prompts_project_once_and_repeated_submissions_stay_distinct() {
-        let prompt = PromptText { shared_connection: None, author: None, agent: "describe this".into(), display: "describe this".into() };
+        let prompt = PromptText { mobile: None, shared_connection: None, author: None, agent: "describe this".into(), display: "describe this".into() };
         let image = ImageRef { url: "attachments/session/proof.png".into(), media_type: Some("image/png".into()), name: Some("proof.png".into()) };
         let mut pending = std::collections::VecDeque::new();
         let mut projected = Vec::new();

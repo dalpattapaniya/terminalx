@@ -2759,7 +2759,6 @@ pub async fn pty_rename(state: State<'_, AppState>, id: String, title: String) -
 #[tauri::command]
 pub async fn pty_write(state: State<'_, AppState>, id: String, data: String) -> CmdResult<()> {
     let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
-    if !state.pairing.desktop_terminal_input_allowed(&id) { return Ok(()); }
     tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.write(&id, data.as_bytes())).await.map_err(err)?.map_err(err)
 }
 
@@ -2797,13 +2796,12 @@ pub fn pty_detach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: 
 #[tauri::command]
 pub async fn pty_resize(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> CmdResult<()> {
     let runtime = state.runtime().ok_or_else(|| state.runtime_error.lock().unwrap().clone())?;
-    if !state.pairing.desktop_terminal_input_allowed(&id) { return Ok(()); }
     tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.resize(&id, cols, rows)).await.map_err(err)?.map_err(err)
 }
 
 #[tauri::command]
-pub fn mobile_terminal_drivers(state: State<'_, AppState>) -> Vec<String> {
-    state.pairing.mobile_driven_tabs()
+pub fn mobile_terminal_drivers(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    state.pairing.mobile_driven_tabs().map_err(err)
 }
 
 #[tauri::command]

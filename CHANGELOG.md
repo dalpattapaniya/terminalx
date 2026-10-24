@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Move paired-device session writes, pending permissions, terminal input and
+  observations to the local owner. Revalidate queued input against revocation,
+  account generation and tab changes, and bound mobile output buffering. Native
+  tray integration and packaged lifecycle acceptance remain in progress. (#467)
+
 - Attach desktop startup and session/terminal commands to the local runtime
   owner. Window-only services use a private, attachment-fenced endpoint that
   cannot take over owner discovery; unavailable owners fail explicitly. Local

@@ -20,6 +20,8 @@ pub mod stream;
 #[cfg(unix)]
 pub(crate) mod window;
 pub mod calls;
+pub mod mobile;
+pub mod mobile_output;
 pub(crate) mod workspaces;
 pub(crate) mod permissions;
 pub(crate) mod scrollback;

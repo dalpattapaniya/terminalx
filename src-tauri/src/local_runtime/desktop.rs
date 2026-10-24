@@ -82,6 +82,17 @@ impl Desktop {
     }
 
 
+    #[cfg(feature = "desktop")]
+    pub(crate) fn mobile(&self, actor: &super::mobile::Actor, method: &str, mut params: serde_json::Value) -> Result<serde_json::Value> {
+        let attachment = self.attachment()?;
+        if actor.epoch != attachment.epoch || actor.lease != attachment.lease {
+            anyhow::bail!("The paired-device attachment changed. Reconnect the device.");
+        }
+        params.as_object_mut().ok_or_else(|| anyhow::anyhow!("Mobile parameters must be an object."))?
+            .insert("actor".into(), serde_json::to_value(actor)?);
+        self.client.call(&format!("runtime.mobile.{method}"), params)
+    }
+
     pub fn attach(&self, window: &str, id: &str, token: &str, tap: Tap) -> Result<()> {
         self.attachment()?;
         let mut windows = self.windows.lock().unwrap();

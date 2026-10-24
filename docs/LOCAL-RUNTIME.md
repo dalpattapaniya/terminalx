@@ -485,3 +485,22 @@ checkpoint. Focused native checks passed 33 window, 153 pipeline and four quit
 tests. These are checkpoint results, not the final full-suite or packaged
 acceptance: paired-device adapters, background tray/notifications and genuine
 packaged quit/reopen/update validation remain outstanding.
+
+
+Paired-device ownership checkpoint: the window authenticates encrypted mobile
+connections, but the owner reads the device/account records and admits each
+connection against its attachment and account generation. Session writes retain
+a permit that is checked again at the provider writer. Revocation, mode changes,
+tab stop and owner loss invalidate queued writes; only a pre-effect busy refusal
+is queued. Permission answers and terminal driver leases now target the owner.
+Viewer observations use ordered retained/live PTY taps with an 8 MiB aggregate
+buffer budget, a 1 MiB per-view bound and 64 KiB live packets. A slow connection
+closes explicitly rather than silently dropping output. Pairing transport still
+requires the desktop window; this checkpoint does not claim phone access while
+the window is closed.
+
+The initial adapter checkpoint passed both all-target Clippy checks, seven
+process regressions and 27 native mobile tests. Subsequent packet-size and
+post-response authorization hardening is being validated separately. Native
+tray/notifications, packaged lifecycle acceptance and current-head full suites
+remain outstanding; this is not issue completion.
