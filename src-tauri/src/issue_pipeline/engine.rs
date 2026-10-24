@@ -190,6 +190,8 @@ enum OnError {
     NeedsYou,
     /// A look at GitHub failed: nothing changed, and the caller hears why.
     Report,
+    /// A timer pass may skip a busy pipeline and retry next time.
+    Background,
 }
 
 struct Step<'a> {
@@ -209,10 +211,10 @@ struct Step<'a> {
 /// Run one step on a pipeline. A stopped pipeline takes no step unless a
 /// person's own action asks for one.
 fn run(host: &dyn Host, id: &str, even_if_stopped: bool, on_error: OnError, action: impl FnOnce(&mut Step<'_>) -> Result<()>) -> Result<Pipeline> {
-    // A stage's work, not a look at GitHub (`OnError::Report`), which the poller takes every few minutes.
+    // Track stage work separately from read-only requests and timer passes.
     let _running = (on_error == OnError::NeedsYou).then(Running::start);
     let lock = step_lock(id);
-    let _guard = if on_error == OnError::Report {
+    let _guard = if on_error == OnError::Background {
         match lock.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -229,10 +231,10 @@ fn run(host: &dyn Host, id: &str, even_if_stopped: bool, on_error: OnError, acti
         Ok(settings) => (settings, None),
         Err(error) => (IssuePipelineSettings::default(), Some(format!("{error:#}"))),
     };
-    let mut step = Step { host, p: pipeline, cwd, author, settings, settings_error, doing: "This step", background: on_error == OnError::Report };
+    let mut step = Step { host, p: pipeline, cwd, author, settings, settings_error, doing: "This step", background: on_error == OnError::Background };
     if let Err(error) = action(&mut step) {
         match on_error {
-            OnError::Report => return Err(error),
+            OnError::Report | OnError::Background => return Err(error),
             OnError::NeedsYou => {
                 let reason = StopReason::Failed { step: step.doing.to_string(), message: format!("{error:#}") };
                 step.needs_you(reason);
@@ -1141,7 +1143,9 @@ pub fn start(host: &dyn Host, session_id: &str, tab_id: &str, auto_merge: Option
     }
     if let Some(existing) = store::for_session(session_id)?.filter(|pipeline| pipeline.author.session_id == session_id) {
         if existing.author.tab_id == tab_id { return Ok(existing); }
-        return run(host, &existing.id, false, OnError::Report, |step| {
+        if existing.stopped { bail!("Resume this pipeline before handing it to a new author conversation."); }
+        return run(host, &existing.id, true, OnError::Report, |step| {
+            if step.p.stopped { bail!("Resume this pipeline before handing it to a new author conversation."); }
             let _admission = super::admission::lock();
             let next = SessionRef { session_id: session_id.into(), tab_id: tab_id.into() };
             if step.p.reviewer.as_ref() == Some(&next) || step.p.resolver.as_ref() == Some(&next) {
@@ -1508,7 +1512,7 @@ pub fn poll(host: &dyn Host) {
             if step.p.stage == Stage::Merge { step.evaluate(Merger::Pipeline) }
             else if step.p.pr.is_some() { step.notice_outcome() } else { Ok(()) }
         };
-        if let Err(error) = run(host, &pipeline.id, false, OnError::Report, look) {
+        if let Err(error) = run(host, &pipeline.id, false, OnError::Background, look) {
             log::warn!("issue pipeline {}: {error:#}", pipeline.id);
             // But not for ever: a wait that has run out stops for a person
             // even while GitHub cannot be read, as it would once it could.

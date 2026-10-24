@@ -2241,3 +2241,28 @@ fn a_resolver_never_runs_beside_a_reviewer_or_discards_its_security_findings() {
     assert_eq!(run.pipeline().verdict, verdict);
     assert!(run.merges().is_empty());
 }
+
+#[test]
+fn an_author_handoff_requires_an_idle_resumed_pipeline_and_preserves_review_evidence() {
+    let run = Run::start(&github_issue(), false);
+    let reviewed = run.to_gate().verdict;
+    {
+        let mut world = run.host.world();
+        let author = world.sessions.get_mut("author").unwrap();
+        let mut tab = author.tabs[0].clone();
+        tab.id = "continuation".into();
+        author.tabs.push(tab);
+        author.tabs[0].status = crate::store::index::TabStatus::InProgress;
+    }
+    assert!(start(&run.host, "author", "continuation", Some(false), None).is_err());
+    assert_eq!(run.pipeline().author.tab_id, "t1");
+    run.host.world().sessions.get_mut("author").unwrap().tabs[0].status = crate::store::index::TabStatus::Completed;
+    act(&run.host, &run.id, Action::Stop).unwrap();
+    assert!(start(&run.host, "author", "continuation", Some(false), None).unwrap_err().to_string().contains("Resume"));
+    store::set_switches(&run.id, |pipeline| { pipeline.stopped = false; }).unwrap();
+    let continued = start(&run.host, "author", "continuation", Some(false), None).unwrap();
+    assert_eq!(continued.author.tab_id, "continuation");
+    assert_eq!(continued.stage, Stage::Work);
+    assert_eq!(continued.verdict, reviewed);
+    assert_eq!(run.host.world().sessions.get("author").unwrap().tabs[0].id, "t1");
+}
