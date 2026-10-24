@@ -427,6 +427,8 @@ impl SessionManager {
             nudge_by: None,
             held: Vec::new(),
             resend_after_abort: None,
+            codex_interrupt_hooks_owed: 0,
+            codex_prompt_starts_turn: false,
             generation,
             restart_when_idle: false,
             settings_asked_at: None,
