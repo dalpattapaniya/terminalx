@@ -314,6 +314,10 @@ fn run(options: Options) -> Result<()> {
                                 || runtime.manager.has_background_work()
                                 || runtime.terminals.stats().running != 0
                                 || crate::issue_pipeline::engine::holding() != 0
+                                // An enabled schedule/issue watcher is an
+                                // explicit standing task, including between
+                                // runs. Never abandon its next dispatch.
+                                || crate::store::automations::list().map_or(true, |automations| automations.iter().any(|automation| automation.enabled))
                         })) { break; }
                     }
                 }
@@ -412,7 +416,7 @@ fn report_activity(runtime: &Runtime, cloud: Arc<crate::cloud_bootstrap::Bootstr
 /// The desktop's `setup`, less everything that needs a window.
 fn start(options: &Options) -> Result<Runtime> {
     let lifetime = (options.runtime_kind == RuntimeKind::Local)
-        .then(|| crate::local_runtime::Lifetime::new(Duration::from_secs(options.idle_grace_seconds)));
+        .then(|| crate::local_runtime::Lifetime::starting(Duration::from_secs(options.idle_grace_seconds)));
     let project_root = match &options.project_root {
         Some(root) => {
             let project = crate::store::projects::add(&root.to_string_lossy())
@@ -471,8 +475,13 @@ fn start(options: &Options) -> Result<Runtime> {
         manager.follow_terminals();
         let pipeline_host = Arc::new(crate::issue_pipeline::host::LocalHost::new(sink.clone(), manager.clone()));
         pipelines.attach(pipeline_host.clone());
+        let automation_host = crate::automations::RuntimeHost { sink: sink.clone(), sessions: manager.clone() };
+        pipelines.attach_local_automations(automation_host.clone());
+        crate::automations::recover_open_runs(&automation_host);
         crate::issue_pipeline::runtime::start(pipeline_host, interrupted.clone());
+        crate::automations::start_recovered_scheduler(automation_host);
     }
+    if let Some(lifetime) = &lifetime { lifetime.ready(); }
     Ok(Runtime { lifetime, sink, host, terminals, manager, socket, project_root, interrupted, pipelines })
 }
 

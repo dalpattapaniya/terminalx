@@ -28,7 +28,12 @@ socket alongside its existing request/response control socket; desktop
 notification hosting and complete desktop RPC integration remain unfinished.
 `BroadcastSink` is bounded and can lag: subscribing alone is not a durable replay
 mechanism. Local mode now starts its own pipeline observer without a synthetic cloud
-identity or cloud agent mailbox.
+identity or cloud agent mailbox. The local owner now also uses the existing
+scheduler and automation store through a portable host; cloud scheduling stays
+on its existing path. Recovery of open local automation runs completes before
+external requests are admitted. Enabled schedules count as standing work even
+between runs; disabled schedules do not prevent idle exit. Desktop scheduler
+ownership still needs to move when desktop attachment is wired.
 
 ## Proposed ownership and attachment
 
@@ -113,9 +118,8 @@ with #232; do not add a competing PTY implementation.
 
 Proposed background duties: automations/scheduler, pipeline runtime observer,
 pairing endpoint, notification decisions and tray count/actions. Exactly one
-runtime owns each scheduler and notification delivery identity. `serve` currently
-excludes automations and desktop notification plumbing; feature gating must be
-factored before claiming parity. A native accessory helper can own the menu-bar
+runtime owns each scheduler and notification delivery identity. `serve` now hosts local automations; desktop notification plumbing and pairing
+remain to be integrated before claiming parity. A native accessory helper can own the menu-bar
 item and notification delivery without a Dock icon; a headless Rust process
 alone cannot retain the desktop's existing tray. Tray actions: Open TerminalX,
 Stop all, Stop all and quit; counts come from runtime state.
@@ -220,8 +224,18 @@ tests before the latest installer and bridge tests were added.
 TypeScript checking passed. The full Vitest run had 3,351 passing tests and one
 GuestSession Stop-button failure; its isolated four-test rerun passed. This is
 not a full-suite pass. A subsequent full rerun passed all 285 files and 3,352
-tests. Desktop Clippy passed before the store transaction edits; native tests
-and validation of those new edits are still being run.
+tests. Checkpoint `d6d31f62` passed desktop Clippy and full native tests
+(2,230 unit tests, six CLI tests and two serialization-contract tests; 14 ignored).
+After the scheduler/module-gating changes, desktop and headless all-target
+Clippy passed and the 14-test local process suite passed, including installed
+helper survival after launcher exit and replacement of its bundle source.
+This is executable replacement evidence, not signed desktop updater acceptance.
+The recovery-before-ready and reattachment-history regression passed. Desktop
+automation unit tests (15) and lifetime unit tests (six) also passed after the
+scheduler changes. The full headless package suite passed 36 tests; eight
+existing relay tests remain ignored because they require the separate SaaS/Redis
+harness. TypeScript and all 3,352 frontend tests passed again after these changes.
+The current full desktop native suite is still being run.
 No actual desktop quit, signed app replacement, tray, notification, keychain,
 ACP, or OpenCode acceptance is established by these checks.
 

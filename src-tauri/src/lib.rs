@@ -11,7 +11,6 @@ mod agent_data;
 mod project_overview;
 #[cfg(feature = "desktop")]
 mod desktop_links;
-#[cfg(feature = "desktop")]
 mod automations;
 mod binpath;
 mod chat_link;
@@ -90,7 +89,6 @@ pub mod hooks;
 #[cfg(feature = "desktop")]
 mod issue_control;
 mod issue_pipeline;
-#[cfg(feature = "desktop")]
 mod issue_ops;
 mod issues;
 #[cfg(feature = "desktop")]

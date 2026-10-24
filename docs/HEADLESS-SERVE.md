@@ -9,7 +9,7 @@ git/worktree code as the desktop app, with no WebView, GTK or audio libraries (P
 
 - `src-tauri` has a default `desktop` feature. It enables Tauri, its plugins,
   `tauri-build` and `cpal`, plus the modules that only serve a window: commands, account,
-  pairing, automations, browser, computer use, dictation, media and the star reminder.
+  pairing, browser, computer use, dictation, media and the star reminder.
 - `src-tauri/serve` is a workspace member that depends on the library with
   `default-features = false`. Its binary is a thin call into `raccoon_lib::serve::main`,
   and the desktop build compiles that module too, so clippy and the tests cover it.
@@ -19,8 +19,9 @@ git/worktree code as the desktop app, with no WebView, GTK or audio libraries (P
     behaves as before.
   - Headless, `BroadcastSink` runs Rust listeners inline and fans every event out on a
     broadcast channel. That channel is what the relay host will serve (PRO-13).
-  - Desktop-only reactions (the star reminder and automation runs) go through
-    `sink::SessionObserver`, which is a no-op headless.
+  - Session reactions (the star reminder and automation runs) go through
+    `sink::SessionObserver`. The local runtime observer handles automation and
+    pipeline turns; the star reminder remains in the window.
 
 ```sh
 cd src-tauri/serve && cargo build --bin terminalx-serve   # or: cargo build -p terminalx-serve
@@ -92,6 +93,11 @@ The native bridge must decode PTY base64 back to the existing raw frontend chann
 Idle grace runs only with no attachments, accepted requests or live work.
 Currently any live PTY conservatively keeps the runtime alive; proving idle
 shells/agent processes and desktop connection/quit integration remain in progress.
+Local mode without a relay link starts the existing automation scheduler and
+pipeline observer. Enabled schedules keep the owner available between runs;
+disabled schedules do not. Open automation runs from a previous owner are
+recovered before client admission. Reattachment never repeats that recovery.
+Cloud workspaces continue using their cloud schedule mailbox separately.
 These APIs do not yet change how quitting the desktop behaves.
 
 ## Cloud idle activity

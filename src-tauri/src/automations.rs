@@ -11,7 +11,35 @@ use chrono::{
 };
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use std::sync::Arc;
+use crate::sink::EventSink;
+
+/// The scheduler needs session ownership and events, never a window. The
+/// desktop adapter remains until its commands attach to the local owner.
+pub trait AutomationHost: Clone + Send + Sync + 'static {
+    fn sink(&self) -> Arc<dyn EventSink>;
+    fn sessions(&self) -> Result<crate::session::SessionManager>;
+}
+
+#[cfg(feature = "desktop")]
+impl AutomationHost for tauri::AppHandle {
+    fn sink(&self) -> Arc<dyn EventSink> { Arc::new(self.clone()) }
+    fn sessions(&self) -> Result<crate::session::SessionManager> {
+        use tauri::Manager;
+        self.state::<crate::AppState>().manager().context("session manager is not ready")
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeHost {
+    pub sink: Arc<dyn EventSink>,
+    pub sessions: crate::session::SessionManager,
+}
+
+impl AutomationHost for RuntimeHost {
+    fn sink(&self) -> Arc<dyn EventSink> { self.sink.clone() }
+    fn sessions(&self) -> Result<crate::session::SessionManager> { Ok(self.sessions.clone()) }
+}
 
 use crate::store::{automations as automation_store, index};
 
@@ -630,17 +658,17 @@ fn new_run(
     }
 }
 
-fn emit_run(app: &AppHandle, run: &AutomationRun) {
-    let _ = app.emit("automation_run", run);
+fn emit_run(app: &impl AutomationHost, run: &AutomationRun) {
+    app.sink().emit("automation_run", run);
 }
 
-pub fn emit_definitions(app: &AppHandle) {
+pub fn emit_definitions(app: &impl AutomationHost) {
     if let Ok(values) = automation_store::list() {
-        let _ = app.emit("automations_changed", values);
+        app.sink().emit("automations_changed", &values);
     }
 }
 
-fn update_summary(app: &AppHandle, automation_id: &str, status: AutomationRunStatus, at: &str) {
+fn update_summary(app: &impl AutomationHost, automation_id: &str, status: AutomationRunStatus, at: &str) {
     let at = at.to_string();
     if automation_store::update(automation_id, |automation| {
         automation.last_run_at = Some(at);
@@ -738,8 +766,8 @@ pub fn issue_prompt(template: &str, issue: &crate::issues::Issue) -> String {
 /// now", and GitHub issue) goes through here, so a run always starts in the
 /// automation's own saved permission mode rather than the session store's
 /// default or whatever an interactive session last used.
-fn run_tab(automation: &Automation) -> crate::commands::NewTab {
-    crate::commands::NewTab {
+fn run_tab(automation: &Automation) -> crate::session_ops::NewTab {
+    crate::session_ops::NewTab {
         harness: automation.harness.clone(),
         model: automation.model.clone(),
         effort: automation.effort.clone(),
@@ -748,7 +776,7 @@ fn run_tab(automation: &Automation) -> crate::commands::NewTab {
 }
 
 fn start_run(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     automation: &Automation,
     mut run: AutomationRun,
     prompt: String,
@@ -782,9 +810,9 @@ fn start_run(
             .as_ref()
             .map(|value| format!("{} {}", value.identifier, value.title))
             .unwrap_or_else(|| format!("{} · Run {}", automation.name, run.run_number));
-        let entry = crate::commands::create_session_blocking(
-            app,
-            crate::commands::NewSession {
+        let entry = crate::session_ops::create_session_blocking(
+            app.sink().as_ref(),
+            crate::session_ops::NewSession {
                 project_path: automation.project_path.clone(),
                 title: Some(title),
                 use_worktree: automation.workspace == AutomationWorkspace::NewWorktree,
@@ -814,13 +842,10 @@ fn start_run(
             Ok(())
         })?;
         emit_run(app, &run);
-        let manager = app
-            .state::<crate::AppState>()
-            .manager()
-            .context("session manager is not ready")?;
+        let manager = app.sessions()?;
         let mut prompt = prompt;
         if let Some(options) = automation.pipeline.as_ref().filter(|options| options.auto_merge || options.resolve_conflicts) {
-            let host = crate::issue_pipeline::desktop::host(app)?;
+            let host = crate::issue_pipeline::host::LocalHost::new(app.sink(), manager.clone());
             let pipeline = crate::issue_pipeline::engine::start(&host, &entry.id, &tab.id, Some(options.auto_merge), None)?;
             crate::issue_pipeline::engine::set_resolve_conflicts(&host, &pipeline.id, options.resolve_conflicts)?;
             prompt.push_str("\n\n");
@@ -852,7 +877,7 @@ fn start_run(
 /// Turn a saved prompt into an ordinary session. The active frontend session
 /// is never selected here; the emitted session simply joins the sidebar.
 pub fn dispatch(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     automation_id: &str,
     trigger: AutomationTrigger,
     scheduled_for: Option<DateTime<Utc>>,
@@ -877,7 +902,7 @@ pub fn dispatch(
 }
 
 fn dispatch_issue(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     automation: &Automation,
     issue: &crate::issues::Issue,
     seen: &mut automation_store::SeenState,
@@ -983,7 +1008,7 @@ fn session_automation(
     Some((entry.clone(), entry.automation?))
 }
 
-pub fn mark_running_from_hook(app: &AppHandle, session_id: &str, tab_id: &str) {
+pub fn mark_running_from_hook(app: &impl AutomationHost, session_id: &str, tab_id: &str) {
     let Some((_, stamp)) = session_automation(session_id, tab_id) else {
         return;
     };
@@ -1084,7 +1109,7 @@ fn has_commits(cwd: &Path) -> bool {
 }
 
 fn report_issue_run(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     entry: Option<&index::SessionEntry>,
     automation_id: &str,
     run_id: &str,
@@ -1204,7 +1229,7 @@ fn report_issue_run(
 }
 
 fn spawn_issue_report(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     entry: Option<index::SessionEntry>,
     automation_id: String,
     run_id: String,
@@ -1223,7 +1248,7 @@ fn spawn_issue_report(
 }
 
 pub fn complete_from_hook(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     session_id: &str,
     tab_id: &str,
     final_message: Option<String>,
@@ -1258,7 +1283,7 @@ pub fn complete_from_hook(
     }
 }
 
-pub fn fail_from_hook(app: &AppHandle, session_id: &str, tab_id: &str, message: &str) {
+pub fn fail_from_hook(app: &impl AutomationHost, session_id: &str, tab_id: &str, message: &str) {
     let Some((entry, stamp)) = session_automation(session_id, tab_id) else {
         return;
     };
@@ -1289,7 +1314,7 @@ pub fn fail_from_hook(app: &AppHandle, session_id: &str, tab_id: &str, message: 
 }
 
 fn record_missed(
-    app: &AppHandle,
+    app: &impl AutomationHost,
     automation: &Automation,
     scheduled_for: DateTime<Utc>,
 ) -> Result<()> {
@@ -1346,10 +1371,10 @@ fn public_issue_state(
     }
 }
 
-fn emit_issue_state(app: &AppHandle, automation_id: &str, state: &automation_store::SeenState) {
-    let _ = app.emit(
+fn emit_issue_state(app: &impl AutomationHost, automation_id: &str, state: &automation_store::SeenState) {
+    app.sink().emit(
         "automation_issue_state",
-        public_issue_state(automation_id, state),
+        &public_issue_state(automation_id, state),
     );
 }
 
@@ -1380,7 +1405,7 @@ fn issue_poll_due(
         .unwrap_or(true)
 }
 
-fn record_poll_error(app: &AppHandle, automation: &Automation, message: &str) -> Result<()> {
+fn record_poll_error(app: &impl AutomationHost, automation: &Automation, message: &str) -> Result<()> {
     if let Some(previous) = automation_store::list_runs(&automation.id)?
         .into_iter()
         .next()
@@ -1413,7 +1438,7 @@ fn record_poll_error(app: &AppHandle, automation: &Automation, message: &str) ->
     Ok(())
 }
 
-fn evaluate_issue(app: &AppHandle, automation: &Automation, now: DateTime<Utc>) -> Result<()> {
+fn evaluate_issue(app: &impl AutomationHost, automation: &Automation, now: DateTime<Utc>) -> Result<()> {
     if !automation.enabled {
         return Ok(());
     }
@@ -1497,7 +1522,7 @@ impl Drop for EvaluationGuard {
     }
 }
 
-fn evaluate(app: &AppHandle) -> Result<()> {
+fn evaluate(app: &impl AutomationHost) -> Result<()> {
     if EVALUATING.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
@@ -1538,7 +1563,7 @@ fn evaluate(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-fn recover_open_runs(app: &AppHandle) {
+pub(crate) fn recover_open_runs(app: &impl AutomationHost) {
     let Ok(automations) = automation_store::list() else {
         return;
     };
@@ -1572,11 +1597,20 @@ fn recover_open_runs(app: &AppHandle) {
     }
 }
 
-pub fn start_scheduler(app: AppHandle) {
+pub fn start_scheduler(app: impl AutomationHost) {
+    start_scheduler_inner(app, true);
+}
+
+/// Local owners recover synchronously before accepting external commands.
+pub(crate) fn start_recovered_scheduler(app: impl AutomationHost) {
+    start_scheduler_inner(app, false);
+}
+
+fn start_scheduler_inner(app: impl AutomationHost, recover: bool) {
     std::thread::Builder::new()
         .name("automation-scheduler".into())
         .spawn(move || {
-            recover_open_runs(&app);
+            if recover { recover_open_runs(&app); }
             loop {
                 if let Err(error) = evaluate(&app) {
                     log::warn!("automation scheduler: {error:#}");

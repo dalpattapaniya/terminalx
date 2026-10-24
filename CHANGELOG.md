@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Run local scheduled automations through the existing scheduler and consent
+  engine in the headless owner, with startup recovery before client admission.
+  Keep cloud scheduling separate and test detached completion and idle exit for
+  disabled schedules. Desktop ownership integration remains in progress. (#467)
+
 - Serialize session-index read/modify/write transactions across processes using
   a stable sidecar lock, retaining closed conversations and unknown fields during
   simultaneous window and runtime updates. Add disposable process regressions

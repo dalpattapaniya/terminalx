@@ -304,6 +304,7 @@ fn installed_runtime_survives_launcher_exit_and_bundle_source_replacement() {
     // Created before the launcher so even an attachment assertion failure
     // asks only this disposable home's owner to stop before fixture deletion.
     let _private_owner = StopPrivate(world.data.clone());
+    std::fs::write(world.data.join("projects.json"), serde_json::to_vec(&json!({"projects":[{"path":world.project,"name":"fixture"}]})).unwrap()).unwrap();
     let source = world.home.join("bundled-terminalx-serve");
     std::fs::copy(env!("CARGO_BIN_EXE_terminalx-serve"), &source).unwrap();
     let mut launcher = std::process::Command::new(std::env::current_exe().unwrap());
@@ -311,6 +312,7 @@ fn installed_runtime_survives_launcher_exit_and_bundle_source_replacement() {
         .env_clear().env("HOME", &world.home)
         .env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", world.bin.display()))
         .env("CLAUDE_CONFIG_DIR", world.home.join(".claude"))
+        .env("TERMINALX_HOME", &world.data)
         .env("TERMINALX_LAUNCHER_FIXTURE_HOME", &world.data)
         .env("TERMINALX_LAUNCHER_FIXTURE_BINARY", &source);
     assert!(launcher.status().unwrap().success());
@@ -372,4 +374,75 @@ fn a_partial_view_request_is_not_discarded_when_an_event_arrives() {
     stream.0.get_mut().write_all(&request.as_bytes()[split..]).unwrap();
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"fragmented-request-survived") { bytes.extend(stream.pty(&id)); }
+}
+
+fn scheduled_fixture(world: &AgentWorld, enabled: bool) {
+    let automation = json!({
+        "id":"scheduled-fixture","name":"Fixture schedule","enabled":enabled,
+        "projectPath":world.project,"harness":"claude","mode":"manual",
+        "prompt":"echo:scheduled-without-a-window","workspace":"newWorktree",
+        "schedule":{"kind":"preset","preset":"hourly","minute":0,"timezone":"UTC","dtstart":"1970-01-01T00:00:00Z"},
+        "nextRunAt":"1970-01-01T00:00:00Z","missedRunGraceMinutes":u32::MAX,
+        "created":"1970-01-01T00:00:00Z","modified":"1970-01-01T00:00:00Z",
+        "pipeline":{"autoMerge":false,"resolveConflicts":false}
+    });
+    std::fs::write(world.data.join("automations.json"), serde_json::to_vec(&json!({"automations":[automation]})).unwrap()).unwrap();
+}
+
+#[test]
+fn local_schedule_runs_and_records_completion_without_a_window() {
+    let world = AgentWorld::new();
+    scheduled_fixture(&world, true);
+    let mut serve = Serve::start(world.command(), &world.data);
+    let completed = common::agent::wait_until("the local scheduled turn to complete", || {
+        let runs = std::fs::read_to_string(world.data.join("automations/scheduled-fixture/runs.jsonl")).ok()?;
+        runs.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|run| run["status"] == "completed")
+    });
+    let tab = completed["tabId"].as_str().unwrap();
+    let events = serve.events(tab);
+    assert!(texts(&events, "assistant_text").iter().any(|text| text.contains("scheduled-without-a-window")));
+    assert_eq!(serve.control("status", json!({}))["localRuntime"]["attachedClients"], 0);
+    let pipelines = std::fs::read_to_string(world.data.join("issue-pipelines.json")).ok()
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text).unwrap()).unwrap_or_else(|| json!({"pipelines":[]}));
+    assert_eq!(pipelines["pipelines"], json!([]), "both-off automation must not create a pipeline");
+    let epoch = serve.control("status", json!({}))["localRuntime"]["epoch"].clone();
+    serve.control("runtime.stopAll", json!({"epoch":epoch}));
+    stopped(&mut serve);
+}
+
+#[test]
+fn a_disabled_schedule_does_not_hold_an_idle_runtime() {
+    let world = AgentWorld::new();
+    scheduled_fixture(&world, false);
+    let mut command = world.command();
+    command.args(["--idle-grace-seconds", "1"]);
+    let mut serve = Serve::start(command, &world.data);
+    stopped(&mut serve);
+    assert!(!world.data.join("automations/scheduled-fixture/runs.jsonl").exists());
+}
+
+#[test]
+fn interrupted_automation_is_recovered_before_ready_and_not_on_reattach() {
+    let world = AgentWorld::new();
+    scheduled_fixture(&world, false);
+    let directory = world.data.join("automations/scheduled-fixture");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("runs.jsonl");
+    let open = json!({"runId":"interrupted-fixture","runNumber":1,
+        "automationId":"scheduled-fixture","trigger":"scheduled","status":"running",
+        "startedAt":"1970-01-01T00:00:00Z","futureField":{"retained":true}});
+    std::fs::write(&path, format!("{open}\n")).unwrap();
+    let serve = Serve::start(world.command(), &world.data);
+    let recovered = std::fs::read_to_string(&path).unwrap();
+    let last: serde_json::Value = serde_json::from_str(recovered.lines().last().unwrap()).unwrap();
+    assert_eq!(last["status"], "failed");
+    assert!(last["endedAt"].is_string());
+    assert_eq!(last["futureField"], open["futureField"]);
+    for _ in 0..2 {
+        let stream = Stream::open(&serve);
+        drop(stream);
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), recovered,
+        "attachment must not rewrite recovered automation history");
 }

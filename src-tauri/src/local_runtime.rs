@@ -84,6 +84,7 @@ impl Owner {
 }
 
 struct State {
+    starting: bool,
     leases: HashMap<String, Instant>,
     requests: usize,
     idle_since: Option<Instant>,
@@ -117,14 +118,30 @@ impl Lifetime {
             stream_socket: std::sync::OnceLock::new(),
             grace,
             state: Mutex::new(State {
+                starting: false,
                 leases: HashMap::new(), requests: 0, idle_since: Some(Instant::now()),
                 stop_requested: false, exiting: false,
             }),
         })
     }
 
+    pub(crate) fn starting(grace: Duration) -> Arc<Self> {
+        let lifetime = Self::new(grace);
+        lifetime.state.lock().unwrap().starting = true;
+        lifetime
+    }
+
+    pub(crate) fn ready(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.starting = false;
+        state.idle_since = Some(Instant::now());
+    }
+
     pub fn enter(self: &Arc<Self>) -> Result<RequestGuard, ControlError> {
         let mut state = self.state.lock().unwrap();
+        if state.starting {
+            return Err(ControlError::new("runtime_starting", "The local runtime is restoring its stores.", None::<String>));
+        }
         if state.exiting || state.stop_requested {
             return Err(unavailable());
         }
@@ -155,6 +172,9 @@ impl Lifetime {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
         state.leases.retain(|_, expires| *expires > now);
+        if state.starting {
+            return Err(ControlError::new("runtime_starting", "The local runtime is restoring its stores.", None::<String>));
+        }
         if state.exiting || state.stop_requested {
             return Err(unavailable());
         }
@@ -209,6 +229,7 @@ impl Lifetime {
 
     fn should_exit_at(&self, now: Instant, busy: impl FnOnce() -> bool) -> bool {
         let mut state = self.state.lock().unwrap();
+        if state.starting { return false; }
         if state.requests != 0 { return false; }
         if state.stop_requested { state.exiting = true; return true; }
         let had_clients = !state.leases.is_empty();
@@ -229,6 +250,18 @@ impl Lifetime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_recovery_precedes_admission_and_idle_exit() {
+        let life = Lifetime::starting(Duration::ZERO);
+        assert!(life.enter().is_err());
+        assert!(life.command("runtime.attach", json!({"protocol": PROTOCOL})).is_err());
+        assert!(!life.should_exit_at(Instant::now() + Duration::from_secs(100), || false));
+        life.ready();
+        assert!(life.enter().is_ok());
+        assert!(life.command("runtime.attach", json!({"protocol": PROTOCOL})).is_ok());
+        assert_eq!(life.status()["attachedClients"], 1);
+    }
 
     #[test]
     fn detach_and_expiry_never_end_busy_work() {
