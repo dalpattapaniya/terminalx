@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Discard delayed process-kill confirmations and errors after runtime invalidation;
+  distinguish missing resource details from a verified empty process list. (#467)
+
 - Show resources as unavailable when the background owner disconnects or a
   resource read fails; discard older replies and hide stale process actions. (#467)
 

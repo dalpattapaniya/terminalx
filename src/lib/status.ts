@@ -17,6 +17,7 @@ interface StatusState {
   usageError: string | null;
   resources: ResourceOverview;
   resourcesAvailable: boolean;
+  resourceGeneration: number;
   resourceSample: ResourceSnapshot | null;
   resourcesRefreshing: boolean;
   ready: boolean;
@@ -30,6 +31,7 @@ let state: StatusState = {
   usageError: null,
   resources: { agentCount: 0, orphanCount: 0, rssBytes: null, pressure: null },
   resourcesAvailable: false,
+  resourceGeneration: 0,
   resourceSample: null,
   resourcesRefreshing: false,
   ready: false,
@@ -139,7 +141,12 @@ export async function resetCodexUsage(): Promise<void> {
 let resourceRevision = 0;
 function invalidateResources() {
   resourceRevision++;
-  set({ resourcesAvailable: false, resourceSample: null, resourcesRefreshing: false });
+  set({ resourcesAvailable: false, resourceGeneration: state.resourceGeneration + 1, resourceSample: null, resourcesRefreshing: false });
+}
+
+/** Synchronous authority check, including invalidations React has not rendered yet. */
+export function resourceGenerationIsCurrent(generation: number): boolean {
+  return state.resourcesAvailable && state.resourceGeneration === generation;
 }
 
 export async function refreshResourceOverview() {

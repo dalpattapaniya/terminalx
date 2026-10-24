@@ -196,9 +196,14 @@ it("invalidates resource authority across disconnect and fences old boot, overvi
   await act(async () => { await store.refreshResourceOverview(); });
   expect(observed.resourcesAvailable).toBe(false);
   expect(observed.resourceSample).toBeNull();
+  const invalidatedGeneration = observed.resourceGeneration;
+  expect(store.resourceGenerationIsCurrent(invalidatedGeneration)).toBe(false);
   mocks.overview.mockResolvedValue(overview(4));
   await act(async () => { mocks.events.get("local_runtime_reattached")!({ payload: usage }); });
   expect(observed.resourcesAvailable).toBe(true);
   expect(observed.resources.agentCount).toBe(4);
+  expect(observed.resourceGeneration).toBeGreaterThan(invalidatedGeneration);
+  expect(store.resourceGenerationIsCurrent(invalidatedGeneration)).toBe(false);
+  expect(store.resourceGenerationIsCurrent(observed.resourceGeneration)).toBe(true);
   expect(observed.usage).toEqual(usage);
 });

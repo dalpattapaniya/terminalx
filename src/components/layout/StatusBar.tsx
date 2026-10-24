@@ -15,6 +15,7 @@ import {
 import { cn } from "@/lib/cn";
 import {
   refreshResourceSample,
+  resourceGenerationIsCurrent,
   refreshUsage,
   removeResourceOptimistically,
   resetCodexUsage,
@@ -123,15 +124,18 @@ function groupProcesses(processes: ProcSample[]): ResourceGroup[] {
 }
 
 function ResourceCluster({ narrow }: { narrow: boolean }) {
-  const { settings, resources, resourcesAvailable, resourceSample, resourcesRefreshing } = useStatus();
+  const { settings, resources, resourcesAvailable, resourceGeneration, resourceSample, resourcesRefreshing } = useStatus();
   const [open, setOpen] = useState(false);
-  const [pending, setPending] = useState<{ process: ProcSample; message: string } | null>(null);
+  const [pending, setPending] = useState<{ process: ProcSample; message: string; generation: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [killing, setKilling] = useState<string | null>(null);
+  const killOperation = useRef(0);
   useResourceSampling(open, refreshResourceSample);
   useEffect(() => {
-    if (!resourcesAvailable) { setOpen(false); setPending(null); setError(null); }
-  }, [resourcesAvailable]);
+    killOperation.current++;
+    setOpen(false); setPending(null); setError(null); setKilling(null);
+    return () => { killOperation.current++; };
+  }, [resourcesAvailable, resourceGeneration]);
   if (!settings.resources) return null;
   if (!resourcesAvailable) return (
     <button type="button" aria-label="Resources unavailable" onClick={() => void refreshResourceSample()}
@@ -154,39 +158,29 @@ function ResourceCluster({ narrow }: { narrow: boolean }) {
     setOpen(false);
   };
 
-  const finishKill = async (process: ProcSample, confirmed: boolean) => {
+  const kill = async (process: ProcSample, confirmed: boolean, generation: number, confirmationOnly = false) => {
+    if (!resourceGenerationIsCurrent(generation)) return;
+    const operation = ++killOperation.current;
+    const current = () => operation === killOperation.current && resourceGenerationIsCurrent(generation);
     setError(null);
+    setPending(null);
     setKilling(process.paneId);
-    removeResourceOptimistically(process.paneId);
+    if (!confirmationOnly) removeResourceOptimistically(process.paneId);
     try {
       const result = await statusBar.killResource(process.paneId, confirmed);
-      if (result.confirmation) {
-        setPending({ process, message: result.confirmation });
-      }
+      if (!current()) return;
+      if (result.confirmation) setPending({ process, message: result.confirmation, generation });
       if (result.killed) await refreshResourceSample();
     } catch (reason) {
+      if (!current()) return;
       setError(errorMessage(reason));
-      await refreshResourceSample();
+      if (!confirmationOnly) await refreshResourceSample();
     } finally {
-      setKilling(null);
+      if (current()) setKilling(null);
     }
   };
 
-  const requestKill = async (process: ProcSample) => {
-    if (process.killRule === "confirm") {
-      setKilling(process.paneId);
-      try {
-        const result = await statusBar.killResource(process.paneId, false);
-        if (result.confirmation) setPending({ process, message: result.confirmation });
-      } catch (reason) {
-        setError(errorMessage(reason));
-      } finally {
-        setKilling(null);
-      }
-      return;
-    }
-    await finishKill(process, false);
-  };
+  const requestKill = (process: ProcSample) => kill(process, false, resourceGeneration, process.killRule === "confirm");
 
   return (
     <>
@@ -303,7 +297,7 @@ function ResourceCluster({ narrow }: { narrow: boolean }) {
                   rss={resourceSample?.app.webviewRssBytes ?? null}
                 />
               </div>
-              {!resourceSample?.processes.length ? <div className="px-3 py-6 text-center text-[11px] text-faint">No live tab or terminal processes.</div> : null}
+              {resourceSample == null ? <div className="px-3 py-6 text-center text-[11px] text-faint">Process details have not been sampled yet.</div> : !resourceSample.processes.length ? <div className="px-3 py-6 text-center text-[11px] text-faint">No live tab or terminal processes.</div> : null}
             </div>
 
             <div className="mt-1 flex items-center justify-between border-t border-hairline px-2 pt-2 text-[10px] text-faint">
@@ -318,7 +312,7 @@ function ResourceCluster({ narrow }: { narrow: boolean }) {
         </PopoverPrimitive.Portal>
       </PopoverPrimitive.Root>
 
-      <Dialog open={pending != null} onOpenChange={(next) => !next && setPending(null)}>
+      <Dialog open={pending != null && pending.generation === resourceGeneration} onOpenChange={(next) => !next && setPending(null)}>
         <DialogContent width="max-w-sm">
           <DialogHeader>
             <DialogTitle>Kill process?</DialogTitle>
@@ -329,10 +323,8 @@ function ResourceCluster({ narrow }: { narrow: boolean }) {
             <Button
               variant="destructive"
               onClick={() => {
-                if (!pending) return;
-                const process = pending.process;
-                setPending(null);
-                void finishKill(process, true);
+                if (!pending || !resourceGenerationIsCurrent(pending.generation)) return;
+                void kill(pending.process, true, pending.generation);
               }}
             >
               Kill process
