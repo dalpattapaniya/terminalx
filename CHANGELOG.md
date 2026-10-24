@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Chat
+
+- Wrap long separators and unbroken plain text inside prompt, delivered and queued
+  messages, including narrow chat and document layouts. Preserve original text,
+  line breaks and selection while keeping code blocks horizontally scrollable. (#623)
+
 ### Workspace cleanup
 
 - Make keeping conversations the default in workspace removal, using the existing
