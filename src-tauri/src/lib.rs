@@ -324,17 +324,18 @@ pub fn run() {
             control::WindowControl::new(sink, computer.clone(), browser.clone())
                 .serve(app.handle().clone(), endpoint.clone(), pairing.clone(), ask)?;
             let _ = app.state::<AppState>().window_endpoint.set(endpoint);
+            // Install window services before publishing their attachment. The
+            // owner's Quick Chat action can arrive as soon as registration
+            // succeeds; publishing first would silently lose that event.
+            browser.attach(app.handle().clone());
+            browser.sweep_orphans();
+            browser.start_keepalive();
+            floating::install(app.handle());
             if let Err(error) = local_runtime::ui::connect(app.handle()) {
                 *app.state::<AppState>().runtime_error.lock().unwrap() = format!("{error:#}");
                 log::error!("attach background runtime: {error:#}");
             }
             work_claims.start(app.handle().clone());
-            // The built-in browser: sweep daemons a crashed run left behind,
-            // then keep this run's own daemons warm and its page list honest.
-            browser.attach(app.handle().clone());
-            browser.sweep_orphans();
-            browser.start_keepalive();
-            floating::install(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

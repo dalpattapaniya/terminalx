@@ -277,6 +277,25 @@ impl WindowControl {
                 let runtime = app.state::<crate::AppState>().runtime().ok_or_else(|| ControlError::new("desktop_unavailable","The desktop has no runtime attachment.",None::<String>))?;
                 let attachment = runtime.attachment().map_err(ControlError::internal)?;
                 let (command,params) = crate::local_runtime::window::receive(&request,&attachment)?;
+                if matches!(command.as_str(),"window.open"|"window.quit"|"window.stopAllAndQuit") {
+                    let action_app = app.clone();
+                    let action_attachment = attachment.clone();
+                    let action = command.clone();
+                    app.run_on_main_thread(move || {
+                        // Scheduling onto AppKit is another asynchronous boundary.
+                        // Never apply an action from a replaced attachment.
+                        let current = action_app.state::<crate::AppState>().runtime()
+                            .and_then(|runtime|runtime.attachment().ok());
+                        if !current.is_some_and(|current|current.epoch == action_attachment.epoch && current.lease == action_attachment.lease) { return; }
+                        match action.as_str() {
+                            "window.open" => crate::account::focus_main_window(&action_app),
+                            "window.quit" => action_app.exit(0),
+                            "window.stopAllAndQuit" => crate::quit::stop_all_and_quit(&action_app),
+                            _ => unreachable!(),
+                        }
+                    }).map_err(ControlError::internal)?;
+                    return Ok(json!({"requested":command}));
+                }
                 self.execute(&command,params,&request.id)
             })();
             match result {

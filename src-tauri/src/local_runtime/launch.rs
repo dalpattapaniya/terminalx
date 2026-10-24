@@ -86,6 +86,19 @@ pub fn install(source: &Path, home: &Path) -> Result<PathBuf> {
 }
 
 pub fn connect_or_start(source: &Path, home: &Path) -> Result<Arc<Client>> {
+    launch(source,home,None)
+}
+
+pub fn connect_desktop(source: &Path, home: &Path, application: &str) -> Result<Arc<Client>> {
+    let client = launch(source,home,Some(application))?;
+    let status: serde_json::Value = client.call("status",serde_json::json!({}))?;
+    if status["localRuntime"]["nativeTray"] != true {
+        bail!("The running local owner does not support the desktop tray. Its work was left running; attach with a compatible build after it finishes.");
+    }
+    Ok(client)
+}
+
+fn launch(source: &Path, home: &Path, application: Option<&str>) -> Result<Arc<Client>> {
     use std::os::fd::AsRawFd;
     let home = std::fs::canonicalize(home)?;
     private_dir(&home.join("run"))?;
@@ -116,6 +129,11 @@ pub fn connect_or_start(source: &Path, home: &Path) -> Result<Arc<Client>> {
         if !verified.status.success() { bail!("the installed runtime's code signature could not be verified"); }
     }
     let mut command = Command::new(executable);
+    if let Some(application) = application {
+        command.env("TERMINALX_LOCAL_DESKTOP","1").env("TERMINALX_LOCAL_APPLICATION",application);
+    } else {
+        command.env_remove("TERMINALX_LOCAL_DESKTOP").env_remove("TERMINALX_LOCAL_APPLICATION");
+    }
     command.args(["--runtime-kind", "local", "--data-dir"]).arg(&home)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // SAFETY: setsid is async-signal-safe and this hook only creates an OS

@@ -385,6 +385,11 @@ fn remember_place(app: &AppHandle) {
 /// The tray icon: the way to the floating window that needs no shortcut and
 /// no main window.
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
+    // The native owner keeps the same item across window closure and updates.
+    // No second desktop item is created during its attachment lifetime.
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
     let quick = MenuItem::with_id(app, "tray-quick-chat", "Quick Chat", true, None::<&str>)?;

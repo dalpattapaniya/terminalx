@@ -48,6 +48,7 @@ pub(crate) fn supported(command: &str) -> bool {
          | "issues.comment" | "issues.status" | "issues.assign" | "issues.label"
          | "issues.create" | "floating.show" | "floating.hide" | "floating.toggle"
          | "perf.terminal.start" | "perf.terminal.poll" | "window.terminalCounters"
+         | "window.open" | "window.quit" | "window.stopAllAndQuit"
     )
 }
 

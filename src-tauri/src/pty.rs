@@ -1036,6 +1036,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mobile_input_permit_cannot_target_a_replacement_terminal_process() {
+        let sink = Arc::new(crate::sink::BroadcastSink::new(64));
+        let terminals = Terminals::new();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().to_str().unwrap();
+        let env = vec![("HOME".to_string(),path.to_string()),("ZDOTDIR".to_string(),path.to_string())];
+        let spec = || PaneSpec { cwd:path,cols:80,rows:24,command:Some("exec /bin/cat"),env:&env };
+        terminals.spawn(sink.clone(),"mobile-process",spec()).unwrap();
+        let original = terminals.panes().into_iter().find(|pane|pane.id == "mobile-process").unwrap().pid.unwrap();
+        assert!(terminals.write_for_process("mobile-process",original,b"first\n").is_ok());
+        terminals.kill_all();
+        terminals.spawn(sink,"mobile-process",spec()).unwrap();
+        let replacement = terminals.panes().into_iter().find(|pane|pane.id == "mobile-process").unwrap().pid.unwrap();
+        assert_ne!(original,replacement);
+        assert!(terminals.write_for_process("mobile-process",original,b"stale\n").is_err());
+        assert!(terminals.write_for_process("mobile-process",replacement,b"current\n").is_ok());
+        terminals.kill_all();
+    }
+
+    #[test]
     fn output_is_sent_when_the_program_goes_quiet_not_on_its_next_write() {
         let sink = Arc::new(crate::sink::BroadcastSink::new(64));
         let (sent, received) = std::sync::mpsc::channel::<Vec<u8>>();

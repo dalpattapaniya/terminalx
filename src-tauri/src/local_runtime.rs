@@ -22,6 +22,15 @@ pub(crate) mod window;
 pub mod calls;
 pub mod mobile;
 pub mod mobile_output;
+#[cfg(all(target_os = "macos", feature = "local-ui"))]
+pub(crate) mod platform;
+
+fn native_tray() -> bool {
+    #[cfg(all(target_os = "macos", feature = "local-ui"))]
+    { platform::running() }
+    #[cfg(not(all(target_os = "macos", feature = "local-ui")))]
+    { false }
+}
 pub(crate) mod workspaces;
 pub(crate) mod permissions;
 pub(crate) mod scrollback;
@@ -206,7 +215,7 @@ impl Lifetime {
         state.leases.retain(|_, attachment| attachment.valid_at(now));
         json!({ "protocol": PROTOCOL, "epoch": self.epoch, "attachedClients": state.leases.len(),
             "stopping": state.stop_requested || state.exiting, "idleGraceSeconds": self.grace.as_secs(),
-            "eventSocket": self.stream_socket.get() })
+            "eventSocket": self.stream_socket.get(), "nativeTray": native_tray() })
     }
 
     pub(crate) fn attachment(&self, epoch: &str, lease: &str) -> anyhow::Result<Arc<Attachment>> {

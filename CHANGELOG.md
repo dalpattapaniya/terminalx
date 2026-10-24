@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Add a macOS accessory tray and background notifications to the local runtime
+  helper, keeping a single tray through desktop detach and reattachment. Quit
+  actions preserve the saved policy and cleanup guard; packaged guest validation
+  remains pending. (#467)
+
 - Move paired-device session writes, pending permissions, terminal input and
   observations to the local owner. Revalidate queued input against revocation,
   account generation and tab changes, and bound mobile output buffering. Native

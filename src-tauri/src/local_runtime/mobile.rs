@@ -94,7 +94,7 @@ struct State {
 }
 
 #[derive(Default)]
-pub struct Registry(Mutex<State>, Mutex<VecDeque<Pending>>, std::sync::atomic::AtomicBool, Mutex<HashSet<(String,String)>>);
+pub struct Registry(Mutex<State>, Mutex<Queue>, std::sync::atomic::AtomicBool, Mutex<HashSet<(String,String)>>);
 
 impl State {
     fn prune(&mut self) {
@@ -131,6 +131,26 @@ struct Pending {
     display: String,
     images: Vec<crate::session::ImageInput>,
     permit: WritePermit,
+}
+#[derive(Default)]
+struct Queue {
+    items: VecDeque<Pending>,
+    in_flight: usize,
+    in_flight_bytes: usize,
+}
+impl Queue {
+    fn accepts(&self, bytes: usize) -> bool {
+        self.items.len() + self.in_flight < 64
+            && self.items.iter().map(Pending::bytes).sum::<usize>() + self.in_flight_bytes + bytes <= 16 * 1024 * 1024
+    }
+}
+struct InFlight<'a> { queue: &'a Mutex<Queue>, bytes: usize }
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.in_flight -= 1;
+        queue.in_flight_bytes -= self.bytes;
+    }
 }
 impl Pending {
     fn bytes(&self) -> usize { self.agent.len() + self.display.len() + self.images.iter().map(|image| image.data.len()).sum::<usize>() }
@@ -197,7 +217,10 @@ impl Registry {
         tabs.sort(); tabs.dedup(); tabs
     }
 
-    pub fn has_pending(&self) -> bool { !self.1.lock().unwrap().is_empty() }
+    pub fn has_pending(&self) -> bool {
+        let queue = self.1.lock().unwrap();
+        !queue.items.is_empty() || queue.in_flight != 0
+    }
 
     fn send(&self, manager: &crate::session::SessionManager, pending: Pending) -> Result<crate::session::SendOutcome> {
         if pending.bytes() > 8 * 1024 * 1024 { bail!("The mobile prompt is too large."); }
@@ -205,13 +228,13 @@ impl Registry {
             Ok(outcome) => Ok(outcome),
             Err(error) if error.is::<Busy>() => {
                 let mut queue = self.1.lock().unwrap();
-                if queue.len() >= 64 || queue.iter().map(Pending::bytes).sum::<usize>() + pending.bytes() > 16 * 1024 * 1024 {
+                if !queue.accepts(pending.bytes()) {
                     bail!("The mobile follow-up queue is full.");
                 }
                 // A stop or revocation between the attempted write and this
                 // insertion still cannot make the permit current again.
                 if !pending.permit.valid() { bail!("The mobile grant changed before queueing."); }
-                queue.push_back(pending);
+                queue.items.push_back(pending);
                 Ok(crate::session::SendOutcome { queued:true, events:Vec::new() })
             }
             Err(error) => Err(error),
@@ -225,15 +248,22 @@ impl Registry {
         impl Drop for Reset<'_> { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
         let _reset = Reset(&self.2);
         self.publish_drivers(manager);
-        let count = self.1.lock().unwrap().len();
+        let count = self.1.lock().unwrap().items.len();
         for _ in 0..count {
-            let Some(pending) = self.1.lock().unwrap().pop_front() else { break };
+            let (pending,_flight) = {
+                let mut queue = self.1.lock().unwrap();
+                let Some(pending) = queue.items.pop_front() else { break };
+                let bytes = pending.bytes();
+                queue.in_flight += 1;
+                queue.in_flight_bytes += bytes;
+                (pending,InFlight { queue:&self.1,bytes })
+            };
             if !pending.permit.valid() || pending.permit.check_mode(&pending.session, &pending.tab).is_err() { continue; }
             match pending.send(manager) {
                 Ok(_) => {},
                 // Only this pre-effect refusal is retryable. Never resend a
                 // prompt after an uncertain transport/provider write.
-                Err(error) if error.is::<Busy>() => self.1.lock().unwrap().push_back(pending),
+                Err(error) if error.is::<Busy>() => self.1.lock().unwrap().items.push_back(pending),
                 Err(error) => log::warn!("mobile follow-up delivery refused: {error:#}"),
             }
         }
@@ -453,8 +483,9 @@ pub fn execute(manager: &crate::session::SessionManager, lifetime: &Lifetime, me
                     Ok(Value::Null)
                 }
                 _ => {
-                    let pane = manager.pane_of(session, tab).context("The terminal is unavailable.")?;
-                    let bytes = manager.terminals().read_output(&pane.pane_id).context("Terminal output is unavailable.")?;
+                    let pane = manager.pane_of(session, tab).map(|pane|pane.pane_id)
+                        .unwrap_or_else(||entry.tab(tab).expect("validated tab").pane_id());
+                    let bytes = manager.terminals().read_output(&pane).context("Terminal output is unavailable.")?;
                     Ok(serde_json::json!({"text":String::from_utf8_lossy(&bytes)}))
                 }
             }
@@ -470,3 +501,19 @@ impl std::fmt::Display for Busy {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { out.write_str("The agent is busy; the mobile prompt must wait.") }
 }
 impl std::error::Error for Busy {}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn popped_delivery_keeps_its_queue_budget_until_the_writer_returns() {
+        let queue = Mutex::new(Queue { in_flight:64,in_flight_bytes:16*1024*1024,..Queue::default() });
+        let delivery = InFlight { queue:&queue,bytes:8*1024*1024 };
+        assert!(!queue.lock().unwrap().accepts(1));
+        drop(delivery);
+        assert!(queue.lock().unwrap().accepts(8*1024*1024));
+        assert!(!queue.lock().unwrap().accepts(8*1024*1024+1));
+        assert_eq!(queue.lock().unwrap().in_flight,63);
+    }
+}

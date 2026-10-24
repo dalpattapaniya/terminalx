@@ -45,7 +45,7 @@ pub(crate) fn connect(app: &AppHandle) -> anyhow::Result<Arc<Desktop>> {
     let state = app.state::<AppState>();
     let source = app.path().resource_dir()?.join("local-runtime/terminalx-serve");
     let home = crate::store::root()?;
-    let client = super::launch::connect_or_start(&source,&home)?;
+    let client = super::launch::connect_desktop(&source,&home,&app.config().identifier)?;
     let next = Arc::new(Desktop::connect(client,Arc::new(app.clone()))?);
     let endpoint = state.window_endpoint.get().ok_or_else(|| anyhow::anyhow!("The private desktop endpoint is not ready."))?.clone();
     next.register_window(endpoint)?;

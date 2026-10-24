@@ -75,7 +75,7 @@ function main() {
   const env = { ...process.env, CARGO_BUILD_JOBS: '2', SDKROOT: run('xcrun', ['--sdk', 'macosx', '--show-sdk-path']).trim() }
   const executables = plan.targets.map(target => cargoArtifact(run('cargo', [
     'build', '--manifest-path', path.join(root, 'src-tauri/serve/Cargo.toml'),
-    '--locked', '--profile', plan.profile, '--target', target, '--message-format=json-render-diagnostics',
+    '--locked', '--features', 'local-ui', '--profile', plan.profile, '--target', target, '--message-format=json-render-diagnostics',
   ], { env, stdio: ['ignore', 'pipe', 'inherit'] })))
   const directory = path.join(root, 'src-tauri/target/local-runtime')
   mkdirSync(directory, { recursive: true })

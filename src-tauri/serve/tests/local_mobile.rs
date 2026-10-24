@@ -113,7 +113,7 @@ fn queued_mobile_follow_up_is_delivered_by_the_owner_after_the_permission_pause(
 
 #[test]
 fn revocation_mode_changes_and_tab_stop_cancel_already_queued_mobile_input() {
-    for fence in ["revoke","mode","stop"] {
+    for fence in ["revoke","mode","mode-aba","stop"] {
         let world = AgentWorld::new();
         devices(&world);
         let serve = Serve::start(world.command(), &world.data);
@@ -128,7 +128,12 @@ fn revocation_mode_changes_and_tab_stop_cancel_already_queued_mobile_input() {
             "sessionId":session,"tabId":tab,"text":"must-not-be-delivered","prompt":"must-not-be-delivered","images":[]}))["queued"],true);
         match fence {
             "revoke" => { serve.control("runtime.mobile.revoke",json!({"actor":actor,"deviceId":"driver"})); }
-            "mode" => { serve.control("runtime.session.mode",json!({"sessionId":session,"tabId":tab,"mode":"auto"})); }
+            "mode" | "mode-aba" => {
+                serve.control("runtime.session.mode",json!({"sessionId":session,"tabId":tab,"mode":"auto"}));
+                if fence == "mode-aba" {
+                    serve.control("runtime.session.mode",json!({"sessionId":session,"tabId":tab,"mode":"manual"}));
+                }
+            }
             _ => { serve.control("runtime.session.stop",json!({"sessionId":session,"tabId":tab})); }
         }
         if fence != "stop" {
@@ -181,11 +186,43 @@ fn mobile_observation_replays_then_streams_only_its_admitted_tab_and_revocation_
     assert_eq!(serve.try_control("runtime.mobile.output",json!({"actor":actor,"connection":"viewer"}))["ok"],false);
 }
 
+// The Stop hook publishes turn completion before the fixture's finally block
+// clears its input-loop busy flag. Observe that actual provider boundary instead
+// of assuming that a persisted completion event means raw input starts a turn.
+fn provider_idle_barrier(world: &AgentWorld) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = world.bin.join("claude");
+    let fixture = std::fs::canonicalize(&executable).unwrap();
+    let ready = world.home.join("provider-idle.log");
+    let wrapper = format!(r#"#!/usr/bin/env python3
+import runpy
+module = runpy.run_path({fixture})
+original = module["Fake"].run_turn
+def observed(self, prompt):
+    original(self, prompt)
+    with open({ready}, "a") as output:
+        output.write("idle\n")
+module["Fake"].run_turn = observed
+module["main"]()
+"#,fixture=serde_json::to_string(&fixture).unwrap(),ready=serde_json::to_string(&ready).unwrap());
+    std::fs::remove_file(&executable).unwrap(); // Disposable fixture symlink only.
+    std::fs::write(&executable,wrapper).unwrap();
+    std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+    ready
+}
+
+fn wait_provider_idle(path: &std::path::Path, turns: usize) {
+    common::agent::wait_until("provider input loop idle",|| {
+        (std::fs::read_to_string(path).unwrap_or_default().lines().count() >= turns).then_some(())
+    });
+}
+
 #[test]
 fn terminal_driver_lease_is_authoritative_at_owner_and_cannot_be_taken_by_a_viewer() {
     use base64::Engine as _;
     let world = AgentWorld::new();
     devices(&world);
+    let idle = provider_idle_barrier(&world);
     let serve = Serve::start(world.command(), &world.data);
     let actor = actor(&serve);
     for (connection,device) in [("viewer","viewer"),("first","driver"),("second","driver")] { register(&serve,&actor,connection,device); }
@@ -193,11 +230,13 @@ fn terminal_driver_lease_is_authoritative_at_owner_and_cannot_be_taken_by_a_view
         "prompt":"echo:driver-ready","mode":"manual","useWorktree":false,"onMain":true}));
     let tab = created["tabId"].as_str().unwrap();
     serve.wait_events(tab,"driver ready",|events|count(events,"turn_completed")==1);
+    wait_provider_idle(&idle,1);
     let mut input = json!({"actor":actor,"connection":"viewer","sessionId":created["sessionId"],"tabId":tab,"text":"echo:mobile-raw\r"});
     assert_eq!(serve.try_control("runtime.mobile.input",input.clone())["ok"],false);
     input["connection"] = json!("first");
     serve.control("runtime.mobile.input",input.clone());
     serve.wait_events(tab,"mobile raw input",|events|count(events,"turn_completed")==2);
+    wait_provider_idle(&idle,2);
     input["connection"] = json!("second");
     assert_eq!(serve.try_control("runtime.mobile.input",input)["ok"],false);
     assert_eq!(serve.control("runtime.pty.mobileDrivers",json!({})),json!([tab]));
@@ -208,4 +247,21 @@ fn terminal_driver_lease_is_authoritative_at_owner_and_cannot_be_taken_by_a_view
     assert_eq!(serve.control("runtime.pty.mobileDrivers",json!({})),json!([]));
     serve.control("runtime.pty.write",native_input);
     serve.wait_events(tab,"native control after release",|events|count(events,"turn_completed")==3);
+}
+
+#[test]
+fn replacement_owner_rejects_previous_epoch_mobile_connections_and_registration() {
+    let world = AgentWorld::new();
+    devices(&world);
+    let mut first = Serve::start(world.command(), &world.data);
+    let old = actor(&first);
+    register(&first,&old,"old-driver","driver");
+    first.kill();
+    let replacement = Serve::start(world.command(), &world.data);
+    assert_eq!(replacement.try_control("runtime.mobile.check",json!({"actor":old,"connection":"old-driver"}))["ok"],false);
+    assert_eq!(replacement.try_control("runtime.mobile.register",json!({"actor":old,"connection":"old-driver","deviceId":"driver"}))["ok"],false);
+    let current = actor(&replacement);
+    assert_ne!(old["epoch"],current["epoch"]);
+    register(&replacement,&current,"new-driver","driver");
+    replacement.control("runtime.mobile.check",json!({"actor":current,"connection":"new-driver"}));
 }

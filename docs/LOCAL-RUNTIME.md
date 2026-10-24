@@ -144,13 +144,24 @@ and other sessions sharing the same checkout remain running.
 
 ## Window features, updates and macOS
 
-Proposed background duties: automations/scheduler, pipeline runtime observer,
-pairing endpoint, notification decisions and tray count/actions. Exactly one
-runtime owns each scheduler and notification delivery identity. `serve` now hosts local automations; desktop notification plumbing and pairing
-remain to be integrated before claiming parity. A native accessory helper can own the menu-bar
-item and notification delivery without a Dock icon; a headless Rust process
-alone cannot retain the desktop's existing tray. Tray actions: Open TerminalX,
-Stop all, Stop all and quit; counts come from runtime state.
+Background duties include the automation scheduler, pipeline runtime observer,
+paired-device admission and writes, notification decisions and tray count/actions.
+The paired-device network endpoint remains window-owned: phones cannot connect
+while the desktop is closed, but pending provider questions remain in the owner.
+Closing the window revokes its mobile attachment and undelivered mobile permits.
+
+The optional macOS `local-ui` feature hosts an AppKit accessory menu-bar item and
+notifications inside the owner. The packaged helper enables it; ordinary/cloud
+serve builds remain headless. Only the desktop launcher opts into AppKit, and
+hook, credential, help and self-test modes return without opening it. The desktop
+requires the helper's native-tray capability and creates no second tray. Tray
+actions include Quick Chat, Open TerminalX, normal Quit while a window is attached,
+and explicit Stop all (Stop all and quit while attached). Attached quit actions
+return through the window's existing quit guard; detached Stop all confirms owned
+process exit and retains a retryable failure. Provider-lock sampling stays off
+the AppKit thread; stale counts show unavailable. Native package behavior and
+notification authorization still require guest acceptance; compilation is not
+that evidence.
 
 Dictation, computer use, built-in browser and star-reminder presentation remain
 window-owned. While detached, browser/computer calls report unavailable rather
@@ -213,7 +224,7 @@ reset/races, singleton concurrent launch, SIGKILL/restart recovery, bounded spoo
 overflow and auth/version mismatch without touching real data.
 
 Native acceptance must use a disposable signed test bundle and private homes,
-with coordinator-operated UI: start work, truly exit the desktop process, verify
+inside the coordinator-assigned guest: start work, truly exit the desktop process, verify
 helper/tray/notifications and same child PIDs, reopen and answer prompts, then
 replace the test bundle while work continues and launch the new client. Record
 versions, runtime/child PIDs, before/after output cursors and visible results.
@@ -504,3 +515,20 @@ process regressions and 27 native mobile tests. Subsequent packet-size and
 post-response authorization hardening is being validated separately. Native
 tray/notifications, packaged lifecycle acceptance and current-head full suites
 remain outstanding; this is not issue completion.
+
+
+Native-tray source checkpoint: desktop, headless and `local-ui` all-target Clippy
+passed. TypeScript and all 288 Vitest files / 3,366 tests passed. The helper-feature
+process regressions passed (30 lifecycle, eight mobile, eight sharing, two startup
+isolation cases and one hook activation case). The full desktop suite passed
+2,261 unit tests, six CLI tests and two serde tests, with 14 existing ignores.
+The full headless suite passed 68 tests, with eight external relay tests ignored.
+A subsequent desktop startup-order fix installs window services before publishing
+the attachment; desktop all-target Clippy passed after that change. The full
+desktop suite has not yet been repeated for that final ordering change.
+The preceding committed mobile checkpoint `e058fa0e` passed seven process tests
+and two output-buffer tests after the packet and response-fencing hardening.
+Current edits additionally cover mode ABA, owner replacement, in-flight queue
+budgets and stale PTY process identities. Packaged guest checks are specified in
+[LOCAL-RUNTIME-ACCEPTANCE.md](LOCAL-RUNTIME-ACCEPTANCE.md); no installed application
+or host GUI has been exercised.

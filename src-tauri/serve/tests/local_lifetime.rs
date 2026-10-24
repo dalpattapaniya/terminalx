@@ -753,6 +753,10 @@ fn owner_hook_process_fails_closed_when_its_socket_disappears() {
             .env_clear().env("HOME",home.path()).env("TERMINALX_HOME",home.path())
             .env("CLAUDE_CONFIG_DIR",home.path()).env("RACCOON_HOOK_SOCKET",&socket)
             .env("RACCOON_TAB_ID","fixture").env("RACCOON_HOOK_TOKEN","fixture-only")
+            // The desktop activation flag is inherited by real hook children.
+            // An invalid application id makes any accidental AppKit path fail
+            // before touching the host GUI; hooks must still answer with deny.
+            .env("TERMINALX_LOCAL_DESKTOP","1").env("TERMINALX_LOCAL_APPLICATION",":invalid:")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = HookChild(command.spawn().unwrap());
         child.0.stdin.take().unwrap().write_all(b"{}\n").unwrap();

@@ -168,7 +168,14 @@ pub fn main() -> i32 {
         }
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    match run(options) {
+    #[cfg(all(target_os = "macos", feature = "local-ui"))]
+    let outcome = if options.runtime_kind == RuntimeKind::Local && !options.self_test
+        && std::env::var("TERMINALX_LOCAL_DESKTOP").as_deref() == Ok("1") {
+        crate::local_runtime::platform::run(move || run(options))
+    } else { run(options) };
+    #[cfg(not(all(target_os = "macos", feature = "local-ui")))]
+    let outcome = run(options);
+    match outcome {
         Ok(()) => 0,
         Err(error) => {
             log::error!("terminalx-serve: {error:#}");
@@ -307,6 +314,8 @@ fn run(options: Options) -> Result<()> {
                 tokio::select! {
                     _ = &mut signal => break,
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        #[cfg(all(target_os = "macos", feature = "local-ui"))]
+                        if crate::local_runtime::platform::shutdown_requested() { break; }
                         if runtime.lifetime.is_some() {
                             crate::local_sharing::owner::reap(&runtime.manager);
                             runtime.manager.mobile.drain(&runtime.manager);
@@ -532,6 +541,8 @@ fn start(options: &Options) -> Result<Runtime> {
 
     }
     if let Some(lifetime) = &lifetime {
+        #[cfg(all(target_os = "macos", feature = "local-ui"))]
+        crate::local_runtime::platform::install(&manager,lifetime,&(sink.clone() as Arc<dyn crate::sink::EventSink>));
         lifetime.ready();
         if options.relay_link.is_none() && !options.self_test {
             crate::local_runtime::workspaces::start_retention(manager.clone(), lifetime.clone());
