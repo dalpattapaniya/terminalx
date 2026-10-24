@@ -692,6 +692,7 @@ pub fn run() {
             commands::issue_pipelines_list,
             commands::issue_pipeline_start,
             commands::issue_pipeline_set_auto_merge,
+            commands::issue_pipeline_set_resolve_conflicts,
             commands::issue_pipeline_act,
             commands::issue_pipeline_merge_cloud,
             commands::issue_pipeline_linear_to_review,

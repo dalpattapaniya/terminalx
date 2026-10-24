@@ -258,7 +258,7 @@ describe("linking a chat to a project", () => {
     fireEvent.click(screen.getByRole("button", { name: "Link and Start" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/The chat has not been archived/);
     expect(screen.getByTitle("Agent").hasAttribute("disabled")).toBe(true);
-    expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("switch", { name: "Start on a new branch in a worktree" }).hasAttribute("disabled")).toBe(true);
     mocks.move.mockResolvedValueOnce({ stage: "delivered", launched });
     fireEvent.click(screen.getByRole("button", { name: "Retry Start" }));
     await waitFor(() => expect(view.onClose).toHaveBeenCalled());

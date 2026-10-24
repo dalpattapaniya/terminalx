@@ -3520,6 +3520,14 @@ pub async fn issue_pipeline_set_auto_merge(app: AppHandle, id: String, value: bo
 }
 
 #[tauri::command]
+pub async fn issue_pipeline_set_resolve_conflicts(app: AppHandle, id: String, value: bool) -> CmdResult<crate::issue_pipeline::Pipeline> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
+        crate::issue_pipeline::engine::set_resolve_conflicts(&host, &id, value).map_err(err)
+    }).await.map_err(err)?
+}
+
+#[tauri::command]
 pub async fn issue_pipeline_act(app: AppHandle, id: String, action: crate::issue_pipeline::engine::Action) -> CmdResult<crate::issue_pipeline::Pipeline> {
     tauri::async_runtime::spawn_blocking(move || {
         let host = crate::issue_pipeline::desktop::host(&app).map_err(err)?;
