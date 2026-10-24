@@ -522,6 +522,8 @@ pub struct TabRuntime {
     /// stored yet: whether the session is shared is asked under the sharing
     /// lock, which is taken before this tab's and so not from under it.
     reported_mode_to_judge: Option<String>,
+    /// The released launch whose settings restart still owns the empty slot.
+    restart_claim: Option<Arc<tui::Tail>>,
     pub stopping: bool,
     pub stop_in_flight: bool,
     pub stopping_pid: Option<u32>,
@@ -532,6 +534,12 @@ pub struct TabRuntime {
     pub log_path: std::path::PathBuf,
     /// Back-reference so work finished off-thread (an HTTP reply) can re-enter.
     pub me: std::sync::Weak<Mutex<TabRuntime>>,
+}
+
+struct CliRestart {
+    tail: Arc<tui::Tail>,
+    pane: String,
+    process: Option<pty::StoppingPane>,
 }
 
 impl TabRuntime {
@@ -1043,6 +1051,7 @@ impl SessionManager {
                 stalled_at: None,
                 last_settings_report: None,
                 reported_mode_to_judge: None,
+                restart_claim: None,
                 stopping: false,
                 stop_in_flight: false,
                 stopping_pid: None,
@@ -1363,7 +1372,7 @@ impl SessionManager {
         runtimes.into_iter().any(|runtime| {
             let runtime = runtime.lock().unwrap();
             runtime.turn_open || !runtime.pending.is_empty() || !runtime.queued.is_empty()
-                || runtime.stop_in_flight
+                || runtime.stop_in_flight || runtime.restart_claim.is_some()
         })
     }
 
@@ -1376,7 +1385,7 @@ impl SessionManager {
         let mut roots = Vec::new();
         for tab in tabs {
             let tab = tab.lock().unwrap();
-            if tab.turn_open || !tab.pending.is_empty() || !tab.queued.is_empty() || tab.stop_in_flight { return None; }
+            if tab.turn_open || !tab.pending.is_empty() || !tab.queued.is_empty() || tab.stop_in_flight || tab.restart_claim.is_some() { return None; }
             match &tab.engine {
                 Engine::Cli(cli) => {
                     if cli.by_hand.is_some() || !cli.ready.settled() || cli.awaiting_delivery.is_some() || cli.resend_after_abort.is_some() || !cli.held.is_empty() {
@@ -1653,6 +1662,7 @@ impl SessionManager {
         // was waiting for its lock. Do not refill a cleared follow-up queue.
         self.accepting_work()?;
         if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
+        if rt.restart_claim.is_some() { bail!("The agent is restarting to apply its settings. Try again shortly."); }
         // A CLI the reader started by hand is theirs to drive: it runs with
         // whatever permissions they gave it, which no share was checked
         // against. And a terminal is the host's to start an agent in.
@@ -2446,12 +2456,13 @@ impl SessionManager {
     /// started again in the mode the tab was in. Returns whether it was.
     ///
     /// Called with no lock held, after anything that may have heard a report.
-    fn judge_reported_mode(&self, rt_arc: &Arc<Mutex<TabRuntime>>) -> bool {
+    fn judge_reported_mode(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &tui::Tail) -> bool {
         if rt_arc.lock().unwrap().reported_mode_to_judge.is_none() {
             return false;
         }
         let sharing = self.sharing.lock().unwrap();
         let mut rt = rt_arc.lock().unwrap();
+        if !Self::has_tail(&rt, tail) { return false; }
         let Some(mode) = rt.reported_mode_to_judge.take() else { return false };
         // A CLI started by hand is not the app's to restart, and takes no
         // guest's prompt (`send_impl`): its mode is simply what it says.
@@ -2473,16 +2484,19 @@ impl SessionManager {
         );
         // Whatever it was doing, it was doing in a mode the share forbids.
         self.close_open_turn(&mut rt, TurnStatus::Aborted, None);
-        self.release_cli(&mut rt);
+        let current_tail = match &rt.engine { Engine::Cli(p) => p.tail.clone(), _ => return false };
+        let work = self.prepare_cli_restart(&mut rt, &current_tail);
         let (session, tab) = (rt.session_id.clone(), rt.tab_id.clone());
         drop(rt);
         drop(sharing);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = manager.restart_for_settings(&session, &tab) {
-                log::warn!("restart {session}/{tab}: {e:#}");
-            }
-        });
+        if let Some(work) = work {
+            let (manager, rt_arc) = (self.clone(), rt_arc.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = manager.complete_cli_restart(&rt_arc, work) {
+                    log::warn!("restart {session}/{tab}: {e:#}");
+                }
+            });
+        }
         true
     }
 
@@ -2665,6 +2679,7 @@ impl SessionManager {
         for runtime in runtimes {
             let mut runtime = runtime.lock().unwrap();
             runtime.stopping = true;
+            runtime.restart_claim = None;
             runtime.queued.clear();
             if let Engine::Cli(cli) = &mut runtime.engine {
                 for echo in &mut cli.echoed {
@@ -2769,6 +2784,7 @@ impl SessionManager {
     fn start_cli(&self, rt: &mut TabRuntime, rt_arc: &Arc<Mutex<TabRuntime>>, entry: &index::SessionEntry, tab: &TabEntry) -> Result<bool> {
         self.accepting_work()?;
         if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
+        if rt.restart_claim.is_some() { bail!("The agent is restarting to apply its settings. Try again shortly."); }
         let Some(kind) = pty_first(&tab.harness) else { return Ok(false) };
         let pane = tab.pane_id();
         if let Engine::Cli(p) = &rt.engine {
@@ -3079,33 +3095,67 @@ impl SessionManager {
     /// another process still has.
     fn restart_for_settings(&self, session_id: &str, tab_id: &str) -> Result<()> {
         let rt_arc = self.runtime(session_id, tab_id)?;
-        let entry = index::get(session_id)?;
-        let tab = entry.tab(tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
-        let pane = tab.pane_id();
-        {
-            let mut rt = rt_arc.lock().unwrap();
-            // Never a CLI the reader started by hand: its pane is their shell.
-            if let Some(refusal) = Self::by_hand_refusal(&rt, "its settings") {
-                bail!(refusal);
-            }
-            if let Engine::Cli(p) = &mut rt.engine {
-                p.restart_when_idle = false;
-            }
-            self.release_cli(&mut rt);
+        let tail = match &rt_arc.lock().unwrap().engine {
+            Engine::Cli(p) => p.tail.clone(),
+            _ => return Ok(()),
+        };
+        self.restart_launch(&rt_arc, &tail)
+    }
+
+    fn restart_launch(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &Arc<tui::Tail>) -> Result<()> {
+        if let Some(work) = self.begin_restart_launch(rt_arc, tail)? {
+            self.complete_cli_restart(rt_arc, work)?;
         }
-        // Outside the lock: this waits on another process.
-        self.terminals.kill_and_wait(&pane, RESTART_WAIT);
+        Ok(())
+    }
+
+    fn begin_restart_launch(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &Arc<tui::Tail>) -> Result<Option<CliRestart>> {
         let mut rt = rt_arc.lock().unwrap();
-        self.start_cli(&mut rt, &rt_arc, &entry, &tab)?;
-        // Codex was restarted to be on these settings, whether they waited
-        // for the turn or were applied at once: its first word is checked
-        // against them. (Its ids are exact; Claude's aliases are not, and
-        // Claude is only restarted for its permission mode.)
-        let now = index::get(session_id).ok().and_then(|entry| entry.tab(tab_id).map(Settings::of));
+        if !Self::has_tail(&rt, tail) { return Ok(None); }
+        if let Some(refusal) = Self::by_hand_refusal(&rt, "its settings") { bail!(refusal); }
+        Ok(self.prepare_cli_restart(&mut rt, tail))
+    }
+
+    fn prepare_cli_restart(&self, rt: &mut TabRuntime, tail: &Arc<tui::Tail>) -> Option<CliRestart> {
+        if !Self::has_tail(rt, tail) || rt.restart_claim.is_some() { return None; }
+        let pane = match &rt.engine { Engine::Cli(p) => p.pane_id.clone(), _ => return None };
+        self.release_cli(rt);
+        // Capture the actual group before dropping runtime. A later stop or
+        // replacement can reuse the pane name without becoming this work's target.
+        let process = self.terminals.begin_stop(&pane);
+        rt.stopping_pid = process.as_ref().and_then(pty::StoppingPane::pid);
+        rt.restart_claim = Some(tail.clone());
+        Some(CliRestart { tail: tail.clone(), pane, process })
+    }
+
+    fn claim_restart_completion<'a>(&self, rt_arc: &'a Arc<Mutex<TabRuntime>>, work: &CliRestart, exited: bool) -> Result<Option<MutexGuard<'a, TabRuntime>>> {
+        let mut rt = rt_arc.lock().unwrap();
+        if !rt.restart_claim.as_ref().is_some_and(|claim| Arc::ptr_eq(claim, &work.tail)) { return Ok(None); }
+        rt.restart_claim = None;
+        if exited { rt.stopping_pid = None; }
+        // A followed agent or a shell may have taken the slot during the wait.
+        if !matches!(rt.engine, Engine::None) || self.terminals.is_live(&work.pane) { return Ok(None); }
+        if !exited {
+            rt.stopping = true;
+            self.needs_recovery(&mut rt, RecoveryKind::Disconnected);
+            bail!("Local process exit could not be confirmed. Retry Stop before resuming.");
+        }
+        rt.stopping_pid = None;
+        if rt.stopping { bail!("Stop has not confirmed local process exit. Retry Stop before resuming."); }
+        self.accepting_work()?;
+        Ok(Some(rt))
+    }
+
+    fn complete_cli_restart(&self, rt_arc: &Arc<Mutex<TabRuntime>>, work: CliRestart) -> Result<()> {
+        // No runtime lock is held across the process wait.
+        let exited = work.process.as_ref().is_none_or(|process| process.wait(RESTART_WAIT));
+        let Some(mut rt) = self.claim_restart_completion(rt_arc, &work, exited)? else { return Ok(()) };
+        let entry = index::get(&rt.session_id)?;
+        let tab = entry.tab(&rt.tab_id).ok_or_else(|| anyhow!("tab not found"))?.clone();
+        self.start_cli(&mut rt, rt_arc, &entry, &tab)?;
+        let now = index::get(&rt.session_id).ok().and_then(|entry| entry.tab(&rt.tab_id).map(Settings::of));
         if let (Engine::Cli(p), Some(now)) = (&mut rt.engine, now) {
-            if p.harness == CliKind::Codex && p.launched_for.is_none() {
-                p.launched_for = Some(now);
-            }
+            if p.harness == CliKind::Codex && p.launched_for.is_none() { p.launched_for = Some(now); }
         }
         Ok(())
     }
@@ -3114,6 +3164,7 @@ impl SessionManager {
     /// resumes. Returns the pane the caller must kill — outside the tab lock,
     /// because waiting for the process to go is a wait on another process.
     fn release_cli(&self, rt: &mut TabRuntime) -> Option<String> {
+        rt.restart_claim = None;
         let Engine::Cli(p) = &rt.engine else { return None };
         let pane = p.pane_id.clone();
         rt.left_at = Some((p.tail.path(), p.tail.offset()));
@@ -3166,21 +3217,26 @@ impl SessionManager {
         self.pump_read_from(rt_arc, tail, || tail.drain_records());
     }
 
+    /// A tab slot survives stop/restart; a tail belongs to exactly one launch.
+    fn has_tail(rt: &TabRuntime, tail: &tui::Tail) -> bool {
+        matches!(&rt.engine, Engine::Cli(p) if std::ptr::eq(p.tail.as_ref(), tail))
+    }
+
     fn pump_read_from(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &tui::Tail, read: impl FnOnce() -> Vec<tui::Record>) {
         // Do not hold runtime while reading the file. This separate gate
         // orders readers through application, after the path/cursor locks
         // have been released. No caller may wait for it while holding runtime.
         let application = tail.application.lock().unwrap();
-        self.pump_read_guarded(rt_arc, read(), Some(application));
+        self.pump_read_guarded(rt_arc, tail, read(), Some(application));
     }
 
     /// One read of the transcript: its payloads, and what it last said about
     /// the turn.
-    fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, records: Vec<tui::Record>) {
-        self.pump_read_guarded(rt_arc, records, None);
+    fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &tui::Tail, records: Vec<tui::Record>) {
+        self.pump_read_guarded(rt_arc, tail, records, None);
     }
 
-    fn pump_read_guarded(&self, rt_arc: &Arc<Mutex<TabRuntime>>, records: Vec<tui::Record>, application: Option<MutexGuard<'_, ()>>) {
+    fn pump_read_guarded(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &tui::Tail, records: Vec<tui::Record>, application: Option<MutexGuard<'_, ()>>) {
         let mark = records.iter().rev().find_map(|(_, mark, _)| *mark);
         // Keep the preceding record's boundary for a command immediately after
         // a completed turn, even when both arrive in one tail read.
@@ -3197,6 +3253,9 @@ impl SessionManager {
             return;
         }
         let mut rt = rt_arc.lock().unwrap();
+        // Reading (and waiting for another reader) may span a replacement.
+        // Check before activity, receipt expiry, or any record is applied.
+        if !Self::has_tail(&rt, tail) { return; }
         rt.last_activity = Instant::now();
         if !payloads.is_empty() {
             self.stall_disproved(&mut rt);
@@ -3409,7 +3468,7 @@ impl SessionManager {
                 drop(application);
                 self.after_turn_completed(rt_arc, rt, said);
             }
-            self.judge_reported_mode(rt_arc);
+            self.judge_reported_mode(rt_arc, tail);
             return;
         }
         // Recorded after the payloads, so an end never gets ahead of the
@@ -3433,7 +3492,7 @@ impl SessionManager {
         // sharing and can restart a provider: release both guards first.
         drop(rt);
         drop(application);
-        self.judge_reported_mode(rt_arc);
+        self.judge_reported_mode(rt_arc, tail);
     }
 
     /// Wait, briefly, for the transcript to deliver the reply the `Stop` hook
@@ -3444,8 +3503,9 @@ impl SessionManager {
         let saw = |rt: &TabRuntime| matches!(&rt.engine, Engine::Cli(p) if p.turn_tail.saw(want));
         let deadline = Instant::now() + tui::STOP_SETTLE;
         loop {
-            if saw(&rt_arc.lock().unwrap()) {
-                return;
+            {
+                let rt = rt_arc.lock().unwrap();
+                if !Self::has_tail(&rt, tail) || saw(&rt) { return; }
             }
             if Instant::now() >= deadline {
                 break;
@@ -3454,8 +3514,8 @@ impl SessionManager {
             self.pump(rt_arc, tail);
         }
         let mut rt = rt_arc.lock().unwrap();
-        // The poll thread may have landed it in the moment since the last look.
-        if saw(&rt) {
+        // The poll thread may have landed it, or the launch may have changed.
+        if !Self::has_tail(&rt, tail) || saw(&rt) {
             return;
         }
         let Engine::Cli(p) = &mut rt.engine else { return };
@@ -3828,6 +3888,11 @@ impl SessionManager {
     /// asking (Codex has no such event), and a Codex `PreToolUse` is a gate
     /// rather than a report when the reader has asked to see every tool.
     pub fn on_hook(&self, frame: HookFrame) -> HookReply {
+        self.on_hook_pumping(frame, |rt, tail| self.pump(rt, tail))
+    }
+
+    // Keep the transcript wait outside runtime; every later mutation must revalidate.
+    fn on_hook_pumping(&self, frame: HookFrame, pump: impl FnOnce(&Arc<Mutex<TabRuntime>>, &Arc<tui::Tail>)) -> HookReply {
         // Every refusal says why, both here and back to the hook: a CLI whose
         // frames go unheard is a chat that never shows its reply (#202).
         let refuse = |reason: String| {
@@ -3854,6 +3919,8 @@ impl SessionManager {
         if !origin.accepts(&frame) {
             return refuse("the frame's token is not the one this tab's CLI launch was given".into());
         }
+        let mine = |rt: &TabRuntime| Self::has_tail(rt, &tail)
+            && matches!(&rt.engine, Engine::Cli(p) if p.origin.accepts(&frame));
         // Direct terminal prompts also reach tool hooks. A resolver's
         // reservation prevents another managed agent from editing even if
         // its prompt did not go through the app's composer.
@@ -3868,17 +3935,11 @@ impl SessionManager {
             // CLI sends it again whenever either changes, from either side.
             if let Some(signal) = (kind == CliKind::Claude).then(|| claude::transcript::status_settings(&frame.payload)).flatten() {
                 let mut rt = rt_arc.lock().unwrap();
-                // A restart may have replaced the launch this frame is from.
-                let mine = match &mut rt.engine {
-                    Engine::Cli(p) if p.origin.accepts(&frame) => {
-                        p.status_names_model |= matches!(&signal, Signal::Current { model: Some(_), .. });
-                        true
-                    }
-                    _ => false,
-                };
-                if mine {
-                    self.provider_settings(&mut rt, signal);
+                if !mine(&rt) { return HookReply::default(); }
+                if let Engine::Cli(p) = &mut rt.engine {
+                    p.status_names_model |= matches!(&signal, Signal::Current { model: Some(_), .. });
                 }
+                self.provider_settings(&mut rt, signal);
             }
             return HookReply::default();
         }
@@ -3888,18 +3949,19 @@ impl SessionManager {
         if let Some(signal) = (kind == CliKind::Claude).then(|| claude::transcript::hook_permissions(&frame.payload)).flatten() {
             {
                 let mut rt = rt_arc.lock().unwrap();
-                if matches!(&rt.engine, Engine::Cli(p) if p.origin.accepts(&frame)) {
-                    self.provider_settings(&mut rt, signal);
-                }
+                if !mine(&rt) { return HookReply::default(); }
+                self.provider_settings(&mut rt, signal);
             }
-            if self.judge_reported_mode(&rt_arc) {
+            if self.judge_reported_mode(&rt_arc, &tail) {
                 return HookReply::default();
             }
         }
         // Stop at hook receipt, before transcript settling/git snapshots, so
         // time spent waiting for display bookkeeping is not agent work.
         if matches!(frame.event.as_str(), "Stop" | "SessionEnd") {
-            self.record_activity(&rt_arc.lock().unwrap(), TabStatus::Completed, store::activity::Source::Live);
+            let rt = rt_arc.lock().unwrap();
+            if !mine(&rt) { return HookReply::default(); }
+            self.record_activity(&rt, TabStatus::Completed, store::activity::Source::Live);
         }
         // Claude's transcript path is a guess made before the CLI ran and
         // Codex's is not knowable at all until now; either way the hook
@@ -3910,9 +3972,13 @@ impl SessionManager {
         // Judged on the tab's own copy, under its lock: what a frame is
         // allowed to name can grow (a folder the conversation is found in, a
         // file the CLI announces), and has to still be so for the next one.
-        let named = match &mut rt_arc.lock().unwrap().engine {
-            Engine::Cli(p) if p.origin.accepts(&frame) => p.origin.transcript(&frame),
-            _ => None,
+        let named = {
+            let mut rt = rt_arc.lock().unwrap();
+            if !mine(&rt) { return HookReply::default(); }
+            match &mut rt.engine {
+                Engine::Cli(p) => p.origin.transcript(&frame),
+                _ => None,
+            }
         };
         match (frame.payload["transcript_path"].as_str(), named) {
             (_, Some(path)) => tail.retarget(path),
@@ -3925,7 +3991,7 @@ impl SessionManager {
             ),
             (None, None) => {}
         }
-        self.pump(&rt_arc, &tail);
+        pump(&rt_arc, &tail);
 
         // Claude Code fires `UserPromptSubmit` for the turns it starts itself
         // too (#540), and says so. Those carry nothing the reader sent.
@@ -3939,9 +4005,8 @@ impl SessionManager {
         if (matches!(frame.event.as_str(), "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PermissionRequest" | "Stop") && source == claude::transcript::PromptSource::Reader)
             || (kind == CliKind::Codex && frame.event == "SessionStart") {
             let mut rt = rt_arc.lock().unwrap();
-            if matches!(&rt.engine, Engine::Cli(p) if p.origin.accepts(&frame)) {
-                self.delivery_confirmed(&mut rt);
-            }
+            if !mine(&rt) { return HookReply::default(); }
+            self.delivery_confirmed(&mut rt);
         }
 
         // A chat links itself to the repo its agent just worked in. Off the
@@ -3960,12 +4025,14 @@ impl SessionManager {
             // also mints its own conversation id, so this is where the app
             // learns which one to resume next time.
             "SessionStart" => {
-                if let Engine::Cli(p) = &rt_arc.lock().unwrap().engine {
-                    p.ready.mark();
+                {
+                    let rt = rt_arc.lock().unwrap();
+                    if !mine(&rt) { return HookReply::default(); }
+                    if let Engine::Cli(p) = &rt.engine { p.ready.mark(); }
                 }
                 if kind == CliKind::Codex {
                     if let Some(id) = frame.payload["session_id"].as_str() {
-                        self.record_provider_session(&rt_arc, id);
+                        self.record_provider_session(&rt_arc, &tail, id);
                     }
                 }
             }
@@ -3980,9 +4047,7 @@ impl SessionManager {
                 let mut rt = rt_arc.lock().unwrap();
                 // A settings restart/teardown may have replaced this launch
                 // while its transcript was being drained above.
-                if !matches!(&rt.engine, Engine::Cli(p) if p.origin.accepts(&frame)) {
-                    return HookReply::default();
-                }
+                if !mine(&rt) { return HookReply::default(); }
                 if frame.event == "UserPromptSubmit" && source == claude::transcript::PromptSource::Reader {
                     if let Engine::Cli(p) = &mut rt.engine {
                         for echo in p.echoed.iter_mut().filter(|echo| echo.submitted && !echo.queued && !echo.command) {
@@ -4020,6 +4085,7 @@ impl SessionManager {
             // hook did not answer in time. The reader has to go and look.
             "Notification" if frame.payload["notification_type"] == "permission_prompt" => {
                 let mut rt = rt_arc.lock().unwrap();
+                if !mine(&rt) { return HookReply::default(); }
                 self.set_status(&mut rt, TabStatus::Waiting);
             }
             "Stop" => {
@@ -4030,6 +4096,7 @@ impl SessionManager {
                 // second time under the "Worked for Ns" line.
                 self.settle_reply(&rt_arc, &tail, final_text.as_deref());
                 let mut rt = rt_arc.lock().unwrap();
+                if !mine(&rt) { return HookReply::default(); }
                 rt.last_activity = Instant::now();
                 if rt.turn_open {
                     self.close_open_turn(&mut rt, TurnStatus::Ok, final_text.clone());
@@ -4040,6 +4107,7 @@ impl SessionManager {
             // Codex only: the reader pressed Escape in the TUI.
             "Interrupt" => {
                 let mut rt = rt_arc.lock().unwrap();
+                if !mine(&rt) { return HookReply::default(); }
                 if let Engine::Cli(p) = &mut rt.engine {
                     if p.codex_interrupt_hooks_owed > 0 {
                         p.codex_interrupt_hooks_owed -= 1;
@@ -4061,6 +4129,7 @@ impl SessionManager {
             }
             "SessionEnd" => {
                 let mut rt = rt_arc.lock().unwrap();
+                if !mine(&rt) { return HookReply::default(); }
                 let turn_was_open = rt.turn_open;
                 self.close_open_turn(&mut rt, TurnStatus::Aborted, None);
                 self.set_status(&mut rt, TabStatus::Idle);
@@ -4075,7 +4144,7 @@ impl SessionManager {
             }
             _ => {}
         }
-        self.restart_if_due(&rt_arc, &frame.session, &frame.tab);
+        self.restart_if_due(&rt_arc, &frame.session, &frame.tab, Some(&tail));
         HookReply::default()
     }
 
@@ -4085,44 +4154,50 @@ impl SessionManager {
     fn after_turn_completed(&self, rt_arc: &Arc<Mutex<TabRuntime>>, mut rt: MutexGuard<'_, TabRuntime>, final_message: Option<String>) {
         self.forget_tool_answers(&mut rt);
         let (session, tab) = (rt.session_id.clone(), rt.tab_id.clone());
+        let tail = match &rt.engine { Engine::Cli(p) => Some(p.tail.clone()), _ => None };
         drop(rt);
         self.observer.automation_completed(&session, &tab, final_message);
-        self.restart_if_due(rt_arc, &session, &tab);
+        self.restart_if_due(rt_arc, &session, &tab, tail.as_deref());
     }
 
     /// A setting the CLI only reads at startup changed mid-turn: the restart
     /// it needs waits here, until the turn it would have interrupted is over.
     /// Off this thread, so the hook's reply reaches the CLI before the CLI is
     /// replaced.
-    fn restart_if_due(&self, rt_arc: &Arc<Mutex<TabRuntime>>, session_id: &str, tab_id: &str) {
-        {
+    fn restart_if_due(&self, rt_arc: &Arc<Mutex<TabRuntime>>, session_id: &str, tab_id: &str, tail: Option<&tui::Tail>) {
+        let expected = {
             let rt = rt_arc.lock().unwrap();
-            let due = matches!(&rt.engine, Engine::Cli(p) if p.restart_when_idle) && !rt.turn_open;
-            if !due {
-                return;
+            if rt.stopping || tail.is_some_and(|tail| !Self::has_tail(&rt, tail)) { return; }
+            match &rt.engine {
+                Engine::Cli(p) if p.restart_when_idle && !rt.turn_open => p.tail.clone(),
+                _ => return,
             }
-        }
-        let (manager, session, tab) = (self.clone(), session_id.to_string(), tab_id.to_string());
+        };
+        let (manager, rt_arc, session, tab) = (self.clone(), rt_arc.clone(), session_id.to_string(), tab_id.to_string());
         std::thread::spawn(move || {
-            if let Err(e) = manager.restart_for_settings(&session, &tab) {
+            if let Err(e) = manager.restart_launch(&rt_arc, &expected) {
                 log::warn!("restart {session}/{tab}: {e:#}");
             }
         });
     }
 
-    fn record_provider_session(&self, rt_arc: &Arc<Mutex<TabRuntime>>, id: &str) {
-        let (session_id, tab_id) = {
-            let rt = rt_arc.lock().unwrap();
-            (rt.session_id.clone(), rt.tab_id.clone())
-        };
-        let id = id.to_string();
-        std::thread::spawn(move || {
-            let _ = index::update_tab(&session_id, &tab_id, |t| {
-                if t.provider_session_id.as_deref() != Some(&id) {
-                    t.provider_session_id = Some(id);
-                }
-                Ok(())
-            });
+    fn record_provider_session(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &Arc<tui::Tail>, id: &str) {
+        let (rt_arc, tail, id) = (rt_arc.clone(), tail.clone(), id.to_string());
+        std::thread::spawn(move || Self::persist_provider_session(&rt_arc, &tail, id));
+    }
+
+    fn persist_provider_session(rt_arc: &Arc<Mutex<TabRuntime>>, tail: &tui::Tail, id: String) {
+        // The worker can be scheduled after teardown. Keep validation and
+        // persistence together so it cannot overwrite a successor's id.
+        // This follows runtime -> index transaction order; the writer closure
+        // only edits the index value and never reacquires runtime.
+        let rt = rt_arc.lock().unwrap();
+        if !Self::has_tail(&rt, tail) { return; }
+        let _ = index::update_tab(&rt.session_id, &rt.tab_id, |t| {
+            if t.provider_session_id.as_deref() != Some(&id) {
+                t.provider_session_id = Some(id);
+            }
+            Ok(())
         });
     }
 
@@ -4158,7 +4233,7 @@ impl SessionManager {
             let already = {
                 let rt = rt_arc.lock().unwrap();
                 match &rt.engine {
-                    Engine::Cli(p) => p.answered.get(&key).copied(),
+                    Engine::Cli(p) if p.origin.accepts(frame) => p.answered.get(&key).copied(),
                     _ => None,
                 }
             };

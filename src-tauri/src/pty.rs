@@ -51,6 +51,33 @@ struct Pane {
 }
 
 
+/// A detached process group, never a pane name that may now identify a successor.
+pub(crate) struct StoppingPane {
+    id: String,
+    group: Arc<OwnedGroup>,
+}
+
+impl StoppingPane {
+    pub(crate) fn pid(&self) -> Option<u32> { self.group.pid() }
+
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        let mut forced = false;
+        while start.elapsed() < timeout {
+            if self.group.pid().is_none() { return true; }
+            if !forced && start.elapsed() >= TERM_GRACE {
+                self.group.signal(true);
+                forced = true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.group.pid().is_none() { return true; }
+        log::warn!("pane {} did not exit within {timeout:?}", self.id);
+        false
+    }
+}
+
+
 /// Keep group ownership separate from output EOF and leader exit. Once an
 /// empty group is observed, permanently retire its numeric identity.
 struct OwnedGroup(Mutex<Option<u32>>);
@@ -776,27 +803,20 @@ impl Terminals {
     /// the old one has let go dies on the spot. Claude Code's TUI also ignores
     /// SIGTERM outright, so asking politely and moving on is not enough.
     pub fn kill_and_wait(&self, id: &str, timeout: Duration) {
+        if let Some(pane) = self.begin_stop(id) { pane.wait(timeout); }
+    }
+
+    /// Detach and signal while the caller still owns its launch lock. Waiting
+    /// happens later, against this exact group rather than a reused pane id.
+    pub(crate) fn begin_stop(&self, id: &str) -> Option<StoppingPane> {
         self.retained.lock().unwrap().remove(id);
-        let Some(pane) = self.panes.lock().unwrap().remove(id) else { return };
+        let pane = self.panes.lock().unwrap().remove(id)?;
         let group = pane.group.clone();
         group.signal(false);
         drop(pane);
         self.drop_slot_if_unused(id);
         self.changed();
-        if group.pid().is_none() { return; }
-        let start = Instant::now();
-        let mut forced = false;
-        while start.elapsed() < timeout {
-            if group.pid().is_none() {
-                return;
-            }
-            if !forced && start.elapsed() >= TERM_GRACE {
-                group.signal(true);
-                forced = true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        log::warn!("pane {id} did not exit within {timeout:?}");
+        Some(StoppingPane { id: id.to_string(), group })
     }
 
     /// Kill the shells opened for a session, whose pane ids are

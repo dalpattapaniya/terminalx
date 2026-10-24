@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fence transcript reads, inbound hooks and delayed provider-session writes to
+  their original launch, preserving successor turns and permissions across restart. (#467)
+
 - Honor explicit Linux helper target ABIs and retain history preparation admission
   until loading finishes, even after snapshot expiry deadlines. (#467)
 

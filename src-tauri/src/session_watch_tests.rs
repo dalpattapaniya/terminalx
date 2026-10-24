@@ -225,6 +225,7 @@ impl Rig {
             stalled_at: None,
             last_settings_report: None,
             reported_mode_to_judge: None,
+            restart_claim: None,
             stopping: false,
             stop_in_flight: false,
             stopping_pid: None,
