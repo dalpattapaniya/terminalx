@@ -74,6 +74,8 @@ const SURFACES = {
   },
   "the composer that starts a session": async () => {
     const page = await app({ cloud: false, localProjects: 1 });
+    // The main window rests at welcome until creation is explicitly requested.
+    await page.locator("main").getByRole("button", { name: "New session", exact: true }).click();
     return { page, field: await composer(page, "textarea[data-new-session-prompt]") };
   },
   "a cloud tab's composer": async () => {

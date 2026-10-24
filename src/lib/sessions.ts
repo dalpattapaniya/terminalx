@@ -29,10 +29,12 @@ interface State {
   /** The folder New chat runs in; its sessions are chats, listed apart from projects. */
   chatsPath: string | null;
   selectedSessionId: string | null;
+  /** The workspace whose last tab closed, available to Reopen while at welcome. */
+  closedWorkspaceSessionId: string | null;
   /** Explicit navigation also reveals a destination that was collapsed. */
   navigationVersion: number;
   /** What the workspace shows when no session is selected. */
-  view: "new" | "issues" | "agents" | "automations" | "skills" | "stats" | "project";
+  view: "welcome" | "new" | "issues" | "agents" | "automations" | "skills" | "stats" | "project";
   /** The issues browser opens its new-issue form when it next shows; it sets this back. */
   newIssueRequested: boolean;
   /** A cross-workspace navigation request can open one automation directly. */
@@ -72,8 +74,9 @@ let state: State = {
   harnesses: [],
   chatsPath: null,
   selectedSessionId: null,
+  closedWorkspaceSessionId: null,
   navigationVersion: 0,
-  view: "new",
+  view: "welcome",
   newIssueRequested: false,
   selectedAutomationId: null,
   skillsFilter: null,
@@ -91,6 +94,17 @@ let state: State = {
 const listeners = new Set<() => void>();
 function set(patch: Partial<State>) {
   const next = { ...state, ...patch };
+  // Background deletion/archival must not replace another destination or an explicit draft.
+  const previous = state.sessions.find((session) => session.id === state.selectedSessionId);
+  if (patch.sessions && previous && !("selectedSessionId" in patch)) {
+    const selected = patch.sessions.find((session) => session.id === previous.id);
+    if (!selected || (!previous.archived && selected.archived)) {
+      next.selectedSessionId = null;
+      next.view = "welcome";
+    }
+  }
+  if ((patch.view && patch.view !== "welcome") || patch.selectedSessionId || patch.selectedCloudWorkspace) next.closedWorkspaceSessionId = null;
+  if (patch.sessions && next.closedWorkspaceSessionId && !patch.sessions.some((session) => session.id === next.closedWorkspaceSessionId && !session.archived && !session.worktreeRemoved)) next.closedWorkspaceSessionId = null;
   // Clear the draft destination when navigating away, not in React cleanup
   // (Strict Mode also runs cleanup when a workspace first mounts).
   if ((patch.view && patch.view !== "new") || patch.selectedSessionId) next.newSessionPreset = null;
@@ -231,7 +245,7 @@ export function removeSessions(ids: string[]) {
   if (!selectedGone && !state.sessions.some((s) => gone.has(s.id))) return;
   set({
     sessions: state.sessions.filter((s) => !gone.has(s.id)),
-    selectedSessionId: selectedGone ? null : state.selectedSessionId,
+    ...(selectedGone ? { selectedSessionId: null, view: "welcome" as const } : {}),
   });
 }
 
@@ -252,9 +266,14 @@ function focusProject(path: string | null, patch: Partial<State> = {}) {
   if (path) void refreshWorkspaces(path);
 }
 
+/** Return to the resting screen without requesting a new session. */
+export function openWelcome(closedWorkspaceSessionId: string | null = null) {
+  set({ selectedSessionId: null, view: "welcome", selectedAutomationId: null, closedWorkspaceSessionId });
+}
+
 export function selectSession(id: string | null) {
   const selected = id ? state.sessions.find((session) => session.id === id) : null;
-  const patch: Partial<State> = { selectedSessionId: id, view: "new", newSessionPreset: null, navigationVersion: state.navigationVersion + 1, selectedAutomationId: null };
+  const patch: Partial<State> = { selectedSessionId: id, view: id ? "welcome" : "new", newSessionPreset: null, navigationVersion: state.navigationVersion + 1, selectedAutomationId: null };
   // A quick chat has no project to focus: the one in focus stays as it is.
   if (selected && selected.kind !== "quick") focusProject(selected.projectPath, patch);
   else set(patch);
@@ -282,7 +301,7 @@ async function refreshProjects() {
  * wakes the workspace. Local project focus is left as it is.
  */
 export function selectCloudSession(key: string) {
-  set({ selectedSessionId: key, view: "new", newSessionPreset: null, navigationVersion: state.navigationVersion + 1, selectedAutomationId: null });
+  set({ selectedSessionId: key, view: "welcome", newSessionPreset: null, navigationVersion: state.navigationVersion + 1, selectedAutomationId: null });
 }
 
 /** The issues browser takes the workspace; no session stays selected. */
@@ -335,7 +354,7 @@ export function openSkills(filter: State["skillsFilter"] = null) {
  * resumes the workspace (the view connects with `connect`, never `wake`).
  */
 export function selectCloudWorkspace(key: string | null) {
-  set({ selectedCloudWorkspace: key, selectedSessionId: null, view: "new", newSessionPreset: null, selectedAutomationId: null });
+  set({ selectedCloudWorkspace: key, selectedSessionId: null, view: "welcome", newSessionPreset: null, selectedAutomationId: null });
 }
 
 /** Open the new-session form for a cloud project, as the project row's `+` does. */

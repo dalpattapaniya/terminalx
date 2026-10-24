@@ -457,18 +457,18 @@ export function SessionView({
   // A local session with no agent opens a shell. A cloud one never opens
   // anything by itself: that could wake a stopped workspace.
   //
-  // That is for a session opened with no agent, and for one whose last tab
-  // of any kind just closed. When its last agent tab closes while a shell or
-  // a page is on screen, the reader is somewhere: the view is not taken from
-  // them, and no shell they did not ask for is opened behind it.
+  // Opening an empty checkout still opens its shell. Closing the main
+  // window's last tab returns to welcome instead; do not start a shell while
+  // that navigation settles. The compact floating window keeps its fallback.
+  // An existing shell or page is never replaced when an agent tab closes.
   const shownKind = useRef(selectedKind);
   shownKind.current = selectedKind;
   const openedOn = useRef<string | null>(null);
   useEffect(() => {
     const opening = openedOn.current !== session.id;
     openedOn.current = session.id;
-    if (!local || session.tabs.length) return;
-    if (!opening && shownKind.current) return;
+    if (!local || session.tabs.length || shownKind.current === "browser" || shownKind.current === "terminal") return;
+    if (!opening && (!compact || shownKind.current)) return;
     // A compact window has no panel to open.
     if (!compact && !getPrefs().panelOpen) setPrefs({ panelOpen: true });
     void activateLatestTerminal(session.id, session.cwd).catch((e) => console.error("terminal open failed", e));

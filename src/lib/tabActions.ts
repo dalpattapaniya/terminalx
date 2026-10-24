@@ -4,7 +4,7 @@ import { getBrowserState, navigateBrowserPage, openBrowserTab, refreshBrowserPag
 import { getDraft } from "@/lib/drafts";
 import { MODE_SET_IN_TERMINAL } from "@/lib/models";
 import { getPrefs } from "@/lib/prefs";
-import { addTab, getSessionStore, reopenTab, selectSession } from "@/lib/sessions";
+import { addTab, getSessionStore, openWelcome, reopenTab, selectSession } from "@/lib/sessions";
 import { activatePeer, endPeer, isShellPeer, noteClosed, openPeer, peerIsLive, peerPaneId, peerShell, peerStatus, sessionOfPeer, workspaceRow, type PeerTab, type TabRow } from "@/lib/sessionTabs";
 import { isByHand } from "@/lib/tabFront";
 import { closedTabsOf, dropClosedTab, forgetClosed, getTabState, moveKey, saveTabLayout, settleLayout, tabKey, type ClosedHere, type TabStore } from "@/lib/tabLayouts";
@@ -267,6 +267,7 @@ export async function closeTabs(row: TabRow, closing: readonly PeerTab[], select
   for (const tab of ordered) {
     await endPeer(row.session.id, tab).catch((error) => console.error("closing a tab failed", error));
   }
+  if (getSessionStore().selectedSessionId === row.session.id && !fresh(row).tabs.length) openWelcome(row.session.id);
 }
 
 // ---------------------------------------------------------------- reopening
@@ -328,6 +329,7 @@ export async function reopenClosedTab(row: TabRow): Promise<boolean> {
   const was = last.page;
   forgetClosed(was.key);
   const key = tabKey("browser", await openPage(row.session, was.page!.url));
+  if (getSessionStore().selectedSessionId !== row.session.id) selectSession(row.session.id);
   restorePlace(row, key, { ...was, key });
   return true;
 }

@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PeerTab } from "./sessionTabs";
 
 vi.mock("@tauri-apps/api/core", async () => {
@@ -22,6 +24,10 @@ const { closePeer, hasOwnTitle, peerAgent, peerKind, peerLabel, peerOrder, peerS
 const actions = await import("./tabActions");
 const { setDraft } = await import("./drafts");
 const { noteStatusChange } = await import("./notify");
+const { WelcomeTabActions } = await import("@/components/start/WelcomeTabActions");
+const { setPrefs } = await import("./prefs");
+const { isMac } = await import("./shortcuts");
+afterEach(() => { cleanup(); setPrefs({ shortcuts: {} }); });
 
 const store = () => getSessionStore();
 const sessionOf = (id: string) => store().sessions.find((session) => session.id === id)!;
@@ -251,6 +257,7 @@ describe("closing several tabs", () => {
   it("closes every tab of the row for 'close all', and only those", async () => {
     await actions.closeTabs(row(), actions.planBulkClose("all", row().tabs, null).targets, { kind: "agent", id: "a1" });
     expect(keys()).toEqual([]);
+    expect(store()).toMatchObject({ selectedSessionId: null, view: "welcome" });
     expect(closedKeys()).not.toContain("agent:o1");
     expect(closedKeys()).not.toContain(`terminal:${otherShell}`);
     expect(closedKeys()).not.toContain("browser:page-main");
@@ -259,6 +266,13 @@ describe("closing several tabs", () => {
 });
 
 describe("closing one tab", () => {
+  it("returns to welcome after closing the last tab of the selected workspace", async () => {
+    for (const tab of [...row().tabs]) {
+      await closePeer("a", tab, row().tabs, null);
+    }
+    expect(store()).toMatchObject({ selectedSessionId: null, view: "welcome" });
+  });
+
   it("hands the view to its neighbour, in another session if that is where the neighbour is", async () => {
     selectSession("b");
     setSelectedAgent("b", "b1");
@@ -424,5 +438,51 @@ describe("a tab that follows what runs in its terminal (#437)", () => {
     expect(entry("a2").titlePinned).toBe(false);
     expect(hasOwnTitle(pick("agent:a2"), row().layout)).toBe(false);
     expect(peerLabel(pick("agent:a2"), row().layout, harnessName)).toBe("Terminal 4");
+  });
+});
+
+
+describe("reopening from welcome", () => {
+  const press = () => fireEvent.keyDown(document.body, { key: "y", code: "KeyY", shiftKey: true, metaKey: isMac, ctrlKey: !isMac });
+
+  it.each(["single", "bulk", "browser"])("reopens after %s close using remapped keys without opening a shell", async (mode) => {
+    if (mode !== "browser") {
+      // Agent-only checkout: backend agent timestamps and page timestamps use separate fixture clocks.
+      backend.pages = backend.pages.filter((page) => page.workspacePath !== FEATURE);
+      await refreshBrowserPages();
+    }
+    if (mode === "bulk") {
+      await actions.closeTabs(row(), actions.planBulkClose("all", row().tabs, null).targets, { kind: "agent", id: "a1" });
+    } else {
+      const last = mode === "browser" ? "browser:page-feature" : "agent:a1";
+      for (const tab of [...row().tabs].filter((tab) => tab.key !== last)) await closePeer("a", tab, row().tabs, null);
+      await closePeer("a", pick(last), row().tabs, null);
+    }
+    await flush();
+    expect(store()).toMatchObject({ view: "welcome", selectedSessionId: null, closedWorkspaceSessionId: "a" });
+    const shells = backend.callsOf("pty_spawn").length;
+    render(createElement(WelcomeTabActions));
+    setPrefs({ shortcuts: { "session.reopenTab": [] } });
+    act(press);
+    await flush();
+    expect(store().selectedSessionId).toBeNull();
+    setPrefs({ shortcuts: { "session.reopenTab": ["mod+shift+y"] } });
+    act(press);
+    await waitFor(() => expect(store().selectedSessionId).not.toBeNull());
+    expect(row().tabs).toHaveLength(1);
+    expect(row().tabs[0].kind).toBe(mode === "browser" ? "browser" : "agent");
+    expect(backend.callsOf("pty_spawn")).toHaveLength(shells);
+    expect(store().closedWorkspaceSessionId).toBeNull();
+  });
+
+  it("forgets the closed workspace after explicit creation navigation", async () => {
+    await actions.closeTabs(row(), row().tabs, { kind: "agent", id: "a1" });
+    selectSession(null);
+    render(createElement(WelcomeTabActions));
+    setPrefs({ shortcuts: { "session.reopenTab": ["mod+shift+y"] } });
+    act(press);
+    await flush();
+    expect(store()).toMatchObject({ view: "new", selectedSessionId: null, closedWorkspaceSessionId: null });
+    expect(backend.callsOf("reopen_tab")).toHaveLength(0);
   });
 });

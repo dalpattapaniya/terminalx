@@ -8,6 +8,7 @@ import { onWorkspaceAccess } from "@/lib/cloudCollab";
 import { cloudTabTitle } from "@/lib/cloudRowState";
 import { onCloudConnected, retainCloudConnection, waitCloudConnected, type CloudTarget } from "@/lib/cloudConnections";
 import { dropCloudTerminals } from "@/lib/cloudTerminals";
+import { getSessionStore, openWelcome } from "@/lib/sessions";
 import { clearSessionTabsUnder } from "@/lib/terminal";
 import { cloudSessionKey, cloudWorkspaceKey, parseCloudWorkspaceKey, type CloudKey, type CloudWorkspaceNode } from "@/types/target";
 import type { TabStatus } from "@/types/session";
@@ -474,9 +475,12 @@ export function forgetCloudSessions(target: CloudTarget, removed: readonly strin
 }
 
 export function updateCloudSession(row: CloudSessionRow, patch: RuntimeSessionPatch): Promise<void> {
+  const before = getSessionStore();
   return onRuntime(row, async (client) => {
     const session = await client.updateSession(row.sessionId, patch);
     applySession(row, session ?? null);
+    const now = getSessionStore();
+    if (patch.archived === true && (session?.archived ?? true) && before.selectedSessionId === row.key && now.selectedSessionId === row.key && now.navigationVersion === before.navigationVersion) openWelcome();
   });
 }
 

@@ -4,11 +4,11 @@ import type { WorkspaceRpcClient } from "@terminalx/portable/workspace";
 const mocks = vi.hoisted(() => ({
   forgetCloudSessions: vi.fn(),
   liveCloudSessionList: vi.fn(),
-  selectSession: vi.fn(),
+  openWelcome: vi.fn(),
   selected: null as string | null,
 }));
 vi.mock("@/lib/cloudSessions", () => ({ forgetCloudSessions: mocks.forgetCloudSessions, liveCloudSessionList: mocks.liveCloudSessionList }));
-vi.mock("@/lib/sessions", () => ({ getSessionStore: () => ({ selectedSessionId: mocks.selected, sessions: [] }), selectSession: mocks.selectSession, removeWorkspace: vi.fn() }));
+vi.mock("@/lib/sessions", () => ({ getSessionStore: () => ({ selectedSessionId: mocks.selected, sessions: [] }), openWelcome: mocks.openWelcome, removeWorkspace: vi.fn() }));
 vi.mock("@/lib/api", () => ({ api: {} }));
 
 import { cloudWorkspaceHost } from "./cloudWorkspaceHost";
@@ -39,21 +39,21 @@ describe("cloudWorkspaceHost", () => {
     // A cloud worktree is deleted, never settled: `keepSessions` is not the runtime's to read.
     expect(client.removeSessionWorkspace).toHaveBeenCalledWith("s1", { deleteBranch: true, confirmedDigest: "digest", expectedSessions: ["s1", "s9"] });
     expect(mocks.forgetCloudSessions).toHaveBeenCalledWith({ orgId: "org-1", workspaceId: "ws-1" }, ["s1", "s9"]);
-    expect(mocks.selectSession).toHaveBeenCalledWith(null);
+    expect(mocks.openWelcome).toHaveBeenCalledWith();
     expect(outcome.keptBranch).toBe("raccoon/kept");
   });
 
   it("keeps the selection when another session is in front by the time the runtime answers", async () => {
     mocks.selected = "cloud:org-1:ws-1:other";
     await host().remove({ keepSessions: false, deleteBranch: false, confirmedDigest: null, expectedSessions: ["s1"] });
-    expect(mocks.selectSession).not.toHaveBeenCalled();
+    expect(mocks.openWelcome).not.toHaveBeenCalled();
   });
 
   it("removes nothing here when the runtime refuses", async () => {
     client.removeSessionWorkspace.mockRejectedValueOnce(new Error("This workspace needs a second confirmation before it is removed"));
     await expect(host().remove({ keepSessions: false, deleteBranch: false, confirmedDigest: null, expectedSessions: ["s1"] })).rejects.toThrow("second confirmation");
     expect(mocks.forgetCloudSessions).not.toHaveBeenCalled();
-    expect(mocks.selectSession).not.toHaveBeenCalled();
+    expect(mocks.openWelcome).not.toHaveBeenCalled();
   });
 
   it("takes a lost answer for a removal when the runtime no longer lists the session", async () => {
@@ -61,7 +61,7 @@ describe("cloudWorkspaceHost", () => {
     client.listSessions.mockResolvedValueOnce([{ id: "s9" }]);
     await host().remove({ keepSessions: false, deleteBranch: true, confirmedDigest: null, expectedSessions: ["s1", "s9"] });
     expect(mocks.forgetCloudSessions).toHaveBeenCalledWith({ orgId: "org-1", workspaceId: "ws-1" }, ["s1"]);
-    expect(mocks.selectSession).toHaveBeenCalledWith(null);
+    expect(mocks.openWelcome).toHaveBeenCalledWith();
 
     // The list could not be read either: nothing is assumed.
     client.removeSessionWorkspace.mockRejectedValueOnce(new Error("timed out"));

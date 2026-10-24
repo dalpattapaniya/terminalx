@@ -1,3 +1,4 @@
+import { EmptyView } from "@/components/start/EmptyView";
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, FileCode2, FolderOpen, Loader2, RefreshCw, Search } from "@/icons";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -180,13 +181,13 @@ export function SkillsView({ projectPath, initialAgent }: { projectPath: string 
           </div>
         </section>
 
-        <SkillReader skill={selected} />
+        <SkillReader skill={selected} onRefresh={() => setRefresh((value) => value + 1)} />
       </div>
     </div>
   );
 }
 
-function SkillReader({ skill }: { skill: DiscoveredSkill | null }) {
+function SkillReader({ skill, onRefresh }: { skill: DiscoveredSkill | null; onRefresh: () => void }) {
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -206,7 +207,7 @@ function SkillReader({ skill }: { skill: DiscoveredSkill | null }) {
   }, [skill]);
 
   if (!skill) {
-    return <div className="flex min-w-0 flex-1 items-center justify-center text-xs text-faint">Select a skill to read it.</div>;
+    return <EmptyView title="Skills" guidance="Select a skill to read it."><div className="mt-5 flex justify-center"><Button variant="secondary" onClick={onRefresh}><RefreshCw aria-hidden /> Refresh skills</Button></div></EmptyView>;
   }
 
   return (

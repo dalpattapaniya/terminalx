@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Welcome
+
+- Show a resting welcome screen when nothing is selected, with the app mark,
+  build name, project/session actions and the current keyboard shortcuts.
+  Share its layout with first-run open/clone/quick-start options and compact
+  Issues and Skills empty detail panes. Explicit New session still opens the
+  form; closing, archiving or deleting the selection returns to welcome.
+  Cloud archival respects later navigation, and Reopen closed tab still works
+  from welcome after closing the last tab, including Close all. Browser
+  dictation checks explicitly enter New session from welcome. Narrow editor
+  toolbar checks click clear of WebKit’s overlay scrollbar while retaining
+  selection, keyboard and layout assertions. (#445)
+
 ### Issue pipelines
 
 - Keep independent reviews in a named Reviewer tab in the issue session, reuse

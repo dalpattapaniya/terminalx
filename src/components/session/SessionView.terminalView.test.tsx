@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CloudWorkspaceListItem } from "@/lib/api";
 import type { AgentEvent, Payload } from "@/types/events";
 import type { SessionEntry } from "@/types/session";
+import { page as browserPage } from "@/test/tabsBackend";
+import { refreshBrowserPages } from "@/lib/browser";
 import { guardedApi } from "@/test/guardedApi";
 
 // PRO-86: the chat / terminal switch on local and cloud agent tabs. The cloud
@@ -50,6 +52,7 @@ vi.mock("@/components/terminal/TerminalView", () => ({
   ),
   createTerminal: () => mocks.createTerminal(),
 }));
+vi.mock("@/components/browser/BrowserView", () => ({ BrowserView: () => <div data-testid="browser-view" /> }));
 vi.mock("@/components/raccoon/Raccoon", () => ({ RaccoonRunner: () => null, RaccoonScene: () => null }));
 vi.mock("@/components/chat/Composer", async () => {
   const { useEffect } = await import("react");
@@ -80,7 +83,7 @@ import { TERMINAL_APPROVAL_REASON, VIEWER_REASON, resetCollab } from "@/lib/clou
 import { dropSessionTerminals, selectSessionTab } from "@/lib/terminal";
 import { TERMINAL_VIEW_OLD_RUNTIME, resetCloudWakes } from "@/lib/sessionBackend";
 import { resetTabViews } from "@/lib/tabViews";
-import { addProject, upsertSession, useSessionStore } from "@/lib/sessions";
+import { addProject, getSessionStore, selectSession, upsertSession, useSessionStore } from "@/lib/sessions";
 import { cloudSessionKey } from "@/types/target";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FakeAgentRuntime, agentTab, fakeXterm, type FakeXterm } from "@/test/fakeAgentRuntime";
@@ -421,12 +424,31 @@ describe("a local session's row of tabs under the title bar", () => {
     expect(spawned()).toHaveLength(1);
   });
 
-  it("opens a shell, as before, when the last tab of any kind closes", async () => {
+  it("does not open a shell when returning to a reopened browser-only workspace", async () => {
+    const session = local({ tabs: [], activeTab: null });
+    guard.handlers.browser_pages = () => [browserPage("reopened-page", session.cwd, 1)];
+    await refreshBrowserPages();
+    upsertSession(session);
+    selectSessionTab(session.id, { kind: "browser", id: "reopened-page" });
+    const view = render(wrap(<Local />));
+    try {
+      await settle();
+      expect(screen.getByTestId("browser-view")).toBeTruthy();
+      expect(spawned()).toHaveLength(0);
+    } finally {
+      view.unmount();
+      guard.handlers.browser_pages = () => [];
+      await refreshBrowserPages();
+    }
+  });
+
+  it("returns to welcome without spawning a shell when the last tab closes", async () => {
     const header = show({ tabs: [tab("st-1", "claude", "Investigate")] }).parentElement!;
-    expect(spawned()).toHaveLength(0);
+    act(() => selectSession("strip-1"));
     fireEvent.click(header.querySelector('[aria-label="Close Investigate"]') as HTMLElement);
-    await waitFor(() => expect(spawned()).toHaveLength(1));
-    await waitFor(() => expect(within(header).getAllByRole("tab").map((item) => item.getAttribute("aria-label"))).toEqual(["Terminal 1"]));
+    await waitFor(() => expect(getSessionStore()).toMatchObject({ selectedSessionId: null, view: "welcome" }));
+    await settle();
+    expect(spawned()).toHaveLength(0);
   });
 });
 
