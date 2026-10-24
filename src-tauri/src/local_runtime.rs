@@ -85,11 +85,37 @@ impl Owner {
 
 struct State {
     starting: bool,
-    leases: HashMap<String, Instant>,
+    leases: HashMap<String, Arc<Attachment>>,
     requests: usize,
     idle_since: Option<Instant>,
     stop_requested: bool,
     exiting: bool,
+}
+
+/// A live UI attachment can delegate scoped sharing operations. Its grant
+/// is checked again at the writer without acquiring the lifetime mutex.
+/// Disconnect revokes this same object; renewal cannot resurrect a removed
+/// attachment or a permit from another owner generation.
+pub(crate) struct Attachment(Mutex<Option<Instant>>);
+
+impl Attachment {
+    pub(crate) fn valid(&self) -> bool { self.valid_at(Instant::now()) }
+
+    fn valid_at(&self, now: Instant) -> bool {
+        self.0.lock().unwrap().is_some_and(|deadline| deadline > now)
+    }
+
+    /// Linearize a write against detach/stop. The writer acquires this only
+    /// after its sharing checks, and retains it through the actual write.
+    pub(crate) fn enter(&self) -> Result<std::sync::MutexGuard<'_, Option<Instant>>> {
+        let deadline = self.0.lock().unwrap();
+        if deadline.is_none_or(|deadline| deadline <= Instant::now()) {
+            bail!("The sharing attachment expired or disconnected before delivery.");
+        }
+        Ok(deadline)
+    }
+
+    fn revoke(&self) { *self.0.lock().unwrap() = None; }
 }
 
 pub struct Lifetime {
@@ -152,10 +178,19 @@ impl Lifetime {
     pub fn status(&self) -> Value {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        state.leases.retain(|_, expires| *expires > now);
+        state.leases.retain(|_, attachment| attachment.valid_at(now));
         json!({ "protocol": PROTOCOL, "epoch": self.epoch, "attachedClients": state.leases.len(),
             "stopping": state.stop_requested || state.exiting, "idleGraceSeconds": self.grace.as_secs(),
             "eventSocket": self.stream_socket.get() })
+    }
+
+    pub(crate) fn attachment(&self, epoch: &str, lease: &str) -> anyhow::Result<Arc<Attachment>> {
+        let state = self.state.lock().unwrap();
+        if epoch != self.epoch || state.starting || state.exiting || state.stop_requested {
+            bail!("The runtime attachment is no longer current.");
+        }
+        state.leases.get(lease).filter(|attachment| attachment.valid()).cloned()
+            .ok_or_else(|| anyhow::anyhow!("The runtime attachment expired or disconnected."))
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -171,7 +206,7 @@ impl Lifetime {
     pub fn command(&self, command: &str, params: Value) -> Result<Value, ControlError> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
-        state.leases.retain(|_, expires| *expires > now);
+        state.leases.retain(|_, attachment| attachment.valid_at(now));
         if state.starting {
             return Err(ControlError::new("runtime_starting", "The local runtime is restoring its stores.", None::<String>));
         }
@@ -187,7 +222,7 @@ impl Lifetime {
                     return Err(ControlError::new("busy", "Too many attached local clients.", None::<String>));
                 }
                 let lease = uuid::Uuid::new_v4().to_string();
-                state.leases.insert(lease.clone(), now + LEASE_TIME);
+                state.leases.insert(lease.clone(), Arc::new(Attachment(Mutex::new(Some(now + LEASE_TIME)))));
                 state.idle_since = None;
                 Ok(json!({ "protocol": PROTOCOL, "epoch": self.epoch, "lease": lease,
                     "leaseSeconds": LEASE_TIME.as_secs(), "heartbeatSeconds": 5 }))
@@ -197,10 +232,11 @@ impl Lifetime {
                     return Err(ControlError::new("runtime_restarted", "This attachment belongs to another runtime.", None::<String>));
                 }
                 let lease = params["lease"].as_str().ok_or_else(|| ControlError::invalid("lease is required"))?;
-                let expiry = state.leases.get_mut(lease).ok_or_else(|| ControlError::new("attachment_expired", "Attach again before using this lease.", None::<String>))?;
+                let attachment = state.leases.get(lease).ok_or_else(|| ControlError::new("attachment_expired", "Attach again before using this lease.", None::<String>))?;
                 if command == "runtime.heartbeat" {
-                    *expiry = now + LEASE_TIME;
+                    *attachment.0.lock().unwrap() = Some(now + LEASE_TIME);
                 } else {
+                    attachment.revoke();
                     state.leases.remove(lease);
                     if state.leases.is_empty() {
                         state.idle_since = Some(now);
@@ -215,6 +251,7 @@ impl Lifetime {
                     return Err(ControlError::new("runtime_restarted", "Refresh runtime status before stopping all work.", None::<String>));
                 }
                 state.stop_requested = true;
+                for attachment in state.leases.values() { attachment.revoke(); }
                 Ok(json!({ "stopping": true }))
             }
             _ => Err(ControlError::new("unsupported", "Unknown local runtime lifecycle command.", None::<String>)),
@@ -233,7 +270,7 @@ impl Lifetime {
         if state.requests != 0 { return false; }
         if state.stop_requested { state.exiting = true; return true; }
         let had_clients = !state.leases.is_empty();
-        state.leases.retain(|_, expires| *expires > now);
+        state.leases.retain(|_, attachment| attachment.valid_at(now));
         if !state.leases.is_empty() || busy() {
             state.idle_since = None;
             return false;
@@ -250,6 +287,47 @@ impl Lifetime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detach_serializes_with_an_admitted_write_and_refuses_the_next_one() {
+        let life = Lifetime::new(IDLE_GRACE);
+        let attached = life.command("runtime.attach", json!({"protocol": PROTOCOL})).unwrap();
+        let grant = life.attachment(&life.epoch, attached["lease"].as_str().unwrap()).unwrap();
+        let write = grant.enter().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let detached = life.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            detached.command("runtime.detach", attached).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(write);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(grant.enter().is_err());
+    }
+
+    #[test]
+    fn scoped_attachment_is_revoked_on_disconnect_and_cannot_follow_a_new_lease() {
+        let life = Lifetime::new(IDLE_GRACE);
+        let attached = life.command("runtime.attach", json!({"protocol": PROTOCOL})).unwrap();
+        let grant = life.attachment(&life.epoch, attached["lease"].as_str().unwrap()).unwrap();
+        assert!(grant.valid());
+        assert!(!grant.valid_at(Instant::now() + LEASE_TIME));
+        assert!(life.attachment("wrong-owner", attached["lease"].as_str().unwrap()).is_err());
+        life.command("runtime.detach", attached.clone()).unwrap();
+        assert!(!grant.valid());
+        assert!(life.command("runtime.heartbeat", attached).is_err());
+        let next = life.command("runtime.attach", json!({"protocol": PROTOCOL})).unwrap();
+        let next_grant = life.attachment(&life.epoch, next["lease"].as_str().unwrap()).unwrap();
+        assert!(next_grant.valid());
+        assert!(!grant.valid());
+        life.command("runtime.stopAll", json!({"epoch":life.epoch})).unwrap();
+        assert!(!next_grant.valid());
+    }
 
     #[test]
     fn startup_recovery_precedes_admission_and_idle_exit() {

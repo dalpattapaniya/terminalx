@@ -3259,15 +3259,18 @@ impl SessionManager {
             let mut admitted_to_writer = false;
             let result = (|| -> Result<()> {
                 let mut sharing = shared.as_ref().map(|_| manager.sharing.lock().unwrap());
+                let mut owner_attachment = None;
                 if let (Some((connection, session_id, tab_id, _)), Some(sharing)) = (&shared, &mut sharing) {
                     let share = sharing.sessions.get_mut(session_id).ok_or_else(|| anyhow!("Sharing ended before prompt delivery."))?;
                     share.admit_at_writer(connection, tab_id, chrono::Utc::now().timestamp_millis())?;
+                    owner_attachment = share.owner.as_ref().map(|owner| owner.attachment.clone());
                     let current = index::get(session_id)?;
                     let tab = current.tab(tab_id).ok_or_else(|| anyhow!("Tab closed before prompt delivery."))?;
                     if !settings::allowed_while_shared(&tab.permission_mode) || manager.pane_of(session_id, tab_id).is_none_or(|current| current.pane_id != pane) {
                         bail!("The shared tab changed before prompt delivery.");
                     }
                 }
+                let _owner_attachment = owner_attachment.as_ref().map(|attachment| attachment.enter()).transpose()?;
                 admitted_to_writer = true;
                 still_there()?;
                 terminals.write(&pane, tui::CLEAR_LINE)?;

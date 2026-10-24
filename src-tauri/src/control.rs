@@ -333,6 +333,9 @@ impl ControlService {
     fn execute(&self, command: &str, params: Value, request_id: &str) -> Result<Value, ControlError> {
         if command.starts_with("runtime.") {
             if let Some(lifetime) = &self.local_lifetime {
+                if let Some(method) = command.strip_prefix("runtime.sharing.") {
+                    return crate::local_sharing::owner::execute(&self.manager, lifetime, method, params).map_err(ControlError::internal);
+                }
                 if command.starts_with("runtime.session.") || command.starts_with("runtime.pty.") {
                     return crate::local_runtime::calls::execute(&self.manager, &self.sink, command, params).map_err(ControlError::internal);
                 }

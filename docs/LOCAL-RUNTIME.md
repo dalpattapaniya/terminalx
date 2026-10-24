@@ -235,7 +235,10 @@ automation unit tests (15) and lifetime unit tests (six) also passed after the
 scheduler changes. The full headless package suite passed 36 tests; eight
 existing relay tests remain ignored because they require the separate SaaS/Redis
 harness. TypeScript and all 3,352 frontend tests passed again after these changes.
-The current full desktop native suite is still being run.
+Checkpoint `462c7502` then passed the full desktop suite (2,231 unit tests,
+six CLI tests and two serialization checks; 14 existing tests ignored). All four
+CONTRIBUTING checks passed for that checkpoint. Subsequent sharing-owner edits
+need their own validation and do not inherit this result.
 No actual desktop quit, signed app replacement, tray, notification, keychain,
 ACP, or OpenCode acceptance is established by these checks.
 
@@ -259,3 +262,36 @@ callbacks fail immediately instead of deadlocking. Acquisition times out after
 so callback errors, panics and process death release it; its sidecar path is
 never unlinked. Older builds that do not use this lock must not concurrently
 write the home: owner compatibility checks are still necessary.
+
+## Sharing-owner integration in progress
+
+The coordinator released `pairing/{mod,sharing,mobile}.rs` and `local_sharing.rs`
+for narrow owner/admission integration. The session-scoped router now lives in
+`local_sharing/runtime.rs`; the desktop adapter calls that same implementation.
+The new internal `runtime.sharing.*` namespace binds registration to an owner
+epoch, attachment lease, account generation and account/profile/organization
+scope. It is not a guest or mobile RPC namespace. Guest roles and approval rights
+are derived from the owner's link settings, never a forwarded admission boolean.
+Account clear retains a revoked generation until the attachment ends, so a late
+register cannot restore its grants. Attachment expiry/disconnect invalidates the
+same grant checked at delivery. A write guard serializes actual input with detach
+and stop-all; share recreation also changes the delivery-permit generation.
+
+This is still backend integration, not complete desktop pairing migration.
+The desktop pairing adapter must register/revoke its context on the live owner,
+route link authentication and identity refresh there, and preserve cancellation
+of subscriptions. Mobile device/account scope and observation-only subscriptions
+still require their own owner-side integration. Do not route mobile requests
+through the internal owner namespace or cache an authorization boolean in the
+window. Real desktop attachment and final independent security review remain
+required before shipping.
+
+Sharing checkpoint validation: desktop and headless all-target Clippy passed;
+14 local lifetime process tests and five owner-sharing process tests passed.
+The latter use actual event-socket disconnects, private homes and a fake provider
+whose readiness is gated, proving revoked input never reaches the PTY before a
+subsequent host turn succeeds. Desktop filters passed 12 sharing tests, three
+sharing-router tests, eight lifetime tests, 24 terminal-follow tests and 54
+prompt/interrupt tests (two existing ignored). These are focused checkpoint
+results; full issue validation, mobile observation and actual desktop acceptance
+remain outstanding.

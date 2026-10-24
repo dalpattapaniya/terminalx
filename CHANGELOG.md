@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Move shared-session admission and dispatch into a portable owner-side router.
+  Bind internal sharing grants to an attachment and account generation, revoke
+  them on disconnect, and reject delivery permits from recreated shares. Desktop
+  attachment and paired-device integration remain in progress. (#467)
+
 - Run local scheduled automations through the existing scheduler and consent
   engine in the headless owner, with startup recovery before client admission.
   Keep cloud scheduling separate and test detached completion and idle exit for

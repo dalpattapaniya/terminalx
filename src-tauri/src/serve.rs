@@ -307,6 +307,7 @@ fn run(options: Options) -> Result<()> {
                 tokio::select! {
                     _ = &mut signal => break,
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        if runtime.lifetime.is_some() { crate::local_sharing::owner::reap(&runtime.manager); }
                         if runtime.lifetime.as_ref().is_some_and(|lifetime| lifetime.should_exit(|| {
                             // An explicitly configured relay server is a
                             // standing service, not a detached desktop owner.
