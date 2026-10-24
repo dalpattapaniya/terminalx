@@ -90,6 +90,7 @@ pub trait Host: Send + Sync {
     fn open_pull_request(&self, cwd: &Path, branch: &str) -> Result<Option<PrSnapshot>>;
     /// Open a pull request for the current branch; its number.
     fn create_pull_request(&self, cwd: &Path, title: &str, body: &str) -> Result<u64>;
+    fn associate_pull_request(&self, session_id: &str, cwd: &Path, pr: &PrSnapshot) -> Result<()>;
     fn pull_request(&self, cwd: &Path, number: u64) -> Result<PrSnapshot>;
     fn edit_pull_request_body(&self, cwd: &Path, number: u64, body: &str) -> Result<()>;
     /// Comment on the pull request; the comment's URL.
@@ -528,6 +529,7 @@ impl Step<'_> {
                 pr
             }
         };
+        self.host.associate_pull_request(&self.p.author.session_id, &self.cwd, &pr)?;
         self.p.pr = Some(PrLink { number: pr.number, url: pr.url.clone(), base: pr.base.clone() });
         // The pull request exists whatever happens to the rest of this step.
         self.save()?;

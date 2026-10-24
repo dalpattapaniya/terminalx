@@ -1874,14 +1874,24 @@ export const git = {
   workingChanges: (cwd: string) => invoke<[string, ChangedFile[]]>("working_changes", { cwd }),
 };
 
+export type PrScope = { kind: "local"; cwd: string } | { kind: "cloud"; workspace: string; repo: string };
+export interface PrAssociation {
+  url: string;
+  number: number;
+  head: string;
+  scope: PrScope;
+}
+
 export const gh = {
+  landed: (cwd: string) => invoke<import("@/types/session").Landed>("pr_landed", { cwd }),
   available: () => invoke<boolean>("gh_available"),
+  associations: (sessionId: string, additions: PrAssociation[] = []) => invoke<PrAssociation[]>("pr_associations", { sessionKey: sessionId, additions }),
   list: (cwd: string, branch: string) => invoke<PullRequest[]>("pr_list", { cwd, branch }),
-  details: (cwd: string, number: number) => invoke<PullRequest>("pr_details", { cwd, number }),
-  create: (cwd: string, title: string, body: string, base: string | null, draft: boolean) =>
-    invoke<string>("pr_create", { cwd, title, body, base, draft }),
-  merge: (cwd: string, number: number, method: "merge" | "squash" | "rebase") => invoke<void>("pr_merge", { cwd, number, method }),
-  ready: (cwd: string, number: number) => invoke<void>("pr_ready", { cwd, number }),
+  details: (cwd: string, number: number, url?: string) => invoke<PullRequest>("pr_details", { cwd, number, ...(url ? { url } : {}) }),
+  create: (cwd: string, title: string, body: string, base: string | null, draft: boolean, sessionId?: string) =>
+    invoke<string>("pr_create", { cwd, title, body, base, draft, ...(sessionId ? { sessionId } : {}) }),
+  merge: (cwd: string, number: number, method: "merge" | "squash" | "rebase", url?: string) => invoke<void>("pr_merge", { cwd, number, method, ...(url ? { url } : {}) }),
+  ready: (cwd: string, number: number, url?: string) => invoke<void>("pr_ready", { cwd, number, ...(url ? { url } : {}) }),
 };
 
 // ---- built-in browser pages

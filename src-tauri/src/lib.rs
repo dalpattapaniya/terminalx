@@ -83,6 +83,7 @@ mod media;
 mod media_types;
 mod git;
 mod github;
+mod pr_associations;
 mod github_identity;
 mod harness;
 pub mod hooks;
@@ -609,7 +610,9 @@ pub fn run() {
             commands::git_checkout,
             commands::working_changes,
             commands::pr_list,
+            commands::pr_associations,
             commands::pr_details,
+            commands::pr_landed,
             commands::pr_create,
             commands::pr_merge,
             commands::pr_ready,

@@ -1,6 +1,7 @@
+import { cloudWorkspaceKey, parseCloudWorkspaceKey } from "@/types/target";
 import { WorkspaceRpcError } from "@terminalx/portable/workspace";
 import { RemoteGit, gitErrorMessage, type GitAuthor } from "@terminalx/portable/workspaceGit";
-import { api, errorMessage, gh, git, type PullRequest } from "@/lib/api";
+import { api, errorMessage, gh, git, type PullRequest, type PrAssociation, type PrScope } from "@/lib/api";
 import type { BranchInfo, ChangedFile, CommitInfo, WorkStatus } from "@/types/session";
 
 /** A workspace's Git status, plus what only a cloud repository reports so far. */
@@ -29,6 +30,8 @@ export interface GitSource {
   changesBetween(base: string, head: string | null): Promise<ChangedFile[]>;
   fileContentsAt(path: string, base: string, head: string | null): Promise<{ before: string | null; after: string | null }>;
   workStatus(): Promise<SourceStatus>;
+  landed?(): Promise<Pick<import("@/types/session").Landed, "safe" | "head" | "branch"> | null>;
+  prAssociations?(sessionId: string): Promise<{ associations: PrAssociation[]; discoveryOnly?: boolean }>;
   logCommits(from: string | null, limit: number): Promise<CommitInfo[]>;
   branches(): Promise<BranchInfo[]>;
   /** Resolves to a notice worth showing (e.g. what a reconciled push found), or null. */
@@ -40,7 +43,14 @@ export interface GitSource {
   discard?(path: string): Promise<void>;
   ghAvailable(): Promise<boolean>;
   prs(branch: string): Promise<PullRequest[]>;
-  createPr(input: { title: string; body: string; base: string | null; draft: boolean }): Promise<string | null>;
+  /** Durable transport locator, separate from the repository/PR URL identity. */
+  prScope?: PrScope;
+  prAccess?(association: PrAssociation): {
+    read(): Promise<PullRequest>;
+    ready(): Promise<void>;
+    merge(method: "merge" | "squash" | "rebase"): Promise<void>;
+  };
+  createPr(input: { title: string; body: string; base: string | null; draft: boolean; sessionId?: string }): Promise<string | null>;
   readyPr(number: number): Promise<void>;
   mergePr(number: number, method: "merge" | "squash" | "rebase"): Promise<void>;
   errorMessage(error: unknown): string;
@@ -61,6 +71,7 @@ export function localGitSource(cwd: string): GitSource {
     changesBetween: (base, head) => api.changesBetween(cwd, base, head),
     fileContentsAt: (path, base, head) => api.fileContentsAt(cwd, path, base, head),
     workStatus: () => api.workStatus(cwd),
+    landed: () => gh.landed(cwd),
     logCommits: (from, limit) => api.logCommits(cwd, from, limit),
     branches: () => api.listBranches(cwd),
     commit: (message) => git.commit(cwd, message).then(() => null),
@@ -69,7 +80,16 @@ export function localGitSource(cwd: string): GitSource {
     discard: (path) => git.discard(cwd, path),
     ghAvailable: () => gh.available(),
     prs: (branch) => gh.list(cwd, branch),
-    createPr: ({ title, body, base, draft }) => gh.create(cwd, title, body, base, draft).then(() => null),
+    prScope: { kind: "local", cwd },
+    prAccess: (association) => {
+      if (association.scope.kind !== "local") throw new Error("Reconnect this PR's cloud workspace to refresh it.");
+      return {
+        read: () => gh.details(cwd, association.number, association.url),
+        ready: () => gh.ready(cwd, association.number, association.url),
+        merge: (method) => gh.merge(cwd, association.number, method, association.url),
+      };
+    },
+    createPr: ({ title, body, base, draft, sessionId }) => gh.create(cwd, title, body, base, draft, sessionId).then(() => null),
     readyPr: (number) => gh.ready(cwd, number),
     mergePr: (number, method) => gh.merge(cwd, number, method),
     errorMessage,
@@ -120,6 +140,13 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     }),
     fileContentsAt: (path, base, head) => remote.fileContents(path, base, head),
     workStatus: statusOf,
+    landed: input.canWrite ? async () => {
+      try { return await remote.prLanded(); }
+      catch (error) {
+        if (error instanceof WorkspaceRpcError && error.code === "method_not_found") return null;
+        throw error;
+      }
+    } : undefined,
     logCommits: (from, limit) => remote.log(limit, from),
     branches: () => remote.branches().then((answer) => answer.branches),
     commit: async (message) => {
@@ -137,8 +164,41 @@ export function cloudGitSource(input: { workspaceKey: string; remote: RemoteGit;
     fetch: () => remote.fetch().then(() => null),
     ghAvailable: () => Promise.resolve(true),
     prs: (branch) => remote.prs(branch).then((answer) => answer.prs),
-    createPr: async ({ title, body, base, draft }) => {
+    prAssociations: async (sessionId) => {
+      const parsed = parseCloudWorkspaceKey(sessionId);
+      if (!parsed?.sessionId || cloudWorkspaceKey(parsed.orgId, parsed.workspaceId) !== input.workspaceKey) throw new Error("This session belongs to a different cloud workspace.");
+      let response;
+      try { response = await remote.prAssociations(parsed.sessionId); }
+      catch (error) {
+        if (!(error instanceof WorkspaceRpcError) || error.code !== "method_not_found") throw error;
+        // Older git/1 runtimes can list branch PRs but cannot prove session
+        // ownership. Show those transiently, never persist them as associations.
+        return { associations: await gh.associations(sessionId), discoveryOnly: true };
+      }
+      return { associations: await gh.associations(sessionId, response.associations.map((entry) => ({
+        url: entry.url, number: entry.number, head: entry.head,
+        scope: { kind: "cloud", workspace: input.workspaceKey, repo: entry.repo ?? "" },
+      }))) };
+    },
+    prScope: { kind: "cloud", workspace: input.workspaceKey, repo: remote.repo },
+    prAccess: (association) => {
+      if (association.scope.kind !== "cloud" || association.scope.workspace !== input.workspaceKey) throw new Error("Reconnect this PR's workspace to refresh it.");
+      if (!association.scope.repo) throw new Error("This PR’s repository is unavailable in the workspace.");
+      const repository = new RemoteGit(remote.client, association.scope.repo);
+      return {
+        read: async () => {
+          const { prs } = await repository.prs(association.head, association.number);
+          const pr = prs.find((pr) => pr.url.toLowerCase().replace(/\/$/, "") === association.url.toLowerCase().replace(/\/$/, ""));
+          if (!pr) throw new Error(`GitHub did not return associated PR #${association.number}.`);
+          return pr;
+        },
+        ready: () => repository.readyPr(association.number).then(() => undefined),
+        merge: (method) => repository.mergePr(association.number, method).then(() => undefined),
+      };
+    },
+    createPr: async ({ title, body, base, draft, sessionId }) => {
       const result = await remote.createPr({ title, body, base, draft });
+      if (sessionId) await gh.associations(sessionId, [{ url: result.pr.url, number: result.pr.number, head: result.pr.head, scope: { kind: "cloud", workspace: input.workspaceKey, repo: remote.repo } }]);
       if (result.existing) return `Pull request #${result.pr.number} for this branch already exists; it is linked below, not duplicated.`;
       return result.reconciled ? `Created #${result.pr.number} (found on GitHub after the answer was lost).` : null;
     },

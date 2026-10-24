@@ -26,6 +26,16 @@
 
 ### Changes
 
+- Retain session pull requests across follow-up branches and restarts, including
+  PRs created or adopted by the issue pipeline and successful CLI creation
+  recorded in session tool journals, including heredoc and Markdown PR bodies.
+  Read cloud agent/pipeline associations and landed-work verification from the
+  runtime, retaining each repository locator. Enforce workspace session visibility
+  and retain cached history and transient branch results on older runtimes. Avoid importing another session’s checkout
+  PRs and recognize squash/rebase-landed work. Refresh each saved PR by its
+  repository identity, keep open PRs above history, and prevent older merged
+  work from offering cleanup while follow-ups or unmerged work remain. (#463)
+
 - Default workspace review to All changes against a displayed merge-base target,
   including committed, uncommitted and untracked files. Remember repository-specific
   scope and target choices, with Uncommitted and turn review available in the same

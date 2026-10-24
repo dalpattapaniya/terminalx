@@ -183,6 +183,8 @@ pub const METHODS: &[Method] = &[
     method("git.log", "git/1", Participate, false),
     method("git.branches", "git/1", Participate, false),
     method("git.prs", "git/1", Participate, false),
+    method("git.prAssociations", "git/1", Participate, false),
+    method("git.prLanded", "git/1", Manage, false),
     method("git.checkout", "git/1", Manage, true),
     // The author comes from the client; credentials never do.
     method("git.commit", "git/1", Manage, true),
@@ -500,6 +502,8 @@ mod tests {
         for name in ["pty.create", "fs.write", "git.commit", "session.send", "session.create", "notes.post"] {
             assert!(find_method(name).unwrap().idempotent, "{name}");
         }
+        assert_eq!(find_method("git.prAssociations").unwrap().authority, Participate);
+        assert_eq!(find_method("git.prLanded").unwrap().authority, Manage);
         // A pipeline is read by whoever sees the sessions and steered by the manager.
         assert_eq!(find_method("pipeline.list").map(|method| (method.capability, method.authority, method.idempotent)), Some(("pipeline/1", Participate, false)));
         for name in ["pipeline.act", "pipeline.noteMerge", "pipeline.noteTracker"] {

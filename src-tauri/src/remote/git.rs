@@ -345,6 +345,8 @@ impl WorkspaceGit {
             "git.push" => self.push(params),
             "git.pull" => self.pull(params),
             "git.prs" => self.prs(params),
+            "git.prAssociations" => self.pr_associations(params),
+            "git.prLanded" => self.pr_landed(params),
             "git.prCreate" => self.pr_create(params),
             "git.prReady" => self.pr_ready(params),
             "git.prMerge" => self.pr_merge(params),
@@ -889,8 +891,50 @@ impl WorkspaceGit {
         }
     }
 
+    fn pr_associations(&self, params: &Value) -> Result<Value, RpcError> {
+        let session = required_str(params, "sessionId")?;
+        let entry = crate::store::index::get(session).map_err(|_| RpcError::not_found("session not found"))?;
+        // The runtime may host more than one workspace. Never expose another
+        // workspace's journal or pipeline evidence through this connection.
+        // Match WorkspaceRpc::workspace_sessions exactly: a checkout location
+        // does not grant visibility into its owning project.
+        if entry.project_path != self.root.to_string_lossy() {
+            return Err(RpcError::not_found("session is not in this workspace"));
+        }
+        let associations = crate::pr_associations::for_session(session, vec![])
+            .map_err(|error| RpcError::new("internal_error", error.to_string()))?;
+        Ok(self.locate_pr_associations(associations))
+    }
+
+    fn locate_pr_associations(&self, associations: Vec<crate::pr_associations::Association>) -> Value {
+        let repositories: Vec<_> = self.repositories().0.into_iter().filter_map(|name| {
+            let origin = crate::git::remote_url(&self.dir(&name))?;
+            let identity = crate::issues::github_repo_from_url(&origin)?;
+            Some((name, format!("https://github.com/{}/pull/", identity.to_ascii_lowercase())))
+        }).collect();
+        json!({ "associations": associations.into_iter().map(|association| {
+            // Match repository identity, never whichever checkout is live.
+            // Keep unavailable identities too, so missing repositories cannot
+            // turn an incomplete history into permission to clean up.
+            let repo = repositories.iter().find(|(_, prefix)| association.url.starts_with(prefix)).map(|(name, _)| name);
+            json!({ "url": association.url, "number": association.number, "head": association.head, "repo": repo })
+        }).collect::<Vec<_>>() })
+    }
+
+    fn pr_landed(&self, params: &Value) -> Result<Value, RpcError> {
+        let repo = self.repo(params)?;
+        // Use the runtime's bounded, authenticated Git transport, then the
+        // same squash/rebase-aware verifier as local workspace cleanup.
+        self.git_timed(&repo, &["fetch", "--prune", "origin"], NETWORK_TIMEOUT, &[])?;
+        Ok(json!(crate::landed::check(&repo.dir, &repo.dir, crate::landed::Fetch::JustFetched)))
+    }
+
     fn prs(&self, params: &Value) -> Result<Value, RpcError> {
         let repo = self.repo(params)?;
+        if params.get("number").is_some() {
+            let pr = self.pr_view(&repo, &Self::pr_number(params)?)?;
+            return Ok(json!({ "repo": repo.name, "branch": pr.head, "prs": [pr] }));
+        }
         let branch = self.branch_param(&repo, params)?;
         let prs = self.list_prs(&repo, &branch, "all", NETWORK_TIMEOUT)?;
         Ok(json!({ "repo": repo.name, "branch": branch, "prs": prs }))

@@ -214,8 +214,18 @@ export class RemoteGit {
     return this.read("git.branches");
   }
 
-  prs(branch?: string): Promise<{ branch: string; prs: RemotePullRequest[] }> {
-    return this.read("git.prs", branch ? { branch } : {});
+  /** With `number`, refresh one retained PR independently of its old branch.
+   * Older runtimes use `branch`; callers still verify the returned identity. */
+  prs(branch?: string, number?: number): Promise<{ branch: string; prs: RemotePullRequest[] }> {
+    return this.read("git.prs", { ...(branch ? { branch } : {}), ...(number ? { number } : {}) });
+  }
+
+  prAssociations(sessionId: string): Promise<{ associations: { url: string; number: number; head: string; repo: string | null }[] }> {
+    return this.read("git.prAssociations", { sessionId });
+  }
+
+  prLanded(): Promise<{ safe: boolean; head: string | null; branch: string | null }> {
+    return this.read("git.prLanded");
   }
 
   stage(paths: string[]): Promise<unknown> {

@@ -38,6 +38,7 @@ struct World {
     sent: Vec<(String, String)>,
     pushes: Vec<String>,
     created: Vec<(String, String)>,
+    associations: Vec<(String, String)>,
     edited: Vec<String>,
     comments: Vec<String>,
     merges: Vec<(String, String)>,
@@ -102,6 +103,7 @@ impl FakeHost {
             sent: Vec::new(),
             pushes: Vec::new(),
             created: Vec::new(),
+            associations: Vec::new(),
             edited: Vec::new(),
             comments: Vec::new(),
             merges: Vec::new(),
@@ -258,6 +260,11 @@ impl Host for FakeHost {
             validation: Some(vec![check("CI", "success")]),
         });
         Ok(7)
+    }
+
+    fn associate_pull_request(&self, session_id: &str, _cwd: &Path, pr: &PrSnapshot) -> Result<()> {
+        self.world().associations.push((session_id.into(), pr.url.clone()));
+        Ok(())
     }
 
     fn pull_request(&self, _cwd: &Path, _number: u64) -> Result<PrSnapshot> {
@@ -431,6 +438,8 @@ fn with_the_switch_off_an_issue_session_ends_reviewed_and_ready_and_nothing_merg
     let reviewing = run.to_review();
     assert_eq!(run.host.world().pushes, [C1]);
     assert_eq!(run.host.world().created, [("Open a pull request".to_string(), "Pads the minutes.\n\nCloses #433".to_string())]);
+    let expected_url = run.host.world().pr.as_ref().unwrap().url.clone();
+    assert_eq!(run.host.world().associations, [("author".into(), expected_url)]);
     let link = reviewing.pr.clone().unwrap();
     assert_eq!((link.number, link.base.as_str()), (7, "main"));
 
@@ -951,6 +960,8 @@ fn a_pull_request_the_session_opened_itself_is_used_and_linked_to_the_issue() {
     let reviewing = run.to_review();
     assert_eq!(reviewing.pr.unwrap().number, 12);
     assert!(run.host.world().created.is_empty(), "no second pull request");
+    let expected_url = run.host.world().pr.as_ref().unwrap().url.clone();
+    assert_eq!(run.host.world().associations, [("author".into(), expected_url)]);
     assert_eq!(run.host.world().edited, ["Pads minutes.\n\nCloses #433"]);
     // Already linked: left alone.
     let linked = FakeHost::new(&github_issue());
@@ -1811,6 +1822,29 @@ fn a_cloud_workspace_that_wakes_picks_its_pipelines_up_where_they_were() {
     run.to_gate();
     resume(&run.host, &[("author".into(), "t1".into())]);
     assert_eq!(run.pipeline().state, State::ReadyToMerge);
+}
+
+#[test]
+fn pr_associations_migrate_only_author_evidence_and_outlive_pipeline_history() {
+    let run = Run::start(&github_issue(), false);
+    let first = run.to_review();
+    let reviewer = first.reviewer.as_ref().unwrap();
+    assert!(crate::pr_associations::for_session(&reviewer.session_id, vec![]).unwrap().is_empty());
+    let saved = crate::pr_associations::for_session("author", vec![]).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].url, first.pr.as_ref().unwrap().url);
+
+    let mut followup = first.clone();
+    followup.id = "followup".into();
+    followup.branch = "followup-branch".into();
+    followup.pr.as_mut().unwrap().number = 8;
+    followup.pr.as_mut().unwrap().url = "https://github.com/acme/widgets/pull/8".into();
+    store::insert(&followup).unwrap();
+    assert_eq!(crate::pr_associations::for_session("author", vec![]).unwrap().len(), 2);
+    // A restart reads the separate file, including after pipeline retention.
+    crate::store::write_json(&crate::store::root().unwrap().join("issue-pipelines.json"), &serde_json::json!({"pipelines":[]})).unwrap();
+    assert_eq!(crate::pr_associations::for_session("author", vec![]).unwrap().len(), 2);
+    assert!(crate::pr_associations::for_session("unrelated", vec![]).unwrap().is_empty());
 }
 
 #[test]

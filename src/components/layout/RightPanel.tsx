@@ -238,7 +238,8 @@ export function RightPanel({
             </div>
             <div className={cn("h-full", tab !== "pr" && "hidden")}>
               <PrPanel
-                key={refreshTick}
+                sessionId={sessionId}
+                key={`${sessionId ?? ""}:${refreshTick}`}
                 cwd={cwd}
                 source={gitSource}
                 branch={resolvedBranch}

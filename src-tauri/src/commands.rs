@@ -2855,30 +2855,47 @@ pub async fn working_changes(cwd: String) -> CmdResult<(String, Vec<git::Changed
 }
 
 #[tauri::command]
+pub async fn pr_associations(session_key: String, additions: Vec<crate::pr_associations::Association>) -> CmdResult<Vec<crate::pr_associations::Association>> {
+    tauri::async_runtime::spawn_blocking(move || crate::pr_associations::for_session(&session_key, additions).map_err(err)).await.map_err(err)?
+}
+
+#[tauri::command]
 pub async fn pr_list(cwd: String, branch: String) -> CmdResult<Vec<crate::github::PullRequest>> {
     tauri::async_runtime::spawn_blocking(move || crate::github::prs_for_branch(Path::new(&cwd), &branch).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
-pub async fn pr_details(cwd: String, number: u64) -> CmdResult<crate::github::PullRequest> {
-    tauri::async_runtime::spawn_blocking(move || crate::github::pr_details(Path::new(&cwd), number).map_err(err)).await.map_err(err)?
+pub async fn pr_landed(cwd: String) -> CmdResult<crate::landed::Landed> {
+    tauri::async_runtime::spawn_blocking(move || crate::landed::check(Path::new(&cwd), Path::new(&cwd), crate::landed::Fetch::Fresh)).await.map_err(err)
 }
 
 #[tauri::command]
-pub async fn pr_create(cwd: String, title: String, body: String, base: Option<String>, draft: bool) -> CmdResult<String> {
-    tauri::async_runtime::spawn_blocking(move || crate::github::create_pr(Path::new(&cwd), &title, &body, base.as_deref(), draft).map_err(err))
+pub async fn pr_details(cwd: String, number: u64, url: Option<String>) -> CmdResult<crate::github::PullRequest> {
+    tauri::async_runtime::spawn_blocking(move || crate::github::associated_pr_details(Path::new(&cwd), number, url.as_deref()).map_err(err)).await.map_err(err)?
+}
+
+#[tauri::command]
+pub async fn pr_create(cwd: String, title: String, body: String, base: Option<String>, draft: bool, session_id: Option<String>) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = crate::github::create_pr(Path::new(&cwd), &title, &body, base.as_deref(), draft).map_err(err)?;
+        if let Some(session) = session_id {
+            crate::pr_associations::record_local(&session, Path::new(&cwd), &url, &crate::git::current_branch(Path::new(&cwd)).unwrap_or_default())
+                .map_err(|error| format!("Created {url}, but saving its session association failed: {error:#}"))?;
+        }
+        Ok(url)
+    })
         .await
         .map_err(err)?
 }
 
 #[tauri::command]
-pub async fn pr_merge(cwd: String, number: u64, method: String) -> CmdResult<()> {
-    tauri::async_runtime::spawn_blocking(move || crate::github::merge_pr(Path::new(&cwd), number, &method).map_err(err)).await.map_err(err)?
+pub async fn pr_merge(cwd: String, number: u64, method: String, url: Option<String>) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(move || crate::github::merge_associated_pr(Path::new(&cwd), number, &method, url.as_deref()).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
-pub async fn pr_ready(cwd: String, number: u64) -> CmdResult<()> {
-    tauri::async_runtime::spawn_blocking(move || crate::github::mark_ready(Path::new(&cwd), number).map_err(err)).await.map_err(err)?
+pub async fn pr_ready(cwd: String, number: u64, url: Option<String>) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(move || crate::github::ready_associated_pr(Path::new(&cwd), number, url.as_deref()).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
