@@ -8,7 +8,7 @@ import { buildPlan } from './build-terminalx-launcher.mjs'
 const host = 'aarch64-apple-darwin'
 test('full target wins over host ABI and cross-platform overlays keep their own installers', () => {
   expect(buildPlan([], { CARGO_BUILD_TARGET: 'x86_64-unknown-linux-musl', TAURI_ENV_PLATFORM: 'linux', TAURI_ENV_ARCH: 'x86_64' }, 'x86_64-unknown-linux-gnu')).toMatchObject({ target: 'x86_64-unknown-linux-musl', skip: true })
-  expect(buildPlan([], { TAURI_ENV_TARGET_TRIPLE: 'x86_64-pc-windows-msvc', TAURI_ENV_PLATFORM: 'win32' }, host).skip).toBe(true)
+  expect(buildPlan([], { TAURI_ENV_TARGET_TRIPLE: 'x86_64-pc-windows-msvc', TAURI_ENV_PLATFORM: 'windows' }, host).skip).toBe(true)
   expect(buildPlan(['--target', 'x86_64-apple-darwin'], {}, host).targets).toEqual(['x86_64-apple-darwin'])
 })
 test('universal plans both slices and debug profile follows Tauri', () => {
@@ -65,4 +65,12 @@ nativeTest('missing and non-executable sibling fail explicitly with shell-compat
   expect(missing.status).toBe(127); expect(missing.stderr).toMatch(/cannot execute sibling raccoon/)
   writeFileSync(path.join(isolated, 'raccoon'), 'not executable', { mode: 0o600 })
   expect(spawnSync(copy).status).toBe(126)
+})
+
+nativeTest('non-UTF8 Unix arguments and environment reach the CLI without lossy conversion', () => {
+  const bridge = path.join(directory, 'raw-argv.py')
+  writeFileSync(bridge, 'import os,sys\nos.environb[b"TX467_TEST"]=bytes([254])\nos.execv(os.fsencode(sys.argv[1]),[b"terminalx",bytes([255])])\n')
+  const result = spawnSync('/usr/bin/python3', [bridge, launcher], { encoding: 'utf8', input: '' })
+  expect(result.status).toBe(23)
+  expect(JSON.parse(result.stdout)).toMatchObject({ argv: ['terminalx', '\udcff'], env: '\udcfe' })
 })

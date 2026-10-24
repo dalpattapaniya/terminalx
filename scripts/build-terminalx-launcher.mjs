@@ -19,7 +19,7 @@ export function buildPlan(args, env, host) {
   const target = explicit ?? env.TAURI_ENV_TARGET_TRIPLE ?? env.CARGO_BUILD_TARGET ??
     (env.TAURI_ENV_PLATFORM === 'darwin' && env.TAURI_ENV_ARCH ? `${env.TAURI_ENV_ARCH}-apple-darwin` : host)
   const macos = /^(aarch64|x86_64|universal)-apple-darwin$/.test(target)
-  const platform = macos ? 'darwin' : /-linux-(gnu|musl)$/.test(target) ? 'linux' : /-windows-(msvc|gnu)$/.test(target) ? 'win32' : undefined
+  const platform = macos ? 'darwin' : /-linux-(gnu|musl)$/.test(target) ? 'linux' : /-windows-(msvc|gnu)$/.test(target) ? 'windows' : undefined
   if (!platform || (env.TAURI_ENV_PLATFORM && env.TAURI_ENV_PLATFORM !== platform) ||
       (env.TAURI_ENV_ARCH && env.TAURI_ENV_ARCH !== target.split('-')[0])) throw new Error('Unsupported or mismatched launcher target')
   return { target, targets: target === 'universal-apple-darwin' ? ['aarch64-apple-darwin', 'x86_64-apple-darwin'] : [target],
