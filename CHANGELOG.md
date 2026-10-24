@@ -63,6 +63,11 @@
 
 ### Chats
 
+- Keep initiating text expandable beneath autonomous-turn status, treat unknown
+  Claude prompt origins as reader messages, and separate scheduled work from
+  unfinished bare slash commands without splitting running work. Preserve
+  compaction summaries within their original turn. (#566)
+
 - Order session lists by verified user and assistant message time, retaining
   pins and filters across local and cloud updates and restarts. Metadata
   edits no longer bump conversations; older logs are indexed in background

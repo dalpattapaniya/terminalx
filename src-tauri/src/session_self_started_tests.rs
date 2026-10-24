@@ -304,3 +304,25 @@ fn a_turn_the_cli_started_itself_is_closed_by_its_own_end_with_no_hooks() {
     assert_eq!(rig.told_in_turns(), ["started by: Scheduled check", &format!("reply: {REPORT}"), "end"]);
     assert_eq!(rig.status(), TabStatus::Completed);
 }
+
+/// A local command's idle time is not scheduled work's duration (#566).
+#[test]
+fn scheduled_work_after_a_bare_command_has_its_own_clock_and_completion() {
+    for command in ["/model x", "/effort high"] {
+        for hook in [false, true] {
+            let rig = Rig::of(CliKind::Claude, "");
+            rig.cli_takes(command);
+            rig.turn_began_earlier(Duration::from_secs(3600));
+            if hook {
+                rig.hook("UserPromptSubmit", json!({ "source": "loop_wakeup", "prompt": "Check the job" }));
+            }
+            rig.append(&scheduled("Check the job"));
+            assert!(rig.compose(GOAL, 0), "a message waits behind the scheduled work");
+            rig.cli_replies(REPORT);
+            assert!(rig.last_turn_took() < Duration::from_secs(60));
+            let events = rig.events();
+            assert_eq!(events.iter().filter(|e| matches!(e.payload, Payload::TurnCompleted { .. })).count(), 1);
+            assert!(events.iter().any(|e| matches!(&e.payload, Payload::TurnStarted { initiating_prompt: Some(text), .. } if text == "Check the job")));
+        }
+    }
+}

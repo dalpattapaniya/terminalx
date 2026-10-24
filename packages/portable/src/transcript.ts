@@ -32,7 +32,7 @@ export type WorkItem =
   | { kind: "queued"; author?: { userId: string; displayName: string }; text: string; key: string; seq: number; ts?: string; messageTs?: string; images?: { url: string; name?: string }[] }
   /** A queued message the agent took mid-turn (#551): the reader's own words, where the agent read them. */
   | { kind: "message"; author?: { userId: string; displayName: string }; text: string; key: string; seq: number; ts?: string; messageTs?: string; images?: { url: string; name?: string }[] }
-  | { kind: "status"; text: string; key: string; seq: number }
+  | { kind: "status"; text: string; initiatingPrompt?: string; key: string; seq: number }
   | { kind: "error"; text: string; key: string; seq: number }
   | { kind: "compaction"; preTokens?: number; postTokens?: number; summary?: string; key: string; seq: number }
   | { kind: "retry"; attempt: number; maxRetries: number; reason?: string; key: string; seq: number }
@@ -242,7 +242,17 @@ export function buildTranscript(events: AgentEvent[], live: boolean): Transcript
         // A turn the agent started itself (#540): nobody's prompt, and a line
         // saying what started it.
         if (payload.startedBy) {
-          ensureTurn(event).work.push({ kind: "status", text: payload.startedBy, key: `st${event.seq}`, seq: event.seq });
+          // Bare local commands often have no completion event. Their status
+          // output is not the next scheduled turn's work (#566). A command
+          // with model/tool work already underway still owns that work.
+          if (!modelRequestOpen && current?.prompt && current.prompt.text.startsWith("/") && !/[\r\n]/.test(current.prompt.text)
+            && current.work.every((item) => item.kind === "status" || item.kind === "queued" || item.kind === "compaction")) {
+            const waiting = current.work.filter((item) => item.kind === "queued");
+            current.work = current.work.filter((item) => item.kind !== "queued");
+            current = null;
+            ensureTurn(event).work.push(...waiting);
+          }
+          ensureTurn(event).work.push({ kind: "status", text: payload.startedBy, initiatingPrompt: payload.initiatingPrompt, key: `st${event.seq}`, seq: event.seq });
           modelRequestOpen = false;
           workingSince = Date.parse(event.ts);
         }

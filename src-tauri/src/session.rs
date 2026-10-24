@@ -2903,7 +2903,7 @@ impl SessionManager {
                     }
                     // The message itself is not published again; this says
                     // which one the new turn is the answer to.
-                    self.publish(&mut rt, Payload::TurnStarted { model: None, provider_session_id: None, prompt_seq: Some(echo.seq), started_by: None }, None);
+                    self.publish(&mut rt, Payload::TurnStarted { model: None, provider_session_id: None, prompt_seq: Some(echo.seq), started_by: None, initiating_prompt: None }, None);
                     self.set_status(&mut rt, TabStatus::InProgress);
                 } else if echo.queued || echo.resent {
                     // Taken within the turn it was queued behind (#551). The

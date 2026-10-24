@@ -379,7 +379,7 @@ pub fn decode_marked(line: &str, skip: &HashSet<String>, out: &mut Vec<Payload>)
         // Ahead of the meta check: a scheduled prompt is written as meta, and
         // dropping it left the CLI working on a turn the tab thought was over.
         if let Some(started_by) = started_by(&v) {
-            out.push(Payload::TurnStarted { model: None, provider_session_id: None, prompt_seq: None, started_by: Some(started_by) });
+            out.push(Payload::TurnStarted { model: None, provider_session_id: None, prompt_seq: None, started_by: Some(started_by), initiating_prompt: Some(text_of(&v["message"]["content"])) });
             return Some(TurnMark::Opened);
         }
     }
@@ -484,9 +484,10 @@ fn decode_user(v: &Value, out: &mut Vec<Payload>) {
 /// the reader's; `scheduled` for a `/loop` wakeup or a scheduled task,
 /// written as meta; `task_notification` for a background task reporting in,
 /// whose text is the `<task-notification>` markup; `peer` for another
-/// agent's message, also meta; `sdk` for a non-interactive run. Some records
+/// agent or channel message, also meta; `sdk` for a non-interactive run. Some records
 /// name only `origin.kind` (a task notification as `task-notification`), and
-/// the oldest name neither: those are the reader's.
+/// the oldest name neither: those are the reader's, as is `unknown` when
+/// the CLI cannot attribute a prompt.
 ///
 /// The `scheduled_task_fire` system record that comes before a scheduled
 /// prompt does not open its turn. It can land ahead of the `turn_duration`
@@ -499,14 +500,14 @@ fn started_by(v: &Value) -> Option<String> {
     }
     let origin = v["turnOrigin"].as_str().or_else(|| v["origin"]["kind"].as_str())?;
     Some(match origin {
-        "human" => return None,
+        "human" | "unknown" => return None,
         "scheduled" => "Scheduled check".into(),
         // The CLI's own summary: "Background command "…" completed (exit
         // code 0)", "Agent "…" finished", "Monitor event: …".
         "task_notification" | "task-notification" => {
             tagged(&text_of(content), "summary").filter(|summary| !summary.is_empty()).unwrap_or("A background task reported in").into()
         }
-        "peer" => "Message from another agent".into(),
+        "peer" => "Message from a peer or channel".into(),
         "sdk" => "Prompt from the Agent SDK".into(),
         _ => "Started by the agent".into(),
     })
@@ -906,18 +907,22 @@ mod tests {
     #[test]
     fn every_turn_the_cli_starts_itself_opens_one_and_the_reader_s_prompts_are_still_theirs() {
         for (origin, extra, expected) in [
-            ("peer", r#","isMeta":true,"origin":{"kind":"peer","from":"a003","name":"fork"}"#, "Message from another agent"),
+            ("peer", r#","isMeta":true,"origin":{"kind":"peer","from":"a003","name":"fork"}"#, "Message from a peer or channel"),
             ("sdk", "", "Prompt from the Agent SDK"),
+            ("scheduled", "", "Scheduled check"),
             ("coordinator", "", "Started by the agent"),
         ] {
             let (p, mark) = started_by_of(&started_record(origin, extra, "a prompt nobody typed"));
             assert_eq!(said(&p), [expected], "{origin}");
+            let serialized = serde_json::to_value(&p[0]).unwrap();
+            assert_eq!(serialized["initiatingPrompt"], "a prompt nobody typed", "{origin}");
             assert_eq!(mark, Some(TurnMark::Opened), "{origin}");
         }
 
         // The reader's, however the CLI came by it: typed, held until a turn
         // was over (2.1.287 on), or written before there was any origin.
         for record in [
+            r#"{"type":"user","turnOrigin":"unknown","isMeta":false,"uuid":"unknown","message":{"role":"user","content":"typed"}}"#,
             r#"{"type":"user","turnOrigin":"human","promptSource":"typed","origin":{"kind":"human"},"uuid":"h1","cwd":"/tmp/x","message":{"role":"user","content":"typed"}}"#,
             r#"{"type":"user","turnOrigin":"human","promptSource":"queued","origin":{"kind":"human"},"uuid":"h2","cwd":"/tmp/x","message":{"role":"user","content":"typed"}}"#,
             r#"{"type":"user","promptSource":"typed","origin":{"kind":"human"},"uuid":"h3","cwd":"/tmp/x","message":{"role":"user","content":"typed"}}"#,
@@ -935,6 +940,19 @@ mod tests {
         assert_eq!(mark, None);
         // Other meta records are still nothing.
         assert_eq!(started_by_of(r#"{"type":"user","isMeta":true,"uuid":"m1","message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}"#), (Vec::new(), None));
+    }
+
+    #[test]
+    fn initiating_text_parts_survive_without_becoming_a_reader_message() {
+        for origin in ["sdk", "peer", "scheduled", "task_notification"] {
+            let record = serde_json::json!({
+                "type": "user", "turnOrigin": origin, "isMeta": true,
+                "message": { "content": [{ "type": "text", "text": "First line" }, { "type": "text", "text": "Second line" }] }
+            });
+            let (payloads, mark) = started_by_of(&record.to_string());
+            assert_eq!(mark, Some(TurnMark::Opened));
+            assert!(matches!(payloads.as_slice(), [Payload::TurnStarted { initiating_prompt: Some(text), .. }] if text == "First line\nSecond line"));
+        }
     }
 
     /// The source Claude Code 2.1.304 names on `UserPromptSubmit`.
