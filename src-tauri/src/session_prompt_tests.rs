@@ -880,6 +880,169 @@ fn codex_continuation_read_before_interrupt_acknowledgement_stays_working() {
     }
 }
 
+/// A completion owed to Stop belongs to A, not to the abort of B that
+/// follows it. Exercise every partition of the four boundaries into reads.
+#[test]
+fn codex_owed_completion_precedes_abort_and_continuation_in_record_order() {
+    let boundaries = [
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"A"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"B"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"B","reason":"interrupted"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"C"}}"#,
+    ];
+    for split in 0..8 {
+        let rig = Rig::of(CliKind::Codex, "");
+        rig.compose("A", 0);
+        rig.cli_takes("A");
+        rig.cli_replies("A finished before its completion record");
+        assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.transcript_end_owed));
+        let mut batch = String::new();
+        for (i, record) in boundaries.iter().enumerate() {
+            batch.push_str(record);
+            batch.push('\n');
+            if i == 3 || split & (1 << i) != 0 {
+                rig.append(&batch);
+                batch.clear();
+            }
+        }
+        assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p)
+            if !p.transcript_end_owed && p.codex_interrupt_hooks_owed == 1), "partition {split}");
+        assert_eq!(rig.events().iter().filter(|e| matches!(e.payload,
+            Payload::TurnCompleted { status: TurnStatus::Aborted, .. })).count(), 1);
+        rig.hook("Interrupt", json!({}));
+        assert!(rig.turn_open(), "C survives B's delayed hook, partition {split}");
+        assert_eq!(rig.status(), TabStatus::InProgress);
+    }
+}
+
+/// Force the poll reader to pause after draining an abort. A concurrent
+/// reader must not apply the captured continuation and acceptance ahead of it.
+#[test]
+fn codex_readers_serialize_drain_through_application() {
+    use std::io::Write;
+    for serialized in [false, true] {
+        let rig = Rig::of(CliKind::Codex, "");
+        let records: Vec<&str> = include_str!("harness/codex/fixtures/queued_escape.jsonl").lines().collect();
+        rig.compose("TX627_START Bare TUI queue probe.", 0);
+        rig.append(&format!("{}\n{}\n", records[0], records[1]));
+        for text in ["TX627_FOLLOW_1 Please summarize progress before continuing.", "TX627_FOLLOW_2 Then list remaining steps."] {
+            rig.compose(text, 0);
+            rig.submitted();
+        }
+        let seqs = rig.held();
+        let append = |text: &str| {
+            std::fs::OpenOptions::new().append(true).open(&rig.transcript).unwrap().write_all(text.as_bytes()).unwrap();
+        };
+        append(&format!("{}\n", records[2]));
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let manager = rig.manager.clone();
+        let rt = rig.rt.clone();
+        let tail = rig.tail.clone();
+        let first = std::thread::spawn(move || {
+            let read = || {
+                let records = tail.drain_records();
+                drained_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                records
+            };
+            if serialized {
+                manager.pump_read_from(&rt, &tail, read);
+            } else {
+                // Negative control: the former production ordering advanced
+                // the cursor before acquiring the runtime lock.
+                manager.pump_read(&rt, read());
+            }
+        });
+        drained_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        append(&format!("{}\n", records[3..5].join("\n")));
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        let manager = rig.manager.clone();
+        let rt = rig.rt.clone();
+        let tail = rig.tail.clone();
+        let second = std::thread::spawn(move || {
+            assert!(rt.try_lock().is_ok(), "paused transcript I/O must not hold runtime");
+            blocked_tx.send(matches!(tail.application.try_lock(), Err(std::sync::TryLockError::WouldBlock))).unwrap();
+            manager.pump(&rt, &tail);
+            // This approval belongs to the continuation, never the old abort.
+            manager.apply(&mut rt.lock().unwrap(), Payload::PermissionRequested {
+                request_id: "continuation-approval".into(), tool_use_id: "next-tool".into(), tool_name: "Bash".into(),
+                input: json!({ "command": "ls" }), title: None, description: None, options: vec![],
+            }, None);
+            applied_tx.send(()).unwrap();
+        });
+        assert_eq!(blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap(), serialized);
+        if !serialized { applied_rx.recv_timeout(Duration::from_secs(10)).unwrap(); }
+        resume_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(rig.turn_open(), serialized, "old read ordering closes the continuation");
+        assert_eq!(rig.rt.lock().unwrap().pending.contains_key("continuation-approval"), serialized,
+            "old read ordering cancels the continuation's permission");
+        assert!(rig.held().is_empty());
+        for seq in seqs {
+            assert_eq!(rig.events().iter().filter(|e| matches!(e.payload,
+                Payload::TurnStarted { prompt_seq: Some(id), .. } | Payload::PromptAbsorbed { prompt_seq: id } if id == seq)).count(), 1);
+        }
+        if serialized {
+            rig.hook("Interrupt", json!({}));
+            assert!(rig.turn_open());
+            assert!(rig.rt.lock().unwrap().pending.contains_key("continuation-approval"));
+            assert_eq!(rig.status(), TabStatus::Waiting);
+        }
+    }
+}
+
+/// Policy reconciliation takes sharing after application. A blocked policy
+/// check must not retain either runtime or the transcript application gate.
+#[test]
+fn transcript_application_gate_is_released_before_policy_reconciliation() {
+    use std::io::Write;
+    for kind in BOTH {
+        let rig = Rig::of(kind, "");
+        std::fs::OpenOptions::new().append(true).open(&rig.transcript).unwrap()
+            .write_all(rig.cli().prompt("policy reconciliation probe").as_bytes()).unwrap();
+        rig.rt.lock().unwrap().reported_mode_to_judge = Some("default".into());
+        let sharing = rig.manager.sharing.lock().unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let manager = rig.manager.clone();
+        let rt = rig.rt.clone();
+        let tail = rig.tail.clone();
+        let reader = std::thread::spawn(move || {
+            manager.pump_read_from(&rt, &tail, || {
+                let records = tail.drain_records();
+                read_tx.send(()).unwrap();
+                records
+            });
+            done_tx.send(()).unwrap();
+        });
+        read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rig.tail.application.try_lock() {
+                Ok(_guard) => break,
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                _ => panic!("policy reconciliation must release the application gate before waiting for sharing"),
+            }
+        }
+        let rt = loop {
+            match rig.rt.try_lock() {
+                Ok(rt) => break rt,
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                _ => panic!("policy reconciliation must release runtime before waiting for sharing"),
+            }
+        };
+        assert!(rt.reported_mode_to_judge.is_some());
+        drop(rt);
+        assert!(matches!(done_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        drop(sharing);
+        reader.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+}
+
 /// Captured from Codex 0.153.4 in the assigned macOS guest with the local
 /// Responses fixture server: Escape combines both pending prompts into one
 /// provider UserMessage. Neither composer identity may remain pending.

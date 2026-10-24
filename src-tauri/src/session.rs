@@ -2809,8 +2809,8 @@ impl SessionManager {
     }
 
     /// Publish everything the transcript has gained since the last look. The
-    /// tail's own lock orders this against the poll loop, so a `Stop` hook
-    /// flushing before it closes the turn cannot overtake it.
+    /// tail's application lock covers managed-session draining through
+    /// publication, so a hook cannot apply a later read ahead of the poll loop.
     fn pump(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &Arc<tui::Tail>) {
         // A CLI the reader started by hand has no hook to close its turns:
         // the transcript does, so each record's word about the turn is acted
@@ -2818,12 +2818,24 @@ impl SessionManager {
         if matches!(&rt_arc.lock().unwrap().engine, Engine::Cli(p) if p.by_hand.is_some()) {
             return self.pump_by_hand(rt_arc, tail);
         }
-        self.pump_read(rt_arc, tail.drain_records());
+        self.pump_read_from(rt_arc, tail, || tail.drain_records());
+    }
+
+    fn pump_read_from(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &tui::Tail, read: impl FnOnce() -> Vec<tui::Record>) {
+        // Do not hold runtime while reading the file. This separate gate
+        // orders readers through application, after the path/cursor locks
+        // have been released. No caller may wait for it while holding runtime.
+        let application = tail.application.lock().unwrap();
+        self.pump_read_guarded(rt_arc, read(), Some(application));
     }
 
     /// One read of the transcript: its payloads, and what it last said about
     /// the turn.
     fn pump_read(&self, rt_arc: &Arc<Mutex<TabRuntime>>, records: Vec<tui::Record>) {
+        self.pump_read_guarded(rt_arc, records, None);
+    }
+
+    fn pump_read_guarded(&self, rt_arc: &Arc<Mutex<TabRuntime>>, records: Vec<tui::Record>, application: Option<MutexGuard<'_, ()>>) {
         let mark = records.iter().rev().find_map(|(_, mark, _)| *mark);
         // Keep the preceding record's boundary for a command immediately after
         // a completed turn, even when both arrive in one tail read.
@@ -2877,11 +2889,22 @@ impl SessionManager {
                             }
                             if let Engine::Cli(p) = &mut rt.engine {
                                 p.codex_prompt_starts_turn = true;
+                                p.transcript_turn = Some(mark);
                                 p.turn_tail.opened();
                             }
                             self.set_status(&mut rt, TabStatus::InProgress);
                         }
-                        tui::TurnMark::Ended => {}
+                        tui::TurnMark::Ended => {
+                            let open = rt.turn_open;
+                            if let Engine::Cli(p) = &mut rt.engine {
+                                // A Stop hook can precede its own completion.
+                                // Consume that debt here, before a later abort
+                                // in this same read can mistake it for its own.
+                                if !std::mem::take(&mut p.transcript_end_owed) {
+                                    p.transcript_turn = open.then_some(mark);
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
@@ -3034,9 +3057,11 @@ impl SessionManager {
                 self.end_open_turn(&mut rt, TurnStatus::Aborted, None);
                 let (session, tab) = (rt.session_id.clone(), rt.tab_id.clone());
                 drop(rt);
+                drop(application);
                 self.observer.automation_failed(&session, &tab, "The automation turn was interrupted.");
             } else {
                 self.end_open_turn(&mut rt, TurnStatus::Ok, None);
+                drop(application);
                 self.after_turn_completed(rt_arc, rt, said);
             }
             self.judge_reported_mode(rt_arc);
@@ -3050,13 +3075,19 @@ impl SessionManager {
         // is open before the transcript gets round to the turn before it.
         let open = rt.turn_open;
         if let (Some(mark), Engine::Cli(p)) = (mark, &mut rt.engine) {
-            let owed = std::mem::take(&mut p.transcript_end_owed);
-            if !(owed && mark.ends()) {
-                p.transcript_turn = open.then_some(mark);
+            // Codex boundaries were reconciled in record order above. In
+            // particular, an Opened marker must not consume an owed end.
+            if p.harness != CliKind::Codex {
+                let owed = std::mem::take(&mut p.transcript_end_owed);
+                if !(owed && mark.ends()) {
+                    p.transcript_turn = open.then_some(mark);
+                }
             }
         }
-        // Codex reports its stance in the rollout just read.
+        // Only record application is serialized. Policy reconciliation takes
+        // sharing and can restart a provider: release both guards first.
         drop(rt);
+        drop(application);
         self.judge_reported_mode(rt_arc);
     }
 

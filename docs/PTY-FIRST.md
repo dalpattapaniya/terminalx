@@ -653,6 +653,16 @@ prompt in front of it and draws the reply again as its final text, which read
 in the app as "delta / Worked for 10s / delta / Worked for 2s". Stop remains
 the authority for normal completion. An abort is applied in transcript order
 so a following `task_started` can open its continuation immediately (#627).
+A completion owed to an earlier Stop is consumed at its own `task_complete`
+record, even when a later start, abort and continuation arrive in that same read.
+Managed transcript polling and hook flushes hold a separate application gate from before
+advancing the tail cursor through applying the records: serializing the file
+read alone would allow a later batch to be applied ahead of an earlier abort.
+The gate is acquired without runtime or tail guards. File I/O finishes and
+releases the path/cursor locks before runtime is acquired for publication;
+other runtime users remain unblocked while a transcript read is pending.
+The gate is released before completion observers, restart callbacks and reported
+permission-mode reconciliation. By-hand history/import behavior is unchanged.
 The matching late Interrupt hook acknowledges that old abort without closing
 the new turn or cancelling its permission request. `TurnTail` latches it: a turn is opened by the prompt that
 starts it and closed by whichever closer arrives first, and a second close is
