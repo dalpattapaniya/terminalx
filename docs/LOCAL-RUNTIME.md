@@ -455,3 +455,17 @@ definition changes and manual dispatch use the owner scheduler/store, including
 the existing pipeline consent flags. Twenty disposable lifecycle process tests
 and desktop/headless Clippy passed for this checkpoint; startup cutover and
 packaged desktop acceptance are still pending.
+
+Workspace cleanup checkpoint: desktop workspace operations now use the owner’s
+admission gate and live process state. Fallible stop variants preserve the
+existing infallible caller APIs, but removal and quick-chat relocation abort
+before moving history or deleting a worktree if any required process stop fails.
+A partially stopped multi-session workspace remains indexed and retryable;
+merged cleanup records the refusal rather than recording successful removal.
+CLI worktree deletion uses the same confirmed-stop requirement.
+
+Desktop/headless Clippy and 29 disposable lifecycle tests passed on this
+checkpoint, alongside 47 session-operation and 19 merged-cleanup tests. The full
+native suite last passed on the preceding checkpoint (2,248 unit, six CLI and
+two serde tests); it has not yet been rerun for these cleanup changes. Production
+startup, paired-device adapters and packaged desktop acceptance remain pending.

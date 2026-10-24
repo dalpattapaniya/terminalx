@@ -959,6 +959,10 @@ impl SessionManager {
         );
     }
 
+    pub(crate) fn workspace(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        crate::local_runtime::workspaces::execute(self, self.sink.as_ref(), method, params)
+    }
+
     pub(crate) fn automation_host(&self) -> crate::automations::RuntimeHost {
         crate::automations::RuntimeHost { sink: self.sink.clone(), sessions: self.clone() }
     }
@@ -2038,8 +2042,47 @@ impl SessionManager {
     }
 
     /// Caller holds checkout admission across its stop and subsequent mutation.
+    /// Relocation stops agents but preserves the shells the reader opened.
+    /// A followed agent owns its job group, not its enclosing shell's group.
+    pub(crate) fn stop_agents_confirmed(&self, entry: &index::SessionEntry) -> Result<()> {
+        let key = format!("{}:agents", entry.id);
+        let mut pids = self.session_stop_pids.lock().unwrap().get(&key).cloned().unwrap_or_default();
+        for tab in entry.tabs.iter().filter(|tab| !tab.is_terminal()) {
+            let runtime = self.runtime(&entry.id, &tab.id)?;
+            let runtime = runtime.lock().unwrap();
+            match &runtime.engine {
+                Engine::Cli(cli) => {
+                    if let Some(by) = &cli.by_hand { pids.push(by.agent.job); }
+                    else { pids.extend(self.terminals.pid(&cli.pane_id)); }
+                }
+                _ => pids.extend(runtime.child_pid.or(runtime.stopping_pid)),
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        self.session_stop_pids.lock().unwrap().insert(key.clone(), pids.clone());
+        let mut failures = Vec::new();
+        for tab in entry.tabs.iter().filter(|tab| !tab.is_terminal()) {
+            if let Err(error) = self.stop(&entry.id, &tab.id) { failures.push(error.to_string()); }
+        }
+        let deadline = Instant::now() + RESTART_WAIT;
+        loop {
+            pids.retain(|pid| crate::harness::host::group_or_process_alive(*pid));
+            if pids.is_empty() { break; }
+            if Instant::now() >= deadline {
+                self.session_stop_pids.lock().unwrap().insert(key, pids);
+                bail!("Agent exit could not be confirmed. Its conversation stayed in its original folder.");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.session_stop_pids.lock().unwrap().remove(&key);
+        if !failures.is_empty() { bail!("Agents could not be stopped: {}", failures.join("; ")); }
+        Ok(())
+    }
+
+    /// Caller holds checkout admission through the subsequent mutation.
     /// Failed group confirmations survive retries even after a PTY was removed.
-    fn stop_session_confirmed(&self, entry: &index::SessionEntry) -> Result<()> {
+    pub(crate) fn stop_session_confirmed(&self, entry: &index::SessionEntry) -> Result<()> {
         let tab_ids: Vec<_> = entry.tabs.iter().map(|tab| tab.id.clone()).collect();
         let mut panes = self.terminals.session_pane_ids(&entry.id, &tab_ids);
         panes.extend(entry.tabs.iter().map(TabEntry::pane_id));

@@ -887,14 +887,12 @@ impl ControlService {
                 "A project's main checkout cannot be deleted.",
             ));
         }
-        // Agents, then the session's shells, each waited for, so nothing
-        // still holds the directory.
+        // Keep admission through confirmed exit and removal. A failed stop
+        // cannot be discarded by a CLI caller either.
+        let _admission = crate::issue_pipeline::admission::lock();
+        self.manager.accepting_work().map_err(ControlError::internal)?;
         let stop = |session: &crate::store::index::SessionEntry| {
-            for tab in &session.tabs {
-                let _ = self.manager.stop(&session.id, &tab.id);
-            }
-            let shells = self.manager.terminals().session_pane_ids(&session.id, &[]);
-            self.manager.terminals().kill_all_and_wait(&shells, std::time::Duration::from_secs(5));
+            self.manager.stop_session_confirmed(session).map_err(|error| format!("{error:#}"))
         };
         #[cfg(feature = "desktop")]
         let browser_key = crate::browser::control::canonical(&worktree.path);
@@ -916,7 +914,7 @@ impl ControlService {
             fetch: crate::landed::Fetch::Fresh,
             guard: None,
         };
-        let removed = crate::session_ops::remove_workspace(&*self.sink, &request, &stop).map_err(|error| {
+        let removed = crate::session_ops::remove_workspace_fallible(&*self.sink, &request, &stop).map_err(|error| {
             if error.starts_with(crate::session_ops::NEEDS_CONFIRMATION) {
                 ControlError::new("needs_force", error, Some("Nothing was removed. Repeat with --force only if losing this work is intended.".into()))
             } else {

@@ -4,6 +4,10 @@
 
 ### Runtime investigation
 
+- Route local workspace cleanup and quick-chat relocation through the runtime
+  owner. A failed process stop preserves the workspace and every affected
+  conversation, including when an earlier session already stopped. (#467)
+
 - Confirm process-group exit before acknowledging local stop-all, retain bounded
   terminal history across orderly idle-owner shutdown, and keep open shells or
   unknown child activity alive. Resource commands now inspect the owner, and

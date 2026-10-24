@@ -506,7 +506,12 @@ fn start(options: &Options) -> Result<Runtime> {
         crate::issue_pipeline::runtime::start(pipeline_host, interrupted.clone());
         crate::automations::start_recovered_scheduler(automation_host);
     }
-    if let Some(lifetime) = &lifetime { lifetime.ready(); }
+    if let Some(lifetime) = &lifetime {
+        lifetime.ready();
+        if options.relay_link.is_none() && !options.self_test {
+            crate::local_runtime::workspaces::start_retention(manager.clone(), lifetime.clone());
+        }
+    }
     Ok(Runtime { lifetime, sink, host, terminals, manager, socket, project_root, interrupted, pipelines })
 }
 

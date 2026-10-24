@@ -945,3 +945,62 @@ fn deleting_a_session_stops_only_its_owner_processes_and_rejects_stale_views() {
     assert!(index["sessions"].as_array().unwrap().iter().any(|entry| entry["id"] == other["sessionId"]));
     assert!(world.project.join("README.md").is_file(),"deleting a conversation must not delete its workspace");
 }
+
+#[test]
+fn owner_relocation_stops_the_agent_but_preserves_the_readers_shell_and_worktree() {
+    use raccoon_lib::local_runtime::{client::Client, sessions::Sessions};
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create",json!({
+        "project":world.project,"agent":"claude","prompt":"ask:echo moving-agent",
+        "useWorktree":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    assert_eq!(serve.control("wait",json!({"target":tab,"timeoutSeconds":10}))["reason"],"permission");
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(world.data.join("sessions/index.json")).unwrap()).unwrap();
+    let cwd = index["sessions"].as_array().unwrap().iter().find(|entry| entry["id"] == session).unwrap()["cwd"].as_str().unwrap().to_string();
+    let sessions = Sessions::new(Client::connect(&world.data).unwrap());
+    let agent = sessions.pane_of(session,tab).unwrap().unwrap().pane_id;
+    let shell = format!("{session}:keep-shell");
+    serve.control("runtime.pty.spawn",json!({"id":shell,"cwd":cwd,"cols":80,"rows":24}));
+    let pid = serve.control("runtime.pty.output",json!({"id":shell}))["pid"].clone();
+    let moved: serde_json::Value = sessions.workspace("relocate",json!({"sessionId":session})).unwrap();
+    assert_eq!(std::path::Path::new(moved["cwd"].as_str().unwrap()),world.project.as_path());
+    assert!(moved["worktreeName"].is_null());
+    assert!(std::path::Path::new(&cwd).join("README.md").is_file());
+    assert_eq!(serve.control("runtime.pty.output",json!({"id":agent}))["running"],false);
+    let kept = serve.control("runtime.pty.output",json!({"id":shell}));
+    assert_eq!(kept["pid"],pid);
+    assert_eq!(kept["running"],true);
+    assert!(sessions.pending_permissions().unwrap().is_empty());
+    sessions.ensure_started(session,tab).unwrap();
+    assert_eq!(serve.control("runtime.pty.output",json!({"id":agent}))["running"],true);
+}
+
+#[test]
+fn cli_workspace_deletion_confirms_owner_processes_and_keeps_the_project() {
+    let world = AgentWorld::new();
+    let serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create",json!({
+        "project":world.project,"agent":"claude","prompt":"ask:echo removed-workspace",
+        "useWorktree":true,"mode":"manual"
+    }));
+    let session = created["sessionId"].as_str().unwrap();
+    let tab = created["tabId"].as_str().unwrap();
+    assert_eq!(serve.control("wait",json!({"target":tab,"timeoutSeconds":10}))["reason"],"permission");
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(world.data.join("sessions/index.json")).unwrap()).unwrap();
+    let cwd = index["sessions"].as_array().unwrap().iter().find(|entry| entry["id"] == session).unwrap()["cwd"].as_str().unwrap().to_string();
+    let shell = format!("{session}:cleanup-shell");
+    serve.control("runtime.pty.spawn",json!({"id":shell,"cwd":cwd,"cols":80,"rows":24,"command":"sleep 60"}));
+    let pid = serve.control("runtime.pty.output",json!({"id":shell}))["pid"].as_u64().unwrap();
+    assert_eq!(serve.try_control("worktrees.delete",json!({"project":world.project,"worktree":cwd,"force":true}))["ok"],false);
+    assert!(std::path::Path::new(&cwd).is_dir(),"missing confirmation must leave the worktree alone");
+    let deleted = serve.control("worktrees.delete",json!({"project":world.project,"worktree":cwd,"force":true,"confirmed":true}));
+    assert_eq!(deleted["deleted"],cwd);
+    assert!(!std::path::Path::new(&cwd).exists());
+    assert!(!std::process::Command::new("/bin/kill").args(["-0",&pid.to_string()])
+        .stderr(std::process::Stdio::null()).status().unwrap().success());
+    assert!(world.project.join("README.md").is_file());
+    assert!(serve.control("permissions.list",json!({}))["permissions"].as_array().unwrap().is_empty());
+}

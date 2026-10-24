@@ -49,6 +49,10 @@ impl Sessions {
         self.call(&format!("runtime.session.{method}"), params)
     }
 
+    pub fn workspace<T: DeserializeOwned>(&self, operation: &str, params: Value) -> Result<T> {
+        self.call("runtime.session.workspace", json!({"operation":operation,"params":params}))
+    }
+
     pub fn delete_session(&self, session: &str) -> Result<()> {
         self.call("runtime.session.deleteSession", json!({"sessionId":session}))
     }

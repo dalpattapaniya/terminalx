@@ -18,6 +18,7 @@ use crate::control::ControlError;
 #[cfg(unix)]
 pub mod stream;
 pub mod calls;
+pub(crate) mod workspaces;
 pub(crate) mod permissions;
 pub(crate) mod scrollback;
 pub(crate) mod idle;
