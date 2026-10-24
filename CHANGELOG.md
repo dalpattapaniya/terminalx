@@ -4,6 +4,11 @@
 
 ### Runtime investigation
 
+- Build the local runtime helper through the Tauri build/dev hooks using the
+  requested target and profile, sign it with the app entitlements and verify its
+  signature before packaging. Direct Cargo checks create only an empty resource
+  directory; production builds refuse an ad-hoc signing fallback. (#467)
+
 - Add a typed native session client with fallible live-state reads and owner-side
   continuation preparation. Verify pending permission reattachment, subsequent
   turns and refusal to follow a replacement owner in disposable process tests.

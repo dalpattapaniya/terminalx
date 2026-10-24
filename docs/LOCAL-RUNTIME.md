@@ -313,3 +313,33 @@ client. This does not yet switch desktop command routing or satisfy packaged
 quit/reopen acceptance. A separate account test covers sign-out overtaking
 registration: a revoked generation cannot register late, and its stale sign-out
 cannot revoke a newer account.
+
+## Helper build checkpoint
+
+`pnpm build:local-runtime` builds `terminalx-serve` independently of the desktop
+Cargo feature graph and packages its executable under `target/local-runtime`
+in the Tauri resource directory. The script honors Tauri's target architecture
+and debug flag; explicit standalone target/profile arguments are supported,
+including two-slice universal macOS builds. It selects the actual executable
+from Cargo's artifact report, so a custom Cargo target directory cannot cause
+an old binary from a guessed path to be bundled. Existing sidecars and the
+computer-use helper remain separate.
+
+The helper receives the app entitlements and a verified code signature. A
+production invocation (`TERMINALX_MAC_RELEASE=1`) requires an explicit
+`APPLE_SIGNING_IDENTITY` and timestamp; development may use an ad-hoc signature.
+The Tauri hooks propagate failures before bundling. Direct `cargo test`/clippy
+only prepare the missing resource directory and never fabricate an executable.
+This packages the real headless helper but does not yet implement its tray or
+switch desktop session ownership. A development signature and disposable PTY
+self-test are not evidence of notarized release or packaged update acceptance.
+
+Checkpoint validation (before merging #623/#624): TypeScript passed; Vitest
+passed 286 files / 3,357 tests; desktop and headless all-target Clippy passed;
+desktop tests passed 2,234 units (14 existing ignored), six CLI tests and two
+serde tests. The full headless suite passed 43 tests, including 15 lifecycle and
+six sharing-owner process tests; eight relay tests require the external harness
+and remained ignored. The real arm64 development helper passed code-signature
+verification, its isolated PTY self-test, and the disposable launcher/reconnect/
+wrong-token/SIGTERM/fresh-credential probe. No installed app or host GUI was
+operated, and no production-signed or notarized artifact was validated.

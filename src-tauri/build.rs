@@ -9,6 +9,7 @@ fn main() {
     #[cfg(feature = "desktop")]
     {
         ensure_helper_resource_dirs();
+        ensure_local_runtime_resource_dir();
         ensure_agent_browser_stand_in();
     }
     // ggml's Metal backend uses `@available` checks, which compile to a call
@@ -37,6 +38,18 @@ fn ensure_helper_resource_dirs() {
             let _ = std::fs::create_dir_all(&dir);
         }
     }
+}
+
+/// Direct cargo checks need the resource directory, not a runnable helper.
+/// Tauri's build/dev hook builds and verifies the real executable separately.
+/// Never invent a successful background runtime in check-only builds.
+#[cfg(feature = "desktop")]
+fn ensure_local_runtime_resource_dir() {
+    let directory = std::path::Path::new("target/local-runtime");
+    if !directory.exists() {
+        std::fs::create_dir_all(directory).expect("create local runtime resource directory");
+    }
+    println!("cargo:rerun-if-changed=target/local-runtime");
 }
 
 fn embed_cli_skill() {
