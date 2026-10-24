@@ -124,11 +124,13 @@ fn real_codex_helpers_stay_background_and_exit_only_with_their_session() {
     let uv = crate::binpath::resolve("uv").expect("install uv for the live regression");
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
-    let config = toml::to_string(&json!({"mcp_servers":{"browser":{
-        "command":uv,"args":["tool","uvx","--offline","--python",python,"browser-use==0.13.11","--cli-mcp"]
-    }}}))
-    .unwrap();
-    for home in [a.path(), b.path()] {
+    // Exercise both plain requirements and the extras form that originally
+    // bypassed configuration matching, through the real uv entry point.
+    for (home, package) in [(a.path(), "browser-use[cli]==0.13.11"), (b.path(), "browser-use==0.13.11")] {
+        let config = toml::to_string(&json!({"mcp_servers":{"browser":{
+            "command":uv,"args":["tool","uvx","--offline","--python",python,package,"--cli-mcp"]
+        }}}))
+        .unwrap();
         std::fs::write(home.join("config.toml"), super::configure(&config, home, None).unwrap()).unwrap();
     }
     let rig = Rig(Terminals::new());

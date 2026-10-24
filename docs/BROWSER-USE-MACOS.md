@@ -6,6 +6,8 @@ on macOS. It prepends an app-owned Python startup directory to that server's
 `LSBackgroundOnly` in the process's main bundle information. An existing
 `sitecustomize` still runs, and existing server arguments, environment variables,
 timeouts, and additional Python import paths are retained.
+Package requirements with extras, such as `browser-use[cli]==0.13.11`, receive
+the same startup handling as plain browser-use requirements.
 
 The startup module checks for `--cli-mcp`; other Python commands, the shared
 browser-harness daemon, and deliberately opened Chrome windows retain their
@@ -69,7 +71,7 @@ venv). `uv` caches this version for the offline Rust test:
 
 ```sh
 uv tool run --python /opt/homebrew/opt/python@3.12/bin/python3.12 \
-  --from browser-use==0.13.11 python scripts/browser-use-macos.test.py -v
+  --from 'browser-use[cli]==0.13.11' python scripts/browser-use-macos.test.py -v
 ```
 
 The Python test verifies three fresh screen probes, an existing `sitecustomize`,
@@ -91,9 +93,10 @@ TERMINALX_BROWSER_USE_PYTHON=/opt/homebrew/opt/python@3.12/bin/python3.12 \
 ```
 
 The Rust test runs real Codex app-server processes **inside TerminalX's PTYs**,
-using the actual managed configuration adapter and uv/browser-use. It keeps a
-second session alive during three open/close or restart cycles, checks the
-helpers' native activation policies, checks that only the closed session's
+using the actual managed configuration adapter and uv/browser-use. It launches
+both plain and `[cli]` package requirements, keeps a second session alive during
+three open/close or restart cycles, checks the helpers' native activation
+policies, checks that only the closed session's
 helpers exit, then exercises the same `kill_all` operation used at app exit.
 The Rust test requires framework Python intentionally, so a standalone Python
 cannot produce a misleading pass.
@@ -104,12 +107,15 @@ On macOS 26.3.1 (Apple silicon), with Homebrew Python 3.12.9, uv 0.9.18,
 browser-use 0.13.11, and Codex 0.162.1:
 
 - The four Python live tests passed, including visible Chrome input and screenshots.
-- The explicit Rust live PTY lifecycle test passed (three close/restart cycles
-  while a second session remained active, then shutdown of both).
+- The explicit Rust live PTY lifecycle test passed with plain and `[cli]`
+  package requirements (three close/restart cycles while a second session
+  remained active, then shutdown of both).
 - `pnpm exec tsc --noEmit` passed.
-- `pnpm vitest run` passed: 285 files, 3,352 tests.
+- `pnpm vitest run --maxWorkers=2` passed: 285 files, 3,352 tests. An unchanged
+  sign-in polling test failed in the initial unrestricted review-fix run; its
+  focused rerun and the complete two-worker rerun both passed.
 - `cargo clippy --all-targets -- -D warnings` passed.
-- `cargo test` passed: 2,219 unit tests and eight integration tests. The standard
+- `cargo test` passed: 2,220 unit tests and eight integration tests. The standard
   run skips 15 opt-in tests; the new browser-use lifecycle test was run explicitly.
 
 Quit coverage exercises the same terminal shutdown operation called by the

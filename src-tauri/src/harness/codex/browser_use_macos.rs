@@ -74,7 +74,13 @@ fn is_browser_use_stdio(server: &toml::Table) -> bool {
     args.contains(&"--cli-mcp")
         && std::iter::once(command).chain(args).any(|arg| {
             let name = Path::new(arg).file_name().and_then(OsStr::to_str).unwrap_or_default();
-            name == "browser-use" || name.starts_with("browser-use@") || name.starts_with("browser-use==") || matches!(name, "browser_use" | "browser_use.cli")
+            // Extras follow the exact package name, before any version pin
+            // (for example uvx browser-use[cli]==0.13.11 --cli-mcp).
+            name == "browser-use"
+                || name.starts_with("browser-use[")
+                || name.starts_with("browser-use@")
+                || name.starts_with("browser-use==")
+                || matches!(name, "browser_use" | "browser_use.cli")
         })
 }
 
@@ -143,5 +149,31 @@ args = ["open", "https://example.com"]
         let home = tempfile::tempdir().unwrap();
         configure("[mcp_servers.docs]\nurl = 'https://example.com/mcp'", home.path(), None).unwrap();
         assert!(!home.path().join("browser-use-python").exists());
+    }
+
+    #[test]
+    fn package_extras_receive_startup_without_matching_other_packages() {
+        for (package, expected) in [
+            ("browser-use[cli]", true),
+            ("browser-use[cli]==0.13.11", true),
+            ("browser-use[cli]@latest", true),
+            ("browser-use[cli,video]>=0.13.11", true),
+            ("browser-use-tools[cli]==0.13.11", false),
+            ("browser-useful[cli]", false),
+            ("other-browser-use[cli]", false),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let config = format!("[mcp_servers.browser]\ncommand = 'uvx'\nargs = ['{package}', '--cli-mcp']\n");
+            let output = configure(&config, home.path(), None).unwrap();
+            let original: toml::Table = toml::from_str(&config).unwrap();
+            let result: toml::Table = toml::from_str(&output).unwrap();
+            let server = &result["mcp_servers"]["browser"];
+            let pythonpath = server.get("env").and_then(|env| env.get("PYTHONPATH")).and_then(toml::Value::as_str);
+            let startup = home.path().join("browser-use-python");
+            assert_eq!(pythonpath, expected.then_some(startup.to_str().unwrap()), "{package}");
+            assert_eq!(startup.join("sitecustomize.py").exists(), expected, "{package}");
+            assert_eq!(server["command"], original["mcp_servers"]["browser"]["command"]);
+            assert_eq!(server["args"], original["mcp_servers"]["browser"]["args"]);
+        }
     }
 }
