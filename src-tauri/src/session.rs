@@ -3116,6 +3116,18 @@ impl SessionManager {
         Ok(self.prepare_cli_restart(&mut rt, tail))
     }
 
+    /// A deferred settings restart must still be due and idle when its worker
+    /// reserves the launch. A prompt may have started on this same tail since
+    /// dispatch; keep its pending settings for the next completion in that case.
+    fn begin_idle_restart_launch(&self, rt_arc: &Arc<Mutex<TabRuntime>>, tail: &Arc<tui::Tail>) -> Option<CliRestart> {
+        let mut rt = rt_arc.lock().unwrap();
+        if rt.stopping || rt.turn_open || !Self::has_tail(&rt, tail)
+            || !matches!(&rt.engine, Engine::Cli(p) if p.restart_when_idle && p.by_hand.is_none()) {
+            return None;
+        }
+        self.prepare_cli_restart(&mut rt, tail)
+    }
+
     fn prepare_cli_restart(&self, rt: &mut TabRuntime, tail: &Arc<tui::Tail>) -> Option<CliRestart> {
         if !Self::has_tail(rt, tail) || rt.restart_claim.is_some() { return None; }
         let pane = match &rt.engine { Engine::Cli(p) => p.pane_id.clone(), _ => return None };
@@ -4175,8 +4187,10 @@ impl SessionManager {
         };
         let (manager, rt_arc, session, tab) = (self.clone(), rt_arc.clone(), session_id.to_string(), tab_id.to_string());
         std::thread::spawn(move || {
-            if let Err(e) = manager.restart_launch(&rt_arc, &expected) {
-                log::warn!("restart {session}/{tab}: {e:#}");
+            if let Some(work) = manager.begin_idle_restart_launch(&rt_arc, &expected) {
+                if let Err(e) = manager.complete_cli_restart(&rt_arc, work) {
+                    log::warn!("restart {session}/{tab}: {e:#}");
+                }
             }
         });
     }

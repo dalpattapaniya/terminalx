@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Recheck deferred settings restarts when their worker reserves the launch so a
+  new turn on the same CLI keeps its process, permissions and pending delivery. (#467)
+
 - Fence transcript reads, inbound hooks and delayed provider-session writes to
   their original launch, preserving successor turns and permissions across restart. (#467)
 

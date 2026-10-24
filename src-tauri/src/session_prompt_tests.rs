@@ -1975,3 +1975,133 @@ fn restart_completion_cannot_take_a_replaced_or_cancelled_slot() {
         if replacement == "pane" { assert!(successor_running); }
     }
 }
+
+#[test]
+fn delayed_idle_restart_defers_to_new_work_on_the_same_launch() {
+    for (state, fenced) in [("idle", true), ("turn", false), ("turn", true), ("cancelled", true), ("stop", true)] {
+        let rig = Rig::of(CliKind::Codex, "");
+        let spec = pty::PaneSpec { cwd: rig._dir.path().to_str().unwrap(), cols: 80, rows: 24, command: Some("sleep 300"), env: &[] };
+        rig.manager.terminals.spawn(rig.manager.sink.clone(), &rig.pane, spec).unwrap();
+        if let Engine::Cli(p) = &mut rig.rt.lock().unwrap().engine { p.restart_when_idle = true; }
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (manager, rt, tail) = (rig.manager.clone(), rig.rt.clone(), rig.tail.clone());
+        let worker = std::thread::spawn(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The old worker validated only tail identity, even if this same
+            // launch had since accepted a new turn. Keep that actual path as
+            // a discriminating control, stopping before real CLI startup.
+            let work = if fenced { manager.begin_idle_restart_launch(&rt, &tail) }
+                else { manager.begin_restart_launch(&rt, &tail).unwrap() };
+            if let Some(work) = work {
+                assert!(work.process.as_ref().is_none_or(|process| process.wait(RESTART_WAIT)));
+                true
+            } else { false }
+        });
+        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let receipt = if state == "turn" {
+            let receipt = rig.compose_confirmed("new work on the same launch");
+            rig.manager.apply(&mut rig.rt.lock().unwrap(), Payload::PermissionRequested {
+                request_id: "same-launch-approval".into(), tool_use_id: "tool".into(), tool_name: "Bash".into(),
+                input: json!({"command":"ls"}), title: None, description: None, options: vec![],
+            }, None);
+            Some(receipt)
+        } else { None };
+        {
+            let mut rt = rig.rt.lock().unwrap();
+            if state == "cancelled" {
+                if let Engine::Cli(p) = &mut rt.engine { p.restart_when_idle = false; }
+            }
+            if state == "stop" { rt.stopping = true; }
+        }
+        let before = rig.events();
+        resume_tx.send(()).unwrap();
+        let reserved = worker.join().unwrap();
+        let survived = rig.manager.terminals.is_running(&rig.pane);
+        let (open, pending, due) = {
+            let rt = rig.rt.lock().unwrap();
+            (rt.turn_open, rt.pending.contains_key("same-launch-approval"),
+                matches!(&rt.engine, Engine::Cli(p) if p.restart_when_idle))
+        };
+        rig.manager.terminals.kill_and_wait(&rig.pane, RESTART_WAIT);
+        rig.manager.terminals.stop_owned_groups(RESTART_WAIT);
+        assert_eq!(reserved, state == "idle" || !fenced, "{state}/{fenced}");
+        assert_eq!(survived, !reserved, "{state}/{fenced}");
+        if !reserved { assert_eq!(rig.events(), before); }
+        if state == "turn" {
+            assert_eq!(open, fenced);
+            assert_eq!(pending, fenced);
+            assert_eq!(due, fenced, "deferred settings remain due for the next idle boundary");
+            if fenced {
+                assert!(matches!(receipt.unwrap().try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+                // When that new turn finishes, the same pending restart can
+                // reserve the slot; deferral must not silently cancel it.
+                rig.rt.lock().unwrap().turn_open = false;
+                assert!(rig.manager.begin_idle_restart_launch(&rig.rt, &rig.tail).is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_restart_wait_blocks_only_its_unchanged_claim() {
+    for replaced in [false, true] {
+        let rig = Rig::of(CliKind::Codex, "");
+        let entry: index::SessionEntry = serde_json::from_value(json!({
+            "id": SESSION, "projectPath": rig._dir.path(), "cwd": rig._dir.path(),
+            "title": "restart failure", "created": index::now(), "modified": index::now(),
+            "tabs": [{ "id": TAB, "harness": "codex", "created": index::now() }]
+        })).unwrap();
+        index::save(&[entry]).unwrap();
+        let work = rig.manager.begin_restart_launch(&rig.rt, &rig.tail).unwrap().unwrap();
+        let successor = Arc::new(tui::Tail::unknown(codex::rollout::decode_line));
+        if replaced {
+            let mut rt = rig.rt.lock().unwrap();
+            rt.restart_claim = Some(successor.clone());
+            rt.engine = Engine::OpenCode(opencode::OpenCode::new(1, "/unused", None, None, "manual"));
+            rt.open_turn();
+            rig.manager.apply(&mut rt, Payload::PermissionRequested {
+                request_id: "successor".into(), tool_use_id: "tool".into(), tool_name: "Bash".into(),
+                input: json!({"command":"ls"}), title: None, description: None, options: vec![],
+            }, None);
+        }
+        let before = rig.events();
+        // Deliberately supply a failed exit confirmation, independently of
+        // OS timing: the continuation must never turn that into a new launch.
+        let refused = match rig.manager.claim_restart_completion(&rig.rt, &work, false) {
+            Ok(None) => false,
+            Ok(Some(_)) => panic!("an unconfirmed process exit must never grant startup"),
+            Err(error) => { assert!(error.to_string().contains("exit could not be confirmed")); true }
+        };
+        assert_eq!(refused, !replaced);
+        {
+            let rt = rig.rt.lock().unwrap();
+            if replaced {
+                assert!(!rt.stopping && rt.turn_open && rt.pending.contains_key("successor"));
+                assert!(rt.recovery.is_none());
+                assert!(rt.restart_claim.as_ref().is_some_and(|claim| Arc::ptr_eq(claim, &successor)));
+            } else {
+                assert!(rt.stopping && matches!(rt.engine, Engine::None));
+                assert_eq!(rt.recovery, Some(RecoveryKind::Disconnected));
+                assert_eq!(rt.status, TabStatus::Waiting);
+                assert!(rt.restart_claim.is_none());
+            }
+        }
+        if replaced { assert_eq!(rig.events(), before); }
+        if !replaced {
+            let prompt = PromptText { mobile: None, agent: "must not start".into(), display: "must not start".into(), author: None, shared_connection: None };
+            let error = rig.manager.send_impl(SESSION, TAB, prompt, vec![], None).err().expect("failed shutdown refuses new work");
+            assert!(error.to_string().contains("Stop has not confirmed local process exit"), "unexpected internal refusal: {error:#}");
+            assert_eq!(rig.rt.lock().unwrap().recovery, Some(RecoveryKind::Disconnected));
+            // The public adapter deliberately normalizes internal failures.
+            // Check its existing contract separately, without expecting the
+            // internal guard's text to pass through that boundary unchanged.
+            let public = rig.manager.send(SESSION, TAB, "must not start".into(), vec![]).err().expect("public send also refuses new work");
+            assert_eq!(public.to_string(), RecoveryKind::Failed.message(), "unexpected public refusal: {public:#}");
+            assert!(!rig.manager.terminals.is_running(&rig.pane));
+            assert!(rig.rt.lock().unwrap().stopping);
+            assert!(!rig.events().iter().any(|event| matches!(&event.payload, Payload::UserMessage { text, .. } if text == "must not start")));
+        }
+    }
+}

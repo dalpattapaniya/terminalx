@@ -446,14 +446,16 @@ fn the_watcher_runs_a_pending_settings_restart_after_closing_the_turn() {
         let mut rt = rig.rt.lock().unwrap();
         let Engine::Cli(p) = &mut rt.engine else { unreachable!() };
         p.restart_when_idle = true;
-        // Exercise the real restart through releasing the old CLI, then
-        // refuse a new process instead of launching an installed agent.
-        rt.stopping = true;
     }
     let (sent, restarted) = std::sync::mpsc::channel();
+    let shutting_down = rig.manager.shutting_down.clone();
     rig.manager.sink.listen("tab_status", Box::new(move |payload| {
         let event: serde_json::Value = serde_json::from_str(payload).unwrap();
         if event["status"] == "idle" {
+            // Exercise the actual idle restart through releasing the CLI, then
+            // refuse startup through the shutdown gate. Marking the tab as
+            // already stopping would correctly cancel the idle dispatch itself.
+            shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = sent.send(());
         }
     }));
