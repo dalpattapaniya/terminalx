@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Runtime investigation
+
+- Document local background runtime ownership, compatibility and integration
+  dependencies, and add a disposable probe of the existing headless runtime's
+  launcher lifetime, control authentication and PTY self-test. Desktop quit and
+  reattachment behavior is not implemented by this preparation. (#467)
+
 ### Workspace cleanup
 
 - Make keeping conversations the default in workspace removal, using the existing
