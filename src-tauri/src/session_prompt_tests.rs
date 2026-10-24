@@ -151,7 +151,7 @@ impl Rig {
     /// "Send now".
     fn held(&self) -> Vec<u64> {
         match &self.rt.lock().unwrap().engine {
-            Engine::Cli(p) => p.held.iter().map(|(seq, _)| *seq).collect(),
+            Engine::Cli(p) => p.held.clone(),
             _ => Vec::new(),
         }
     }
@@ -755,7 +755,7 @@ fn a_queued_composer_prompt_the_cli_takes_mid_turn_is_one_message() {
         assert!(rig.held().is_empty(), "{kind:?}: the CLI has it; nothing is left to send now");
 
         // A "Send now" that crossed the take: the turn goes on, and nothing is typed again.
-        assert!(rig.manager.send_queued_now(SESSION, TAB, seq).is_err(), "{kind:?}");
+        assert!(rig.manager.send_queued_now(SESSION, TAB, seq).is_ok(), "{kind:?}");
         assert!(rig.turn_open(), "{kind:?}: not interrupted");
         assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.resend_after_abort.is_none()), "{kind:?}");
 
@@ -776,40 +776,179 @@ impl Rig {
     }
 }
 
-/// "Send now" on the second of two queued prompts: the turn is stopped, that
-/// one is typed again as a prompt of its own, and the first behind it,
-/// queued. The chat is told the new turn is the chosen message's answer, and
-/// that the other was taken when the CLI takes it (#551). Neither used to be
-/// said: the chosen message stayed a queued card in the stopped turn, with a
-/// Send now that could only answer that the agent had taken it. And with the
-/// echoes awaited in the order they were first sent, the chosen one's record
-/// dropped the other's echo as missed, and drew it again when it came.
+/// Codex owns its pending input. Escape advances that queue itself; an
+/// interrupt acknowledgement is not permission to paste any of it again.
 #[test]
-fn a_queued_prompt_sent_now_starts_the_turn_it_is_typed_again_for() {
+fn send_now_preserves_the_provider_queue_until_acceptance() {
     for kind in BOTH {
         let rig = Rig::of(kind, "").with_pane();
         rig.compose("start", 0);
         rig.cli_takes("start");
-        assert!(rig.compose("first held", 0) && rig.compose("second held", 0), "{kind:?}");
-        let (first, second) = (rig.queued_seq("first held"), rig.queued_seq("second held"));
+        rig.compose("Please summarize progress before continuing.", 0);
+        rig.compose("Then list the remaining steps.", 0);
+        let first = rig.queued_seq("Please summarize progress before continuing.");
+        let second = rig.queued_seq("Then list the remaining steps.");
 
         rig.manager.send_queued_now(SESSION, TAB, second).unwrap();
+        rig.manager.send_queued_now(SESSION, TAB, first).unwrap();
+        assert_eq!(rig.observer.interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        rig.manager.send_queued_now(SESSION, TAB, second).unwrap();
         rig.interrupt();
-        assert!(rig.turn_open(), "{kind:?}: the chosen message opens a turn of its own");
-        assert_eq!(rig.held(), [first], "{kind:?}: the other is held behind it");
+        assert_eq!(rig.held(), [first, second], "only provider acceptance removes pending messages");
+        assert!(!rig.turn_open(), "writing Escape alone does not prove a continuation started");
 
-        rig.cli_takes("second held");
-        assert_eq!(rig.taken_as_prompts(), ["second held"], "{kind:?}: the log says which message the new turn answers");
-        assert_eq!(rig.held(), [first], "{kind:?}");
-        rig.append(&rig.cli().steer("first held"));
-        assert!(rig.held().is_empty(), "{kind:?}");
-        rig.cli_replies("both");
-        assert_eq!(
-            rig.told(),
-            ["user: start", "queued: first held", "queued: second held", "end", "taken: first held", "reply: both", "end"],
-            "{kind:?}: each message once, and the one taken mid-turn said so"
-        );
+        rig.cli_takes("Please summarize progress before continuing.");
+        assert_eq!(rig.status(), TabStatus::InProgress);
+        assert_eq!(rig.taken_as_prompts(), ["Please summarize progress before continuing."]);
+        assert_eq!(rig.held(), [second]);
+        rig.append(&rig.cli().steer("Then list the remaining steps."));
+        assert!(rig.held().is_empty());
+        assert_eq!(rig.events().iter().filter(|e| matches!(e.payload, Payload::UserMessage { .. })).count(), 3);
+        rig.manager.send_queued_now(SESSION, TAB, second).unwrap();
+        assert_eq!(rig.observer.interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn send_now_flushes_an_acceptance_already_on_disk_before_interrupting() {
+    use std::io::Write;
+    for kind in BOTH {
+        let rig = Rig::of(kind, "").with_pane();
+        rig.compose("start", 0);
+        rig.cli_takes("start");
+        rig.compose("Please summarize progress before continuing.", 0);
+        let seq = rig.queued_seq("Please summarize progress before continuing.");
+        std::fs::OpenOptions::new().append(true).open(&rig.transcript).unwrap()
+            .write_all(rig.cli().steer("Please summarize progress before continuing.").as_bytes()).unwrap();
+        rig.manager.send_queued_now(SESSION, TAB, seq).unwrap();
+        assert!(rig.held().is_empty());
+        assert!(rig.turn_open());
+        assert_eq!(rig.observer.interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn failed_send_now_retains_pending_messages_and_allows_a_retry() {
+    for kind in BOTH {
+        let rig = Rig::of(kind, "");
+        rig.compose("start", 0);
+        rig.cli_takes("start");
+        rig.compose("Please summarize progress before continuing.", 0);
+        let seq = rig.queued_seq("Please summarize progress before continuing.");
+        assert!(rig.manager.send_queued_now(SESSION, TAB, seq).is_err());
+        assert_eq!(rig.held(), [seq]);
+        assert!(matches!(&rig.rt.lock().unwrap().engine, Engine::Cli(p) if p.resend_after_abort.is_none()));
+        let rig = rig.with_pane();
+        rig.manager.send_queued_now(SESSION, TAB, seq).unwrap();
+        assert_eq!(rig.held(), [seq]);
+        assert_eq!(rig.observer.interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+/// A poll can read the old turn's abort and the provider's continuation
+/// before the Interrupt hook reaches the app. That hook must not close the
+/// continuation or leave an accepted instruction marked pending.
+#[test]
+fn codex_continuation_read_before_interrupt_acknowledgement_stays_working() {
+    for hook_at in 0..4 {
+        let rig = Rig::of(CliKind::Codex, "").with_pane();
+        rig.compose("start", 0);
+        rig.cli_takes("start");
+        rig.compose("Please summarize progress before continuing.", 0);
+        let seq = rig.queued_seq("Please summarize progress before continuing.");
+        rig.manager.send_queued_now(SESSION, TAB, seq).unwrap();
+        let abort = r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t-start","reason":"interrupted"}}"#;
+        if hook_at == 0 { rig.hook("Interrupt", json!({})); }
+        if hook_at == 3 {
+            // All records land in one poll, then the old hook arrives.
+            rig.append(&format!("{abort}\n{}", rig.cli().prompt("Please summarize progress before continuing.")));
+        } else {
+            rig.append(&format!("{abort}\n"));
+            if hook_at == 1 { rig.hook("Interrupt", json!({})); }
+            rig.append("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"next\"}}\n");
+            if hook_at == 2 { rig.hook("Interrupt", json!({})); }
+            rig.append(&rig.cli().steer("Please summarize progress before continuing."));
+        }
+        if hook_at == 3 { rig.hook("Interrupt", json!({})); }
+        assert!(rig.turn_open(), "hook position {hook_at}");
+        assert_eq!(rig.status(), TabStatus::InProgress, "hook position {hook_at}");
+        assert!(rig.held().is_empty());
+        assert_eq!(rig.taken_as_prompts(), ["Please summarize progress before continuing."]);
+        assert_eq!(rig.events().iter().filter(|e| matches!(e.payload, Payload::TurnCompleted { status: TurnStatus::Aborted, .. })).count(), 1);
+        rig.cli_replies("Synthetic progress summary.");
+        assert_eq!(rig.status(), TabStatus::Completed);
+    }
+}
+
+/// Captured from Codex 0.153.4 in the assigned macOS guest with the local
+/// Responses fixture server: Escape combines both pending prompts into one
+/// provider UserMessage. Neither composer identity may remain pending.
+#[test]
+fn real_codex_escape_capture_acknowledges_the_whole_combined_queue() {
+    let rig = Rig::of(CliKind::Codex, "").with_pane();
+    let records: Vec<&str> = include_str!("harness/codex/fixtures/queued_escape.jsonl").lines().collect();
+    rig.compose("TX627_START Bare TUI queue probe.", 0);
+    rig.append(&format!("{}\n{}\n", records[0], records[1]));
+    let first_text = "TX627_FOLLOW_1 Please summarize progress before continuing.";
+    let second_text = "TX627_FOLLOW_2 Then list remaining steps.";
+    rig.compose(first_text, 0);
+    rig.submitted();
+    rig.compose(second_text, 0);
+    rig.submitted();
+    let first = rig.queued_seq(first_text);
+    let second = rig.queued_seq(second_text);
+    let third_text = "TX627_FOLLOW_3 Preserve this later instruction.";
+    rig.compose(third_text, 0);
+    rig.submitted();
+    let third = rig.queued_seq(third_text);
+    rig.manager.send_queued_now(SESSION, TAB, second).unwrap();
+    rig.append(&format!("{}\n", records[2..5].join("\n")));
+    rig.hook("Interrupt", json!({}));
+    assert_eq!(rig.status(), TabStatus::InProgress);
+    assert_eq!(rig.held(), [third], "only identities named by the combined acceptance are removed");
+    assert_eq!(rig.taken_as_prompts(), [first_text]);
+    let events = rig.events();
+    assert!(events.iter().any(|e| matches!(e.payload, Payload::TurnStarted { prompt_seq: Some(seq), .. } if seq == first)));
+    assert!(events.iter().any(|e| matches!(e.payload, Payload::PromptAbsorbed { prompt_seq } if prompt_seq == second)));
+    assert_eq!(events.iter().filter(|e| matches!(e.payload, Payload::UserMessage { .. })).count(), 4, "no duplicate combined prompt");
+    rig.append(&rig.cli().steer(third_text));
+    assert!(rig.held().is_empty());
+}
+
+#[test]
+fn codex_batch_acknowledgement_requires_the_exact_written_fifo() {
+    let queue = |texts: &[&str]| -> std::collections::VecDeque<ComposerEcho> {
+        texts.iter().enumerate().map(|(i, text)| ComposerEcho {
+            queued: true, submitted: true, seq: i as u64 + 1,
+            ..ComposerEcho::new((*text).into(), 0)
+        }).collect()
+    };
+    let message = |text: &str| Payload::UserMessage { author: None, text: text.into(), images: Vec::new(), baseline: None, queued: false, cwd: None };
+    let mut repeated = queue(&["same", "same", "later"]);
+    let accepted = consume_codex_queue_echo(&mut repeated, &message("same\nsame"));
+    assert_eq!(accepted.iter().map(|echo| echo.seq).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(repeated.iter().map(|echo| echo.seq).collect::<Vec<_>>(), [3]);
+    assert!(consume_codex_queue_echo(&mut repeated, &message("same\nsame")).is_empty(), "duplicate acceptance cannot consume a later identity");
+
+    for unmatched in ["first line\nsecond lines", "second\nlines\nfirst\nline", "first\nline\nsecond", "first\nline\nsecond\nlines\nextra"] {
+        let mut pending = queue(&["first\nline", "second\nlines"]);
+        assert!(consume_codex_queue_echo(&mut pending, &message(unmatched)).is_empty());
+        assert_eq!(pending.len(), 2, "unmatched content must not acknowledge a batch");
+    }
+    let mut multiline = queue(&["first\nline", "second\nlines"]);
+    assert_eq!(consume_codex_queue_echo(&mut multiline, &message("first\nline\nsecond\nlines")).len(), 2);
+    assert!(multiline.is_empty());
+
+    let mut unwritten = queue(&["first", "second"]);
+    unwritten[1].submitted = false;
+    assert!(consume_codex_queue_echo(&mut unwritten, &message("first\nsecond")).is_empty());
+    assert_eq!(unwritten.len(), 2);
+    let mut images = queue(&["first", "second"]);
+    images[0].image_count = 1;
+    assert!(consume_codex_queue_echo(&mut images, &message("[Image #1] first\nsecond")).is_empty(), "unverified batch attachment representation stays pending");
+    assert_eq!(images.len(), 2);
+    assert_eq!(consume_codex_queue_echo(&mut images, &message("[Image #1] first"))[0].seq, 1, "single-image acceptance keeps the established matching rule");
+    assert_eq!(images[0].seq, 2);
 }
 
 /// A "Send now" that crosses a take the tab has not read yet: the CLI wrote
