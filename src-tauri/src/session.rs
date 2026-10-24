@@ -1335,6 +1335,30 @@ impl SessionManager {
         self.status.usage.snapshot(&self.running_agents())
     }
 
+    /// Refresh in the session owner so account generations, provider backoff and
+    /// live hook samples share the same store across desktop attachments.
+    pub fn refresh_usage(&self, manual: bool) -> crate::status::usage::UsageSnapshot {
+        let cadence = crate::store::settings::load().status_bar.usage_refresh_ms();
+        if let Err(error) = self.status.usage.refresh_claude(manual, cadence) {
+            log::warn!("Claude usage refresh: {error:#}");
+        }
+        // A slow Codex app-server must not delay publishing Claude's rollover.
+        self.emit_usage();
+        if let Err(error) = self.status.usage.refresh_codex(manual, cadence) {
+            log::warn!("Codex usage refresh: {error:#}");
+        }
+        let snapshot = self.usage_snapshot();
+        self.sink.emit(crate::status::usage::EVENT, &snapshot);
+        snapshot
+    }
+
+    pub fn reset_codex_usage(&self) -> Result<crate::status::usage::UsageSnapshot> {
+        self.status.usage.reset_codex()?;
+        let snapshot = self.usage_snapshot();
+        self.sink.emit(crate::status::usage::EVENT, &snapshot);
+        Ok(snapshot)
+    }
+
     fn emit_usage(&self) {
         self.sink.emit(crate::status::usage::EVENT, &self.usage_snapshot());
     }

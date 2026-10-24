@@ -208,7 +208,7 @@ enum First {
 }
 
 /// The agent in front of a pane, for a window to draw the pane's tab with.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneAgent {
     pub pane_id: String,

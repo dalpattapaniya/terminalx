@@ -343,3 +343,35 @@ and remained ignored. The real arm64 development helper passed code-signature
 verification, its isolated PTY self-test, and the disposable launcher/reconnect/
 wrong-token/SIGTERM/fresh-credential probe. No installed app or host GUI was
 operated, and no production-signed or notarized artifact was validated.
+
+## Desktop adapter checkpoint
+
+`local_runtime::desktop::Desktop` holds one app-wide event attachment and one
+independent PTY bridge per window. Window destruction releases only its view
+connection; it does not stop processes or drop the control attachment. View
+connections consume but do not republish app-wide events, avoiding duplicate
+chat/status updates when the floating window is open. Tokens and cumulative
+acknowledgements remain scoped to their window connection. The existing stream
+protocol remains unchanged.
+
+Usage refresh and Codex reset now use SessionManager's owner store and sink,
+including the existing provider account generations, backoff and early Claude
+publication. Typed usage and activity reads fail on owner disconnect instead of
+opening a second activity collector or synthesizing an empty account. Session commands now use this typed boundary through a transitional in-process
+backend. Startup still requires the production owner cutover; this checkpoint does
+not establish desktop quit/reopen acceptance.
+
+The desktop session and PTY commands now have owner-compatible paths. AppState
+still starts with its in-process backend until pairing, cleanup and lifetime
+integration are complete; it never falls back to that backend after an installed
+owner connection fails. Closing a window deliberately silences its connection's
+disconnect event, while unexpected view failure and owner failure remain distinct.
+Directly launched commands in shell tabs count as busy even when their process
+group equals the original PTY process; a bare interactive shell still uses its
+foreground job to classify close confirmation. This is not yet proof that every
+idle interactive shell can safely be reaped by the detached-owner policy.
+
+Seventeen disposable lifecycle tests pass at this checkpoint, including typed
+terminal input/resize/stop and per-window acknowledgement isolation. Saved quit
+policy data defaults to keeping work, with an unset value reserved for the first
+quit choice; the quit dialog and settings presentation are still pending.

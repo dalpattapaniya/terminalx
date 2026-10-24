@@ -22,6 +22,7 @@ struct State {
     write: UnixStream,
     views: Views,
     connected: bool,
+    detached: bool,
 }
 
 impl State {
@@ -50,9 +51,19 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn connect(client: &Client, sink: Arc<dyn EventSink>) -> Result<Self> {
+        Self::open(client, sink, true)
+    }
+
+    /// Additional windows need independent flow control, but must not publish
+    /// another copy of the owner's app-wide events into the desktop event bus.
+    pub fn connect_views(client: &Client, sink: Arc<dyn EventSink>) -> Result<Self> {
+        Self::open(client, sink, false)
+    }
+
+    fn open(client: &Client, sink: Arc<dyn EventSink>, publish_events: bool) -> Result<Self> {
         let mut connection = client.stream()?;
         let attachment = connection.attachment().clone();
-        let state = Arc::new(Mutex::new(State { write: connection.writer()?, views: HashMap::new(), connected: true }));
+        let state = Arc::new(Mutex::new(State { write: connection.writer()?, views: HashMap::new(), connected: true, detached: false }));
         let reader = state.clone();
         std::thread::Builder::new().name("local-runtime-events".into()).spawn(move || {
             let outcome: Result<()> = (|| {
@@ -61,7 +72,9 @@ impl Bridge {
                     match frame["type"].as_str() {
                         Some("event") => {
                             let event = frame["event"].as_str().ok_or_else(|| anyhow::anyhow!("event name is missing"))?;
-                            sink.emit_raw(event, serde_json::value::to_raw_value(&frame["payload"])?);
+                            if publish_events {
+                                sink.emit_raw(event, serde_json::value::to_raw_value(&frame["payload"])?);
+                            }
                         }
                         Some("pty") => {
                             let id = frame["id"].as_str().ok_or_else(|| anyhow::anyhow!("pane id is missing"))?;
@@ -82,12 +95,18 @@ impl Bridge {
                     }
                 }
             })();
-            reader.lock().unwrap().close();
+            let detached = {
+                let mut state = reader.lock().unwrap();
+                state.close();
+                state.detached
+            };
             if let Err(error) = outcome {
+                if detached { return; }
                 log::debug!("local runtime bridge disconnected: {error}");
                 // Do not synthesize terminal exits or recoveries: the owner
                 // may still be running. A new bridge starts with new taps.
-                sink.emit("local_runtime_disconnected", &json!({"reattachRequired":true}));
+                let event = if publish_events { "local_runtime_disconnected" } else { "local_runtime_view_disconnected" };
+                sink.emit(event, &json!({"reattachRequired":true}));
             }
         })?;
         Ok(Self { state, attachment })
@@ -131,5 +150,9 @@ impl Bridge {
 }
 
 impl Drop for Bridge {
-    fn drop(&mut self) { self.state.lock().unwrap().close(); }
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.detached = true;
+        state.close();
+    }
 }

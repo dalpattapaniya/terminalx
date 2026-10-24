@@ -192,12 +192,18 @@ fn native_client_pins_its_owner_and_cannot_send_to_a_replacement() {
     assert_eq!(events.attachment().epoch, status["localRuntime"]["epoch"]);
     assert!(!events.attachment().lease.is_empty());
     let sessions = raccoon_lib::local_runtime::sessions::Sessions::new(client.clone());
+    sessions.usage_snapshot().unwrap();
+    let activity = sessions.activity_summary().unwrap();
+    assert_eq!(activity.agents_spawned, 0);
+    assert!(activity.accounting_error.is_none());
     client.stop_all().unwrap();
     stopped(&mut serve);
     drop(events);
     drop(serve);
     let replacement = Serve::start(world.command(), &world.data);
     assert!(client.call::<serde_json::Value>("status", json!({})).is_err());
+    assert!(sessions.usage_snapshot().is_err(), "disconnected usage must not look like an empty account");
+    assert!(sessions.activity_summary().is_err(), "disconnected activity must not be read by a new UI owner");
     assert!(sessions.running_tabs().is_err(), "disconnect is not an empty running list");
     assert!(sessions.pending_permissions().is_err(), "disconnect must not hide pending asks");
     assert!(sessions.status_of("unknown", "unknown").is_err(), "disconnect is not idle");
@@ -492,4 +498,104 @@ fn typed_session_adapter_reattaches_to_a_pending_turn_and_answers_without_recove
     client.stop_all().unwrap();
     stopped(&mut serve);
     assert!(sessions.load_events(session, tab).is_err());
+}
+
+#[test]
+fn desktop_windows_share_events_once_and_release_only_their_own_flow_control() {
+    use raccoon_lib::local_runtime::{client::Client, desktop::Desktop};
+    use raccoon_lib::sink::EventSink;
+    use std::sync::Arc;
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:ready",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let id = format!("{}:8", created["sessionId"].as_str().unwrap());
+    serve.control("runtime.pty.spawn", json!({"id":id,"cwd":world.project,"cols":80,"rows":24,
+        "command":"sh -c 'printf window-replay; sleep 60'"}));
+    let output = common::agent::wait_until("window replay", || {
+        let value = serve.control("runtime.pty.output", json!({"id":id}));
+        let bytes = base64::engine::general_purpose::STANDARD.decode(value["data"].as_str().unwrap()).unwrap();
+        bytes.ends_with(b"window-replay").then_some(bytes)
+    });
+    let sink = Arc::new(raccoon_lib::sink::BroadcastSink::new(16));
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    sink.listen("pty_renamed", Box::new(move |event| { let _ = events_tx.send(event.to_owned()); }));
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    for event in ["local_runtime_disconnected", "local_runtime_view_disconnected"] {
+        let closed_tx = closed_tx.clone();
+        sink.listen(event, Box::new(move |_| { let _ = closed_tx.send(()); }));
+    }
+    let desktop = Desktop::connect(Client::connect(&world.data).unwrap(), sink).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    desktop.attach("main", &id, "same-token", Box::new(move |bytes| tx.send(bytes.to_vec()).is_ok())).unwrap();
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    desktop.attach("floating", &id, "same-token", Box::new(move |bytes| tx2.send(bytes.to_vec()).is_ok())).unwrap();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), output);
+    assert_eq!(rx2.recv_timeout(Duration::from_secs(5)).unwrap(), output);
+    serve.control("runtime.pty.rename", json!({"id":id,"title":"Renamed once"}));
+    assert!(events_rx.recv_timeout(Duration::from_secs(5)).unwrap().contains("Renamed once"));
+    assert!(events_rx.recv_timeout(Duration::from_millis(200)).is_err(), "one owner event must not be published by each window");
+    desktop.detach_window("main");
+    common::agent::wait_until("only floating view remains", || {
+        (serve.control("runtime.pty.stats", json!({}))["views"] == 1).then_some(())
+    });
+    // Identical view tokens in different windows cannot acknowledge each other.
+    desktop.ack("main", &id, "same-token", output.len() as u64).unwrap();
+    assert_eq!(serve.control("runtime.pty.stats", json!({}))["unackedBytes"], output.len());
+    desktop.ack("floating", &id, "same-token", output.len() as u64).unwrap();
+    common::agent::wait_until("floating acknowledgement", || {
+        (serve.control("runtime.pty.stats", json!({}))["unackedBytes"] == 0).then_some(())
+    });
+    desktop.detach_window("floating");
+    common::agent::wait_until("all views released", || {
+        (serve.control("runtime.pty.stats", json!({}))["views"] == 0).then_some(())
+    });
+    assert_eq!(serve.control("runtime.pty.output", json!({"id":id}))["running"], true);
+    assert!(desktop.sessions().is_ok(), "closing both views must retain the desktop control attachment");
+    assert!(closed_rx.recv_timeout(Duration::from_millis(200)).is_err(), "intentional view detachment must not announce a lost runtime");
+    desktop.stop_all().unwrap();
+    stopped(&mut serve);
+    common::agent::wait_until("desktop disconnect", || desktop.sessions().is_err().then_some(()));
+}
+
+#[test]
+fn typed_terminal_adapter_preserves_input_resize_and_explicit_stop() {
+    use raccoon_lib::local_runtime::{client::Client, terminals::Terminals};
+    let world = AgentWorld::new();
+    let mut serve = Serve::start(world.command(), &world.data);
+    let created = serve.control("sessions.create", json!({
+        "project":world.project,"agent":"claude","prompt":"echo:ready",
+        "useWorktree":false,"onMain":true,"mode":"manual"
+    }));
+    let id = format!("{}:9", created["sessionId"].as_str().unwrap());
+    let client = Client::connect(&world.data).unwrap();
+    let terminals = Terminals::new(client.clone());
+    terminals.spawn(&id, world.project.to_str().unwrap(), 80, 24,
+        Some("sh -c 'stty -echo; printf adapter-ready; IFS= read -r line; printf \"\\nreceived:%s\\n\" \"$line\"; stty size; sleep 60'"), Some("Adapter terminal")).unwrap();
+    let read = || {
+        let value = serve.control("runtime.pty.output", json!({"id":id}));
+        String::from_utf8(base64::engine::general_purpose::STANDARD.decode(value["data"].as_str().unwrap()).unwrap()).unwrap()
+    };
+    common::agent::wait_until("terminal adapter readiness", || read().contains("adapter-ready").then_some(()));
+    assert!(terminals.shells().unwrap().iter().any(|shell| shell.id == id && shell.title.as_deref() == Some("Adapter terminal")));
+    terminals.resize(&id, 100, 30).unwrap();
+    terminals.write(&id, b"typed input survives\n").unwrap();
+    common::agent::wait_until("typed input and resize", || {
+        let output = read();
+        (output.contains("received:typed input survives") && output.contains("30 100")).then_some(())
+    });
+    assert_eq!(terminals.busy(std::slice::from_ref(&id)).unwrap(), [id.clone()]);
+    terminals.rename(&id, "Renamed through owner").unwrap();
+    assert!(terminals.shells().unwrap().iter().any(|shell| shell.id == id && shell.title.as_deref() == Some("Renamed through owner")));
+    assert!(terminals.spawn("unknown-session:1", world.project.to_str().unwrap(), 80, 24, None, None).is_err());
+    terminals.kill(&id).unwrap();
+    common::agent::wait_until("explicit terminal stop", || {
+        (!serve.control("runtime.pty.output", json!({"id":id}))["running"].as_bool().unwrap()).then_some(())
+    });
+    client.stop_all().unwrap();
+    stopped(&mut serve);
+    assert!(terminals.stats().is_err());
+    assert!(terminals.shells().is_err());
 }

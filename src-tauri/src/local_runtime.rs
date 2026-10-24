@@ -26,6 +26,10 @@ pub mod sessions;
 pub mod launch;
 #[cfg(unix)]
 pub mod bridge;
+#[cfg(unix)]
+pub mod desktop;
+#[cfg(unix)]
+pub mod terminals;
 
 pub const PROTOCOL: u64 = 1;
 pub const IDLE_GRACE: Duration = Duration::from_secs(60);

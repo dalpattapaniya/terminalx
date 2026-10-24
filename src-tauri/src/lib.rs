@@ -160,6 +160,7 @@ pub struct AppState {
     /// The built-in browser: agent-browser sessions, pages and profiles.
     pub browser: Arc<browser::BrowserRuntime>,
     manager: std::sync::Mutex<Option<session::SessionManager>>,
+    runtime: std::sync::Mutex<Option<Arc<local_runtime::desktop::Desktop>>>,
 }
 
 #[cfg(feature = "desktop")]
@@ -167,6 +168,17 @@ impl AppState {
     pub fn manager(&self) -> Option<session::SessionManager> {
         self.manager.lock().unwrap().clone()
     }
+
+    pub fn runtime(&self) -> Option<Arc<local_runtime::desktop::Desktop>> {
+        self.runtime.lock().unwrap().clone()
+    }
+
+    pub fn sessions(&self) -> anyhow::Result<local_runtime::sessions::Sessions> {
+        if let Some(runtime) = self.runtime() { return runtime.sessions(); }
+        self.manager().map(local_runtime::sessions::Sessions::in_process)
+            .ok_or_else(|| anyhow::anyhow!("not ready"))
+    }
+
 }
 
 #[cfg(feature = "desktop")]
@@ -217,6 +229,7 @@ pub fn run() {
         computer: computer.clone(),
         browser: browser.clone(),
         manager: std::sync::Mutex::new(None),
+        runtime: std::sync::Mutex::new(None),
     };
 
     tauri::Builder::default()

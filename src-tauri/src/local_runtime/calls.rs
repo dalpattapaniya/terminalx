@@ -14,39 +14,22 @@ fn string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
 
 pub fn execute(manager: &SessionManager, sink: &Arc<dyn EventSink>, command: &str, params: Value) -> Result<Value> {
     if let Some(method) = command.strip_prefix("runtime.session.") {
-        if method == "running" { return Ok(serde_json::to_value(manager.running_tabs())?); }
-        if method == "permissions" { return Ok(serde_json::to_value(manager.pending_permissions())?); }
-        let session = string(&params, "sessionId")?;
-        let tab = string(&params, "tabId")?;
-        let value = match method {
-            "ensureStarted" => { manager.ensure_started(session, tab)?; Value::Null }
-            "events" => serde_json::to_value(manager.load_events(session, tab)?)?,
-            "status" => serde_json::to_value(manager.status_of(session, tab))?,
-            "pane" => serde_json::to_value(manager.pane_of(session, tab))?,
-            "queued" => serde_json::to_value(manager.queued(session, tab))?,
-            "sendConfirmed" => serde_json::to_value(manager.send_confirmed(session, tab, string(&params, "text")?.into())?)?,
-            "prepareContinuation" => serde_json::to_value(crate::continuation::prepare(session, tab, manager.tracked_transcript(session, tab))?)?,
-            "send" => serde_json::to_value(manager.send(session, tab, string(&params, "text")?.into(),
-                serde_json::from_value(params.get("images").cloned().unwrap_or_else(|| json!([])))?)?)?,
-            "interrupt" => json!(manager.interrupt(session, tab)?),
-            "stop" => { manager.stop(session, tab)?; Value::Null }
-            "sendQueuedNow" => { manager.send_queued_now(session, tab, params["seq"].as_u64().context("seq is required")?)?; Value::Null }
-            "cancelQueued" => serde_json::to_value(manager.cancel_queued(session, tab, string(&params, "messageId")?)?)?,
-            "permission" => { manager.respond_permission(session, tab, string(&params, "requestId")?, string(&params, "optionId")?)?; Value::Null }
-            "questions" => { manager.answer_questions(session, tab, string(&params, "requestId")?, serde_json::from_value(params["answers"].clone())?)?; Value::Null }
-            "model" => { manager.set_model(session, tab, string(&params, "model")?)?; Value::Null }
-            "mode" => { manager.set_permission_mode(session, tab, string(&params, "mode")?)?; Value::Null }
-            "effort" => { manager.set_effort(session, tab, params["effort"].as_str())?; Value::Null }
-            "markRead" => { manager.mark_read(session, tab)?; Value::Null }
-            "handoff" => serde_json::to_value(manager.handoff(session, tab)?)?,
-            _ => bail!("unsupported local session operation"),
-        };
-        return Ok(value);
+        return session(manager, method, params);
     }
     if let Some(method) = command.strip_prefix("runtime.pty.") {
         let terminals = manager.terminals();
         if method == "shells" { return Ok(serde_json::to_value(terminals.shells())?); }
         if method == "stats" { return Ok(serde_json::to_value(terminals.stats())?); }
+        if method == "visibleShells" {
+            let sessions = crate::store::index::load()?;
+            let taken: std::collections::HashSet<_> = sessions.iter().flat_map(|session| &session.tabs).filter_map(|tab| tab.follow.pane.as_deref()).collect();
+            return Ok(serde_json::to_value(terminals.shells().into_iter().filter(|shell| !taken.contains(shell.id.as_str())).collect::<Vec<_>>())?);
+        }
+        if method == "busyMany" {
+            let ids: Vec<String> = serde_json::from_value(params["ids"].clone())?;
+            if ids.len() > 4096 || ids.iter().any(|id| id.is_empty() || id.len() > 256) { bail!("invalid pane list"); }
+            return Ok(serde_json::to_value(ids.into_iter().filter(|id| terminals.is_busy(id)).collect::<Vec<_>>())?);
+        }
         let id = string(&params, "id")?;
         if id.is_empty() || id.len() > 256 { bail!("invalid pane id"); }
         let size = || -> Result<(u16, u16)> {
@@ -92,4 +75,45 @@ pub fn execute(manager: &SessionManager, sink: &Arc<dyn EventSink>, command: &st
     } else {
         bail!("unsupported local runtime operation")
     }
+}
+
+pub(crate) fn session(manager: &SessionManager, method: &str, params: Value) -> Result<Value> {
+    if method == "running" { return Ok(serde_json::to_value(manager.running_tabs())?); }
+    if method == "permissions" { return Ok(serde_json::to_value(manager.pending_permissions())?); }
+    match method {
+        "paneAgents" => return Ok(serde_json::to_value(manager.pane_agents())?),
+        "addTab" => return Ok(serde_json::to_value(manager.add_tab(string(&params, "sessionId")?, &serde_json::from_value(params["tab"].clone())?)?)?),
+        "usage" => return Ok(serde_json::to_value(manager.usage_snapshot())?),
+        "refreshUsage" => return Ok(serde_json::to_value(manager.refresh_usage(params["manual"].as_bool().context("manual must be a boolean")?))?),
+        "resetCodexUsage" => return Ok(serde_json::to_value(manager.reset_codex_usage()?)?),
+        "activity" => return Ok(serde_json::to_value(crate::store::activity::summary()?)?),
+        _ => {}
+    }
+    let session = string(&params, "sessionId")?;
+    let tab = string(&params, "tabId")?;
+    let value = match method {
+        "resumeConversation" => { manager.resume_conversation(session, tab, string(&params, "harness")?, string(&params, "providerSessionId")?)?; Value::Null }
+        "ensureStarted" => { manager.ensure_started(session, tab)?; Value::Null }
+        "events" => serde_json::to_value(manager.load_events(session, tab)?)?,
+        "status" => serde_json::to_value(manager.status_of(session, tab))?,
+        "pane" => serde_json::to_value(manager.pane_of(session, tab))?,
+        "queued" => serde_json::to_value(manager.queued(session, tab))?,
+        "sendConfirmed" => serde_json::to_value(manager.send_confirmed(session, tab, string(&params, "text")?.into())?)?,
+        "prepareContinuation" => serde_json::to_value(crate::continuation::prepare(session, tab, manager.tracked_transcript(session, tab))?)?,
+        "send" => serde_json::to_value(manager.send(session, tab, string(&params, "text")?.into(),
+            serde_json::from_value(params.get("images").cloned().unwrap_or_else(|| json!([])))?)?)?,
+        "interrupt" => json!(manager.interrupt(session, tab)?),
+        "stop" => { manager.stop(session, tab)?; Value::Null }
+        "sendQueuedNow" => { manager.send_queued_now(session, tab, params["seq"].as_u64().context("seq is required")?)?; Value::Null }
+        "cancelQueued" => serde_json::to_value(manager.cancel_queued(session, tab, string(&params, "messageId")?)?)?,
+        "permission" => { manager.respond_permission(session, tab, string(&params, "requestId")?, string(&params, "optionId")?)?; Value::Null }
+        "questions" => { manager.answer_questions(session, tab, string(&params, "requestId")?, serde_json::from_value(params["answers"].clone())?)?; Value::Null }
+        "model" => { manager.set_model(session, tab, string(&params, "model")?)?; Value::Null }
+        "mode" => { manager.set_permission_mode(session, tab, string(&params, "mode")?)?; Value::Null }
+        "effort" => { manager.set_effort(session, tab, params["effort"].as_str())?; Value::Null }
+        "markRead" => { manager.mark_read(session, tab)?; Value::Null }
+        "handoff" => serde_json::to_value(manager.handoff(session, tab)?)?,
+        _ => bail!("unsupported local session operation"),
+    };
+    Ok(value)
 }

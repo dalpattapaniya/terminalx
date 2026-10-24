@@ -1876,8 +1876,9 @@ pub async fn session_summaries(session_ids: Option<Vec<String>>) -> CmdResult<Ve
 
 /// Cached display/status reads never walk transcripts or wait for the scan.
 #[tauri::command]
-pub async fn app_activity_summary() -> CmdResult<crate::store::activity::Summary> {
-    tauri::async_runtime::spawn_blocking(|| crate::store::activity::summary().map_err(err))
+pub async fn app_activity_summary(state: State<'_, AppState>) -> CmdResult<crate::store::activity::Summary> {
+    let sessions = state.sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || sessions.activity_summary().map_err(err))
         .await.map_err(err)?
 }
 
@@ -1919,7 +1920,7 @@ fn announce_session(app: &AppHandle, session_id: &str) {
 
 #[tauri::command]
 pub fn add_tab(app: AppHandle, state: State<'_, AppState>, session_id: String, tab: NewTab) -> CmdResult<TabEntry> {
-    let tab = state.manager().ok_or("not ready")?.add_tab(&session_id, &tab).map_err(err)?;
+    let tab = state.sessions().map_err(err)?.add_tab(&session_id, &tab).map_err(err)?;
     announce_session(&app, &session_id);
     Ok(tab)
 }
@@ -2450,16 +2451,15 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn prepare_continuation(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<crate::continuation::Context> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let tracked = m.tracked_transcript(&session_id, &tab_id);
-        crate::continuation::prepare(&session_id, &tab_id, tracked).map_err(err)
+        m.prepare_continuation(&session_id, &tab_id).map_err(err)
     }).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn load_tab_events(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<Vec<crate::events::AgentEvent>> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || m.load_events(&session_id, &tab_id).map_err(err)).await.map_err(err)?
 }
 
@@ -2497,7 +2497,7 @@ pub async fn send_message(
     images: Option<Vec<ImageInput>>,
     confirm_delivery: Option<bool>,
 ) -> CmdResult<SendOutcome> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || {
         if confirm_delivery.unwrap_or(false) {
             m.send_confirmed(&session_id, &tab_id, text).map_err(err)
@@ -2511,26 +2511,26 @@ pub async fn send_message(
 
 #[tauri::command]
 pub fn interrupt_turn(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<bool> {
-    state.manager().ok_or("not ready")?.interrupt(&session_id, &tab_id).map_err(err)
+    state.sessions().map_err(err)?.interrupt(&session_id, &tab_id).map_err(err)
 }
 
 #[tauri::command]
 pub fn tab_handoff(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<crate::session::HandoffInfo> {
-    state.manager().ok_or("not ready")?.handoff(&session_id, &tab_id).map_err(err)
+    state.sessions().map_err(err)?.handoff(&session_id, &tab_id).map_err(err)
 }
 
 /// The terminal pane a tab's CLI is running in, or nothing if it is not.
 /// A window that opened after the CLI did never saw the pane announced.
 #[tauri::command]
 pub fn tab_pane(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<Option<crate::session::TabPtyEvent>> {
-    Ok(state.manager().ok_or("not ready")?.pane_of(&session_id, &tab_id))
+    state.sessions().map_err(err)?.pane_of(&session_id, &tab_id).map_err(err)
 }
 
 /// Start a tab's own CLI. PTY-first tabs are the CLI, so opening one starts
 /// it; harnesses that still run headless do nothing here.
 #[tauri::command]
 pub async fn ensure_tab_started(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<()> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || m.ensure_started(&session_id, &tab_id).map_err(err)).await.map_err(err)?
 }
 
@@ -2538,29 +2538,29 @@ pub async fn ensure_tab_started(state: State<'_, AppState>, session_id: String, 
 /// really be gone before they answer, so none of them runs on the main thread.
 #[tauri::command]
 pub async fn stop_tab(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<()> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || m.stop(&session_id, &tab_id).map_err(err)).await.map_err(err)?
 }
 
 /// Send a message the CLI holds behind its running turn now: interrupt, then type it.
 #[tauri::command]
 pub fn send_queued_now(state: State<'_, AppState>, session_id: String, tab_id: String, seq: u64) -> CmdResult<()> {
-    state.manager().ok_or("not ready")?.send_queued_now(&session_id, &tab_id, seq).map_err(err)
+    state.sessions().map_err(err)?.send_queued_now(&session_id, &tab_id, seq).map_err(err)
 }
 
 #[tauri::command]
 pub fn cancel_queued(state: State<'_, AppState>, session_id: String, tab_id: String, message_id: String) -> CmdResult<Option<QueuedMessage>> {
-    state.manager().ok_or("not ready")?.cancel_queued(&session_id, &tab_id, &message_id).map_err(err)
+    state.sessions().map_err(err)?.cancel_queued(&session_id, &tab_id, &message_id).map_err(err)
 }
 
 #[tauri::command]
 pub fn list_queued(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<Vec<QueuedMessage>> {
-    Ok(state.manager().ok_or("not ready")?.queued(&session_id, &tab_id))
+    state.sessions().map_err(err)?.queued(&session_id, &tab_id).map_err(err)
 }
 
 #[tauri::command]
 pub fn respond_permission(state: State<'_, AppState>, session_id: String, tab_id: String, request_id: String, option_id: String) -> CmdResult<()> {
-    state.manager().ok_or("not ready")?.respond_permission(&session_id, &tab_id, &request_id, &option_id).map_err(err)
+    state.sessions().map_err(err)?.respond_permission(&session_id, &tab_id, &request_id, &option_id).map_err(err)
 }
 
 #[tauri::command]
@@ -2571,35 +2571,35 @@ pub fn answer_questions(
     request_id: String,
     answers: std::collections::HashMap<String, String>,
 ) -> CmdResult<()> {
-    state.manager().ok_or("not ready")?.answer_questions(&session_id, &tab_id, &request_id, answers).map_err(err)
+    state.sessions().map_err(err)?.answer_questions(&session_id, &tab_id, &request_id, answers).map_err(err)
 }
 
 #[tauri::command]
 pub async fn set_tab_model(state: State<'_, AppState>, session_id: String, tab_id: String, model: String) -> CmdResult<()> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || m.set_model(&session_id, &tab_id, &model).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn set_tab_permission_mode(state: State<'_, AppState>, session_id: String, tab_id: String, mode: String) -> CmdResult<()> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || m.set_permission_mode(&session_id, &tab_id, &mode).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub async fn set_tab_effort(state: State<'_, AppState>, session_id: String, tab_id: String, effort: Option<String>) -> CmdResult<()> {
-    let m = state.manager().ok_or("not ready")?;
+    let m = state.sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || m.set_effort(&session_id, &tab_id, effort.as_deref()).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
 pub fn mark_tab_read(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<()> {
-    state.manager().ok_or("not ready")?.mark_read(&session_id, &tab_id).map_err(err)
+    state.sessions().map_err(err)?.mark_read(&session_id, &tab_id).map_err(err)
 }
 
 #[tauri::command]
 pub fn tab_status(state: State<'_, AppState>, session_id: String, tab_id: String) -> CmdResult<TabStatus> {
-    Ok(state.manager().ok_or("not ready")?.status_of(&session_id, &tab_id))
+    state.sessions().map_err(err)?.status_of(&session_id, &tab_id).map_err(err)
 }
 
 /// The picker's list. Claude and Codex depend on the signed-in account and
@@ -2678,49 +2678,19 @@ pub fn set_status_bar_settings(app: AppHandle, patch: StatusBarPatch) -> CmdResu
 
 #[tauri::command]
 pub fn status_usage_snapshot(state: State<'_, AppState>) -> CmdResult<crate::status::usage::UsageSnapshot> {
-    Ok(state.manager().ok_or("not ready")?.usage_snapshot())
+    state.sessions().map_err(err)?.usage_snapshot().map_err(err)
 }
 
 #[tauri::command]
-pub async fn status_usage_refresh(app: AppHandle, state: State<'_, AppState>, manual: Option<bool>) -> CmdResult<crate::status::usage::UsageSnapshot> {
-    let status = state.status.clone();
-    let manager = state.manager().ok_or("not ready")?;
-    let manual = manual.unwrap_or(false);
-    // Read per request, so a changed interval governs the very next refresh.
-    let cadence = store::settings::load().status_bar.usage_refresh_ms();
-    let publishing_app = app.clone();
-    let publishing_manager = manager.clone();
-    let failures = tauri::async_runtime::spawn_blocking(move || {
-        let mut failures = Vec::new();
-        if let Err(error) = status.usage.refresh_claude(manual, cadence) {
-            failures.push(format!("Claude usage refresh: {error:#}"));
-        }
-        // Publish Claude as soon as its source settles; starting Codex's
-        // app-server must not hold a confirmed Claude rollover off-screen.
-        let _ = publishing_app.emit(crate::status::usage::EVENT, publishing_manager.usage_snapshot());
-        if let Err(error) = status.usage.refresh_codex(manual, cadence) {
-            failures.push(format!("Codex usage refresh: {error:#}"));
-        }
-        failures
-    })
-    .await
-    .map_err(err)?;
-    for failure in failures {
-        log::warn!("{failure}");
-    }
-    let snapshot = manager.usage_snapshot();
-    let _ = app.emit(crate::status::usage::EVENT, &snapshot);
-    Ok(snapshot)
+pub async fn status_usage_refresh(state: State<'_, AppState>, manual: Option<bool>) -> CmdResult<crate::status::usage::UsageSnapshot> {
+    let manager = state.sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || manager.refresh_usage(manual.unwrap_or(false)).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
-pub async fn status_codex_reset(app: AppHandle, state: State<'_, AppState>) -> CmdResult<crate::status::usage::UsageSnapshot> {
-    let status = state.status.clone();
-    let manager = state.manager().ok_or("not ready")?;
-    tauri::async_runtime::spawn_blocking(move || status.usage.reset_codex().map_err(err)).await.map_err(err)??;
-    let snapshot = manager.usage_snapshot();
-    let _ = app.emit(crate::status::usage::EVENT, &snapshot);
-    Ok(snapshot)
+pub async fn status_codex_reset(state: State<'_, AppState>) -> CmdResult<crate::status::usage::UsageSnapshot> {
+    let manager = state.sessions().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || manager.reset_codex_usage().map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
@@ -2907,7 +2877,11 @@ pub fn gh_available() -> bool {
 
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
-pub fn pty_spawn(app: AppHandle, state: State<'_, AppState>, id: String, cwd: String, cols: u16, rows: u16, command: Option<String>, title: Option<String>) -> CmdResult<()> {
+pub async fn pty_spawn(app: AppHandle, state: State<'_, AppState>, id: String, cwd: String, cols: u16, rows: u16, command: Option<String>, title: Option<String>) -> CmdResult<()> {
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.spawn(&id, &cwd, cols, rows, command.as_deref(), title.as_deref()))
+            .await.map_err(err)?.map_err(err);
+    }
     let spec = crate::pty::PaneSpec { cwd: &cwd, cols: cols.max(2), rows: rows.max(1), command: command.as_deref(), env: &[] };
     state.terminals.spawn(std::sync::Arc::new(app.clone()), &id, spec).map_err(err)?;
     if let Some(title) = title.as_deref().filter(|title| !title.trim().is_empty()) {
@@ -2926,47 +2900,60 @@ pub(crate) const PTY_RENAMED_EVENT: &str = "pty_renamed";
 
 /// Which of these shell tabs are running a command now, for a close that would end it.
 #[tauri::command]
-pub fn pty_busy(state: State<'_, AppState>, ids: Vec<String>) -> Vec<String> {
-    ids.into_iter().filter(|id| state.terminals.is_busy(id)).collect()
+pub async fn pty_busy(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<Vec<String>> {
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.busy(&ids)).await.map_err(err)?.map_err(err);
+    }
+    Ok(ids.into_iter().filter(|id| state.terminals.is_busy(id)).collect())
 }
 
 /// The shell tabs that are open, in every session: a window loaded after
 /// they were opened (the floating one, a reload) lists them from this.
 #[tauri::command]
-pub fn pty_shells(state: State<'_, AppState>) -> Vec<crate::pty::ShellPane> {
+pub async fn pty_shells(state: State<'_, AppState>) -> CmdResult<Vec<crate::pty::ShellPane>> {
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.shells()).await.map_err(err)?.map_err(err);
+    }
     // A shell an agent was started in is that agent's tab from then on
     // (#437): the session lists it, and it is not also a shell tab.
     let taken: std::collections::HashSet<String> = index::load().unwrap_or_default().iter().flat_map(|session| &session.tabs).filter_map(|tab| tab.follow.pane.clone()).collect();
-    state.terminals.shells().into_iter().filter(|shell| !taken.contains(&shell.id)).collect()
+    Ok(state.terminals.shells().into_iter().filter(|shell| !taken.contains(&shell.id)).collect())
 }
 
 /// The agents in front of terminals right now (#437), for a window that
 /// loads after they were started.
 #[tauri::command]
-pub fn pane_agents(state: State<'_, AppState>) -> Vec<crate::session::follow::PaneAgent> {
-    state.manager().map(|manager| manager.pane_agents()).unwrap_or_default()
+pub fn pane_agents(state: State<'_, AppState>) -> CmdResult<Vec<crate::session::follow::PaneAgent>> {
+    state.sessions().map_err(err)?.pane_agents().map_err(err)
 }
 
 /// Start a tab's agent again on one of the tab's conversations (#437): the
 /// one it holds, or one it held before another agent was run in its terminal.
 #[tauri::command]
 pub async fn tab_resume_conversation(app: AppHandle, session_id: String, tab_id: String, harness: String, provider_session_id: String) -> CmdResult<()> {
-    let manager = app.state::<AppState>().manager().ok_or("not ready")?;
+    let manager = app.state::<AppState>().sessions().map_err(err)?;
     tauri::async_runtime::spawn_blocking(move || manager.resume_conversation(&session_id, &tab_id, &harness, &provider_session_id).map_err(err)).await.map_err(err)?
 }
 
 #[tauri::command]
-pub fn pty_rename(app: AppHandle, state: State<'_, AppState>, id: String, title: String) {
+pub async fn pty_rename(app: AppHandle, state: State<'_, AppState>, id: String, title: String) -> CmdResult<()> {
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.rename(&id, &title)).await.map_err(err)?.map_err(err);
+    }
     state.terminals.rename(&id, &title);
     if let Some(shell) = state.terminals.shell(&id) {
         let _ = app.emit(PTY_RENAMED_EVENT, &shell);
     }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn pty_write(state: State<'_, AppState>, id: String, data: String) -> CmdResult<()> {
     if !state.pairing.desktop_terminal_input_allowed(&id) {
         return Ok(());
+    }
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.write(&id, data.as_bytes())).await.map_err(err)?.map_err(err);
     }
     // A paste can fill the PTY's input buffer while the program is busy
     // writing output. Never wait for it on the UI thread: that also prevents
@@ -2978,32 +2965,46 @@ pub async fn pty_write(state: State<'_, AppState>, id: String, data: String) -> 
 /// scrollback so far first. No base64, no JSON, and no other listener hears it.
 /// `token` names this attachment in the acknowledgements and the detach that follow.
 #[tauri::command]
-pub fn pty_attach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) {
+pub async fn pty_attach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> CmdResult<()> {
+    if let Some(runtime) = state.runtime() {
+        let label = window.label().to_owned();
+        return tauri::async_runtime::spawn_blocking(move || runtime.attach(&label, &id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok())))
+            .await.map_err(err)?.map_err(err);
+    }
     state.terminals.attach(window.label(), &id, &token, Box::new(move |bytes| channel.send(tauri::ipc::InvokeResponseBody::Raw(bytes.to_vec())).is_ok()));
+    Ok(())
 }
 
 /// The window has drawn `drawn` bytes of the pane's output since it attached (flow control).
 #[tauri::command]
-pub fn pty_ack(state: State<'_, AppState>, id: String, token: String, drawn: u64) {
+pub fn pty_ack(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String, drawn: u64) -> CmdResult<()> {
+    if let Some(runtime) = state.runtime() { return runtime.ack(window.label(), &id, &token, drawn).map_err(err); }
     state.terminals.ack(&id, &token, drawn);
+    Ok(())
 }
 
 /// A freshly loaded window: whatever its previous page was shown is gone.
 /// Only this window's views: another window goes on showing its terminals.
 #[tauri::command]
 pub fn pty_detach_all(window: tauri::WebviewWindow, state: State<'_, AppState>) {
+    if let Some(runtime) = state.runtime() { runtime.detach_window(window.label()); return; }
     state.terminals.detach_window(window.label());
 }
 
 #[tauri::command]
-pub fn pty_detach(state: State<'_, AppState>, id: String, token: String) {
+pub fn pty_detach(window: tauri::WebviewWindow, state: State<'_, AppState>, id: String, token: String) -> CmdResult<()> {
+    if let Some(runtime) = state.runtime() { return runtime.detach(window.label(), &id, &token).map_err(err); }
     state.terminals.detach(&id, &token);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn pty_resize(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> CmdResult<()> {
+pub async fn pty_resize(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> CmdResult<()> {
     if !state.pairing.desktop_terminal_input_allowed(&id) {
         return Ok(());
+    }
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.resize(&id, cols, rows)).await.map_err(err)?.map_err(err);
     }
     state.terminals.resize(&id, cols.max(2), rows.max(1)).map_err(err)
 }
@@ -3014,7 +3015,10 @@ pub fn mobile_terminal_drivers(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn pty_kill(app: AppHandle, state: State<'_, AppState>, id: String) {
+pub async fn pty_kill(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    if let Some(runtime) = state.runtime() {
+        return tauri::async_runtime::spawn_blocking(move || runtime.terminals()?.kill(&id)).await.map_err(err)?.map_err(err);
+    }
     // By its name, not by whether it is still running: a shell whose process
     // has already gone is still a tab in the other window, to be dropped there.
     let shell = crate::pty::is_shell_id(&id);
@@ -3023,6 +3027,7 @@ pub fn pty_kill(app: AppHandle, state: State<'_, AppState>, id: String) {
     if shell {
         let _ = app.emit(PTY_CLOSED_EVENT, &id);
     }
+    Ok(())
 }
 
 /// The webview's answer to a `terminal_perf_request` event.

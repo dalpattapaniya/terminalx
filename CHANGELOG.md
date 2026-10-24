@@ -4,6 +4,14 @@
 
 ### Runtime investigation
 
+- Centralize provider usage refresh in the session owner, preserving account
+  privacy, refresh backoff and early Claude updates. Add fallible usage/activity
+  adapters and independent desktop-window PTY connections without duplicate
+  app-wide events or false disconnects on window closure. Route desktop commands
+  through owner-compatible adapters, preserve independent acknowledgements, and
+  classify directly launched terminal commands as busy. Desktop startup cutover
+  remains in progress. (#467)
+
 - Build the local runtime helper through the Tauri build/dev hooks using the
   requested target and profile, sign it with the app entitlements and verify its
   signature before packaging. Direct Cargo checks create only an empty resource

@@ -35,6 +35,9 @@ struct Pane {
     /// only this pane, not every other pane's resize or kill.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pid: Option<u32>,
+    /// A shell tab launched directly into a command has no interactive shell
+    /// beneath it; its original foreground group is work too.
+    explicit_command: bool,
     alive: Arc<Mutex<bool>>,
     /// When this pane last wrote something. A caller that has to type into a
     /// program rather than talk to it uses the gap since the last byte as its
@@ -134,7 +137,7 @@ pub struct Terminals {
 }
 
 /// A shell tab of a session: a pane the reader opened, as every window lists it.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellPane {
     pub id: String,
@@ -189,7 +192,7 @@ impl Default for Terminals {
 }
 
 /// What the terminals hold and have sent, for `terminalx status` (issue #232).
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalStats {
     pub panes: usize,
@@ -323,6 +326,13 @@ impl Terminals {
             return Ok(());
         }
         let PaneSpec { cwd, cols, rows, command, env } = spec;
+        // A bare shell is still an interactive shell (also used by disposable
+        // PTY fixtures). Shell scripts/arguments are work until the pane exits.
+        let explicit_command = command.is_some_and(|command| {
+            let command = command.trim();
+            command.chars().any(char::is_whitespace)
+                || !matches!(std::path::Path::new(command).file_name().and_then(|name| name.to_str()), Some("sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "tcsh" | "csh"))
+        });
         *self.sink.lock().unwrap() = Some(sink.clone());
         let pty = portable_pty::native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("openpty: {e}"))?;
@@ -481,7 +491,7 @@ impl Terminals {
             })?;
         }
         let writer = Arc::new(Mutex::new(writer));
-        self.panes.lock().unwrap().insert(id.to_string(), Pane { master: pair.master, writer, pid, alive, last_output, scrollback, cwd: cwd.to_string(), created: crate::store::index::now() });
+        self.panes.lock().unwrap().insert(id.to_string(), Pane { master: pair.master, writer, pid, explicit_command, alive, last_output, scrollback, cwd: cwd.to_string(), created: crate::store::index::now() });
         self.keep_slot(id, &tap);
         self.changed();
         Ok(())
@@ -828,7 +838,8 @@ impl Terminals {
     }
 
     /// Whether the shell in `id` is running something: the terminal's
-    /// foreground process group is no longer the shell's own. `false` for a
+    /// foreground process group is no longer the shell's own, or the shell
+    /// tab was launched directly into a command rather than a prompt. `false` for a
     /// pane that has exited, and wherever that cannot be told.
     pub fn is_busy(&self, id: &str) -> bool {
         let panes = self.panes.lock().unwrap();
@@ -836,6 +847,7 @@ impl Terminals {
         if !*pane.alive.lock().unwrap() {
             return false;
         }
+        if is_shell_id(id) && pane.explicit_command { return true; }
         #[cfg(unix)]
         {
             matches!((pane.master.process_group_leader(), pane.pid), (Some(leader), Some(shell)) if leader > 0 && leader as u32 != shell)
