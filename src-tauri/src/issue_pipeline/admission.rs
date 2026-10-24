@@ -16,8 +16,13 @@ fn same_checkout(a: &str, b: &str) -> bool {
 
 /// Called under the admission lock before dispatching a new prompt.
 pub fn check(session_id: &str, tab_id: &str) -> Result<()> {
+    let reservations: Vec<_> = super::store::list()?.into_iter()
+        .filter(|pipeline| pipeline.checking_locally || pipeline.resolution.is_some()).collect();
+    // Ordinary hooks also serve live conversations before index persistence.
+    // There is no checkout restriction to enforce without a reservation.
+    if reservations.is_empty() { return Ok(()); }
     let session = index::get(session_id)?;
-    for pipeline in super::store::list()? {
+    for pipeline in reservations {
         if pipeline.checking_locally && same_checkout(&index::get(&pipeline.author.session_id)?.cwd, &session.cwd) {
             bail!("TerminalX is running checks on this checkout. Wait for them to finish before starting another turn.");
         }
@@ -36,6 +41,12 @@ pub fn check(session_id: &str, tab_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::issue_pipeline::{Pipeline, Resolution, SessionRef, Stage};
+
+    #[test]
+    fn no_reservation_leaves_unindexed_live_conversations_alone() {
+        let _home = crate::store::temp_home();
+        assert!(check("live-before-index", "t1").is_ok());
+    }
 
     #[test]
     fn a_reservation_excludes_other_conversations_but_allows_its_resolver() {
