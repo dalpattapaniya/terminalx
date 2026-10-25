@@ -7,7 +7,7 @@ vi.mock("@/lib/pipelineLaunch", () => ({ preparePipelineContinuation: mocks.pipe
 vi.mock("@/lib/agentEvents", () => ({ applyEvent: mocks.apply }));
 vi.mock("@/lib/prefs", () => ({ getPrefs: () => ({ lastModel: { codex: "codex-default" }, lastEffort: { codex: "high" }, lastMode: "default" }) }));
 import { continuationPrompt, launchContinuation, type ContinuationContext } from "./continuation";
-import { getDraft, setDraft } from "@/lib/drafts";
+import { clearDrafts, getDraft, setDraft } from "@/lib/drafts";
 import type { LaunchSettings } from "@/lib/useSessionAgent";
 const settings = (harness: string): LaunchSettings => ({ harness, model: `${harness}-model`, effort: "medium", permissionMode: "acceptEdits" });
 const codex = settings("codex");
@@ -171,4 +171,85 @@ it.each(["delivered", "delivery"])("clears the original draft for an augmented p
   else delivery.reject(new Error("no confirmation"));
   expect((await running).stage).toBe(stage);
   expect(getDraft(tab.id)).toBe(stage === "delivered" ? "" : "prepared prompt\n\npipeline instructions");
+});
+
+// R1: edits happen before deliver starts, while the real launch helper is awaiting.
+describe("seed ownership before sending", () => {
+  it.each(["pipeline", "startup"].flatMap((phase) => ["delivered", "delivery"].flatMap((stage) => ["prepared prompt", "", "different draft"].map((draft) => ({ phase, stage, draft })))))(
+    "preserves $draft edited during $phase through pending send and $stage", async ({ phase, stage, draft }) => {
+      const entered = deferred<void>();
+      const gate = deferred<string>();
+      const sending = deferred<void>();
+      const delivery = deferred<{ events: [] }>();
+      const augmented = "prepared prompt\n\npipeline instructions";
+      if (phase === "pipeline") mocks.pipeline.mockImplementationOnce(() => { entered.resolve(); return gate.promise; });
+      else {
+        mocks.pipeline.mockResolvedValueOnce(augmented);
+        mocks.start.mockImplementationOnce(() => { entered.resolve(); return gate.promise; });
+      }
+      mocks.send.mockImplementationOnce(() => { sending.resolve(); return delivery.promise; });
+      const running = launchContinuation(context, codex, "prepared prompt", vi.fn());
+      await entered.promise;
+      expect(getDraft(tab.id)).toBe("prepared prompt");
+      expect(mocks.send).not.toHaveBeenCalled();
+      setDraft(tab.id, "user edit");
+      setDraft(tab.id, draft);
+      gate.resolve(augmented);
+      await sending.promise;
+      expect(getDraft(tab.id)).toBe(draft);
+      expect(mocks.send).toHaveBeenCalledExactlyOnceWith("workspace", "fresh", augmented, undefined, true);
+      if (stage === "delivered") delivery.resolve({ events: [] });
+      else delivery.reject(new Error("uncertain delivery"));
+      const result = await running;
+      expect(result.stage).toBe(stage);
+      expect(getDraft(tab.id)).toBe(draft);
+      if (result.stage === "delivery") expect(result.error).toContain("composer edits have been preserved");
+    },
+  );
+
+  it.each([true, false].flatMap((edited) => ["delivered", "delivery"].map((stage) => ({ edited, stage }))))(
+    "retains seed ownership across a failed launch and retry: edited=$edited, $stage", async ({ edited, stage }) => {
+      const entered = deferred<void>();
+      const startup = deferred<void>();
+      mocks.start.mockImplementationOnce(() => { entered.resolve(); return startup.promise; });
+      const first = launchContinuation(context, codex, "prepared prompt", vi.fn());
+      await entered.promise;
+      if (edited) setDraft(tab.id, "user edit before failure");
+      startup.reject(new Error("spawn failed"));
+      const failed = await first;
+      expect(failed.stage).toBe("launch");
+      expect(mocks.send).not.toHaveBeenCalled();
+      // The final identical write occurs between invocations, with no live listener.
+      if (edited) setDraft(tab.id, "prepared prompt");
+      const sending = deferred<void>();
+      const delivery = deferred<{ events: [] }>();
+      const augmented = "prepared prompt\n\npipeline instructions";
+      mocks.pipeline.mockResolvedValueOnce(augmented);
+      mocks.send.mockImplementationOnce(() => { sending.resolve(); return delivery.promise; });
+      const retry = launchContinuation(context, codex, "prepared prompt", vi.fn(), failed.launched);
+      await sending.promise;
+      expect(getDraft(tab.id)).toBe(edited ? "prepared prompt" : "");
+      if (stage === "delivered") delivery.resolve({ events: [] });
+      else delivery.reject(new Error("uncertain delivery"));
+      expect((await retry).stage).toBe(stage);
+      expect(getDraft(tab.id)).toBe(edited ? "prepared prompt" : stage === "delivery" ? augmented : "");
+      expect(mocks.add).toHaveBeenCalledTimes(1);
+      expect(mocks.start).toHaveBeenCalledTimes(2);
+      expect(mocks.send).toHaveBeenCalledTimes(1);
+    },
+  );
+});
+
+it("does not recover a draft forgotten during pending delivery", async () => {
+  const sending = deferred<void>();
+  const delivery = deferred<{ events: [] }>();
+  mocks.send.mockImplementationOnce(() => { sending.resolve(); return delivery.promise; });
+  const running = launchContinuation(context, codex, "prepared prompt", vi.fn());
+  await sending.promise;
+  clearDrafts((id) => id === tab.id);
+  // An identical empty write after removal must not reuse the removed revision.
+  setDraft(tab.id, "");
+  delivery.reject(new Error("uncertain delivery"));
+  expect((await running).stage).toBe("delivery");
+  expect(getDraft(tab.id)).toBe("");
 });
