@@ -196,6 +196,10 @@ export function Composer({
   const [highlight, setHighlight] = useState<{ list: string | null; row: number }>({ list: null, row: 0 });
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  // Guard synchronously too: two submissions can arrive before React renders.
+  const sendPending = useRef(false);
+  const draftRevision = useRef(0);
+  useLayoutEffect(() => { draftRevision.current += 1; }, [draft]);
   // The model and permission pickers open on a click and an accessibility press too.
   const modelMenu = useRowMenu({ onOpenChange: (open) => open && void refreshPickerModels() });
   const [optionsOpen, setOptionsOpen] = useState(false);
@@ -387,7 +391,9 @@ export function Composer({
 
   const send = useCallback(async () => {
     const text = draft.trim();
-    if ((!text && !attachments.length) || sending || disabled) return;
+    if ((!text && !attachments.length) || sendPending.current || disabled) return;
+    sendPending.current = true;
+    const submittedRevision = draftRevision.current;
     setSending(true);
     try {
       await onSend(text, attach.images);
@@ -396,13 +402,17 @@ export function Composer({
       // here so the reader can retry without selecting them again.
       return;
     } finally {
+      sendPending.current = false;
       setSending(false);
     }
     // Sending a recalled message gives back the draft that was set aside for it.
-    onDraftChange(recall.sent());
-    attach.clear();
+    const restored = recall.sent();
+    if (draftRevision.current === submittedRevision) onDraftChange(restored);
+    // Only consume the images in this submission; new attachments stay queued.
+    for (const attachment of attachments) attach.remove(attachment.id);
+    if (attach.fileRef.current) attach.fileRef.current.value = "";
     ref.current?.focus({ preventScroll: true });
-  }, [draft, attachments, attach, sending, disabled, onSend, onDraftChange, recall.sent]);
+  }, [draft, attachments, attach, disabled, onSend, onDraftChange, recall.sent]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (pickerOpen && items.length) {
@@ -515,6 +525,7 @@ export function Composer({
           {...textProps}
           value={draft}
           onChange={(e) => {
+            draftRevision.current += 1;
             onDraftChange(e.target.value);
             setCaret(e.target.selectionStart ?? e.target.value.length);
             setDismissedToken(null);
@@ -626,7 +637,8 @@ export function Composer({
               </WithTooltip>
             )}
             {/* One button: Stop while the agent works and nothing is typed, Send (a queued message while it works) once something is. Stop's shortcut works either way. */}
-            {busy && canStop && !draft.trim() && !attachments.length ? (
+            {sending && <span role="status" className="text-xs text-muted-foreground">Sending…</span>}
+            {!sending && busy && canStop && !draft.trim() && !attachments.length ? (
               <WithTooltip label={stopMode === "force" ? "Stop session" : "Stop"} keys={keysOf(stopMode === "interrupt" ? "session.interrupt" : "session.stop")}>
                 <Button
                   size="icon-sm"
@@ -639,12 +651,13 @@ export function Composer({
                 </Button>
               </WithTooltip>
             ) : (
-              <WithTooltip label={busy ? "Queue" : "Send"} keys={keysOf("composer.send")}>
+              <WithTooltip label={sending ? "Sending…" : busy ? "Queue" : "Send"} keys={keysOf("composer.send")}>
                 <Button
                   size="icon-sm"
                   className={CORNER}
                   variant={draft.trim() || attachments.length ? "accent" : "secondary"}
-                  aria-label="Send"
+                  aria-label={sending ? "Sending" : "Send"}
+                  aria-busy={sending}
                   disabled={disabled || sending || (!draft.trim() && !attachments.length)}
                   onClick={() => void send()}
                 >

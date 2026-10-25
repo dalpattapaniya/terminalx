@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { agent as agentApi, errorMessage, type ImageInput } from "@/lib/api";
 import { applyEvent, getTabLog, useTabLog } from "@/lib/agentEvents";
 import { buildTranscript, conversationEvents, type Transcript } from "@/lib/transcript";
-import { getDraft, setDraft, useDraft } from "@/lib/drafts";
+import { getDraft, setDraft, subscribeDrafts, useDraft } from "@/lib/drafts";
 import { useSessionIsGit } from "@/lib/quickChats";
 import { hasEscapeOverlay, useShortcut } from "@/lib/hotkeys";
 import { changeRange, useChanges } from "@/lib/changes";
@@ -234,6 +234,10 @@ export function TabView({
       if (blockedRef.current) throw new Error(blockedRef.current);
       setError(null);
       setStopped(false);
+      let draftEdited = false;
+      const unsubscribeDraft = subscribeDrafts((id) => {
+        if (id === tab.id) draftEdited = true;
+      });
       try {
         const out = await backend.send(tab.id, text, images);
         for (const ev of out.events) applyEvent(ev);
@@ -241,8 +245,10 @@ export function TabView({
       } catch (e) {
         setError(local ? safeError(e) : commandError(e));
         backend.setTabStatus(tab.id, "waiting");
-        setDraft(tab.id, getDraft(tab.id) || text);
+        if (!draftEdited) setDraft(tab.id, getDraft(tab.id) || text);
         throw e;
+      } finally {
+        unsubscribeDraft();
       }
     },
     [backend, local, tab.id],

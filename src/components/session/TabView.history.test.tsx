@@ -199,3 +199,34 @@ describe.each(["local", "cloud"] as const)("composer history in a %s tab", (kind
     expect(walk("ArrowUp", 4)).toEqual(["third, queued while working", "one more thing", "second", "first"]);
   });
 });
+
+// #637: exercise the real local backend/composer with a deferred runtime reply.
+describe("detached runtime send acknowledgment", () => {
+  it.each(["accepted", "queued", "refused"])("shows progress before a %s runtime reply and preserves edits", async (outcome) => {
+    let resolve!: (value: { queued: boolean; events: AgentEvent[] }) => void;
+    let reject!: (error: Error) => void;
+    const delivery = new Promise<{ queued: boolean; events: AgentEvent[] }>((yes, no) => { resolve = yes; reject = no; });
+    const original = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation((command: string, args?: { text?: string }) => {
+      if (command === "send_message") { sends.push(args!.text!); return delivery; }
+      return original(command, args);
+    });
+    const view = render(<LocalTab />);
+    fireEvent.change(field(), { target: { value: "hello" } });
+    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    expect(view.getByText("Sending…")).toBeTruthy();
+    expect(sends).toEqual(["hello"]);
+    expect(mocks.invoke).toHaveBeenCalledWith("send_message", expect.objectContaining({ text: "hello", images: [] }));
+    press("Enter");
+    fireEvent.change(field(), { target: { value: "next" } });
+    // Explicitly clearing a draft must survive a late delivery error too.
+    if (outcome === "refused") fireEvent.change(field(), { target: { value: "" } });
+    await act(async () => {
+      if (outcome === "refused") reject(new Error("delivery uncertain"));
+      else resolve({ queued: outcome === "queued", events: [] });
+    });
+    expect(view.queryByText("Sending…")).toBeNull();
+    expect(field().value).toBe(outcome === "refused" ? "" : "next");
+    expect(sends).toEqual(["hello"]);
+  });
+});
