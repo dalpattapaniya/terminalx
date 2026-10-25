@@ -347,6 +347,18 @@ it.each([null, new Error("Credential storage unavailable")])("keeps credential f
   fake.start.mockClear();
   await act(async () => { expect(await app.connectHost({ ...HOST, id: "host-bbbb2222" })).toBe(false); });
   expect(app.activeHost?.id).toBe(HOST.id);
-  expect(app.error).toBe(failure?.message ?? "The device credential is unavailable. Pair this computer again.");
+  // readHostCredential deliberately treats secure-store failures as unavailable credentials.
+  expect(app.error).toBe("The device credential is unavailable. Pair this computer again.");
+  expect(fake.start).not.toHaveBeenCalled();
+});
+
+it("reports malformed stored credentials without leaving an unhandled selection rejection", async () => {
+  fake.credentialRead = async () => "{";
+  let expected = "";
+  try { JSON.parse("{"); } catch (cause) { expected = (cause as Error).message; }
+  fake.start.mockClear();
+  await act(async () => { expect(await app.connectHost({ ...HOST, id: "host-bbbb2222" })).toBe(false); });
+  expect(app.error).toBe(expected);
+  expect(app.activeHost?.id).toBe(HOST.id);
   expect(fake.start).not.toHaveBeenCalled();
 });
