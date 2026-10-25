@@ -97,7 +97,11 @@ fn quote(s: &str) -> String {
 /// login shell, so it is one string rather than an argv.
 pub fn launch_command(opts: LaunchOptions<'_>) -> Option<String> {
     let program = crate::binpath::resolve("codex")?;
-    let mut c = quote(&program.to_string_lossy());
+    // Hooks authenticate this launch with its tab, socket and token. A shared
+    // Codex daemon inherits those from whichever tab started it, including a
+    // retired owner after an app restart (#638). Keep the engine in this
+    // launch so every hook inherits the same identity as its TUI.
+    let mut c = format!("{} --no-daemon", quote(&program.to_string_lossy()));
     if let Some(id) = opts.resume {
         c.push_str(&format!(" resume {}", quote(id)));
     }
@@ -153,6 +157,23 @@ pub fn pre_tool_decision(allow: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires installed Codex with daemon support; isolated home, loopback provider, no model or account"]
+    fn fresh_and_resumed_tabs_keep_their_hook_routing_with_a_shared_daemon() {
+        let program = crate::binpath::resolve("codex").expect("install Codex to run its live routing regression");
+        let fresh = launch_command(LaunchOptions { resume: None, model: "", effort: None, permission_mode: "bypassPermissions" }).unwrap();
+        let resumed = launch_command(LaunchOptions { resume: Some("fixture-resume-id"), model: "", effort: None, permission_mode: "bypassPermissions" }).unwrap();
+        let probe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/local-runtime/codex-routing-probe.py");
+        let output = std::process::Command::new("python3")
+            .arg(probe)
+            .arg("--codex").arg(program)
+            .arg("--fresh-command").arg(fresh)
+            .arg("--resume-command").arg(resumed)
+            .output().expect("run the real Codex routing regression");
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
 
     #[test]
     fn only_local_owner_deciding_hooks_use_the_extended_wait() {

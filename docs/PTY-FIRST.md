@@ -588,6 +588,28 @@ thing to get wrong on every upgrade. The answer is cached against a digest of
 `hooks.json`, so the short-lived child runs when TerminalX moves or is
 upgraded, not on every tab.
 
+The home is shared; the running engine must belong to the tab's launch.
+Codex 0.164.0 can attach each TUI to a shared app-server daemon, whose process
+environment still contains the first tab's hook identity and socket. After
+that owner exits, even a new TUI with the right environment sends its hooks
+to the retired owner: `SessionStart` never reaches TerminalX and deciding
+hooks fail closed. Fresh and resumed TerminalX tabs therefore pass
+`--no-daemon`, which keeps hooks in the current launch's environment even
+when a shared daemon already exists. This requires a Codex CLI that supports
+that option. The existing daemon, other sessions, hook trust and permission
+mode are left alone. A failed owner connection is reported as unavailable
+permission authority, not as a human refusing the action.
+
+The opt-in regression uses the installed Codex, a disposable home and a
+private daemon with a deliberately old identity. It checks fresh and resumed
+`SessionStart` receipts against the current launch, with a loopback-only
+provider and fixture credentials; it uses no real account or remote model:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --lib \
+  fresh_and_resumed_tabs_keep_their_hook_routing_with_a_shared_daemon -- --ignored
+```
+
 Two startup dialogs would otherwise eat the first prompt, and both are handled
 before the CLI starts:
 
