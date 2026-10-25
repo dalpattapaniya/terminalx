@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.2.19
+
+### Permissions
+
+- Fix local sessions rejecting tool calls with “The user declined this action”
+  when nobody declined them. Authenticated tool reports now leave the provider's
+  own permission policy in charge; missing replies, stale launches and explicit
+  denials remain blocked. (#632)
+- Show the full command, working directory and approval reason in local and shared
+  permission cards, including Codex commands. Preserve whitespace and long command
+  suffixes, wrap long lines and keep approval buttons reachable in narrow and
+  floating windows. (#632)
+
 ## 0.2.18
 
 ### Background sessions
