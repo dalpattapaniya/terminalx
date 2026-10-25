@@ -1,6 +1,13 @@
 import { useSyncExternalStore } from "react";
 import { getDraft, subscribeDrafts } from "./drafts";
 
+/** Connection generations govern attachment, not an unresolved mailbox enqueue. */
+export function composerSendScope(backend: { kind: string; key: string; logSessionId: string }, tabId: string): string {
+  // Keep the full key (including cloud organization/workspace), backend kind,
+  // destination session and tab. Never reduce ownership to just a tab ID.
+  return JSON.stringify([backend.kind, backend.key, backend.logSessionId, tabId]);
+}
+
 // UI ownership only, not a delivery receipt or a transport retry token.
 export interface ComposerSend {
   edited: boolean;

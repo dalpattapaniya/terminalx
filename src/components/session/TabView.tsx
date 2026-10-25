@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { agent as agentApi, errorMessage, type ImageInput } from "@/lib/api";
 import { applyEvent, getTabLog, useTabLog } from "@/lib/agentEvents";
 import { buildTranscript, conversationEvents, type Transcript } from "@/lib/transcript";
-import { clearComposerSendError, useComposerSend } from "@/lib/composerSends";
+import { clearComposerSendError, composerSendScope, useComposerSend } from "@/lib/composerSends";
 import { getDraft, setDraft, subscribeDrafts, useDraft } from "@/lib/drafts";
 import { useSessionIsGit } from "@/lib/quickChats";
 import { hasEscapeOverlay, useShortcut } from "@/lib/hotkeys";
@@ -105,7 +105,7 @@ export function TabView({
     if (message && message === backend.readOnlyReason) return message;
     return cloudCommandError(e);
   };
-  const sendScope = JSON.stringify([backend.kind, backend.key, backend.generation, tab.id]);
+  const sendScope = composerSendScope(backend, tab.id);
   const sendState = useComposerSend(sendScope);
   const [localError, setError] = useState<string | null>(null);
   const error = localError ?? (sendState.error != null ? (local ? safeError(sendState.error) : commandError(sendState.error)) : null);

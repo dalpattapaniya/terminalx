@@ -339,3 +339,90 @@ describe("pending send ownership across session remounts", () => {
     expect(sends).toEqual(["H"]);
   });
 });
+
+// R3: real TabView/Composer and ownership/draft stores; the cloud backend's
+// enqueue boundary is deferred independently of live connection attachment.
+describe("cloud send ownership across connection generations", () => {
+  function deferredCloud() {
+    let resolve!: (value: { queued: boolean; events: AgentEvent[] }) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<{ queued: boolean; events: AgentEvent[] }>((yes, no) => { resolve = yes; reject = no; });
+    const send = vi.fn(() => promise);
+    const backend = { ...cloudBackend(() => {}), send };
+    return { backend, send, resolve, reject };
+  }
+  function cloudView(backend: SessionBackend) {
+    return <TooltipProvider><TabView session={session} tab={session.tabs[0]} active backend={backend} /></TooltipProvider>;
+  }
+
+  describe.each([false, true])("remount=%s", (remount) => {
+    it.each(["accepted", "refused"])("retains pending ownership and current feedback on %s", async (outcome) => {
+      const delivery = deferredCloud();
+      let view = render(cloudView(delivery.backend));
+      fireEvent.change(field(), { target: { value: "P" } });
+      press("Enter");
+      expect(delivery.send).toHaveBeenCalledExactlyOnceWith(session.tabs[0].id, "P", []);
+      const reconnected = { ...delivery.backend, generation: "g2" };
+      if (remount) { view.unmount(); view = render(cloudView(reconnected)); }
+      else view.rerender(cloudView(reconnected));
+      expect(view.getByText("Sending…")).toBeTruthy();
+      expect(view.getByRole("button", { name: "Sending" }).hasAttribute("disabled")).toBe(true);
+      press("Enter");
+      expect(delivery.send).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        if (outcome === "accepted") delivery.resolve({ queued: true, events: [] });
+        else delivery.reject(new Error("enqueue refused"));
+      });
+      expect(view.queryByText("Sending…")).toBeNull();
+      expect(field().value).toBe(outcome === "accepted" ? "" : "P");
+      expect(delivery.send).toHaveBeenCalledTimes(1);
+      if (outcome === "refused") {
+        expect(view.getByText(/Could not queue the command/)).toBeTruthy();
+        view.unmount();
+        view = render(cloudView({ ...reconnected, generation: "g3" }));
+        expect(view.getByText(/Could not queue the command/)).toBeTruthy();
+      }
+    });
+
+    it("preserves a newer draft when g1 accepts after reconnect", async () => {
+      const delivery = deferredCloud();
+      let view = render(cloudView(delivery.backend));
+      fireEvent.change(field(), { target: { value: "P" } });
+      press("Enter");
+      const reconnected = { ...delivery.backend, generation: "g2" };
+      if (remount) { view.unmount(); view = render(cloudView(reconnected)); }
+      else view.rerender(cloudView(reconnected));
+      fireEvent.change(field(), { target: { value: "N" } });
+      press("Enter");
+      await act(async () => delivery.resolve({ queued: true, events: [] }));
+      expect(field().value).toBe("N");
+      expect(delivery.send).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it.each(["organization", "workspace", "session"])("keeps a different %s destination independent of an old failure", async (part) => {
+    const first = deferredCloud();
+    const second = deferredCloud();
+    const key = part === "organization" ? `cloud:org-2:ws-1:${logSessionId}`
+      : part === "workspace" ? `cloud:org-1:ws-2:${logSessionId}`
+      : `cloud:org-1:ws-1:other-${logSessionId}`;
+    const other = { ...second.backend, key, generation: "g2" };
+    let view = render(cloudView(first.backend));
+    fireEvent.change(field(), { target: { value: "P" } });
+    press("Enter");
+    view.unmount();
+    view = render(cloudView(other));
+    expect(view.queryByText("Sending…")).toBeNull();
+    fireEvent.change(field(), { target: { value: "N" } });
+    press("Enter");
+    expect(second.send).toHaveBeenCalledTimes(1);
+    await act(async () => first.reject(new Error("old destination refused")));
+    expect(view.getByText("Sending…")).toBeTruthy();
+    expect(view.queryByText(/Could not queue the command/)).toBeNull();
+    expect(field().value).toBe("N");
+    await act(async () => second.resolve({ queued: true, events: [] }));
+    expect(field().value).toBe("");
+    expect(first.send).toHaveBeenCalledTimes(1);
+    expect(second.send).toHaveBeenCalledTimes(1);
+  });
+});
