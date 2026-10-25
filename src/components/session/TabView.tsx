@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { agent as agentApi, errorMessage, type ImageInput } from "@/lib/api";
 import { applyEvent, getTabLog, useTabLog } from "@/lib/agentEvents";
 import { buildTranscript, conversationEvents, type Transcript } from "@/lib/transcript";
+import { clearComposerSendError, useComposerSend } from "@/lib/composerSends";
 import { getDraft, setDraft, subscribeDrafts, useDraft } from "@/lib/drafts";
 import { useSessionIsGit } from "@/lib/quickChats";
 import { hasEscapeOverlay, useShortcut } from "@/lib/hotkeys";
@@ -97,7 +98,17 @@ export function TabView({
   const isGit = useSessionIsGit(session);
   const log = useTabLog(backend.logSessionId, tab.id);
   const draft = useDraft(tab.id);
-  const [error, setError] = useState<string | null>(null);
+  const safeError = (e: unknown) => RECOVERY_MESSAGES[classifyRecovery(String(e))];
+  // A cloud command's refusal says what happened to it (queued, view only, no key yet).
+  const commandError = (e: unknown) => {
+    const message = e instanceof Error ? e.message : null;
+    if (message && message === backend.readOnlyReason) return message;
+    return cloudCommandError(e);
+  };
+  const sendScope = JSON.stringify([backend.kind, backend.key, backend.generation, tab.id]);
+  const sendState = useComposerSend(sendScope);
+  const [localError, setError] = useState<string | null>(null);
+  const error = localError ?? (sendState.error != null ? (local ? safeError(sendState.error) : commandError(sendState.error)) : null);
   const views = useTabViews();
   // A cloud tab's terminal view (PRO-86) attaches to its CLI on the VM; it is
   // only there while the runtime serves it, else the tab shows its chat.
@@ -152,13 +163,7 @@ export function TabView({
   // The retry and resume flows restart a local agent process; a cloud tab's runtime recovers itself.
   // A tab that is a terminal has no agent to recover: what went wrong there is said as it is.
   const recovery = !backend.caps.recovery || readOnly ? null : eventRecovery ?? (error || viewError ? classifyRecovery(error ?? viewError!) : null);
-  const safeError = (e: unknown) => RECOVERY_MESSAGES[classifyRecovery(String(e))];
-  // A cloud command's refusal says what happened to it (queued, view only, no key yet).
-  const commandError = (e: unknown) => {
-    const message = e instanceof Error ? e.message : null;
-    if (message && message === backend.readOnlyReason) return message;
-    return cloudCommandError(e);
-  };
+
 
   const backendRef = useRef(backend);
   backendRef.current = backend;
@@ -304,12 +309,13 @@ export function TabView({
       // A queued cloud stop ends the turn on the runtime; there is nothing local to resume.
       if (backend.caps.recovery) setStopped(true);
       setError(null);
+      clearComposerSendError(sendScope);
       clearTabViewError(tab.id);
     }).catch((e) => setError(local ? safeError(e) : commandError(e))).finally(() => {
       recoveryLock.current = false;
       setRecovering(false);
     });
-  }, [backend, local, tab.id, gate?.mayStop]);
+  }, [backend, local, tab.id, gate?.mayStop, sendScope]);
 
   const retry = async (model?: string) => {
     if (recoveryLock.current) return;
@@ -327,6 +333,7 @@ export function TabView({
       setStopped(false);
       for (const ev of out.events) applyEvent(ev);
       setError(null);
+      clearComposerSendError(sendScope);
       clearTabViewError(tab.id);
       // Recovery never touches the unsent composer draft or attachments.
     } catch (e) { setError(safeError(e)); }
@@ -467,6 +474,7 @@ export function TabView({
           </div>
         )}
         <Composer
+          sendScope={sendScope}
           tab={tab}
           cwd={local ? session.cwd : undefined}
           // A tab that is not on screen asks its runtime for nothing: on a runtime that answers

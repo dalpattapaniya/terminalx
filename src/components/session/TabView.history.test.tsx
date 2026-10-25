@@ -230,3 +230,112 @@ describe("detached runtime send acknowledgment", () => {
     expect(sends).toEqual(["hello"]);
   });
 });
+
+// R1/R2: real module-level draft/history stores, real Composer and local adapter;
+// only IPC delivery is deferred. No detached process is launched by these drafts.
+describe("pending send ownership across session remounts", () => {
+  function deferDelivery() {
+    let resolve!: (value: { queued: boolean; events: AgentEvent[] }) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<{ queued: boolean; events: AgentEvent[] }>((yes, no) => { resolve = yes; reject = no; });
+    const original = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation((command: string, args?: { text?: string }) => {
+      if (command === "send_message") { sends.push(args!.text!); return promise; }
+      return original(command, args);
+    });
+    return { resolve, reject };
+  }
+
+  describe.each(["accepted", "queued", "refused"])("%s reply", (outcome) => {
+    it.each([undefined, "N", "", "P"])("preserves remounted draft ownership for %j", async (next) => {
+      const delivery = deferDelivery();
+      let view = render(<LocalTab />);
+      fireEvent.change(field(), { target: { value: "P" } });
+      fireEvent.click(view.getByRole("button", { name: "Send" }));
+      view.unmount();
+      // A write without any mounted composer must also be tracked, even P -> P.
+      if (next !== undefined) act(() => setDraft(session.tabs[0].id, next));
+      view = render(<LocalTab />);
+      expect(view.getByText("Sending…")).toBeTruthy();
+      expect(view.getByRole("button", { name: "Sending" }).hasAttribute("disabled")).toBe(true);
+      press("Enter");
+      expect(sends).toEqual(["P"]);
+      await act(async () => {
+        if (outcome === "refused") delivery.reject(new Error("network disconnected"));
+        else delivery.resolve({ queued: outcome === "queued", events: [] });
+      });
+      expect(view.queryByText("Sending…")).toBeNull();
+      expect(field().value).toBe(next ?? (outcome === "refused" ? "P" : ""));
+      expect(sends).toEqual(["P"]);
+      if (outcome === "refused") {
+        expect(view.getAllByText("The connection was lost. The process outcome is unknown.").length).toBeGreaterThan(0);
+        view.unmount();
+        view = render(<LocalTab />);
+        expect(view.getAllByText("The connection was lost. The process outcome is unknown.").length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  it("retains a rejection that arrives with no view mounted", async () => {
+    const delivery = deferDelivery();
+    let view = render(<LocalTab />);
+    fireEvent.change(field(), { target: { value: "P" } });
+    press("Enter");
+    view.unmount();
+    await act(async () => delivery.reject(new Error("network disconnected")));
+    view = render(<LocalTab />);
+    expect(view.queryByText("Sending…")).toBeNull();
+    expect(view.getAllByText("The connection was lost. The process outcome is unknown.").length).toBeGreaterThan(0);
+    expect(field().value).toBe("P");
+    expect(sends).toEqual(["P"]);
+  });
+
+  it("observes edits in the returned composer before original acceptance", async () => {
+    const delivery = deferDelivery();
+    let view = render(<LocalTab />);
+    fireEvent.change(field(), { target: { value: "P" } });
+    press("Enter");
+    view.unmount();
+    view = render(<LocalTab />);
+    fireEvent.change(field(), { target: { value: "N" } });
+    press("Enter");
+    await act(async () => delivery.resolve({ queued: false, events: [] }));
+    expect(field().value).toBe("N");
+    expect(sends).toEqual(["P"]);
+    expect(view.queryByText("Sending…")).toBeNull();
+  });
+
+  it.each([false, true])("retains newer browsing and saved N (remount=%s)", async (remount) => {
+    saved = [user("H")];
+    const delivery = deferDelivery();
+    let view = render(<LocalTab />);
+    await waitFor(() => { press("ArrowUp"); expect(field().value).toBe("H"); });
+    press("ArrowDown");
+    fireEvent.change(field(), { target: { value: "P" } });
+    press("Enter");
+    if (remount) { view.unmount(); view = render(<LocalTab />); }
+    fireEvent.change(field(), { target: { value: "N" } });
+    press("ArrowUp");
+    expect(field().value).toBe("H");
+    await act(async () => delivery.resolve({ queued: false, events: [] }));
+    expect(field().value).toBe("H");
+    press("ArrowDown");
+    expect(field().value).toBe("N");
+    expect(sends).toEqual(["P"]);
+  });
+
+  it.each([false, true])("restores the untouched recalled-send draft (remount=%s)", async (remount) => {
+    saved = [user("H")];
+    const delivery = deferDelivery();
+    let view = render(<LocalTab />);
+    await waitFor(() => { press("ArrowUp"); expect(field().value).toBe("H"); });
+    press("ArrowDown");
+    fireEvent.change(field(), { target: { value: "saved draft" } });
+    press("ArrowUp");
+    press("Enter");
+    if (remount) { view.unmount(); view = render(<LocalTab />); }
+    await act(async () => delivery.resolve({ queued: false, events: [] }));
+    expect(field().value).toBe("saved draft");
+    expect(sends).toEqual(["H"]);
+  });
+});
