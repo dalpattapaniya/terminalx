@@ -132,6 +132,11 @@
   dependencies, and add a disposable probe of the existing headless runtime's
   launcher lifetime, control authentication and PTY self-test. Desktop quit and
   reattachment behavior is not implemented by this preparation. (#467)
+### Agent sessions
+
+- Keep macOS browser-use MCP helpers out of the Dock and app switcher while
+  preserving screen detection and usable browser windows. Close agent PTYs on
+  Cmd+Q and relaunch so their session-owned MCP helpers receive EOF. (PRO-116)
 
 ### Chat
 
