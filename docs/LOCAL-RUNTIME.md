@@ -473,7 +473,12 @@ with production startup still using the in-process backend.
 
 The connection notice separates unavailable live state from session history. It
 subscribes before reading status, ignores older status results after a disconnect,
-and reconnects only when explicitly requested. A reconnect closes old view leases
+and rechecks current window health on disconnect events. It attempts reader
+recovery after 1, 2 and 4 seconds, then leaves manual reconnect available while
+checking for independent recovery every 5 seconds. A terminal-view failure is
+scoped to its window's shared PTY connection; healthy windows and cloud session
+connections are not declared unavailable by that event. Only a failed shared
+event connection needs desktop-wide reattachment. A reconnect closes old view leases
 before opening a replacement event attachment to the same owner generation; it
 never replays input or silently follows a replacement runtime. Successful
 reattachment reloads the view once to rebuild snapshots and PTY taps. Pairing must
