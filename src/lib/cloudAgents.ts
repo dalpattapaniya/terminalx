@@ -92,8 +92,6 @@ interface Store {
   pollKick: boolean;
   pollDelay: number;
   saves: Map<string, ReturnType<typeof setTimeout>>;
-  /** Serialize cache writes so a late old write cannot overwrite a new draft. */
-  writes: Map<string, Promise<void>>;
   /** Text acknowledged by this account's cache, not merely scheduled for save. */
   savedDrafts: Map<string, string>;
   /** Decisions being enqueued right now, by request id. */
@@ -107,6 +105,9 @@ export const SAVE_DEBOUNCE_MS = 500;
 const CACHE_EVENTS = 2_000;
 
 const stores = new Map<string, Store>();
+/** Issued mutations outlive disposable stores. Do not clear this queue on
+ * account changes: A -> B -> A must still wait for A's older native operation. */
+const cacheMutations = new Map<string, Promise<void>>();
 /** The signed-in account (`context.account`), as `@/lib/account` reports it; "" while signed out. */
 let account = "";
 
@@ -166,7 +167,6 @@ function store(scope: CloudAgentScope): Store {
       pollKick: false,
       pollDelay: POLL_FIRST_MS,
       saves: new Map(),
-      writes: new Map(),
       savedDrafts: new Map(),
       deciding: new Set(),
     };
@@ -327,16 +327,40 @@ function scheduleSave(s: Store, tabId: string) {
   );
 }
 
-function saveNow(s: Store, tabId: string): Promise<void> {
-  const previous = s.writes.get(tabId) ?? Promise.resolve();
-  const writing = previous.catch(() => undefined).then(() => persistNow(s, tabId));
-  s.writes.set(tabId, writing);
+function invalidateSavedDraft(s: Store, owner: string, tabId: string) {
+  s.savedDrafts.delete(tabId);
+  const current = stores.get(cloudAgentsKey(s.scope));
+  if (current?.account === owner) current.savedDrafts.delete(tabId);
+}
+
+function queueCacheMutation(s: Store, tabId: string, mutate: (owner: string) => Promise<void>): Promise<void> {
+  const owner = cacheAccount(s);
+  const key = JSON.stringify([owner, s.scope.organizationId, s.scope.workspaceId, tabId]);
+  invalidateSavedDraft(s, owner, tabId);
+  const previous = cacheMutations.get(key) ?? Promise.resolve();
+  const writing = previous.catch(() => undefined).then(() => mutate(owner));
+  cacheMutations.set(key, writing);
   return writing.finally(() => {
-    if (s.writes.get(tabId) === writing) s.writes.delete(tabId);
+    if (cacheMutations.get(key) === writing) cacheMutations.delete(key);
   });
 }
 
-async function persistNow(s: Store, tabId: string) {
+async function mutateCache(s: Store, owner: string, tabId: string, entry: CachedTab | null) {
+  invalidateSavedDraft(s, owner, tabId);
+  try {
+    await cloudAgentApi.cacheSave(owner, s.scope, tabId, entry);
+  } finally {
+    // Invalidate replacement-store evidence too, including uncertain failure
+    // and deletion. Only a later successful current-store upsert can affirm it.
+    invalidateSavedDraft(s, owner, tabId);
+  }
+}
+
+function saveNow(s: Store, tabId: string): Promise<void> {
+  return queueCacheMutation(s, tabId, (owner) => persistNow(s, tabId, owner));
+}
+
+async function persistNow(s: Store, tabId: string, owner: string) {
   if (stores.get(cloudAgentsKey(s.scope)) !== s) return;
   if (isDevScope(s.scope)) return;
   const tab = s.tabs.get(tabId);
@@ -354,8 +378,8 @@ async function persistNow(s: Store, tabId: string) {
     updatedAt: Date.now(),
   };
   try {
-    await cloudAgentApi.cacheSave(cacheAccount(s), s.scope, tabId, entry);
-    s.savedDrafts.set(tabId, entry.draft ?? "");
+    await mutateCache(s, owner, tabId, entry);
+    if (stores.get(cloudAgentsKey(s.scope)) === s) s.savedDrafts.set(tabId, entry.draft ?? "");
   } catch {
     // A failed acknowledgement may hide a partial write. Even an older saved
     // value equal to today's text is no longer proof that reload is safe.
@@ -399,12 +423,15 @@ function restoreDraft(s: Store, tab: CloudAgentTab, draft: string | undefined) {
  * Failed/unsavable drafts remain in memory. Unlike cleanup's best-effort flush,
  * a scheduled or swallowed-error save is never evidence of persistence. */
 export function cloudDraftsReadyForRecovery(): boolean {
+  // A reload must not discard ordering ownership while detached stores still
+  // have native mutations in flight, even if this account has no drafts yet.
+  if (cacheMutations.size) return false;
   for (const tabId of draftTabs) {
     let owned = false;
     for (const s of stores.values()) {
       if (!s.tabs.has(tabId)) continue;
       owned = true;
-      if (s.saves.has(tabId) || s.writes.has(tabId)
+      if (s.saves.has(tabId)
         || s.savedDrafts.get(tabId) !== getDraft(tabId)) return false;
     }
     // Closed/unknown tabs with retained text cannot be handed off safely.
@@ -615,7 +642,9 @@ function forgetTab(s: Store, tab: CloudAgentTab) {
   if (pending) clearTimeout(pending);
   s.saves.delete(tab.tabId);
   if (tab.info.sessionId) dropTabLog(tab.info.sessionId, tab.tabId);
-  if (!isDevScope(s.scope)) void cloudAgentApi.cacheSave(cacheAccount(s), s.scope, tab.tabId, null).catch(() => undefined);
+  s.savedDrafts.delete(tab.tabId);
+  if (!isDevScope(s.scope)) void queueCacheMutation(s, tab.tabId,
+    (owner) => mutateCache(s, owner, tab.tabId, null)).catch(() => undefined);
 }
 
 export async function syncLiveTabs(scope: CloudAgentScope, client: WorkspaceRpcClient) {

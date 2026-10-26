@@ -491,8 +491,12 @@ local index to load before checkpointing. Recovery also waits until each cloud
 draft matches text acknowledged by its account-scoped cache, with no queued or
 in-flight write for that tab. Pending, failed or unsavable drafts keep the
 document open; a health poll can finish recovery after a later successful save.
-Cache writes per tab are serialized so an older write cannot overwrite a newer
-draft. This barrier is synchronous with checkpoint/reload and does not rely on
+Cache mutations, including deletion, are serialized by account, organization,
+workspace and tab beyond individual store lifetimes. Returning A -> B -> A
+cannot let an old issued mutation overtake the replacement store's save. Recovery
+also waits for detached stores' outstanding mutations before destroying the
+document that owns this ordering. Deletion and uncertain results invalidate
+matching saved-draft evidence. This barrier is synchronous with checkpoint/reload and does not rely on
 the best-effort unmount flush. If
 checkpointing fails, the page stays open with its drafts. The attempt budget is
 also window-scoped session storage, recorded before native recovery and retained
