@@ -481,7 +481,16 @@ connections are not declared unavailable by that event. Only a failed shared
 event connection needs desktop-wide reattachment. A reconnect closes old view leases
 before opening a replacement event attachment to the same owner generation; it
 never replays input or silently follows a replacement runtime. Successful
-reattachment reloads the view once to rebuild snapshots and PTY taps. Pairing must
+reattachment rechecks current health before reloading the view to rebuild snapshots
+and PTY taps. Unsent tab drafts are checkpointed to window-scoped session storage
+before that reload and consumed by the next document, without sending them. If
+checkpointing fails, the page stays open with its drafts. The attempt budget is
+also window-scoped session storage, recorded before native recovery and retained
+across reloads/remounts. Neither reader release nor a connected control read
+replenishes it: automatic attempts are conservatively limited to three per window
+browsing lifetime, with manual recovery still available. This avoids assuming an
+absent replacement reader has recovered. Manual clicks during a pending health
+read are coalesced and honored after it completes. Pairing must
 bind its new account-scoped owner adapter before production reconnect is enabled.
 
 The first intercepted quit offers keep-running, stop-all, and cancellation. Only

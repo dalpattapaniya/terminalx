@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "@/components/ui/button";
 import { errorMessage, localRuntime, type LocalRuntimeState } from "@/lib/api";
+import { checkpointDraftsForRecovery } from "@/lib/drafts";
+import { RECOVERY_DELAYS, recoveryAttempts, recordRecoveryAttempt } from "@/lib/localRuntimeRecovery";
 
 const reloadWindow = () => window.location.reload();
-const RETRY_DELAYS = [1_000, 2_000, 4_000];
 
 /** Recover readers only: connection health never implies an agent stopped. */
 export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => void }) {
@@ -20,11 +21,14 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
     let revision = 0;
     let running = false;
     let pending = false;
-    let attempts = 0;
+    let pendingRetry = false;
+    let reloadRequired = false;
+    let attempts = recoveryAttempts();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const unlisten: (() => void)[] = [];
     const recovered = () => {
       if (cancelled || reloaded) return;
+      checkpointDraftsForRecovery();
       reloaded = true;
       clearTimeout(timer);
       setState(null);
@@ -33,11 +37,16 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
     };
     const schedule = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => void check(attempts < RETRY_DELAYS.length), RETRY_DELAYS[attempts] ?? 5_000);
+      timer = setTimeout(() => void check(attempts < RECOVERY_DELAYS.length), RECOVERY_DELAYS[attempts] ?? 5_000);
     };
     async function check(retry = false) {
       if (cancelled || reloaded) return;
-      if (running) { pending = true; return; }
+      if (running) {
+        pending = true;
+        pendingRetry ||= retry;
+        if (retry) setBusy(true);
+        return;
+      }
       clearTimeout(timer);
       running = true;
       const requested = revision;
@@ -47,15 +56,26 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
         const found: LocalRuntimeState = await localRuntime.status().catch((error: unknown) => ({
           state: "unavailable" as const, message: errorMessage(error),
         }));
-        if (cancelled || reloaded || requested !== revision) return;
+        if (cancelled || reloaded) return;
+        if (requested !== revision) { pendingRetry ||= retry; return; }
         setState(found);
-        if (found.state !== "unavailable") { attempts = 0; return; }
+        if (found.state !== "unavailable") {
+          if (reloadRequired && found.state === "connected") recovered();
+          return;
+        }
         if (retry) {
-          attempts++;
+          attempts = recordRecoveryAttempt();
           setBusy(true);
           const attached = await localRuntime.reconnect();
           if (cancelled || reloaded) return;
-          if (attached.state === "connected") { recovered(); return; }
+          if (attached.state === "connected") {
+            // Reader release is an instruction to rebuild taps, not proof of
+            // replacement health. Check again, including any newer disconnect.
+            reloadRequired = true;
+            pending = true;
+            return;
+          }
+          if (requested !== revision) return;
           setState(attached.state === "unavailable" ? attached : { state: "unavailable", message: "The background runtime is not available. Reopen TerminalX to try again." });
         }
         schedule();
@@ -67,7 +87,12 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
       } finally {
         running = false;
         if (!cancelled && !reloaded) setBusy(false);
-        if (pending) { pending = false; void check(); }
+        if (pending) {
+          const retryNext = pendingRetry;
+          pending = false;
+          pendingRetry = false;
+          void check(retryNext);
+        }
       }
     }
     // Manual recovery grants one attempt, without replenishing the auto budget.
@@ -76,9 +101,13 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
       revision++;
       void check();
     };
+    const reattached = () => {
+      reloadRequired = true;
+      disconnected();
+    };
     void (async () => {
       for (const event of ["local_runtime_disconnected", "local_runtime_view_disconnected", "local_runtime_reattached"]) {
-        const stop = await listen(event, event === "local_runtime_reattached" ? recovered : disconnected);
+        const stop = await listen(event, event === "local_runtime_reattached" ? reattached : disconnected);
         if (cancelled) { stop(); return; }
         unlisten.push(stop);
       }

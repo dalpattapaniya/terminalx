@@ -4,7 +4,27 @@ import { useSyncExternalStore } from "react";
  * Unsent text per tab, module-level so a remount of the composer (switching
  * tabs, collapsing the panel) never loses what was typed.
  */
-const drafts = new Map<string, string>();
+const RECOVERY_DRAFTS = "terminalx.localRuntime.drafts.v1";
+
+function restoreRecoveryDrafts(): Map<string, string> {
+  try {
+    const saved: unknown = JSON.parse(sessionStorage.getItem(RECOVERY_DRAFTS) ?? "[]");
+    if (!Array.isArray(saved) || !saved.every((entry) => Array.isArray(entry)
+      && entry.length === 2 && entry.every((value) => typeof value === "string"))) return new Map();
+    // Consume once. Later sends/clears cannot resurrect an old checkpoint on
+    // an unrelated reload; the next recovery saves the current map afresh.
+    sessionStorage.removeItem(RECOVERY_DRAFTS);
+    return new Map(saved as [string, string][]);
+  } catch { return new Map(); }
+}
+
+const drafts = restoreRecoveryDrafts();
+
+/** Synchronous, window-scoped handoff before recovery destroys this document.
+ * Let storage failure abort the reload rather than discard unsent text. */
+export function checkpointDraftsForRecovery() {
+  sessionStorage.setItem(RECOVERY_DRAFTS, JSON.stringify([...drafts]));
+}
 const listeners = new Map<string, Set<() => void>>();
 /** Told of every change, e.g. to keep a cloud tab's draft with its cache. */
 const changes = new Set<(tabId: string, text: string) => void>();

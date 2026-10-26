@@ -97,9 +97,14 @@ pub async fn local_runtime_reconnect(app: AppHandle, window: tauri::WebviewWindo
     if previous.attachment().is_ok() {
         let label = window.label().to_owned();
         return tauri::async_runtime::spawn_blocking(move || {
-            let status = connected(&previous).map_err(|error| format!("{error:#}"))?;
-            if previous.window_connection(&label).is_err() { previous.detach_window(&label); }
-            Ok(status)
+            connected(&previous).map_err(|error| format!("{error:#}"))?;
+            if previous.window_connection(&label).is_err() {
+                // A newer shared failure must not be mistaken for a view-only
+                // failure or return the earlier control snapshot as success.
+                previous.attachment().map_err(|error| format!("{error:#}"))?;
+                previous.detach_window(&label);
+            }
+            connected(&previous).map_err(|error| format!("{error:#}"))
         }).await.map_err(|error| error.to_string())?;
     }
     if !app.state::<AppState>().runtime().as_ref().is_some_and(|current| Arc::ptr_eq(current, &previous)) {
