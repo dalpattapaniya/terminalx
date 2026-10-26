@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const native = vi.hoisted(() => ({ status: vi.fn(), reconnect: vi.fn(), listeners: new Map<string, () => void>() }));
+const localIndex = vi.hoisted(() => ({ loaded: true, sessions: [{ tabs: [{ id: "local-tab-a" }, { id: "local-tab-b" }, { id: "local-tab" }] }] }));
+vi.mock("@/lib/sessions", () => ({ getSessionStore: () => localIndex }));
 vi.mock("@/lib/api", () => ({ localRuntime: native, errorMessage: (error: unknown) => String(error) }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event: string, callback: () => void) => {
@@ -18,6 +20,7 @@ const unavailable = { state: "unavailable", message: "Live terminal output in wi
 beforeEach(() => {
   vi.useFakeTimers();
   sessionStorage.clear();
+  localIndex.loaded = true;
   clearDrafts(() => true);
   native.status.mockReset().mockResolvedValue(connected);
   native.reconnect.mockReset().mockImplementation(async () => {
@@ -142,7 +145,7 @@ it.each(["view", "shared"])("F1 preserves unsent local text across a %s recovery
   expect(restored.getDraft("unrelated-tab")).toBe("");
   restored.setDraft("local-tab-a", ""); // Composer's existing clear-on-send path.
   restored.clearDrafts((id) => id === "local-tab-b");
-  restored.checkpointDraftsForRecovery();
+  restored.checkpointDraftsForRecovery(["local-tab-a", "local-tab-b"]);
   vi.resetModules();
   const afterAnotherReload = await import("@/lib/drafts");
   expect(afterAnotherReload.getDraft("local-tab-a")).toBe("");
@@ -150,6 +153,27 @@ it.each(["view", "shared"])("F1 preserves unsent local text across a %s recovery
   // The native mock exposes only status/reconnect; any prompt dispatch is an
   // unexpected API call. A shared event doesn't reconnect unrelated readers.
   expect(native.reconnect).toHaveBeenCalledTimes(kind === "view" ? 1 : 0);
+});
+
+it("waits for positive local ownership before checkpointing a fresh document", async () => {
+  localIndex.loaded = false;
+  setDraft("local-tab", "Keep while the local index loads");
+  const { reload } = await mounted();
+  await disconnect("local_runtime_reattached");
+  expect(reload).not.toHaveBeenCalled();
+  expect(getDraft("local-tab")).toBe("Keep while the local index loads");
+  localIndex.loaded = true;
+  await advance(1_000);
+  expect(reload).toHaveBeenCalledOnce();
+  expect(native.reconnect).not.toHaveBeenCalled();
+});
+
+it("does not hydrate legacy unclassified recovery text", async () => {
+  sessionStorage.setItem("terminalx.localRuntime.drafts.v1", JSON.stringify([["t-1", "A's cloud text"]]));
+  vi.resetModules();
+  const restored = await import("@/lib/drafts");
+  expect(restored.getDraft("t-1")).toBe("");
+  expect(sessionStorage.getItem("terminalx.localRuntime.drafts.v1")).toBeNull();
 });
 
 it("F1 preserves in-memory text and refuses reload if its checkpoint cannot be stored", async () => {

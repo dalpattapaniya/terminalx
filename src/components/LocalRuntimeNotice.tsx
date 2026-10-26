@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { errorMessage, localRuntime, type LocalRuntimeState } from "@/lib/api";
 import { checkpointDraftsForRecovery } from "@/lib/drafts";
 import { RECOVERY_DELAYS, recoveryAttempts, recordRecoveryAttempt } from "@/lib/localRuntimeRecovery";
+import { getSessionStore } from "@/lib/sessions";
 
 const reloadWindow = () => window.location.reload();
 
@@ -28,7 +29,11 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
     const unlisten: (() => void)[] = [];
     const recovered = () => {
       if (cancelled || reloaded) return;
-      checkpointDraftsForRecovery();
+      const local = getSessionStore();
+      // On a fresh document, wait for the authoritative local index rather
+      // than treating unknown (possibly restored) drafts as local or empty.
+      if (!local.loaded) throw new Error("Waiting for local sessions before restoring live views. Unsent drafts have been kept.");
+      checkpointDraftsForRecovery(local.sessions.flatMap((session) => session.tabs.map((tab) => tab.id)));
       reloaded = true;
       clearTimeout(timer);
       setState(null);

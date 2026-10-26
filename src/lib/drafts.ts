@@ -4,10 +4,14 @@ import { useSyncExternalStore } from "react";
  * Unsent text per tab, module-level so a remount of the composer (switching
  * tabs, collapsing the panel) never loses what was typed.
  */
-const RECOVERY_DRAFTS = "terminalx.localRuntime.drafts.v1";
+// v1 contained unclassified raw tab IDs, including account-owned cloud drafts.
+// Never hydrate that format into the account-unscoped composer map.
+const LEGACY_RECOVERY_DRAFTS = "terminalx.localRuntime.drafts.v1";
+const RECOVERY_DRAFTS = "terminalx.localRuntime.localDrafts.v2";
 
 function restoreRecoveryDrafts(): Map<string, string> {
   try {
+    sessionStorage.removeItem(LEGACY_RECOVERY_DRAFTS);
     const saved: unknown = JSON.parse(sessionStorage.getItem(RECOVERY_DRAFTS) ?? "[]");
     if (!Array.isArray(saved) || !saved.every((entry) => Array.isArray(entry)
       && entry.length === 2 && entry.every((value) => typeof value === "string"))) return new Map();
@@ -20,10 +24,13 @@ function restoreRecoveryDrafts(): Map<string, string> {
 
 const drafts = restoreRecoveryDrafts();
 
-/** Synchronous, window-scoped handoff before recovery destroys this document.
- * Let storage failure abort the reload rather than discard unsent text. */
-export function checkpointDraftsForRecovery() {
-  sessionStorage.setItem(RECOVERY_DRAFTS, JSON.stringify([...drafts]));
+/** Synchronous, window-scoped handoff for positively identified local tabs only.
+ * The caller supplies IDs from the local session index, never a cloud catalog.
+ * Cloud/issue drafts retain their own scoped persistence and clearing metadata.
+ * Let storage failure abort the reload rather than discard unsent local text. */
+export function checkpointDraftsForRecovery(localTabIds: Iterable<string>) {
+  const local = new Set(localTabIds);
+  sessionStorage.setItem(RECOVERY_DRAFTS, JSON.stringify([...drafts].filter(([id]) => local.has(id))));
 }
 const listeners = new Map<string, Set<() => void>>();
 /** Told of every change, e.g. to keep a cloud tab's draft with its cache. */

@@ -482,8 +482,12 @@ event connection needs desktop-wide reattachment. A reconnect closes old view le
 before opening a replacement event attachment to the same owner generation; it
 never replays input or silently follows a replacement runtime. Successful
 reattachment rechecks current health before reloading the view to rebuild snapshots
-and PTY taps. Unsent tab drafts are checkpointed to window-scoped session storage
-before that reload and consumed by the next document, without sending them. If
+and PTY taps. Only unsent drafts positively identified by the loaded local session
+index are checkpointed to window-scoped session storage before that reload and
+consumed by the next document, without sending them. Cloud and issue drafts keep
+their existing scoped persistence; unclassified draft IDs and the legacy all-draft
+checkpoint are never restored through the local handoff. Recovery waits for the
+local index to load before checkpointing. If
 checkpointing fails, the page stays open with its drafts. The attempt budget is
 also window-scoped session storage, recorded before native recovery and retained
 across reloads/remounts. Neither reader release nor a connected control read

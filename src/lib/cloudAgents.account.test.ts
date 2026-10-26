@@ -36,7 +36,7 @@ vi.mock("@/lib/account", () => ({
 
 const { applyLiveTabs, dropCloudAgents, getCloudAgents, loadCloudAgents, resetCloudAgents, SAVE_DEBOUNCE_MS } = await import("./cloudAgents");
 const { bootCloudCatalog, resetCloudCatalog } = await import("./cloudCatalog");
-const { getDraft, setDraft } = await import("./drafts");
+const { getDraft, setDraft, clearDrafts, checkpointDraftsForRecovery } = await import("./drafts");
 
 const ORG = "org-a";
 const shared = { organizationId: ORG, workspaceId: "shared" };
@@ -76,6 +76,7 @@ const saved = (email: string) => mocks.caches[email]?.["t-1"]?.draft;
 
 beforeEach(() => {
   vi.useFakeTimers();
+  sessionStorage.clear();
   mocks.caches = {};
   mocks.hold = false;
   mocks.held = null;
@@ -104,11 +105,71 @@ beforeEach(() => {
 afterEach(() => {
   resetCloudCatalog();
   resetCloudAgents();
-  setDraft("t-1", "");
+  clearDrafts(() => true);
   vi.useRealTimers();
 });
 
 describe("a cloud draft stays with its account", () => {
+  it.each(["a@example.com", "b@example.com"])("recovery followed by %s loading first keeps shared-workspace drafts account-owned", async (firstAccount) => {
+    await open();
+    setDraft("t-1", "A's half-written prompt");
+    setDraft("local-recovery", "Local text survives either account");
+    setDraft("unclassified", "Not proven local");
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+    expect(saved("a@example.com")).toBe("A's half-written prompt");
+    // The local session index positively identifies only this local tab.
+    checkpointDraftsForRecovery(["local-recovery"]);
+
+    // Dispose the old document's stores/listeners, then recreate the REAL
+    // drafts/cloudAgents/cloudCatalog graph with window storage and native
+    // account caches retained. No cloud ownership metadata survives in JS.
+    resetCloudCatalog();
+    resetCloudAgents();
+    signIn(firstAccount);
+    vi.resetModules();
+    const freshDrafts = await import("./drafts");
+    expect(freshDrafts.getDraft("t-1")).toBe(""); // Before account stores even load.
+    expect(freshDrafts.getDraft("unclassified")).toBe("");
+    expect(freshDrafts.getDraft("local-recovery")).toBe("Local text survives either account");
+    const freshAgents = await import("./cloudAgents");
+    const freshCatalog = await import("./cloudCatalog");
+    const openFresh = async () => {
+      await freshAgents.loadCloudAgents(shared);
+      freshAgents.applyLiveTabs(shared, [tab()]);
+    };
+    try {
+      freshCatalog.bootCloudCatalog();
+      if (firstAccount === "a@example.com") {
+        await openFresh();
+        expect(freshDrafts.getDraft("t-1")).toBe("A's half-written prompt");
+        // Deliberately NO edit after restore: clearing must use the metadata
+        // built by the existing account cache path, not a new keystroke.
+        signIn(null);
+        expect(freshDrafts.getDraft("t-1")).toBe("");
+        signIn("b@example.com");
+      }
+      await openFresh();
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+      expect(freshDrafts.getDraft("t-1")).toBe("");
+      expect(mocks.caches["b@example.com"]["t-1"]).toBeDefined();
+      expect(saved("b@example.com")).toBeUndefined();
+      expect(freshDrafts.getDraft("local-recovery")).toBe("Local text survives either account");
+      // The original same-workspace control still restores A's OWN cache.
+      signIn("a@example.com");
+      await openFresh();
+      expect(freshDrafts.getDraft("t-1")).toBe("A's half-written prompt");
+      signIn("b@example.com"); // Direct A-to-B also clears without any edit.
+      expect(freshDrafts.getDraft("t-1")).toBe("");
+      await openFresh();
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+      expect(saved("b@example.com")).toBeUndefined();
+    } finally {
+      freshCatalog.resetCloudCatalog();
+      freshAgents.resetCloudAgents();
+      freshDrafts.clearDrafts(() => true);
+    }
+  });
+
   it("switching from A to B on one shared workspace: B's composer is empty and B's cache never gets A's text", async () => {
     await open();
     setDraft("t-1", "A's half-written prompt");
