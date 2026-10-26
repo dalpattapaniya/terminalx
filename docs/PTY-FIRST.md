@@ -595,8 +595,15 @@ that owner exits, even a new TUI with the right environment sends its hooks
 to the retired owner: `SessionStart` never reaches TerminalX and deciding
 hooks fail closed. Fresh and resumed TerminalX tabs therefore pass
 `--no-daemon`, which keeps hooks in the current launch's environment even
-when a shared daemon already exists. This requires a Codex CLI that supports
-that option. The existing daemon, other sessions, hook trust and permission
+when a shared daemon already exists. Before preparing the managed home or
+spawning either a fresh or resumed TUI, TerminalX probes the resolved executable's
+`--help` with a five-second deadline and requires its `--no-daemon` option.
+Unsupported versions (including the previously documented 0.152.0/0.153.4) get
+an actionable upgrade message; 0.164.0 is verified. Failed or timed-out probes
+also stop launch. There is no fallback to the shared daemon. The probe is repeated
+for each launch so an upgrade at the same executable path takes effect without
+restarting TerminalX or trusting cached capability state.
+The existing daemon, other sessions, hook trust and permission
 mode are left alone. A failed owner connection is reported as unavailable
 permission authority, not as a human refusing the action.
 

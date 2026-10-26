@@ -3011,6 +3011,7 @@ impl SessionManager {
         env: &mut Vec<(String, String)>,
         grant: &crate::cloud_grants::LaunchGrant,
     ) -> Result<CliLaunch> {
+        let launcher = codex::pty::Launcher::resolve()?;
         let route = grant.route.as_ref();
         // A route's provider serves the model the route names (PRO-18), not
         // the account's list, so neither the tab's model nor a substitute
@@ -3060,13 +3061,12 @@ impl SessionManager {
             self.publish(rt, Payload::Status { text: "The previous Codex conversation is no longer on this machine; starting a new one.".into() }, None);
             resume = None;
         }
-        let command = codex::pty::launch_command(codex::pty::LaunchOptions {
+        let command = launcher.command(codex::pty::LaunchOptions {
             resume: resume.as_deref(),
             model: &model,
             effort: tab.effort.as_deref(),
             permission_mode: &tab.permission_mode,
-        })
-        .ok_or_else(|| anyhow!("Codex is not installed. Install it and log in, then try again."))?;
+        });
         // The route's model provider, as user-level overrides.
         let command = format!("{command}{}", route.map(|route| route.codex_args.as_str()).unwrap_or_default());
         Ok(CliLaunch {
