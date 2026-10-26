@@ -92,6 +92,10 @@ interface Store {
   pollKick: boolean;
   pollDelay: number;
   saves: Map<string, ReturnType<typeof setTimeout>>;
+  /** Serialize cache writes so a late old write cannot overwrite a new draft. */
+  writes: Map<string, Promise<void>>;
+  /** Text acknowledged by this account's cache, not merely scheduled for save. */
+  savedDrafts: Map<string, string>;
   /** Decisions being enqueued right now, by request id. */
   deciding: Set<string>;
 }
@@ -162,6 +166,8 @@ function store(scope: CloudAgentScope): Store {
       pollKick: false,
       pollDelay: POLL_FIRST_MS,
       saves: new Map(),
+      writes: new Map(),
+      savedDrafts: new Map(),
       deciding: new Set(),
     };
     stores.set(k, s);
@@ -321,7 +327,17 @@ function scheduleSave(s: Store, tabId: string) {
   );
 }
 
-async function saveNow(s: Store, tabId: string) {
+function saveNow(s: Store, tabId: string): Promise<void> {
+  const previous = s.writes.get(tabId) ?? Promise.resolve();
+  const writing = previous.catch(() => undefined).then(() => persistNow(s, tabId));
+  s.writes.set(tabId, writing);
+  return writing.finally(() => {
+    if (s.writes.get(tabId) === writing) s.writes.delete(tabId);
+  });
+}
+
+async function persistNow(s: Store, tabId: string) {
+  if (stores.get(cloudAgentsKey(s.scope)) !== s) return;
   if (isDevScope(s.scope)) return;
   const tab = s.tabs.get(tabId);
   if (!tab || tab.placeholder || !tab.info.sessionId) return;
@@ -339,8 +355,11 @@ async function saveNow(s: Store, tabId: string) {
   };
   try {
     await cloudAgentApi.cacheSave(cacheAccount(s), s.scope, tabId, entry);
+    s.savedDrafts.set(tabId, entry.draft ?? "");
   } catch {
-    // The cache is only a head start; the checkpoint and the runtime hold the truth.
+    // A failed acknowledgement may hide a partial write. Even an older saved
+    // value equal to today's text is no longer proof that reload is safe.
+    s.savedDrafts.delete(tabId);
   }
 }
 
@@ -371,6 +390,27 @@ function restoreDraft(s: Store, tab: CloudAgentTab, draft: string | undefined) {
   tab.draft = draft;
   draftTabs.add(tab.tabId);
   setDraft(tab.tabId, draft);
+  // Reaffirm the restored value through the serialized writer. A cache read
+  // started before another write is not proof of what remains on disk now.
+  scheduleSave(s, tab.tabId);
+}
+
+/** Synchronous navigation barrier: no await between this check and reload.
+ * Failed/unsavable drafts remain in memory. Unlike cleanup's best-effort flush,
+ * a scheduled or swallowed-error save is never evidence of persistence. */
+export function cloudDraftsReadyForRecovery(): boolean {
+  for (const tabId of draftTabs) {
+    let owned = false;
+    for (const s of stores.values()) {
+      if (!s.tabs.has(tabId)) continue;
+      owned = true;
+      if (s.saves.has(tabId) || s.writes.has(tabId)
+        || s.savedDrafts.get(tabId) !== getDraft(tabId)) return false;
+    }
+    // Closed/unknown tabs with retained text cannot be handed off safely.
+    if (!owned && getDraft(tabId)) return false;
+  }
+  return true;
 }
 
 /** Write pending cache entries now (e.g. before leaving the page). */

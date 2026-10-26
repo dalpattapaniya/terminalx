@@ -5,6 +5,7 @@ import { errorMessage, localRuntime, type LocalRuntimeState } from "@/lib/api";
 import { checkpointDraftsForRecovery } from "@/lib/drafts";
 import { RECOVERY_DELAYS, recoveryAttempts, recordRecoveryAttempt } from "@/lib/localRuntimeRecovery";
 import { getSessionStore } from "@/lib/sessions";
+import { cloudDraftsReadyForRecovery } from "@/lib/cloudAgents";
 
 const reloadWindow = () => window.location.reload();
 
@@ -33,6 +34,7 @@ export function LocalRuntimeNotice({ reload = reloadWindow }: { reload?: () => v
       // On a fresh document, wait for the authoritative local index rather
       // than treating unknown (possibly restored) drafts as local or empty.
       if (!local.loaded) throw new Error("Waiting for local sessions before restoring live views. Unsent drafts have been kept.");
+      if (!cloudDraftsReadyForRecovery()) throw new Error("Waiting for cloud drafts to be saved before restoring live views. Unsent text has been kept in this window.");
       checkpointDraftsForRecovery(local.sessions.flatMap((session) => session.tabs.map((tab) => tab.id)));
       reloaded = true;
       clearTimeout(timer);

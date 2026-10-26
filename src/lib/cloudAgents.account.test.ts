@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import type { AgentTabInfo } from "@terminalx/portable/workspace";
 import type { AccountStatus } from "@/lib/api";
 import type { CachedTab } from "@/lib/cloudAgentApi";
@@ -11,6 +13,10 @@ import type { CachedTab } from "@/lib/cloudAgentApi";
 const mocks = vi.hoisted(() => ({
   account: { status: { state: "signed-out", identity: null, expiresAt: null, lastError: null } as AccountStatus, ready: true, busy: false },
   listeners: new Set<() => void>(),
+  events: new Map<string, Set<() => void>>(),
+  runtime: { status: vi.fn(), reconnect: vi.fn() },
+  saveMode: "ok" as "ok" | "held" | "failed",
+  finishSave: null as null | (() => void),
   /** Each account's on-disk agent cache, by tab id, as the native side keeps it. */
   caches: {} as Record<string, Record<string, CachedTab>>,
   /** Hold the next cache read open; its answer is given by `held`. */
@@ -22,9 +28,18 @@ const mocks = vi.hoisted(() => ({
 
 const owner = () => (mocks.account.status.state === "signed-in" ? mocks.account.status.identity!.email : "nobody");
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke, convertFileSrc: (path: string) => path }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => undefined) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (event: string, listener: () => void) => {
+  let listeners = mocks.events.get(event);
+  if (!listeners) mocks.events.set(event, (listeners = new Set()));
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}) }));
+vi.mock("@/lib/sessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/sessions")>()),
+  getSessionStore: () => ({ loaded: true, sessions: [] }),
+}));
 vi.mock("@/lib/notify", () => ({ noteStatusChange: vi.fn() }));
-vi.mock("@/lib/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("@/lib/api")>()), api: mocks.api }));
+vi.mock("@/lib/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("@/lib/api")>()), api: mocks.api, localRuntime: mocks.runtime }));
 vi.mock("@/lib/account", () => ({
   refreshAccount: vi.fn(),
   getAccount: () => mocks.account,
@@ -37,6 +52,7 @@ vi.mock("@/lib/account", () => ({
 const { applyLiveTabs, dropCloudAgents, getCloudAgents, loadCloudAgents, resetCloudAgents, SAVE_DEBOUNCE_MS } = await import("./cloudAgents");
 const { bootCloudCatalog, resetCloudCatalog } = await import("./cloudCatalog");
 const { getDraft, setDraft, clearDrafts, checkpointDraftsForRecovery } = await import("./drafts");
+const { LocalRuntimeNotice } = await import("@/components/LocalRuntimeNotice");
 
 const ORG = "org-a";
 const shared = { organizationId: ORG, workspaceId: "shared" };
@@ -77,6 +93,11 @@ const saved = (email: string) => mocks.caches[email]?.["t-1"]?.draft;
 beforeEach(() => {
   vi.useFakeTimers();
   sessionStorage.clear();
+  mocks.events.clear();
+  mocks.runtime.status.mockReset().mockResolvedValue({ state: "connected", epoch: "owner", runningAgents: 1, terminals: 1 });
+  mocks.runtime.reconnect.mockReset();
+  mocks.saveMode = "ok";
+  mocks.finishSave = null;
   mocks.caches = {};
   mocks.hold = false;
   mocks.held = null;
@@ -92,7 +113,12 @@ beforeEach(() => {
       return new Promise((resolve) => (mocks.held = (tabs) => resolve({ tabs })));
     }
     if (command === "cloud_agent_cache_save") {
-      if (args.entry) cache[String(args.tabId)] = args.entry as CachedTab;
+      const write = () => { if (args.entry) cache[String(args.tabId)] = args.entry as CachedTab; };
+      if (mocks.saveMode === "failed") throw new Error("Cache write refused");
+      if (mocks.saveMode === "held") return new Promise<void>((resolve) => {
+        mocks.finishSave = () => { write(); resolve(); };
+      });
+      write();
       return undefined;
     }
     if (command === "cloud_agent_outbox" || command === "cloud_agent_checkpoints") return [];
@@ -103,6 +129,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanup();
   resetCloudCatalog();
   resetCloudAgents();
   clearDrafts(() => true);
@@ -110,6 +137,127 @@ afterEach(() => {
 });
 
 describe("a cloud draft stays with its account", () => {
+  const reattached = async () => {
+    await act(async () => { for (const listener of mocks.events.get("local_runtime_reattached") ?? []) listener(); });
+  };
+  const mountedRecovery = async () => {
+    const reload = vi.fn();
+    let view!: ReturnType<typeof render>;
+    await act(async () => { view = render(createElement(LocalRuntimeNotice, { reload })); });
+    return { ...view, reload };
+  };
+  const expectNoPrompt = () => {
+    expect(mocks.invoke.mock.calls.every(([command]) => [
+      "cloud_agent_cache_load", "cloud_agent_cache_save", "cloud_agent_outbox", "cloud_agent_checkpoints",
+    ].includes(command))).toBe(true);
+    expect(mocks.runtime.reconnect).not.toHaveBeenCalled();
+  };
+
+  it("R2 real recovery defers a sub-500ms edit until saved, then restores A in a fresh graph without disclosing to B", async () => {
+    await open();
+    setDraft("t-1", "older saved text");
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+    const { reload, unmount } = await mountedRecovery();
+    const latest = "Latest unsent text typed immediately before recovery";
+    setDraft("t-1", latest);
+    await act(async () => vi.advanceTimersByTimeAsync(100));
+    await reattached();
+    expect(reload).not.toHaveBeenCalled();
+    expect(saved("a@example.com")).toBe("older saved text");
+    expect(getDraft("t-1")).toBe(latest);
+    await act(async () => vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS - 100));
+    expect(saved("a@example.com")).toBe(latest);
+    await act(async () => vi.advanceTimersByTimeAsync(600)); // Existing recovery health timer.
+    expect(reload).toHaveBeenCalledOnce();
+    expectNoPrompt();
+    unmount();
+    resetCloudCatalog();
+    resetCloudAgents();
+    // No old save timers are advanced after destruction of this document.
+    vi.resetModules();
+    const freshDrafts = await import("./drafts");
+    const freshAgents = await import("./cloudAgents");
+    const freshCatalog = await import("./cloudCatalog");
+    try {
+      expect(freshDrafts.getDraft("t-1")).toBe(""); // Never in the local checkpoint.
+      freshCatalog.bootCloudCatalog();
+      await freshAgents.loadCloudAgents(shared);
+      freshAgents.applyLiveTabs(shared, [tab()]);
+      expect(freshDrafts.getDraft("t-1")).toBe(latest);
+      signIn(null); // No edit after restoration.
+      expect(freshDrafts.getDraft("t-1")).toBe("");
+      signIn("b@example.com");
+      await freshAgents.loadCloudAgents(shared);
+      freshAgents.applyLiveTabs(shared, [tab()]);
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+      expect(freshDrafts.getDraft("t-1")).toBe("");
+      expect(saved("b@example.com")).toBeUndefined();
+      expectNoPrompt();
+    } finally {
+      freshCatalog.resetCloudCatalog();
+      freshAgents.resetCloudAgents();
+      freshDrafts.clearDrafts(() => true);
+    }
+  });
+
+  it.each(["held", "failed"] as const)("R2 a %s cache write prevents real recovery reload and sends no prompt", async (mode) => {
+    await open();
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+    const { reload } = await mountedRecovery();
+    mocks.saveMode = mode;
+    setDraft("t-1", "Still only in memory");
+    await reattached();
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+    expect(reload).not.toHaveBeenCalled();
+    expect(getDraft("t-1")).toBe("Still only in memory");
+    expect(saved("a@example.com")).toBeUndefined();
+    expect(screen.getByRole("status").textContent).toContain("Waiting for cloud drafts to be saved");
+    expectNoPrompt();
+    if (mode === "held") {
+      await act(async () => mocks.finishSave!());
+      await reattached();
+      expect(reload).toHaveBeenCalledOnce();
+      expect(saved("a@example.com")).toBe("Still only in memory");
+    }
+  });
+
+  it("R2 an edit while an older save is held cannot be mistaken for completed persistence", async () => {
+    await open();
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+    const { reload } = await mountedRecovery();
+    mocks.saveMode = "held";
+    setDraft("t-1", "old write in flight");
+    await act(async () => vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS));
+    const finishOld = mocks.finishSave!;
+    setDraft("t-1", "newest edit");
+    await act(async () => vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS));
+    await reattached();
+    expect(reload).not.toHaveBeenCalled();
+    await act(async () => finishOld());
+    expect(saved("a@example.com")).toBe("old write in flight");
+    await reattached();
+    expect(reload).not.toHaveBeenCalled();
+    await act(async () => mocks.finishSave!());
+    await reattached();
+    expect(saved("a@example.com")).toBe("newest edit");
+    expect(reload).toHaveBeenCalledOnce();
+    expectNoPrompt();
+  });
+
+  it("R2 a failed acknowledgement invalidates even an earlier matching saved draft", async () => {
+    await open();
+    setDraft("t-1", "previously acknowledged");
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS + 1);
+    const { reload } = await mountedRecovery();
+    mocks.saveMode = "failed";
+    applyLiveTabs(shared, [tab()]); // Another cache write with the same draft.
+    await act(async () => vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS));
+    await reattached();
+    expect(reload).not.toHaveBeenCalled();
+    expect(getDraft("t-1")).toBe("previously acknowledged");
+    expectNoPrompt();
+  });
+
   it.each(["a@example.com", "b@example.com"])("recovery followed by %s loading first keeps shared-workspace drafts account-owned", async (firstAccount) => {
     await open();
     setDraft("t-1", "A's half-written prompt");

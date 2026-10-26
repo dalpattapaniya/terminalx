@@ -487,7 +487,13 @@ index are checkpointed to window-scoped session storage before that reload and
 consumed by the next document, without sending them. Cloud and issue drafts keep
 their existing scoped persistence; unclassified draft IDs and the legacy all-draft
 checkpoint are never restored through the local handoff. Recovery waits for the
-local index to load before checkpointing. If
+local index to load before checkpointing. Recovery also waits until each cloud
+draft matches text acknowledged by its account-scoped cache, with no queued or
+in-flight write for that tab. Pending, failed or unsavable drafts keep the
+document open; a health poll can finish recovery after a later successful save.
+Cache writes per tab are serialized so an older write cannot overwrite a newer
+draft. This barrier is synchronous with checkpoint/reload and does not rely on
+the best-effort unmount flush. If
 checkpointing fails, the page stays open with its drafts. The attempt budget is
 also window-scoped session storage, recorded before native recovery and retained
 across reloads/remounts. Neither reader release nor a connected control read

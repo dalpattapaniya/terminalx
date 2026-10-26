@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const native = vi.hoisted(() => ({ status: vi.fn(), reconnect: vi.fn(), listeners: new Map<string, () => void>() }));
 const localIndex = vi.hoisted(() => ({ loaded: true, sessions: [{ tabs: [{ id: "local-tab-a" }, { id: "local-tab-b" }, { id: "local-tab" }] }] }));
 vi.mock("@/lib/sessions", () => ({ getSessionStore: () => localIndex }));
+vi.mock("@/lib/cloudAgents", () => ({ cloudDraftsReadyForRecovery: () => true }));
 vi.mock("@/lib/api", () => ({ localRuntime: native, errorMessage: (error: unknown) => String(error) }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event: string, callback: () => void) => {
