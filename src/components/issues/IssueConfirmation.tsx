@@ -29,7 +29,7 @@ export function IssueConfirmation() {
   const [error, setError] = useState("");
   const cancel = useRef<HTMLButtonElement>(null);
   const store = useSessionStore();
-  const context = JSON.stringify([store.selectedSessionId, store.view, store.selectedProject]);
+  const context = JSON.stringify([store.selectedSessionId, store.view, store.selectedProject, store.selectedCloudWorkspace]);
   useEffect(() => setReview(null), [store.navigationVersion, context]);
   useEffect(() => {
     let disposed = false;
