@@ -4835,8 +4835,9 @@ mod tests {
         let answered = out(CliKind::Claude, "PermissionRequest", Decision::Answers(json!({"answers": {"q": "a"}})));
         assert_eq!(answered["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["q"], "a");
 
-        // Codex: two events, two shapes, and neither takes anything extra —
-        // it fails the hook closed if updatedInput is so much as present.
+        // Codex: an unchanged allowed PreToolUse call is an acknowledgement.
+        // A bare permissionDecision:allow is rejected by Codex 0.164.0.
+        assert_eq!(out(CliKind::Codex, "PreToolUse", Decision::Allow), json!({}));
         let gate = out(CliKind::Codex, "PreToolUse", Decision::Deny);
         assert_eq!(gate["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(gate["hookSpecificOutput"]["permissionDecision"], "deny");

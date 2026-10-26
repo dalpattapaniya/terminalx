@@ -728,9 +728,14 @@ It is built on **`PreToolUse`**, which fires for every tool and can answer:
 ```
 
 A denial blocks the call and the model is told `Command blocked by PreToolUse
-hook: <reason>`; the reason is required, and `permissionDecision: "ask"` was
-probed and does nothing useful (the tool simply runs). An allow at `PreToolUse`
-does *not* satisfy the sandbox, so an escalating command reaches
+hook: <reason>`; the reason is required. In Codex 0.164.0, an approved,
+unchanged tool must receive `{}`. A bare `permissionDecision: "allow"` is
+rejected with `PreToolUse hook returned unsupported permissionDecision:allow`;
+that decision is supported only alongside rewritten `updatedInput`. `ask` is
+also unsupported. This is checked against the
+[0.164.0 hook parser](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/hooks/src/engine/output_parser.rs).
+
+Acknowledging `PreToolUse` does *not* satisfy the sandbox, so an escalating command reaches
 `PermissionRequest` a moment later with the same `tool_input.command`. One tool
 must not cost two cards, so the answer is remembered for the turn under the
 tool and its target and reused for the request that follows.
@@ -738,6 +743,13 @@ tool and its target and reused for the request that follows.
 Permission modes map as `plan → -a on-request -s read-only`, everything else
 `→ -a on-request -s workspace-write` (with the `PreToolUse` gate for "Ask every
 time"), and `bypassPermissions → --dangerously-bypass-approvals-and-sandbox`.
+
+In bypass, auto and plan modes, `PreToolUse` reports activity and acknowledges
+with `{}` rather than requesting another approval or overriding Codex's policy.
+The hook still enforces TerminalX's checkout reservations and authenticates the
+owning launch. Those app restrictions are separate from Codex's command
+permissions. Losing that authenticated owner currently fails closed; it must
+identify an owner/routing failure, not claim that a person declined the tool.
 
 One thing `SessionStart` is *not* good for here: readiness. Codex fires it
 when the session is created, which is at the first prompt — 20 ms before

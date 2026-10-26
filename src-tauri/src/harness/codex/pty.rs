@@ -140,17 +140,17 @@ pub fn permission_decision(allow: bool) -> Value {
 /// The reply a `PreToolUse` hook prints to gate a tool the reader has been
 /// asked about. A denial has to carry a reason — Codex rejects
 /// `permissionDecision: "deny"` without one — and the model is shown it as
-/// `Command blocked by PreToolUse hook: <reason>`.
+/// `Command blocked by PreToolUse hook: <reason>`. An unchanged allowed tool
+/// is acknowledged with an empty object: Codex 0.164.0 only accepts
+/// `permissionDecision: "allow"` when it also carries rewritten input.
 pub fn pre_tool_decision(allow: bool) -> Value {
-    let (decision, reason) = if allow {
-        ("allow", "The user allowed this action.")
-    } else {
-        ("deny", "The user declined this action.")
-    };
+    if allow {
+        return json!({});
+    }
     json!({ "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": decision,
-        "permissionDecisionReason": reason,
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "The user declined this action.",
     }})
 }
 
@@ -281,6 +281,6 @@ mod tests {
         let block = pre_tool_decision(false);
         assert_eq!(block["hookSpecificOutput"]["permissionDecision"], "deny");
         assert!(!block["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().is_empty());
-        assert_eq!(pre_tool_decision(true)["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(pre_tool_decision(true), json!({}));
     }
 }
