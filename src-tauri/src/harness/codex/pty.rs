@@ -342,6 +342,8 @@ mod tests {
             ("printf '  --no-daemon\n'; exit 2", Duration::from_secs(5), "exited unsuccessfully"),
             ("printf '  --no-daemon-other\n'", Duration::from_secs(5), "Update Codex"),
             ("exec sleep 30", Duration::from_millis(50), "timed out"),
+            ("sleep 2 2>/dev/null & printf '  --no-daemon\\n'; exit 0", Duration::from_millis(50), "timed out"),
+            ("sleep 2 >/dev/null & printf '  --no-daemon\\n'; exit 0", Duration::from_millis(50), "timed out"),
         ] {
             let program = help_program(directory.path(), body);
             let error = Launcher::inspect(program, timeout).err().expect("an unsuccessful probe must reject launch");
