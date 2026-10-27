@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep issue confirmations compact and scrollable with visible decision controls
+  and originating-session context. Background requests wait for explicit review
+  without interrupting another conversation; human approval remains required. (#641)
+
 ## 0.2.20
 
 ### Codex sessions and permissions

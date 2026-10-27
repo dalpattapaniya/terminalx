@@ -998,10 +998,22 @@ mod tests {
         assert!(!socket_dir.exists());
     }
 
+    fn socket_fixture_dir() -> tempfile::TempDir {
+        // CI's standard TMPDIR can exceed sun_path once the fixture is nested.
+        // Isolated runs must supply their owned short root; never fall back from it.
+        let root = std::env::var_os("TERMINALX_TEST_SOCKET_ROOT")
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        assert!(root.is_absolute(), "socket fixture root must be absolute");
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let socket = dir.path().join("terminalx-computer-use-xxxxxxxx/provider.sock");
+        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH_BYTES,
+            "socket fixture root is too long: {}", socket.display());
+        dir
+    }
+
     #[test]
     fn the_sweep_removes_dead_socket_dirs_and_keeps_live_and_fresh_ones() {
-        // Honor the isolated TMPDIR; keep it short enough for the nested socket path.
-        let base = tempfile::tempdir().unwrap();
+        let base = socket_fixture_dir();
         let dead = base.path().join("terminalx-computer-use-dead0001");
         std::fs::create_dir(&dead).unwrap();
         std::fs::write(dead.join("provider.sock"), b"").unwrap();
@@ -1162,7 +1174,7 @@ PY
         let dir = tempfile::tempdir().unwrap();
         let script = fake_helper(dir.path());
         let ran = dir.path().join("ran");
-        let base = tempfile::tempdir().unwrap();
+        let base = socket_fixture_dir();
         let checked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = checked.clone();
         let marker = ran.clone();
@@ -1189,7 +1201,7 @@ PY
     fn an_accepted_helper_is_checked_by_pid_and_again_on_its_socket() {
         let dir = tempfile::tempdir().unwrap();
         let script = fake_helper(dir.path());
-        let base = tempfile::tempdir().unwrap();
+        let base = socket_fixture_dir();
         let checked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = checked.clone();
         let check: CodeCheck = std::sync::Arc::new(move |peer| {
@@ -1220,7 +1232,7 @@ PY
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let base = tempfile::tempdir().unwrap();
+        let base = socket_fixture_dir();
         let error = start_session_in(&script, base.path(), &accept_all()).err().unwrap();
         assert_eq!(error.code, "provider_incompatible");
         assert!(error.message.contains("not by the helper just started"), "{}", error.message);
