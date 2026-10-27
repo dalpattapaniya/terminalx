@@ -230,6 +230,11 @@ function GeneralTab() {
         control={<Switch checked={prefs.foldToolCalls} onCheckedChange={(v) => setPrefs({ foldToolCalls: v })} />}
       />
       <SettingRow
+        label="Show files changed"
+        description="Under each finished turn, the files the agent changed with the lines it added and removed. Click a file to open it."
+        control={<Switch aria-label="Show files changed" checked={prefs.turnChanges} onCheckedChange={(v) => setPrefs({ turnChanges: v })} />}
+      />
+      <SettingRow
         label="Autocorrect"
         description="Your keyboard's spelling correction, smart quotes and dashes, and text replacements apply in prompts, answers to an agent's questions, and notes. Off leaves what you type exactly as typed."
         control={<Switch aria-label="Autocorrect" checked={prefs.autocorrect} onCheckedChange={(v) => setPrefs({ autocorrect: v })} />}

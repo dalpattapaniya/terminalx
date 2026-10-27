@@ -18,6 +18,25 @@ const props = () => ({ kind: null, waiting: false, asks: [], busy: false, models
 afterEach(cleanup);
 
 describe("session recovery UI smoke", () => {
+  it("says the agent is signed out and offers to sign in before a retry", () => {
+    for (const text of ["Login expired · Please run /login", "Invalid API key · Please run /login", "Not logged in · Please run /login", "Please run codex login"]) {
+      expect(classifyRecovery(text)).toBe("signed_out");
+    }
+    expect(classifyRecovery("The agent is signed out, or its sign-in expired. Sign in again, then retry.")).toBe("signed_out");
+    const p = { ...props(), onSignIn: vi.fn() };
+    const { rerender } = render(<RecoveryBanner {...p} kind="signed_out" />);
+    expect(screen.getByText("Signed out")).toBeTruthy();
+    expect(screen.queryByText(/encountered an error/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry safely" })).toBeNull();
+    expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Sign in", "Retry", "Stop session", "Continue in new session"]);
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(p.onSignIn).toHaveBeenCalledOnce();
+    // An agent with no sign-in of its own here still says what is wrong, and leaves the retry.
+    rerender(<RecoveryBanner {...props()} kind="signed_out" />);
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
   it("shows the full local Codex command, working directory and reason before approval", () => {
     const command = `printf 'keep  two spaces\\n'\n${"echo next\n".repeat(40)}echo final-command`;
     const local: PendingAsk = { ...ask, toolName: "exec_command", input: { cmd: command, workdir: "/workspace/app", justification: "Run the focused regression test" }, description: undefined };
