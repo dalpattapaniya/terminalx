@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Open a mobile machine’s sessions without restarting an active connection, and
+  load its sessions automatically after reconnecting. (#633)
+
 ## 0.2.19
 
 ### Permissions
