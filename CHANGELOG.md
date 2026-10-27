@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Chat
+
+- Show sending progress immediately and prevent repeat submissions while a message
+  is pending. Preserve newer drafts and recalled text, and keep pending sends and
+  errors visible across tab remounts and cloud reconnects. (#637)
+
 ## 0.2.19
 
 ### Permissions
