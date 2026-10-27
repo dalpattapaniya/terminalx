@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Show clear delivery progress when continuing in a new session, remove the submitted
+  handoff draft, and preserve any edits made while the handoff is starting. (#635)
+
 ## 0.2.20
 
 ### Codex sessions and permissions
