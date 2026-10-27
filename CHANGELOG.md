@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Show clear delivery progress when continuing in a new session, remove the submitted
+  handoff draft, and preserve any edits made while the handoff is starting. (#635)
+
 - Open a mobile machine’s sessions without restarting an active connection, and
   load its sessions automatically after reconnecting. (#633)
 
