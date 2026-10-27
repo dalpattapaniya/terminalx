@@ -5,6 +5,9 @@
 - Keep issue confirmations compact and scrollable with visible decision controls
   and originating-session context. Background requests wait for explicit review
   without interrupting another conversation; human approval remains required. (#641)
+- Recover unavailable live connections automatically without restarting agents or
+  resending prompts, while preserving unsent drafts and isolating unrelated window
+  connection failures. (#643)
 
 ## 0.2.20
 
