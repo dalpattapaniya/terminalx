@@ -8,6 +8,9 @@
   is pending. Preserve newer drafts and recalled text, and keep pending sends and
   errors visible across tab remounts and cloud reconnects. (#637)
 
+- Show clear delivery progress when continuing in a new session, remove the submitted
+  handoff draft, and preserve any edits made while the handoff is starting. (#635)
+
 - Open a mobile machine’s sessions without restarting an active connection, and
   load its sessions automatically after reconnecting. (#633)
 
