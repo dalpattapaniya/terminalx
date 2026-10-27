@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Recover unavailable live connections automatically without restarting agents or
+  resending prompts, while preserving unsent drafts and isolating unrelated window
+  connection failures. (#643)
+
 ## 0.2.20
 
 ### Codex sessions and permissions
