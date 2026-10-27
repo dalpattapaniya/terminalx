@@ -8,6 +8,29 @@
   is pending. Preserve newer drafts and recalled text, and keep pending sends and
   errors visible across tab remounts and cloud reconnects. (#637)
 
+- Recover unavailable live connections automatically without restarting agents or
+  resending prompts, while preserving unsent drafts and isolating unrelated window
+  connection failures. (#643)
+
+## 0.2.20
+
+### Codex sessions and permissions
+
+- Keep fresh and resumed Codex sessions isolated from the shared daemon so
+  hooks use the current tab and runtime, fixing false tool-call refusals after
+  restarting TerminalX. Accept unchanged approved tools with a supported hook
+  reply, and explain when the session owner is unavailable instead of claiming
+  the user declined. Explicit denials and human-only controls remain enforced. (#639)
+- Check that the installed Codex supports `--no-daemon` before preparing or
+  starting a session; 0.164.0 is verified. Unsupported versions receive an
+  actionable upgrade message. Keep the capability check within its deadline,
+  including subprocesses that retain output pipes after their parent exits. (#639)
+
+### Documentation
+
+- Add a fresh-VM Zeron comparison, narrated walkthrough and prioritized
+  improvement backlog, with account-dependent features marked untested. (#640)
+
 ## 0.2.19
 
 ### Permissions
