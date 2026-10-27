@@ -8,6 +8,9 @@
   is pending. Preserve newer drafts and recalled text, and keep pending sends and
   errors visible across tab remounts and cloud reconnects. (#637)
 
+- Open a mobile machine’s sessions without restarting an active connection, and
+  load its sessions automatically after reconnecting. (#633)
+
 - Recover unavailable live connections automatically without restarting agents or
   resending prompts, while preserving unsent drafts and isolating unrelated window
   connection failures. (#643)
