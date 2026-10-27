@@ -3,6 +3,7 @@ import { Archive, ChevronDown, Copy, Ellipsis, Folder, FolderInput, FolderOpen, 
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
+import { UpdateButton } from "./UpdateNotice";
 import { WithTooltip } from "@/components/ui/tooltip";
 import {
   ContextMenu,
@@ -312,6 +313,7 @@ export function SessionSidebar({ onHide, onOpenSettings, onOpenAccount, onSearch
           <AccountSidebarEntry onOpenAccount={onOpenAccount} />
         </div>
         <div className="flex-1" />
+        <UpdateButton />
         <WithTooltip label="Settings" shortcut="app.settings" side="top">
           <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Settings" onClick={() => onOpenSettings()}>
             <Settings />

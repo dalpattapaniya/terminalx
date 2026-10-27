@@ -22,6 +22,8 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { useShortcut } from "@/lib/hotkeys";
 import { setPrefs, usePrefs } from "@/lib/prefs";
 import { NewSessionDialog } from "@/components/session/NewSessionDialog";
+import { UpdateNotice } from "./UpdateNotice";
+import { startUpdateChecks } from "@/lib/updates";
 import { bootSessions, closeNewSession, openNewSession, openAgents, openAutomations, openIssues, openSkills, openStats, useSessionStore } from "@/lib/sessions";
 import { applyEvent, subscribeAgentEvents } from "@/lib/agentEvents";
 import { agent, type ImageInput } from "@/lib/api";
@@ -97,6 +99,8 @@ export function AppShell() {
   const [settingsRequest, setSettingsRequest] = useState(0);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
+  // An update is looked for in the background, so it is seen without going to Settings for it.
+  useEffect(() => startUpdateChecks(), []);
   useEffect(() => {
     void subscribeAgentEvents();
     void subscribeTabPty();
@@ -299,6 +303,7 @@ export function AppShell() {
       ) : null}
 
       {paletteOpen ? <CommandPalette open onOpenChange={setPaletteOpen} onOpenSettings={openSettings} onCreated={onCreated} /> : null}
+      <UpdateNotice />
     </div>
   );
 }

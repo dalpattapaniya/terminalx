@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Archive, Ellipsis, GitBranch, Pencil, Pin, Settings, SquarePen, Trash2 } from "@/icons";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
+import { UpdateButton } from "./UpdateNotice";
 import { WithTooltip } from "@/components/ui/tooltip";
 import { ContextMenu, ContextMenuTrigger, DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/menu";
 import { RowActions, actionRow, yieldsToRowActions } from "@/components/layout/RowActions";
@@ -126,6 +127,7 @@ export function ChatListSidebar({ onHide, onOpenSettings, onOpenAccount, onSearc
           <AccountSidebarEntry onOpenAccount={onOpenAccount} />
         </div>
         <div className="flex-1" />
+        <UpdateButton />
         <WithTooltip label="Settings" shortcut="app.settings" side="top">
           <Button variant="ghost" size="icon-sm" className="shrink-0" aria-label="Settings" onClick={() => onOpenSettings()}>
             <Settings />
