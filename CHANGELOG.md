@@ -8,6 +8,9 @@
   is pending. Preserve newer drafts and recalled text, and keep pending sends and
   errors visible across tab remounts and cloud reconnects. (#637)
 
+- Keep issue confirmations compact and scrollable with visible decision controls
+  and originating-session context. Background requests wait for explicit review
+  without interrupting another conversation; human approval remains required. (#641)
 - Show clear delivery progress when continuing in a new session, remove the submitted
   handoff draft, and preserve any edits made while the handoff is starting. (#635)
 
